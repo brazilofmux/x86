@@ -278,7 +278,13 @@ static int fill_operand(cursor *c, x86_insn *in, x86_operand *o, int form) {
         o->kind = OPK_REG; o->reg = in->reg;
         o->size = form == F_Gb ? 1 : form == F_Gw ? 2 : in->opsize;
         break;
-    case F_Sw: o->kind = OPK_SREG; o->reg = c->model < X86_MODEL_386 ? (in->reg & 3) : in->reg; o->size = 2; break;
+    case F_Sw:
+        /* 8086/186 alias reg 4..7 onto ES..DS; the 286 has no FS/GS and raises #UD */
+        o->kind = OPK_SREG; o->size = 2;
+        o->reg = c->model < X86_MODEL_286 ? (in->reg & 3) : in->reg;
+        if (c->model == X86_MODEL_286 && in->reg >= 4) return 0;
+        if (in->reg >= 6) return 0;                                   /* 386: no segment register 6/7 */
+        break;
     case F_Ib:  o->kind = OPK_IMM; o->size = 1; o->imm = fetch8(c); break;
     case F_Iw:  o->kind = OPK_IMM; o->size = 2; o->imm = fetch16(c); break;
     case F_Iv:  o->kind = OPK_IMM; o->imm = in->opsize == 2 ? fetch16(c) : fetch32(c); break;
@@ -425,8 +431,8 @@ done_prefix:
         if (in->reg == 7 && model > X86_MODEL_8086) in->op = OP_UD;
         if (in->reg == 3 || in->reg == 5) fd = F_Mp;
         break;
-    case G_8F: in->op = OP_POP; break;                                     /* reg field ignored */
-    case G_C6: in->op = OP_MOV; break;                                     /* reg field ignored */
+    case G_8F: in->op = (in->reg && model >= X86_MODEL_286) ? OP_UD : OP_POP; break;   /* 8086 ignores reg; 286+ #UD */
+    case G_C6: in->op = (in->reg && model >= X86_MODEL_286) ? OP_UD : OP_MOV; break;
     case G_0F00: in->op = grp0f00[in->reg]; break;
     case G_0F01:
         in->op = grp0f01[in->reg];

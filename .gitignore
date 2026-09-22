@@ -28,9 +28,12 @@ tests/*.bin
 !tests/dos/*.exe
 tests/*.json
 
-# Test-suite data (tests/sst8088/fetch.sh)
-tests/sst8088/*.MOO.gz
-tests/sst8088/metadata.json
-tools/sst8088
+# Test-suite data (tests/sst8088/fetch.sh, tests/sst386/fetch.sh)
+tests/sst*/*.MOO.gz
+tests/sst*/metadata.json
+tests/sst*/urls.txt
+tests/sst*/80386.csv
+tests/sst*/README.md
+tools/sst
 tools/jittest
 .venv/

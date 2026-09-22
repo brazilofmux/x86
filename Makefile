@@ -18,12 +18,12 @@ TARGET = dos-monster
 
 .PHONY: all clean test-sst test-jit test-dos
 
-all: $(TARGET) tools/sst8088 tools/jittest
+all: $(TARGET) tools/sst tools/jittest
 
 $(TARGET): main.o $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
-tools/sst8088: tools/sst8088.o $(CORE_OBJS)
+tools/sst: tools/sst.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lz
 
 tools/jittest: tools/jittest.o $(CORE_OBJS) $(DBT_OBJS)
@@ -32,11 +32,15 @@ tools/jittest: tools/jittest.o $(CORE_OBJS) $(DBT_OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
--include $(CORE_OBJS:.o=.d) $(DBT_OBJS:.o=.d) $(PC_OBJS:.o=.d) $(DOS_OBJS:.o=.d) main.d tools/sst8088.d tools/jittest.d
+-include $(CORE_OBJS:.o=.d) $(DBT_OBJS:.o=.d) $(PC_OBJS:.o=.d) $(DOS_OBJS:.o=.d) main.d tools/sst.d tools/jittest.d
 
-# Full 8088 suite (tests/sst8088/*.MOO.gz, not committed — see tests/sst8088/README)
-test-sst: tools/sst8088
-	./tools/sst8088 -n 3 tests/sst8088/*.MOO.gz
+# SingleStepTests suites (tests/sst*/, not committed — see tests/sst8088/fetch.sh, tests/sst386/fetch.sh)
+test-sst: tools/sst
+	./tools/sst -n 3 tests/sst8088/*.MOO.gz
+test-sst286: tools/sst
+	./tools/sst -n 3 tests/sst286/*.MOO.gz
+test-sst386: tools/sst
+	./tools/sst -n 3 tests/sst386/*.MOO.gz
 
 # JIT vs interpreter: built-in programs plus a fuzz sweep, all under -V lockstep
 test-jit: tools/jittest
@@ -50,4 +54,4 @@ test-dos: $(TARGET)
 clean:
 	rm -f $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(DBT_OBJS) $(DBT_OBJS:.o=.d) \
 	      $(PC_OBJS) $(PC_OBJS:.o=.d) $(DOS_OBJS) $(DOS_OBJS:.o=.d) main.o main.d \
-	      tools/sst8088 tools/sst8088.o tools/sst8088.d tools/jittest tools/jittest.o tools/jittest.d $(TARGET)
+	      tools/sst tools/sst.o tools/sst.d tools/jittest tools/jittest.o tools/jittest.d $(TARGET)

@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <setjmp.h>
 
 /* ============================================================================
  * FLAGS
@@ -98,6 +99,10 @@ typedef struct x86_cpu {
     /* Pending exception raised during a step (X86_EXC_*), -1 if none */
     int      exc;
     uint32_t exc_err;
+    /* Faults abort the instruction: x86_fault() longjmps here when armed
+     * (x86_step, x86_exec_decoded) so no further state is committed. */
+    jmp_buf  fault_jb;
+    int      fault_armed;
 
     /* I/O port hooks (pc/ layer). NULL = open bus. */
     uint32_t (*io_read)(struct x86_cpu *, uint16_t port, int size);
@@ -204,6 +209,10 @@ void x86_exec_decoded(x86_cpu *c, const struct x86_insn *in);
 
 /* Deliver interrupt/exception vector n (pushes flags/CS/IP, loads vector). */
 void x86_interrupt(x86_cpu *c, int vector, int is_sw);
+
+/* Raise a fault from inside an instruction: records it and, when a step
+ * is armed, abandons the instruction (longjmp). Never returns if armed. */
+void x86_fault(x86_cpu *c, int vector, uint32_t err);
 
 /* Flags after POPF/IRET are model dependent: 8086 forces 12-15 set,
  * 286 real mode forces them clear, 386 allows IOPL/NT. */
