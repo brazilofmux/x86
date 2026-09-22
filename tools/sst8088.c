@@ -259,7 +259,7 @@ int main(int argc, char **argv) {
     load_metadata(meta);
 
     x86_cpu cpu;
-    x86_init(&cpu, X86_MODEL_8086, 0x100000);
+    x86_init(&cpu, X86_MODEL_8086);
 
     int total_fail = 0, files_bad = 0;
     for (; i < argc; i++) {

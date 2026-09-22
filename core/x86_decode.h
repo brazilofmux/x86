@@ -13,11 +13,14 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Internal opcodes. The first eight match the ALU encoding in bits 5:3
- * of opcodes 00-3F and the reg field of group 1 (80-83); the rotate
- * group matches the reg field of C0/C1/D0-D3. Keep those orders. */
+/* Internal opcodes. OP_UD is 0 so that holes in the designated-
+ * initializer opcode maps decode as invalid. OP_ADD..OP_CMP follow the
+ * ALU encoding in bits 5:3 of opcodes 00-3F and the reg field of group 1
+ * (80-83); the rotate group follows the reg field of C0/C1/D0-D3. Keep
+ * those orders. */
 enum x86_op {
-    OP_ADD = 0, OP_OR, OP_ADC, OP_SBB, OP_AND, OP_SUB, OP_XOR, OP_CMP,
+    OP_UD = 0,                  /* invalid opcode (#UD on 186+) */
+    OP_ADD, OP_OR, OP_ADC, OP_SBB, OP_AND, OP_SUB, OP_XOR, OP_CMP,
     OP_ROL, OP_ROR, OP_RCL, OP_RCR, OP_SHL, OP_SHR, OP_SAL, OP_SAR,
     OP_TEST, OP_NOT, OP_NEG, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV,
     OP_INC, OP_DEC,
@@ -43,7 +46,6 @@ enum x86_op {
     OP_MOVCR, OP_MOVDR, OP_MOVTR,
     OP_INT1,
     OP_SETMO,                   /* 8086 undocumented D0-D3 /6: operand = -1 (if count != 0) */
-    OP_UD,                      /* invalid opcode (#UD on 186+) */
     OP__COUNT
 };
 

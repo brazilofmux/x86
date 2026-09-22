@@ -74,6 +74,13 @@ static inline uint32_t do_logic(x86_cpu *c, uint32_t r, int size) {
 static inline uint32_t admask(const x86_insn *in) { return in->adsize == 2 ? 0xFFFF : 0xFFFFFFFFu; }
 static inline uint32_t stkmask(x86_cpu *c) { return c->seg[S_SS].big ? 0xFFFFFFFFu : 0xFFFF; }
 
+/* CONTRACT: a word straddling offset FFFF wraps within the segment on
+ * the 8086/186 (silicon-verified by the 8088 suite). A 286/386 would
+ * raise #GP there; we access linearly instead, which is what the JIT's
+ * unchecked host-pointer loads do, and no program that survives real
+ * hardware can tell the difference. */
+static inline uint32_t wrapmask(const x86_cpu *c, uint32_t m) { return c->model >= X86_MODEL_286 ? 0xFFFFFFFFu : m; }
+
 static uint32_t calc_ea(x86_cpu *c, const x86_insn *in) {
     uint32_t ea = (uint32_t)in->disp;
     if (in->base >= 0) ea += c->r[in->base];
@@ -82,10 +89,10 @@ static uint32_t calc_ea(x86_cpu *c, const x86_insn *in) {
 }
 
 static inline uint32_t mrd(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, int size) {
-    return x86_rd(c, c->seg[seg].base, off, admask(in), size);
+    return x86_rd(c, c->seg[seg].base, off, wrapmask(c, admask(in)), size);
 }
 static inline void mwr(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, int size, uint32_t v) {
-    x86_wr(c, c->seg[seg].base, off, admask(in), size, v);
+    x86_wr(c, c->seg[seg].base, off, wrapmask(c, admask(in)), size, v);
 }
 
 static uint32_t rd_op(x86_cpu *c, const x86_insn *in, int i, uint32_t ea) {
@@ -111,13 +118,13 @@ static void push(x86_cpu *c, int size, uint32_t v) {
     uint32_t m = stkmask(c);
     uint32_t sp = (c->r[R_SP] - size) & m;
     c->r[R_SP] = m == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
-    x86_wr(c, c->seg[S_SS].base, sp, m, size, v);
+    x86_wr(c, c->seg[S_SS].base, sp, wrapmask(c, m), size, v);
 }
 
 static uint32_t pop(x86_cpu *c, int size) {
     uint32_t m = stkmask(c);
     uint32_t sp = c->r[R_SP] & m;
-    uint32_t v = x86_rd(c, c->seg[S_SS].base, sp, m, size);
+    uint32_t v = x86_rd(c, c->seg[S_SS].base, sp, wrapmask(c, m), size);
     sp = (sp + size) & m;
     c->r[R_SP] = m == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
     return v;
@@ -668,7 +675,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             for (uint32_t i = 1; i < level; i++) {
                 uint32_t bp = (x86_get_reg(c, R_BP, os) - os) & sm;
                 x86_set_reg(c, R_BP, os, bp);
-                push(c, os, x86_rd(c, c->seg[S_SS].base, bp, sm, os));
+                push(c, os, x86_rd(c, c->seg[S_SS].base, bp, wrapmask(c, sm), os));
             }
             push(c, os, frame);
         }
@@ -871,6 +878,10 @@ static void fetch_bytes(x86_cpu *c, uint8_t *buf) {
     uint32_t base = c->seg[S_CS].base, ip = c->eip;
     uint32_t m = c->seg[S_CS].big ? 0xFFFFFFFFu : 0xFFFF;
     for (int i = 0; i < 16; i++) buf[i] = x86_phys_rd8(c, base + ((ip + i) & m));
+}
+
+void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
+    execute(c, in, c->eip - in->len);
 }
 
 int x86_step(x86_cpu *c) {

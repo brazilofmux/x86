@@ -384,6 +384,8 @@ done_prefix:
         if (model < X86_MODEL_286) { in->op = OP_UD; in->len = c.pos; return in->len; }
         in->opcode2 = fetch8(&c);
         d = &map0f[in->opcode2];
+        /* The map is the 386 truth; a 286 only has the system group. */
+        if (model < X86_MODEL_386 && in->opcode2 > 0x06) d = &map0f[0x07];
         if (in->opcode2 >= 0x80 && in->opcode2 <= 0x9F) in->cond = in->opcode2 & 15;
     } else {
         d = &primary[opc];
@@ -400,7 +402,7 @@ done_prefix:
     int fd = d->d, fs = d->s;
     switch (d->grp) {
     case G_NONE: break;
-    case G_1: in->op = in->reg; break;                                     /* ADD..CMP */
+    case G_1: in->op = OP_ADD + in->reg; break;                            /* ADD..CMP */
     case G_2:
         in->op = OP_ROL + in->reg;
         /* /6: undocumented SETMO/SETMOC on the 8086, SHL alias on 186+ */

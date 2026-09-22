@@ -68,10 +68,26 @@ typedef struct x86_cpu {
     x86_seg  seg[6];
 
     /* Guest memory: flat host buffer. Physical address = linear & a20_mask,
-     * and anything >= mem_size is open bus (reads 0xFF, writes dropped). */
+     * and anything >= mem_size is open bus (reads 0xFF, writes dropped).
+     * See x86_mem.c for the A20 mirror that lets the JIT skip the mask. */
     uint8_t *mem;
     uint32_t mem_size;
     uint32_t a20_mask;
+    int      mem_fd;        /* backing object of the mirrored mapping, -1 if plain */
+    uint8_t  mem_mirrored;  /* 1: HMA window aliases low memory while A20 is off */
+    uint8_t  pad1[3];
+
+    /* One byte per guest byte, nonzero while a translated block covers
+     * it. Always allocated (all zero without a DBT) so the store path
+     * below needs no NULL test. Same mirror layout as mem. */
+    uint8_t *code_bitmap;
+    void   (*smc_hook)(struct x86_cpu *, uint32_t phys);   /* DBT: a store hit code */
+    void    *dbt;           /* owning translator, NULL when interpreting only */
+    void    *jit_aux;       /* DBT aux block base, reloaded by helper-call sequences */
+    uint64_t jit_budget;    /* insn budget handed to the trampoline (exit stub math) */
+    uint64_t jit_cnt_save;  /* pinned budget register parked across helper calls */
+    uint32_t jit_cur_lin;   /* linear address of the block making a helper call... */
+    uint32_t jit_cur_hit;   /* ...set by the SMC sweep if that block got invalidated */
 
     int      model;       /* X86_MODEL_* */
     uint8_t  pmode;       /* 0 = real mode, 1 = protected */
@@ -121,7 +137,10 @@ static inline uint8_t x86_phys_rd8(x86_cpu *c, uint32_t lin) {
 }
 static inline void x86_phys_wr8(x86_cpu *c, uint32_t lin, uint8_t v) {
     uint32_t p = lin & c->a20_mask;
-    if (p < c->mem_size) c->mem[p] = v;
+    if (p < c->mem_size) {
+        c->mem[p] = v;
+        if (c->code_bitmap[p]) c->smc_hook(c, p);
+    }
 }
 
 /* Segment-relative access with in-segment offset wrap. offmask is
@@ -138,6 +157,15 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
         x86_phys_wr8(c, base + ((off + i) & offmask), (uint8_t)(v >> (8 * i)));
 }
 
+/* Guest memory geometry: 1 MB + 64 KB HMA, plus readable slack so the
+ * decoder and straddling accesses at the top never fault. */
+#define X86_MEM_SIZE  0x110000u
+#define X86_MEM_SLACK 0x10000u
+
+int  x86_mem_alloc(x86_cpu *c);
+void x86_mem_free(x86_cpu *c);
+int  x86_set_a20(x86_cpu *c, int on);
+
 /* Exceptions (vector numbers) */
 enum {
     X86_EXC_DE = 0, X86_EXC_DB = 1, X86_EXC_BP = 3, X86_EXC_OF = 4,
@@ -149,15 +177,21 @@ enum {
 /* ============================================================================
  * Public API (core/x86_state.c, core/x86_interp.c)
  * ========================================================================= */
-void x86_init(x86_cpu *c, int model, uint32_t mem_size);
+void x86_init(x86_cpu *c, int model);
 void x86_free(x86_cpu *c);
 void x86_reset(x86_cpu *c);
 void x86_load_seg(x86_cpu *c, int s, uint16_t sel);   /* real mode: base = sel<<4 */
 void x86_dump(x86_cpu *c, FILE *f);
 
-/* Execute one instruction. Returns 0 on success, or a negative code
- * when the instruction could not be executed (undecodable, unimplemented). */
+/* Execute one instruction. Returns 0 on success, 1 if halted, or a
+ * negative code when the instruction could not be executed. */
 int  x86_step(x86_cpu *c);
+
+/* Run an already-decoded instruction's semantics with c->eip pointing
+ * past it — the DBT's generic slow path. Does not count the instruction
+ * or dispatch exceptions; the caller has excluded anything that raises. */
+struct x86_insn;
+void x86_exec_decoded(x86_cpu *c, const struct x86_insn *in);
 
 /* Deliver interrupt/exception vector n (pushes flags/CS/IP, loads vector). */
 void x86_interrupt(x86_cpu *c, int vector, int is_sw);

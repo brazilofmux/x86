@@ -4,19 +4,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-void x86_init(x86_cpu *c, int model, uint32_t mem_size) {
+static void smc_hook_none(x86_cpu *c, uint32_t phys) { (void)c; (void)phys; }
+
+void x86_init(x86_cpu *c, int model) {
     memset(c, 0, sizeof(*c));
     c->model = model;
-    c->mem_size = mem_size;
-    c->mem = calloc(mem_size, 1);
-    c->a20_mask = 0xFFFFF;          /* A20 gated off at power-on */
+    if (x86_mem_alloc(c) < 0) {         /* A20 gated off at power-on */
+        fprintf(stderr, "x86_init: cannot allocate guest memory\n");
+        exit(1);
+    }
+    c->smc_hook = smc_hook_none;
     c->exc = -1;
     x86_reset(c);
 }
 
 void x86_free(x86_cpu *c) {
-    free(c->mem);
-    c->mem = NULL;
+    x86_mem_free(c);
 }
 
 /* Real-mode segment load: base = sel << 4, limit 64K, 16-bit. Phase B
