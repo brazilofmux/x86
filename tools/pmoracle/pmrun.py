@@ -81,24 +81,34 @@ def cases(states, under):
         i = j
     return res
 
-def main():
-    img = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "pmtest.img")
+def records(img=None):
+    """Per-case results from QEMU, in the shape pmbochs.py also returns."""
+    img = img or os.path.join(HERE, "pmtest.img")
     under, after, fault, ncases = footer(img)
     run_qemu(img)
-    states = parse(LOG)
-    got = cases(states, under)
-    print("log %.1f MB, %d dumps, %d/%d cases"
-          % (os.path.getsize(LOG) / 1e6, len(states), len(got), ncases))
-    for pre, post in got:
+    out = []
+    for pre, post in cases(parse(LOG), under):
         sel = pre["regs"].get("EAX", 0) & 0xFFFF
         if pre["exc"]:
             v, err = pre["exc"]
-            print("  sel %04X  ->  #%02X err=%04X" % (sel, v, err))
+            out.append({"sel": sel, "faulted": True, "vec": v, "err": err})
         elif post is None:
-            print("  sel %04X  ->  (truncated)" % sel)
+            out.append({"sel": sel, "faulted": None})
         else:
-            s = post["segs"].get("DS", (0, 0, 0, 0))
-            print("  sel %04X  ->  ok  DS=%04X base=%08X limit=%08X ar=%06X"
-                  % (sel, s[0], s[1], s[2], s[3] >> 8))
+            d = post["segs"].get("DS", (0, 0, 0, 0))
+            out.append({"sel": sel, "faulted": False, "ds": d[0],
+                        "base": d[1], "limit": d[2], "ar": d[3] >> 8})
+    return out
 
-main()
+def show(recs, title):
+    print(title)
+    for r in recs:
+        if r["faulted"]:
+            extra = "  #%02X err=%04X" % (r["vec"], r["err"]) if "vec" in r else ""
+            print("  sel %04X  ->  fault%s" % (r["sel"], extra))
+        else:
+            print("  sel %04X  ->  ok  DS=%04X base=%08X limit=%08X ar=%06X"
+                  % (r["sel"], r["ds"], r["base"], r["limit"], r["ar"]))
+
+if __name__ == "__main__":
+    show(records(), "QEMU:")

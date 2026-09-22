@@ -35,17 +35,50 @@ that is the interesting list, and it gets adjudicated against the Intel
 manual rather than by majority vote. The kernel is deliberately written
 as a plain boot sector so it also runs on a real 386 if one ever turns up.
 
-### Known divergence
+## Running both
 
-QEMU 11.0.0 does not fault on a selector with TI=1 when LDTR has never
-been loaded. Its power-on LDTR cache is `base 0, limit FFFF, ar 8200`,
-which has the present bit set, so it happily reads a "descriptor" from
-linear address 0 and loads the garbage:
+    make -C ../.. test-pm            # QEMU
+    python3 pmbochs.py               # Bochs
+    python3 compare.py               # both, diffed case by case
 
-    sel 0084  ->  ok  DS=0084 base=F053F000 limit=0000FF53 ar=0000FF
-    sel 000C  ->  ok  DS=000C base=F053F000 limit=0000E2C3 ar=0000FF
+Bochs needs `brew install bochs`; the build Homebrew ships has the
+internal debugger, which is what `pmbochs.py` drives (a physical
+breakpoint on the instruction under test, then `r`/`s`/`r`/`sreg` per
+case, fed on stdin). `bochsrc` here is a floppy-only machine with no
+display.
 
-Real hardware holds LDTR null out of reset and should raise `#GP` with
-the selector as the error code, as it does for a GDT index past the
-limit (`sel 0088 -> #0D err=0088`, which QEMU gets right). Do not copy
-this behaviour into the interpreter; confirm against Bochs first.
+## First results
+
+Ten of fourteen cases agree exactly. A not-present descriptor gives #NP
+with the selector as the error code, execute-only code loaded into DS
+gives #GP, a GDT index past the limit gives #GP, and the loaded
+descriptor caches match down to the byte-granular `limit=0FFF`.
+
+Of the four that differ, three differ only in the access-rights word of
+a cache that is unusable anyway (a null selector, or the garbage below),
+which is an internal encoding rather than behaviour. `compare.py`
+reports those separately from behavioural differences.
+
+### The one that matters
+
+**Neither emulator faults on a selector with TI=1 when LDTR has never
+been loaded.** Both hold a reset LDTR whose cache has the present bit
+set (`ldtr:0x0000, dh=0x00008200, valid=1` in Bochs; `LDT=0000 00000000
+0000ffff 00008200` in QEMU), so both read a "descriptor" from linear
+address 0 and load whatever is there. They disagree only about the
+garbage, because the garbage is IVT contents and their BIOSes differ:
+
+    sel 0084  qemu  ok DS=0084 base=F053F000 limit=0000FF53
+              bochs ok DS=0084 base=F053F000 limit=0000FF53 (different ar)
+    sel 000C  qemu  ok DS=000C base=F053F000 limit=0000E2C3
+              bochs ok DS=000C base=F053F000 limit=0000FF53
+
+Real hardware holds LDTR null out of reset, and a selector with TI=1
+should raise #GP with the selector as the error code — as both get right
+for a GDT index past the limit (`sel 0088 -> #0D err=0088`).
+
+**Do not copy this into the interpreter.** It is the worked example of
+why two references are not a vote: they agree here and are, on the
+manual's reading, both wrong. Settle cases like this against the manual,
+and if the ambiguity ever matters enough, against a real 386 — which the
+kernel can boot on unchanged.

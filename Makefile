@@ -54,6 +54,9 @@ test-dos: $(TARGET)
 test-pm:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 pmrun.py
 
+test-pm-compare:
+	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 compare.py
+
 clean:
 	rm -f $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(DBT_OBJS) $(DBT_OBJS:.o=.d) \
 	      $(PC_OBJS) $(PC_OBJS:.o=.d) $(DOS_OBJS) $(DOS_OBJS:.o=.d) main.o main.d \

@@ -1,0 +1,12 @@
+# Minimal machine for the oracle kernel: a floppy, no display, no sound.
+romimage:      file=/opt/homebrew/share/bochs/BIOS-bochs-latest
+vgaromimage:   file=/opt/homebrew/share/bochs/VGABIOS-elpin-2.40
+megs:          32
+floppya:       1_44=pmtest.img, status=inserted
+boot:          floppy
+display_library: nogui
+log:           /tmp/bochs.log
+panic:   action=fatal
+error:   action=report
+info:    action=ignore
+debug:   action=ignore
