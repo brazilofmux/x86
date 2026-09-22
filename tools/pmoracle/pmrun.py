@@ -80,7 +80,14 @@ def cases(states, under):
         while j < len(states) and states[j].get("eip") == under:
             if states[j]["exc"]: pre = dict(pre, exc=states[j]["exc"])
             j += 1
-        res.append((pre, states[j] if j < len(states) else None))
+        post = states[j] if j < len(states) else None
+        # An exception reported between the instruction and the next dump
+        # belongs to that instruction. QEMU reports it before re-dumping the
+        # faulting EIP, so it lands on `pre`; dos-monster reports it after,
+        # so it lands on `post`. Either way it is this case's.
+        if post is not None and post["exc"] and not pre["exc"]:
+            pre = dict(pre, exc=post["exc"])
+        res.append((pre, post))
         i = j
     return res
 

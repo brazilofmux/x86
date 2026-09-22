@@ -93,15 +93,15 @@ static void pm_trace(x86_cpu *c) {
     }
     static const char *sname[6] = { "ES", "CS", "SS", "DS", "FS", "GS" };
     static const int sorder[6] = { S_ES, S_CS, S_SS, S_DS, S_FS, S_GS };
-    fprintf(stderr, "EAX=%08X EBX=%08X ECX=%08X EDX=%08X\n",
+    fprintf(stderr, "EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
             c->r[R_AX], c->r[R_BX], c->r[R_CX], c->r[R_DX]);
-    fprintf(stderr, "ESI=%08X EDI=%08X EBP=%08X ESP=%08X\n",
+    fprintf(stderr, "ESI=%08x EDI=%08x EBP=%08x ESP=%08x\n",
             c->r[R_SI], c->r[R_DI], c->r[R_BP], c->r[R_SP]);
-    fprintf(stderr, "EIP=%08X EFL=%08X [-------] CPL=%d II=0 A20=%d SMM=0 HLT=%d\n",
+    fprintf(stderr, "EIP=%08x EFL=%08x [-------] CPL=%d II=0 A20=%d SMM=0 HLT=%d\n",
             c->eip, c->eflags, c->seg[S_CS].sel & 3, c->a20_mask != 0xFFFFFu, c->halted);
     for (int i = 0; i < 6; i++) {
         const x86_seg *g = &c->seg[sorder[i]];
-        fprintf(stderr, "%s =%04X %08X %08X %08X\n", sname[i], g->sel, g->base, g->limit,
+        fprintf(stderr, "%s =%04x %08x %08x %08x\n", sname[i], g->sel, g->base, g->limit,
                 (uint32_t)g->attr << 8);
     }
     /* No LDTR/TR/GDTR/IDTR state yet: printed as zero so the record parses. */
@@ -109,7 +109,7 @@ static void pm_trace(x86_cpu *c) {
     fprintf(stderr, "TR =0000 00000000 00000000 00000000\n");
     fprintf(stderr, "GDT=     00000000 00000000\n");
     fprintf(stderr, "IDT=     00000000 00000000\n");
-    fprintf(stderr, "CR0=%08X CR2=00000000 CR3=00000000 CR4=00000000\n", c->pmode ? 0x11u : 0x10u);
+    fprintf(stderr, "CR0=%08x CR2=00000000 CR3=00000000 CR4=00000000\n", c->pmode ? 0x11u : 0x10u);
 }
 
 static int run_interp(x86_cpu *c, uint64_t limit) {

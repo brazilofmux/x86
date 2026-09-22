@@ -24,12 +24,113 @@ void x86_free(x86_cpu *c) {
 
 /* Real-mode segment load: base = sel << 4, limit 64K, 16-bit. Phase B
  * replaces this with descriptor lookup when c->pmode is set. */
+
+/* ------------------------------------------------------------------------
+ * Protected mode: descriptor tables and segment loading.
+ *
+ * Every rule here has a case in tools/pmoracle. Where the emulators we
+ * compare against are permissive we follow the manual instead; those
+ * places say so.
+ * --------------------------------------------------------------------- */
+
+/* CPL lives in the low two bits of CS, which is where the processor keeps it. */
+int x86_cpl(const x86_cpu *c) { return c->pmode ? (c->seg[S_CS].sel & 3) : 0; }
+
+/* Fetch the 8 bytes of a descriptor. Returns 0 when the selector's index
+ * falls outside its table, which is the caller's cue to raise #GP. */
+int x86_read_desc(x86_cpu *c, uint16_t sel, uint32_t *lo, uint32_t *hi) {
+    uint32_t base, off = sel & 0xFFF8;
+    uint16_t limit;
+    if (sel & 4) {
+        /* LDTR is null out of reset, and a selector that needs it is then
+         * simply invalid — both QEMU and Bochs instead read whatever lies
+         * at linear 0. See tools/pmoracle/expected.py. */
+        if (!c->ldtr.usable || !X86_AR_P(c->ldtr.attr)) return 0;
+        base = c->ldtr.base;
+        limit = (uint16_t)c->ldtr.limit;
+    } else {
+        base = c->gdtr.base;
+        limit = c->gdtr.limit;
+    }
+    if (off + 7 > limit) return 0;
+    *lo = x86_rd(c, base, off, 0xFFFFFFFFu, 4);
+    *hi = x86_rd(c, base, off + 4, 0xFFFFFFFFu, 4);
+    return 1;
+}
+
+void x86_unpack_desc(x86_seg *g, uint16_t sel, uint32_t lo, uint32_t hi) {
+    g->sel = sel;
+    g->base = (lo >> 16) | ((hi & 0xFF) << 16) | (hi & 0xFF000000u);
+    g->limit = (lo & 0xFFFF) | (hi & 0x000F0000u);
+    g->attr = (uint16_t)(((hi >> 8) & 0xFF) | (((hi >> 20) & 0x0F) << 8));
+    if (X86_AR_G(g->attr)) g->limit = (g->limit << 12) | 0xFFF;
+    g->big = X86_AR_DB(g->attr);
+    g->usable = 1;
+}
+
+/* The accessed bit is set in the descriptor itself the first time it is
+ * loaded, not merely in the cached copy. */
+void x86_set_accessed(x86_cpu *c, uint16_t sel, uint32_t hi) {
+    uint32_t base = (sel & 4) ? c->ldtr.base : c->gdtr.base;
+    if (hi & (X86_TYPE_ACCESSED << 8)) return;
+    x86_wr(c, base, (sel & 0xFFF8) + 4, 0xFFFFFFFFu, 4, hi | (X86_TYPE_ACCESSED << 8));
+}
+
+/* Load a data or stack segment register. CS goes through the control
+ * transfer paths instead, which have their own rules. */
+static void load_seg_pm(x86_cpu *c, int s, uint16_t sel) {
+    int cpl = x86_cpl(c), rpl = sel & 3;
+    uint32_t lo, hi;
+
+    if ((sel & 0xFFFC) == 0) {
+        /* Null is legal in a data register and leaves it unusable; in SS it
+         * is #GP(0), because there is no such thing as no stack. */
+        if (s == S_SS) x86_fault(c, X86_EXC_GP, 0);
+        c->seg[s].sel = sel;
+        c->seg[s].base = 0; c->seg[s].limit = 0; c->seg[s].attr = 0;
+        c->seg[s].big = 0; c->seg[s].usable = 0;
+        return;
+    }
+    if (!x86_read_desc(c, sel, &lo, &hi)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+    uint16_t attr = (uint16_t)(((hi >> 8) & 0xFF) | (((hi >> 20) & 0x0F) << 8));
+    int type = X86_AR_TYPE(attr);
+
+    if (!X86_AR_S(attr)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);   /* a system descriptor */
+
+    if (s == S_SS) {
+        /* The stack is the strict one: writable data, and both RPL and DPL
+         * equal to CPL. A read-only segment that any other register accepts
+         * is rejected here. */
+        if ((type & X86_TYPE_CODE) || !(type & X86_TYPE_WRITABLE))
+            x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        if (rpl != cpl || X86_AR_DPL(attr) != cpl)
+            x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_SS, sel & 0xFFFC);
+    } else {
+        /* Code is only a legal data segment if it can be read. */
+        if ((type & X86_TYPE_CODE) && !(type & X86_TYPE_READABLE))
+            x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        /* Conforming code is reachable from anywhere; everything else has to
+         * be at least as privileged as the more privileged of CPL and RPL. */
+        int conforming = (type & X86_TYPE_CODE) && (type & X86_TYPE_CONFORM);
+        if (!conforming) {
+            int need = cpl > rpl ? cpl : rpl;
+            if (need > X86_AR_DPL(attr)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        }
+        if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
+    }
+    x86_unpack_desc(&c->seg[s], sel, lo, hi);
+    x86_set_accessed(c, sel, hi);
+}
+
 void x86_load_seg(x86_cpu *c, int s, uint16_t sel) {
+    if (c->pmode) { load_seg_pm(c, s, sel); return; }
     c->seg[s].sel = sel;
     c->seg[s].base = (uint32_t)sel << 4;
     c->seg[s].limit = 0xFFFF;
     c->seg[s].big = 0;
     c->seg[s].attr = 0;
+    c->seg[s].usable = 1;
 }
 
 uint32_t x86_flags_fixup(x86_cpu *c, uint32_t f) {

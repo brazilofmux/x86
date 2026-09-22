@@ -19,7 +19,7 @@ def run(img=None, insn_limit=2_000_000):
     img = img or os.path.join(HERE, "pmtest.img")
     f = pmcases.footer(img)
     with open(LOG, "wb") as log:
-        subprocess.run([MONSTER, "-boot", img, "-i", "-L", str(insn_limit),
+        subprocess.run([MONSTER, "-boot", img, "-i", "-m", "386", "-L", str(insn_limit),
                         "-pmtrace", "0x7c00:0x8fff"],
                        stdout=subprocess.DEVNULL, stderr=log,
                        timeout=300, check=False)

@@ -182,7 +182,191 @@ static void push_raw(x86_cpu *c, uint32_t v) {
     x86_wr(c, c->seg[S_SS].base, sp, wrapmask(c, m), 2, v);
     c->r[R_SP] = m == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
 }
+/* Vectors that push an error code. Software interrupts never do. */
+static int vec_has_err(int v) {
+    return v == 8 || (v >= 10 && v <= 14) || v == 17;
+}
+
+/* Load CS for a control transfer. Unlike a data register, the descriptor
+ * must be code, and conforming code is reachable from any less privileged
+ * level without changing CPL — the RPL written back says which happened. */
+static void load_cs_pm(x86_cpu *c, uint16_t sel, int cpl) {
+    uint32_t lo, hi;
+    if ((sel & 0xFFFC) == 0) x86_fault(c, X86_EXC_GP, 0);
+    if (!x86_read_desc(c, sel, &lo, &hi)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+    uint16_t attr = (uint16_t)(((hi >> 8) & 0xFF) | (((hi >> 20) & 0x0F) << 8));
+    if (!X86_AR_S(attr) || !(X86_AR_TYPE(attr) & X86_TYPE_CODE))
+        x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+    int dpl = X86_AR_DPL(attr);
+    if (X86_AR_TYPE(attr) & X86_TYPE_CONFORM) {
+        if (dpl > cpl) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+    } else if (dpl != cpl) {
+        x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+    }
+    if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
+    x86_unpack_desc(&c->seg[S_CS], (uint16_t)((sel & 0xFFFC) | cpl), lo, hi);
+    x86_set_accessed(c, sel, hi);
+}
+
+/* Push through an explicit stack, so a transfer that switches stacks can
+ * build the new frame before committing SS:ESP. */
+static void push_on(x86_cpu *c, const x86_seg *ss, uint32_t *sp, int size, uint32_t v) {
+    *sp = (*sp - size) & (ss->big ? 0xFFFFFFFFu : 0xFFFFu);
+    x86_wr(c, ss->base, *sp, 0xFFFFFFFFu, size, v);
+}
+
+/* Protected-mode interrupt and exception delivery through the IDT. */
+static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
+    uint32_t off = (uint32_t)vector * 8;
+    if (off + 7 > c->idtr.limit) x86_fault(c, X86_EXC_GP, (off | 2));   /* IDT error codes set the IDT bit */
+    uint32_t lo = x86_rd(c, c->idtr.base, off, 0xFFFFFFFFu, 4);
+    uint32_t hi = x86_rd(c, c->idtr.base, off + 4, 0xFFFFFFFFu, 4);
+    uint16_t gattr = (uint16_t)((hi >> 8) & 0xFF);
+    int type = gattr & 0x1F;
+    int gate32 = (type & 0x08) != 0;
+    if (!(gattr & 0x80)) x86_fault(c, X86_EXC_NP, (off | 2));
+    if ((type & 0x17) != 0x06) x86_fault(c, X86_EXC_GP, (off | 2));     /* not an interrupt/trap gate */
+    /* A software INT may only use a gate at or below its own privilege. */
+    int cpl = x86_cpl(c);
+    if (is_sw && ((gattr >> 5) & 3) < cpl) x86_fault(c, X86_EXC_GP, (off | 2));
+
+    uint16_t gsel = (uint16_t)(lo >> 16);
+    uint32_t gip = (lo & 0xFFFF) | (gate32 ? (hi & 0xFFFF0000u) : 0);
+
+    /* Work out the target privilege before touching anything. */
+    uint32_t dlo, dhi;
+    if (!x86_read_desc(c, gsel, &dlo, &dhi)) x86_fault(c, X86_EXC_GP, gsel & 0xFFFC);
+    uint16_t dattr = (uint16_t)(((dhi >> 8) & 0xFF) | (((dhi >> 20) & 0x0F) << 8));
+    int dpl = X86_AR_DPL(dattr);
+    int conforming = (X86_AR_TYPE(dattr) & X86_TYPE_CONFORM) != 0;
+    int newcpl = (conforming || dpl > cpl) ? cpl : dpl;
+
+    uint32_t flags = c->eflags, oldeip = c->eip;
+    uint16_t oldcs = c->seg[S_CS].sel, oldss = c->seg[S_SS].sel;
+    uint32_t oldsp = c->r[R_SP];
+    x86_seg stack = c->seg[S_SS];
+    uint32_t sp = c->r[R_SP];
+
+    if (newcpl < cpl) {
+        /* Inward: the stack comes from the TSS, and the interrupted one is
+         * recorded on it. */
+        uint32_t nsp = x86_rd(c, c->tr.base, 4 + newcpl * 8, 0xFFFFFFFFu, 4);
+        uint16_t nss = (uint16_t)x86_rd(c, c->tr.base, 8 + newcpl * 8, 0xFFFFFFFFu, 2);
+        uint32_t slo, shi;
+        if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_TS, nss & 0xFFFC);
+        x86_unpack_desc(&stack, nss, slo, shi);
+        sp = nsp;
+        push_on(c, &stack, &sp, gate32 ? 4 : 2, oldss);
+        push_on(c, &stack, &sp, gate32 ? 4 : 2, oldsp);
+    }
+    push_on(c, &stack, &sp, gate32 ? 4 : 2, flags);
+    push_on(c, &stack, &sp, gate32 ? 4 : 2, oldcs);
+    push_on(c, &stack, &sp, gate32 ? 4 : 2, oldeip);
+    if (vec_has_err(vector) && !is_sw) push_on(c, &stack, &sp, gate32 ? 4 : 2, err);
+
+    load_cs_pm(c, gsel, newcpl);
+    c->seg[S_SS] = stack;
+    c->r[R_SP] = sp;
+    c->eip = gip;
+    c->eflags &= ~(X86_TF | X86_NT);
+    if (!(type & 1)) c->eflags &= ~X86_IF;         /* interrupt gate, not trap gate */
+    c->int_inhibit = 0;
+}
+
+
+/* A far JMP or CALL in protected mode. The selector may name a code
+ * segment directly, or a call gate that names one; a gate is also the only
+ * way a CALL can raise privilege, and it brings a new stack with it. */
+static void far_transfer_pm(x86_cpu *c, uint16_t sel, uint32_t off, int is_call, int os) {
+    int cpl = x86_cpl(c), rpl = sel & 3;
+    uint32_t lo, hi;
+    if ((sel & 0xFFFC) == 0) x86_fault(c, X86_EXC_GP, 0);
+    if (!x86_read_desc(c, sel, &lo, &hi)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+    uint16_t attr = (uint16_t)(((hi >> 8) & 0xFF) | (((hi >> 20) & 0x0F) << 8));
+    int type = X86_AR_TYPE(attr);
+
+    if (X86_AR_S(attr)) {
+        /* Straight to a code segment: no privilege change either way. */
+        if (!(type & X86_TYPE_CODE)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        if (type & X86_TYPE_CONFORM) {
+            if (X86_AR_DPL(attr) > cpl) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        } else {
+            if (rpl > cpl || X86_AR_DPL(attr) != cpl) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        }
+        if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
+        if (is_call) {
+            push(c, os, c->seg[S_CS].sel);
+            push(c, os, c->eip);
+        }
+        x86_unpack_desc(&c->seg[S_CS], (uint16_t)((sel & 0xFFFC) | cpl), lo, hi);
+        x86_set_accessed(c, sel, hi);
+        c->eip = os == 2 ? (off & 0xFFFF) : off;
+        return;
+    }
+
+    /* A system descriptor: the only kind we follow is a call gate. */
+    if (type != 0x0C && type != 0x04) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+    int gate32 = type == 0x0C;
+    if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
+    /* Software may only use a gate at or below its own privilege. */
+    if (X86_AR_DPL(attr) < cpl || X86_AR_DPL(attr) < rpl)
+        x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+
+    uint16_t tsel = (uint16_t)(lo >> 16);
+    uint32_t tip = (lo & 0xFFFF) | (gate32 ? (hi & 0xFFFF0000u) : 0);
+    int nparams = hi & 0x1F;
+
+    uint32_t tlo, thi;
+    if ((tsel & 0xFFFC) == 0) x86_fault(c, X86_EXC_GP, 0);
+    if (!x86_read_desc(c, tsel, &tlo, &thi)) x86_fault(c, X86_EXC_GP, tsel & 0xFFFC);
+    uint16_t tattr = (uint16_t)(((thi >> 8) & 0xFF) | (((thi >> 20) & 0x0F) << 8));
+    if (!X86_AR_S(tattr) || !(X86_AR_TYPE(tattr) & X86_TYPE_CODE))
+        x86_fault(c, X86_EXC_GP, tsel & 0xFFFC);    /* the error names the target, not the gate */
+    int tdpl = X86_AR_DPL(tattr);
+    int conforming = (X86_AR_TYPE(tattr) & X86_TYPE_CONFORM) != 0;
+    if (tdpl > cpl) x86_fault(c, X86_EXC_GP, tsel & 0xFFFC);
+    if (!X86_AR_P(tattr)) x86_fault(c, X86_EXC_NP, tsel & 0xFFFC);
+
+    int newcpl = (conforming || tdpl == cpl) ? cpl : tdpl;
+    if (!is_call && newcpl != cpl) x86_fault(c, X86_EXC_GP, tsel & 0xFFFC);   /* JMP cannot change privilege */
+
+    if (is_call && newcpl < cpl) {
+        /* Inward call: a fresh stack out of the TSS, the old one recorded on
+         * it, and any parameters copied across. */
+        uint32_t nsp = x86_rd(c, c->tr.base, 4 + newcpl * 8, 0xFFFFFFFFu, 4);
+        uint16_t nss = (uint16_t)x86_rd(c, c->tr.base, 8 + newcpl * 8, 0xFFFFFFFFu, 2);
+        uint32_t slo, shi;
+        if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_TS, nss & 0xFFFC);
+        x86_seg stack;
+        x86_unpack_desc(&stack, nss, slo, shi);
+        uint16_t oldss = c->seg[S_SS].sel;
+        uint32_t oldsp = c->r[R_SP], sp = nsp;
+        uint32_t params[32];
+        for (int i = 0; i < nparams; i++)
+            params[i] = x86_rd(c, c->seg[S_SS].base, oldsp + (uint32_t)i * os, 0xFFFFFFFFu, os);
+        push_on(c, &stack, &sp, os, oldss);
+        push_on(c, &stack, &sp, os, oldsp);
+        for (int i = nparams - 1; i >= 0; i--) push_on(c, &stack, &sp, os, params[i]);
+        push_on(c, &stack, &sp, os, c->seg[S_CS].sel);
+        push_on(c, &stack, &sp, os, c->eip);
+        x86_unpack_desc(&c->seg[S_CS], (uint16_t)((tsel & 0xFFFC) | newcpl), tlo, thi);
+        x86_set_accessed(c, tsel, thi);
+        c->seg[S_SS] = stack;
+        c->r[R_SP] = sp;
+        c->eip = gate32 ? tip : (tip & 0xFFFF);
+        return;
+    }
+    if (is_call) {
+        push(c, os, c->seg[S_CS].sel);
+        push(c, os, c->eip);
+    }
+    x86_unpack_desc(&c->seg[S_CS], (uint16_t)((tsel & 0xFFFC) | newcpl), tlo, thi);
+    x86_set_accessed(c, tsel, thi);
+    c->eip = gate32 ? tip : (tip & 0xFFFF);
+}
+
 void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
+    if (c->pmode) { deliver_pm(c, vector, is_sw, c->exc_err); return; }
     (void)is_sw;
     /* The vector is read before the frame is pushed (measured on the
      * 386: a frame landing on the IVT entry does not redirect). */
@@ -895,6 +1079,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             off = mrd(c, in, in->seg, ea, in->opsize);
             sel = mrd(c, in, in->seg, (ea + in->opsize) & admask(in), 2);
         }
+        if (c->pmode) { far_transfer_pm(c, (uint16_t)sel, off, in->op == OP_CALLF, in->opsize); break; }
         check_target(c, off, in->opsize);        /* real mode: the new CS has the same 64K limit */
         if (in->op == OP_CALLF) {
             push(c, in->opsize, c->seg[S_CS].sel);
@@ -920,7 +1105,57 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         set_ip(c, a, in->opsize);
         break;
     }
-    case OP_IRET: {
+    case OP_IRET:
+        if (c->pmode) {
+            /* Pops EIP, CS, EFLAGS — and, only when the return is to a less
+             * privileged level, ESP and SS as well. CS.RPL is what decides,
+             * so a frame whose SS does not agree with it is rejected. */
+            int cpl = x86_cpl(c);
+            int os = in->opsize;
+            uint32_t nip = peek(c, 0, os);
+            uint16_t ncs = (uint16_t)peek(c, os, os);
+            uint32_t nfl = peek(c, 2 * os, os);
+            int rpl = ncs & 3;
+            if (rpl < cpl) x86_fault(c, X86_EXC_GP, ncs & 0xFFFC);   /* never inward */
+            if (rpl > cpl) {
+                uint32_t nsp = peek(c, 3 * os, os);
+                uint16_t nss = (uint16_t)peek(c, 4 * os, os);
+                if ((nss & 3) != rpl) x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
+                uint32_t slo, shi;
+                if ((nss & 0xFFFC) == 0) x86_fault(c, X86_EXC_GP, 0);
+                if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
+                uint16_t sattr = (uint16_t)(((shi >> 8) & 0xFF) | (((shi >> 20) & 0x0F) << 8));
+                if (!X86_AR_S(sattr) || (X86_AR_TYPE(sattr) & X86_TYPE_CODE)
+                    || !(X86_AR_TYPE(sattr) & X86_TYPE_WRITABLE)
+                    || X86_AR_DPL(sattr) != rpl)
+                    x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
+                if (!X86_AR_P(sattr)) x86_fault(c, X86_EXC_SS, nss & 0xFFFC);
+                load_cs_pm(c, ncs, rpl);
+                x86_unpack_desc(&c->seg[S_SS], nss, slo, shi);
+                c->r[R_SP] = nsp;
+                /* Any data segment the new level cannot reach becomes null. */
+                for (int k = 0; k < 6; k++) {
+                    if (k == S_CS || k == S_SS) continue;
+                    x86_seg *g = &c->seg[k];
+                    if (!g->usable) continue;
+                    int t = X86_AR_TYPE(g->attr);
+                    int conf = (t & X86_TYPE_CODE) && (t & X86_TYPE_CONFORM);
+                    if (!conf && X86_AR_DPL(g->attr) < rpl) {
+                        g->sel = 0; g->base = 0; g->limit = 0; g->attr = 0; g->usable = 0;
+                    }
+                }
+            } else {
+                load_cs_pm(c, ncs, cpl);
+                uint32_t sm = stkmask(c);
+                uint32_t nsp2 = (c->r[R_SP] + 3u * os) & sm;
+                c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | nsp2) : nsp2;
+            }
+            c->eip = os == 2 ? (nip & 0xFFFF) : nip;
+            uint32_t fm = os == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+            c->eflags = x86_flags_fixup(c, (c->eflags & ~fm) | (nfl & fm));
+            break;
+        }
+        {
         check_target(c, peek(c, 0, in->opsize), in->opsize);
         peek(c, in->opsize, in->opsize);
         peek(c, 2 * in->opsize, in->opsize);
@@ -932,7 +1167,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         set_ip(c, a, in->opsize);
         c->eflags = x86_flags_fixup(c, (c->eflags & ~m) | (f & m));
         break;
-    }
+        }
     case OP_INT:
         x86_interrupt(c, in->ops[0].imm, 1);
         break;
@@ -1049,9 +1284,69 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     /* System instructions: Phase B (DPMI host). */
     case OP_CLTS:
         break;                                  /* CR0.TS: no CR0 yet (Phase B); legal at CPL 0 */
-    case OP_LAR: case OP_LSL: case OP_SGDT: case OP_SIDT: case OP_LGDT: case OP_LIDT:
-    case OP_SLDT: case OP_STR: case OP_LLDT: case OP_LTR: case OP_VERR: case OP_VERW:
-    case OP_SMSW: case OP_LMSW: case OP_MOVCR: case OP_MOVDR: case OP_MOVTR:
+    /* ---- descriptor tables and CR0 -------------------------------- */
+    case OP_LGDT: case OP_LIDT: {
+        /* m16&32: a limit then a base. A 16-bit operand keeps only 24 bits
+         * of base — the 286 form, still reachable on a 386. */
+        uint32_t lim = mrd(c, in, in->seg, ea, 2);
+        uint32_t b = mrd(c, in, in->seg, (ea + 2) & admask(in), 4);
+        if (in->opsize == 2) b &= 0x00FFFFFFu;
+        if (in->op == OP_LGDT) { c->gdtr.limit = (uint16_t)lim; c->gdtr.base = b; }
+        else                   { c->idtr.limit = (uint16_t)lim; c->idtr.base = b; }
+        break;
+    }
+    case OP_SGDT: case OP_SIDT: {
+        int is_g = in->op == OP_SGDT;
+        mwr(c, in, in->seg, ea, 2, is_g ? c->gdtr.limit : c->idtr.limit);
+        mwr(c, in, in->seg, (ea + 2) & admask(in), 4, is_g ? c->gdtr.base : c->idtr.base);
+        break;
+    }
+    case OP_LLDT: case OP_LTR: {
+        if (!c->pmode) RAISE(X86_EXC_UD);
+        uint16_t lsel = (uint16_t)rd_op(c, in, 0, ea);
+        x86_seg *g = in->op == OP_LLDT ? &c->ldtr : &c->tr;
+        if ((lsel & 0xFFFC) == 0) {
+            if (in->op == OP_LTR) RAISE(X86_EXC_GP);       /* the task register cannot be null */
+            memset(g, 0, sizeof *g);
+            break;
+        }
+        if (lsel & 4) x86_fault(c, X86_EXC_GP, lsel & 0xFFFC);   /* both live in the GDT only */
+        uint32_t dlo, dhi;
+        if (!x86_read_desc(c, lsel, &dlo, &dhi)) x86_fault(c, X86_EXC_GP, lsel & 0xFFFC);
+        uint16_t dattr = (uint16_t)(((dhi >> 8) & 0xFF) | (((dhi >> 20) & 0x0F) << 8));
+        int dtype = X86_AR_TYPE(dattr);
+        int ok_type = in->op == OP_LLDT ? (dtype == 0x2)            /* LDT */
+                                        : (dtype == 0x1 || dtype == 0x9);   /* available TSS */
+        if (X86_AR_S(dattr) || !ok_type) x86_fault(c, X86_EXC_GP, lsel & 0xFFFC);
+        if (!X86_AR_P(dattr)) x86_fault(c, X86_EXC_NP, lsel & 0xFFFC);
+        x86_unpack_desc(g, lsel, dlo, dhi);
+        if (in->op == OP_LTR)                              /* mark the TSS busy */
+            x86_wr(c, c->gdtr.base, (lsel & 0xFFF8) + 4, 0xFFFFFFFFu, 4, dhi | 0x0200u);
+        break;
+    }
+    case OP_SLDT: case OP_STR:
+        wr_op(c, in, 0, ea, in->op == OP_SLDT ? c->ldtr.sel : c->tr.sel);
+        break;
+    case OP_SMSW:
+        wr_op(c, in, 0, ea, c->cr0 & 0xFFFF);
+        break;
+    case OP_LMSW:
+        c->cr0 = (c->cr0 & ~0xEu) | (rd_op(c, in, 0, ea) & 0xFu) | (c->cr0 & 1u);
+        c->pmode = (c->cr0 & 1) != 0;              /* LMSW can set PE but never clear it */
+        break;
+    case OP_MOVCR: {
+        int cr = in->ops[0].kind == OPK_CR ? in->ops[0].reg : in->ops[1].reg;
+        if (in->ops[0].kind == OPK_CR) {
+            if (cr == 0) { c->cr0 = rd_op(c, in, 1, ea); c->pmode = (c->cr0 & 1) != 0; }
+        } else {
+            wr_op(c, in, 0, ea, cr == 0 ? c->cr0 : 0);
+        }
+        break;
+    }
+
+    /* System instructions still to come. */
+    case OP_LAR: case OP_LSL: case OP_VERR: case OP_VERW:
+    case OP_MOVDR: case OP_MOVTR:
     case OP_UD:
     default:
         (void)start_ip;

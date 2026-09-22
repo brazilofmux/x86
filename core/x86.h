@@ -51,9 +51,28 @@ enum { S_ES, S_CS, S_SS, S_DS, S_FS, S_GS, S_NONE = 0xFF };
 
 /* Per-segment cached state. In real mode base = sel<<4 and limit is
  * 0xFFFF; in PM the DPMI host fills these from the descriptor. */
+/* attr packs the descriptor's access byte in bits 0-7 and its flags nibble
+ * (G, D/B, L, AVL) in bits 8-11 — the two bytes the processor keeps once the
+ * base and limit have been unpacked. `usable` is the hidden valid bit: a
+ * segment register loaded with a null selector holds no descriptor at all. */
+#define X86_AR_TYPE(a)    ((a) & 0x0F)
+#define X86_AR_S(a)       (((a) >> 4) & 1)        /* 1 = code/data, 0 = system */
+#define X86_AR_DPL(a)     (((a) >> 5) & 3)
+#define X86_AR_P(a)       (((a) >> 7) & 1)
+#define X86_AR_G(a)       (((a) >> 11) & 1)
+#define X86_AR_DB(a)      (((a) >> 10) & 1)
+#define X86_TYPE_CODE     0x08                    /* within a code/data type */
+#define X86_TYPE_CONFORM  0x04                    /* code: conforming */
+#define X86_TYPE_READABLE 0x02                    /* code: readable */
+#define X86_TYPE_EXPDOWN  0x04                    /* data: expand-down */
+#define X86_TYPE_WRITABLE 0x02                    /* data: writable */
+#define X86_TYPE_ACCESSED 0x01
+
 typedef struct x86_seg {
     uint16_t sel;
     uint16_t attr;      /* PM: access byte + flags; 0 in real mode */
+    uint8_t  usable;    /* 0 after a null selector: present but unusable */
+    uint8_t  pad1[3];
     uint32_t base;
     uint32_t limit;     /* byte granular, inclusive */
     uint8_t  big;       /* D/B bit: default 32-bit operands/stack */
@@ -91,6 +110,13 @@ typedef struct x86_cpu {
     uint64_t jit_cnt_save;  /* pinned budget register parked across helper calls */
     uint32_t jit_cur_lin;   /* linear address of the block making a helper call... */
     uint32_t jit_cur_hit;   /* ...set by the SMC sweep if that block got invalidated */
+
+    /* Descriptor tables. In real mode these sit unused; CR0.PE turns them on.
+     * ldtr/tr keep the cached descriptor the same way the segment registers
+     * do, because that is what the processor actually consults. */
+    struct { uint32_t base; uint16_t limit; } gdtr, idtr;
+    x86_seg  ldtr, tr;
+    uint32_t cr0;
 
     int      model;       /* X86_MODEL_* */
     uint8_t  pmode;       /* 0 = real mode, 1 = protected */
@@ -196,7 +222,11 @@ enum {
 void x86_init(x86_cpu *c, int model);
 void x86_free(x86_cpu *c);
 void x86_reset(x86_cpu *c);
-void x86_load_seg(x86_cpu *c, int s, uint16_t sel);   /* real mode: base = sel<<4 */
+void x86_load_seg(x86_cpu *c, int s, uint16_t sel);
+int  x86_cpl(const x86_cpu *c);
+int  x86_read_desc(x86_cpu *c, uint16_t sel, uint32_t *lo, uint32_t *hi);
+void x86_unpack_desc(x86_seg *g, uint16_t sel, uint32_t lo, uint32_t hi);
+void x86_set_accessed(x86_cpu *c, uint16_t sel, uint32_t hi);   /* real mode: base = sel<<4 */
 void x86_dump(x86_cpu *c, FILE *f);
 
 /* Execute one instruction. Returns 0 on success, 1 if halted, or a
