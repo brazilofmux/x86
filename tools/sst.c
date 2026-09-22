@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 
 /* ---- 8088 metadata.json flag masks -------------------------------------- */
@@ -49,6 +50,35 @@ static void load_metadata(const char *path) {
         if (depth < 0) break;
     }
     fclose(f);
+}
+
+/* ---- 80386.csv undefined-flag masks (f_umask) ------------------------------
+ * Keyed by opcode string ("0FBA") and group reg (-1 = none): mask of
+ * DEFINED flag bits; the 386 files carry no RM32 chunks. */
+static struct { char op[8]; int reg; uint16_t umask; } csv_masks[1024];
+static int n_csv;
+
+static void load_csv(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[2048];
+    if (!fgets(line, sizeof line, f)) { fclose(f); return; }
+    while (fgets(line, sizeof line, f) && n_csv < 1024) {
+        char *cols[64]; int nc = 0;
+        for (char *p = line; p && nc < 64; ) { cols[nc++] = p; p = strchr(p, ','); if (p) *p++ = 0; }
+        if (nc < 40) continue;
+        snprintf(csv_masks[n_csv].op, sizeof csv_masks[n_csv].op, "%s", cols[0]);
+        csv_masks[n_csv].reg = cols[4][0] ? atoi(cols[4]) : -1;
+        csv_masks[n_csv].umask = cols[39][0] ? (uint16_t)strtoul(cols[39], NULL, 16) : 0xFFFF;
+        n_csv++;
+    }
+    fclose(f);
+}
+
+static uint16_t csv_mask_for(const char *op, int reg) {
+    for (int i = 0; i < n_csv; i++)
+        if (!strcasecmp(csv_masks[i].op, op) && (csv_masks[i].reg == reg || csv_masks[i].reg < 0)) return csv_masks[i].umask;
+    return 0xFFFF;
 }
 
 /* ---- MOO parsing -------------------------------------------------------- */
@@ -149,7 +179,7 @@ static uint8_t *read_gz(const char *path, size_t *out_len) {
 }
 
 /* ---- running ------------------------------------------------------------ */
-static int verbose = 0, max_fail = 10, no_mask = 0;
+static int verbose = 0, max_fail = 10, no_mask = 0, list_all = 0;
 
 static void apply_regs(x86_cpu *c, const uint32_t *r) {
     c->r[R_AX] = r[G_EAX]; c->r[R_BX] = r[G_EBX]; c->r[R_CX] = r[G_ECX]; c->r[R_DX] = r[G_EDX];
@@ -187,9 +217,13 @@ static int run_test(x86_cpu *c, const test_t *t, uint16_t meta_fmask, int *fail_
     int rc = x86_step(c);
     /* 286/386 tests follow the instruction with HLT and record the
      * state after it (the exception vectors point at HLTs as well). */
-    if (rc == 0 && c->model >= X86_MODEL_286 && !c->halted) {
-        uint32_t next = phys_of(c, c->seg[S_CS].base + (c->eip & 0xFFFF));
-        if (next < c->mem_size && c->mem[next] == 0xF4) rc = x86_step(c);
+    for (int extra = 0; extra < 3 && rc == 0 && c->model >= X86_MODEL_286 && !c->halted; extra++) {
+        /* the 386 does not wrap EIP: HLT at FFFF leaves it at 10000h, the
+         * fetch there faults, and the handler's HLT is stepped as well */
+        uint32_t ip = c->model >= X86_MODEL_386 ? c->eip : (c->eip & 0xFFFF);
+        uint32_t next = phys_of(c, c->seg[S_CS].base + ip);
+        if (next >= c->mem_size || c->mem[next] != 0xF4) break;
+        rc = x86_step(c);
     }
 
     uint32_t expect[G_N], got[G_N];
@@ -202,7 +236,7 @@ static int run_test(x86_cpu *c, const test_t *t, uint16_t meta_fmask, int *fail_
     for (int i = 0; i < G_N; i++) {
         if (i == G_CR0 || i == G_CR3 || i == G_DR6 || i == G_DR7) continue;   /* no PM/debug state in real-mode tests */
         uint32_t m = no_mask ? 0xFFFFFFFFu : t->fin.mask[i];
-        if (i == G_EFL && !no_mask && c->model == X86_MODEL_8086) m &= meta_fmask;
+        if (i == G_EFL && !no_mask) m &= meta_fmask;
         if (i == G_EFL && c->model == X86_MODEL_8086) m &= 0xFFFF;
         if ((expect[i] & m) != (got[i] & m)) {
             bad = 1;
@@ -216,8 +250,7 @@ static int run_test(x86_cpu *c, const test_t *t, uint16_t meta_fmask, int *fail_
         uint8_t want = e[4], have = c->mem[a];
         /* the flags word pushed by an exception may hold undefined bits */
         if (t->has_exc && !no_mask && (raw == t->exc_flag_addr || raw == t->exc_flag_addr + 1)) {
-            uint32_t fm = t->fin.mask[G_EFL];
-            if (c->model == X86_MODEL_8086) fm &= meta_fmask;
+            uint32_t fm = t->fin.mask[G_EFL] & meta_fmask;
             uint8_t bm = (uint8_t)(fm >> (raw == t->exc_flag_addr ? 0 : 8));
             want &= bm; have &= bm;
         }
@@ -228,6 +261,19 @@ static int run_test(x86_cpu *c, const test_t *t, uint16_t meta_fmask, int *fail_
     }
     if (rc < 0) { bad = 1; mp += snprintf(msg + mp, sizeof msg - mp, " (step rc=%d)", rc); }
 
+    if (list_all && !bad) {
+        printf("  ok   #%u %.*s  bytes:", t->idx, (int)t->name_len, t->name);
+        for (uint32_t i = 0; i < t->nbytes; i++) printf(" %02X", t->bytes[i]);
+        if (t->has_exc) printf("  (exception %u)", t->exc_num);
+        printf("\n");
+        if (verbose) {
+            printf("       init:");
+            for (int i = 0; i < G_N; i++) if (t->init.present & (1u << i)) printf(" %s=%X", gname[i], t->init.regs[i]);
+            printf("\n       fin:");
+            for (int i = 0; i < G_N; i++) if (t->fin.present & (1u << i)) printf(" %s=%X", gname[i], t->fin.regs[i]);
+            printf("\n");
+        }
+    }
     if (bad && (*fail_count)++ < max_fail) {
         printf("  FAIL #%u %.*s  bytes:", t->idx, (int)t->name_len, t->name);
         for (uint32_t i = 0; i < t->nbytes; i++) printf(" %02X", t->bytes[i]);
@@ -241,6 +287,11 @@ static int run_test(x86_cpu *c, const test_t *t, uint16_t meta_fmask, int *fail_
                 const uint8_t *e = t->init.ram + i * 5;
                 printf(" %06X=%02X", rd32(e), e[4]);
             }
+            printf("\n       fin:");
+            for (uint32_t i = 0; i < t->fin.nram; i++) {
+                const uint8_t *e = t->fin.ram + i * 5;
+                printf(" %06X=%02X", rd32(e), e[4]);
+            }
             printf("\n");
         }
     }
@@ -248,6 +299,19 @@ static int run_test(x86_cpu *c, const test_t *t, uint16_t meta_fmask, int *fail_
     for (uint32_t i = 0; i < t->init.nram; i++) { uint32_t a = phys_of(c, rd32(t->init.ram + i * 5)); if (a < c->mem_size) c->mem[a] = 0; }
     for (uint32_t i = 0; i < t->fin.nram; i++) { uint32_t a = phys_of(c, rd32(t->fin.ram + i * 5)); if (a < c->mem_size) c->mem[a] = 0; }
     return !bad;
+}
+
+/* The 386EX test board: its on-chip REMAPCFG/index ports at 22h/23h
+ * read back 7Fh/42h; every other port floats high. */
+static uint32_t board_io_read(x86_cpu *c, uint16_t port, int size) {
+    (void)c;
+    uint32_t v = 0;
+    for (int i = 0; i < size; i++) {
+        uint16_t p = port + i;
+        uint32_t b = (c->model >= X86_MODEL_386 && p == 0x22) ? 0x7F : (c->model >= X86_MODEL_386 && p == 0x23) ? 0x42 : 0xFF;
+        v |= b << (8 * i);
+    }
+    return v;
 }
 
 static int model_for_cpu(const char *id) {
@@ -271,6 +335,7 @@ static int run_file(x86_cpu **cpup, const char *path) {
         if (c) { x86_free(c); free(c); }
         c = calloc(1, sizeof *c);
         x86_init(c, model);
+        c->io_read = board_io_read;
         if (model >= X86_MODEL_286) x86_set_a20(c, 1);   /* 24/32-bit address lines */
         *cpup = c;
     }
@@ -281,6 +346,15 @@ static int run_file(x86_cpu **cpup, const char *path) {
     int reg = 8;
     if (base[2] == '.' && base[3] >= '0' && base[3] <= '7' && base[4] == '.') reg = base[3] - '0';
     uint16_t fmask = (model == X86_MODEL_8086 && have_meta) ? flag_mask[opc & 0xFF][reg] : 0xFFFF;
+    if (model == X86_MODEL_386 && n_csv) {
+        /* "67660FBA.4.MOO.gz" → opcode "0FBA", reg 4 */
+        char key[16]; const char *b = base;
+        while ((b[0] == '6' && (b[1] == '6' || b[1] == '7'))) b += 2;
+        size_t l = strcspn(b, ".");
+        snprintf(key, sizeof key, "%.*s", (int)(l < 15 ? l : 15), b);
+        int rg = (b[l] == '.' && b[l + 1] >= '0' && b[l + 1] <= '7') ? b[l + 1] - '0' : -1;
+        fmask = csv_mask_for(key, rg);
+    }
 
     state_t file_masks; memset(&file_masks, 0, sizeof file_masks);
     uint32_t pos = 8 + hlen;
@@ -317,6 +391,7 @@ int main(int argc, char **argv) {
     int i = 1;
     for (; i < argc && argv[i][0] == '-'; i++) {
         if (!strcmp(argv[i], "-v")) verbose = 1;
+        else if (!strcmp(argv[i], "-a")) list_all = 1;
         else if (!strcmp(argv[i], "-M")) no_mask = 1;
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) max_fail = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) meta = argv[++i];
@@ -324,10 +399,12 @@ int main(int argc, char **argv) {
     }
     if (meta) load_metadata(meta);
     else if (i < argc) {
-        /* default: metadata.json next to the first file, if any (8088 suite) */
+        /* default: metadata.json / 80386.csv next to the first file */
         char p[4096]; const char *s = strrchr(argv[i], '/');
         snprintf(p, sizeof p, "%.*smetadata.json", s ? (int)(s - argv[i] + 1) : 0, argv[i]);
         load_metadata(p);
+        snprintf(p, sizeof p, "%.*s80386.csv", s ? (int)(s - argv[i] + 1) : 0, argv[i]);
+        load_csv(p);
     }
 
     x86_cpu *cpu = NULL;

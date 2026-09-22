@@ -81,10 +81,9 @@ static inline uint32_t admask(const x86_insn *in) { return in->adsize == 2 ? 0xF
 static inline uint32_t stkmask(x86_cpu *c) { return c->seg[S_SS].big ? 0xFFFFFFFFu : 0xFFFF; }
 
 /* CONTRACT: a word straddling offset FFFF wraps within the segment on
- * the 8086/186 (silicon-verified by the 8088 suite). A 286/386 would
- * raise #GP there; we access linearly instead, which is what the JIT's
- * unchecked host-pointer loads do, and no program that survives real
- * hardware can tell the difference. */
+ * the 8086/186 (silicon-verified by the 8088 suite). The 286/386 fault
+ * instead (limit_check below: #GP, or #SS through SS on the 386), so
+ * their accesses are linear. */
 static inline uint32_t wrapmask(const x86_cpu *c, uint32_t m) { return c->model >= X86_MODEL_286 ? 0xFFFFFFFFu : m; }
 
 static uint32_t calc_ea(x86_cpu *c, const x86_insn *in) {
@@ -98,7 +97,7 @@ static uint32_t calc_ea(x86_cpu *c, const x86_insn *in) {
  * with nothing of the instruction committed. The 8086/186 wrap. */
 static inline void limit_check(x86_cpu *c, int seg, uint32_t off, int size) {
     if (c->model >= X86_MODEL_286 && (off > c->seg[seg].limit || off + size - 1 > c->seg[seg].limit))
-        x86_fault(c, X86_EXC_GP, 0);
+        x86_fault(c, (seg == S_SS && c->model >= X86_MODEL_386) ? X86_EXC_SS : X86_EXC_GP, 0);   /* 386: stack-segment faults are #SS (measured) */
 }
 static inline uint32_t mrd(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, int size) {
     limit_check(c, seg, off, size);
@@ -146,8 +145,25 @@ static uint32_t pop(x86_cpu *c, int size) {
     return v;
 }
 
-static inline void set_ip(x86_cpu *c, uint32_t ip) {
-    c->eip = c->seg[S_CS].big ? ip : (ip & 0xFFFF);
+/* Control transfer: a 16-bit operand truncates the target to IP. The
+ * 386 keeps EIP whole otherwise, even in a 16-bit code segment — the
+ * next fetch is what faults (#GP) when it lies past the limit. The
+ * 8086..286 have a 16-bit IP and simply wrap. */
+/* Read a stack slot without moving SP (frame prechecks). */
+static uint32_t peek(x86_cpu *c, uint32_t off, int size) {
+    uint32_t m = stkmask(c);
+    uint32_t sp = (c->r[R_SP] + off) & m;
+    limit_check(c, S_SS, sp, size);
+    return x86_rd(c, c->seg[S_SS].base, sp, wrapmask(c, m), size);
+}
+/* 386: a 32-bit transfer target past the code limit is #GP before
+ * anything is committed. 16-bit targets cannot leave a real-mode segment. */
+static inline void check_target(x86_cpu *c, uint32_t ip, int os) {
+    if (os == 4 && c->model >= X86_MODEL_386 && ip > c->seg[S_CS].limit) x86_fault(c, X86_EXC_GP, 0);
+}
+
+static inline void set_ip(x86_cpu *c, uint32_t ip, int os) {
+    c->eip = (os == 2 || c->model < X86_MODEL_386) ? (ip & 0xFFFF) : ip;
 }
 
 /* Segment register load. Real mode only for now; Phase B hooks PM here. */
@@ -168,15 +184,17 @@ static void push_raw(x86_cpu *c, uint32_t v) {
 }
 void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
     (void)is_sw;
+    /* The vector is read before the frame is pushed (measured on the
+     * 386: a frame landing on the IVT entry does not redirect). */
+    uint32_t off = x86_rd(c, 0, vector * 4, 0xFFFFFFFFu, 2);
+    uint32_t sel = x86_rd(c, 0, vector * 4 + 2, 0xFFFFFFFFu, 2);
     push_raw(c, c->eflags & 0xFFFF);
     c->eflags &= ~(X86_IF | X86_TF);
     push_raw(c, c->seg[S_CS].sel);
     push_raw(c, c->eip & 0xFFFF);
-    uint32_t off = x86_rd(c, 0, vector * 4, 0xFFFFFFFFu, 2);
-    uint32_t sel = x86_rd(c, 0, vector * 4 + 2, 0xFFFFFFFFu, 2);
     load_seg(c, S_CS, sel);
     c->int_inhibit = 0;
-    set_ip(c, off);
+    set_ip(c, off, 2);
 }
 
 /* ------------------------------------------------------------------------
@@ -211,17 +229,26 @@ static uint32_t do_shift(x86_cpu *c, int op, uint32_t v, uint32_t cnt, int size)
             uint32_t nc = v & 1; v = (v >> 1) | (cf << (bits - 1)); cf = nc;
         }
         break;
-    case OP_SHL: case OP_SAL:
+    case OP_SHL: case OP_SAL: {
+        uint32_t v0 = v;
         for (uint32_t i = 0; i < cnt; i++) { cf = (v & sb) != 0; v = (v << 1) & m; }
+        /* 386 (measured): a byte shifted by exactly 16 or 24 reports the
+         * bit a byte-rotate would have dropped (bit 0 / bit 7); every
+         * other over-width count shifts out zeros. */
+        if (size == 1 && cnt > 8 && !(cnt & 7) && c->model >= X86_MODEL_386) cf = v0 & 1;
         of = ((v & sb) != 0) ^ cf;
         set_szp(c, v, size);
         c->eflags &= ~X86_AF;                       /* CONTRACT: AF cleared by shifts */
         break;
-    case OP_SHR:
+    }
+    case OP_SHR: {
+        uint32_t v0 = v;
         for (uint32_t i = 0; i < cnt; i++) { of = (v & sb) != 0; cf = v & 1; v >>= 1; }
+        if (size == 1 && cnt > 8 && !(cnt & 7) && c->model >= X86_MODEL_386) cf = (v0 >> 7) & 1;
         set_szp(c, v, size);
         c->eflags &= ~X86_AF;
         break;
+    }
     case OP_SAR:
         for (uint32_t i = 0; i < cnt; i++) { cf = v & 1; v = (v >> 1) | (v & sb); }
         of = 0;
@@ -382,7 +409,7 @@ static void do_string(x86_cpu *c, const x86_insn *in) {
     int32_t delta = (c->eflags & X86_DF) ? -size : size;
     int rep = in->rep;
     int test_z = (in->op == OP_CMPS || in->op == OP_SCAS);
-    int early = c->model >= X86_MODEL_286;
+    int early = c->model == X86_MODEL_286;   /* the 386 commits nothing on a faulting iteration (measured) */
 
     for (;;) {
         if (rep && (c->r[R_CX] & am) == 0) break;
@@ -635,6 +662,8 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         if (in->ops[0].kind == OPK_SREG) {
             if (in->ops[0].reg == S_CS && c->model > X86_MODEL_8086) RAISE(X86_EXC_UD);
             load_seg(c, in->ops[0].reg, rd_op(c, in, 1, ea));
+        } else if (in->ops[0].kind == OPK_REG && in->opsize == 4) {
+            x86_set_reg(c, in->ops[0].reg, 4, c->seg[in->ops[1].reg].sel);   /* 386: o32 MOV r32,sreg zero-extends (measured); memory stays a word */
         } else {
             wr_op(c, in, 0, ea, c->seg[in->ops[1].reg].sel);
         }
@@ -709,35 +738,78 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         push(c, in->opsize, a);
         break;
     case OP_POP:
-        a = pop(c, in->opsize);
-        if (in->ops[0].kind == OPK_SREG) load_seg(c, in->ops[0].reg, a);
-        else {
-            /* POP [mem]: EA is computed after SP is incremented */
-            if (in->ops[0].kind == OPK_MEM) ea = calc_ea(c, in);
+        if (in->ops[0].kind == OPK_SREG) {
+            /* o32 POP sreg on the 386 reads only the word (no straddle
+             * fault for the upper half) and still skips 4 (measured). */
+            if (in->opsize == 4 && c->model >= X86_MODEL_386) {
+                a = peek(c, 0, 2);
+                uint32_t sm = stkmask(c), sp = (c->r[R_SP] + 4) & sm;
+                c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
+            } else a = pop(c, in->opsize);
+            load_seg(c, in->ops[0].reg, a);
+        } else {
+            uint32_t sp0 = c->r[R_SP];
+            a = pop(c, in->opsize);
+            /* POP [mem]: EA is computed after SP is incremented; the 386
+             * leaves SP where it was if the destination faults (measured). */
+            if (in->ops[0].kind == OPK_MEM) {
+                ea = calc_ea(c, in);
+                if (c->model >= X86_MODEL_386 && (ea > c->seg[in->seg].limit || ea + size - 1 > c->seg[in->seg].limit)) {
+                    c->r[R_SP] = sp0;
+                    x86_fault(c, in->seg == S_SS ? X86_EXC_SS : X86_EXC_GP, 0);
+                }
+            }
             wr_op(c, in, 0, ea, a);
         }
         break;
     case OP_PUSHA: {
         uint32_t sp = x86_get_reg(c, R_SP, in->opsize);
-        /* 286+: if any of the pushes would straddle the limit (odd SP below
-         * the frame size) the fault is taken with SP intact (measured). */
-        if (c->model >= X86_MODEL_286 && (sp & 1) && sp < 8u * in->opsize) x86_fault(c, X86_EXC_GP, 0);
+        uint32_t sm = stkmask(c), os = in->opsize, lim = c->seg[S_SS].limit;
+        if (c->model == X86_MODEL_286) {
+            /* 286 (measured): a straddling push faults up front, SP intact */
+            for (uint32_t i = 1; i <= 8; i++)
+                if (((c->r[R_SP] - os * i) & sm) + os - 1 > lim) x86_fault(c, X86_EXC_GP, 0);
+        } else if (c->model >= X86_MODEL_386) {
+            /* 386 (measured): every push that fits lands, the straddling
+             * one is skipped, and #SS is raised at the end with SP intact */
+            uint32_t sp0 = c->r[R_SP];
+            int bad = 0;
+            for (int i = 0; i < 8; i++) {
+                uint32_t p = (c->r[R_SP] - os) & sm;
+                if (p + os - 1 > lim) bad = 1;
+                else x86_wr(c, c->seg[S_SS].base, p, sm, os, i == R_SP ? sp : x86_get_reg(c, i, os));
+                c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | p) : p;
+            }
+            if (bad) { c->r[R_SP] = sp0; x86_fault(c, X86_EXC_SS, 0); }
+            break;
+        }
         for (int i = 0; i < 8; i++) push(c, in->opsize, i == R_SP ? sp : x86_get_reg(c, i, in->opsize));
         break;
     }
-    case OP_POPA:
-        /* 286+: restartable — a straddling pop faults with nothing popped */
-        if (c->model >= X86_MODEL_286) {
-            uint32_t sp = c->r[R_SP] & stkmask(c);
-            if ((sp & 1) && sp > stkmask(c) - 8u * in->opsize + 1) x86_fault(c, X86_EXC_GP, 0);
+    case OP_POPA: {
+        uint32_t sm = stkmask(c), os = in->opsize, sp0 = c->r[R_SP];
+        if (c->model == X86_MODEL_286) {
+            /* 286 (measured): restartable — a straddling pop faults with nothing popped */
+            for (uint32_t i = 0; i < 8; i++)
+                if (((c->r[R_SP] + os * i) & sm) + os - 1 > c->seg[S_SS].limit) x86_fault(c, X86_EXC_GP, 0);
         }
         for (int i = 7; i >= 0; i--) {
+            /* 386 (measured): registers popped before a straddling slot
+             * keep their new values; only SP is restored for the #SS */
+            if (c->model >= X86_MODEL_386 && (c->r[R_SP] & sm) + os - 1 > c->seg[S_SS].limit) {
+                c->r[R_SP] = sp0; x86_fault(c, X86_EXC_SS, 0);
+            }
             a = pop(c, in->opsize);
             if (i != R_SP) x86_set_reg(c, i, in->opsize, a);
+            /* CONTRACT (386, measured): POPAD on a 16-bit stack leaves the
+             * popped image's upper half in ESP; SP itself keeps counting. */
+            else if (in->opsize == 4 && stkmask(c) == 0xFFFF && c->model >= X86_MODEL_386)
+                c->r[R_SP] = (a & 0xFFFF0000u) | (c->r[R_SP] & 0xFFFF);
         }
         break;
+    }
     case OP_PUSHF:
-        push(c, in->opsize, in->opsize == 2 ? (c->eflags & 0xFFFF) : (c->eflags & ~(X86_RF | X86_VM)));
+        push(c, in->opsize, in->opsize == 2 ? (c->eflags & 0xFFFF) : (c->eflags & 0x3FFFF & ~(X86_RF | X86_VM)));   /* 386: bits 18-31 push as 0 (measured) */
         break;
     case OP_POPF: {
         a = pop(c, in->opsize);
@@ -746,47 +818,43 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
     }
     case OP_ENTER: {
+        /* One pass, as the microcode does it: each push is limit-checked
+         * (286+) right before it lands, so a wrapping frame overwrites
+         * the very slots the later levels read (measured). On a fault
+         * SP and BP are restored and the pushes already made stay. */
         uint32_t fsize = in->ops[0].imm, level = in->ops[1].imm & 31;
         int os = in->opsize;
-        uint32_t sm = stkmask(c);
-        if (c->model >= X86_MODEL_286) {
-            /* Restartable: pushes reach memory up to the one that would
-             * straddle the limit; then SP and BP are left as they were
-             * and #GP is taken (measured). The frame may wrap SP freely. */
-            uint32_t sp0 = c->r[R_SP] & sm, bp0 = x86_get_reg(c, R_BP, os) & sm;
-            uint32_t psp = (sp0 - os) & sm, pbp = bp0, lim = c->seg[S_SS].limit;
-            int bad = psp + os - 1 > lim;
-            if (!bad) x86_wr(c, c->seg[S_SS].base, psp, sm, os, bp0);
-            uint32_t frame0 = psp;
-            for (uint32_t i = 1; i < level && !bad; i++) {
-                pbp = (pbp - os) & sm; psp = (psp - os) & sm;
-                if (pbp + os - 1 > lim || psp + os - 1 > lim) { bad = 1; break; }
-                x86_wr(c, c->seg[S_SS].base, psp, sm, os, x86_rd(c, c->seg[S_SS].base, pbp, sm, os));
-            }
-            if (!bad && level > 0) {
-                psp = (psp - os) & sm;
-                if (psp + os - 1 > lim) bad = 1; else x86_wr(c, c->seg[S_SS].base, psp, sm, os, frame0);
-            }
-            if (bad) x86_fault(c, X86_EXC_GP, 0);
-        }
-        push(c, os, x86_get_reg(c, R_BP, os));
+        uint32_t sm = stkmask(c), lim = c->seg[S_SS].limit, base = c->seg[S_SS].base;
+        uint32_t sp0 = c->r[R_SP], bp0 = c->r[R_BP];
+        int chk = c->model >= X86_MODEL_286;
+        int vec = c->model >= X86_MODEL_386 ? X86_EXC_SS : X86_EXC_GP;
+#define ENTER_PUSH(v) do { \
+            uint32_t p_ = (c->r[R_SP] - os) & sm; \
+            if (chk && p_ + os - 1 > lim) { c->r[R_SP] = sp0; c->r[R_BP] = bp0; x86_fault(c, vec, 0); } \
+            x86_wr(c, base, p_, wrapmask(c, sm), os, (v)); \
+            c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | p_) : p_; \
+        } while (0)
+        ENTER_PUSH(x86_get_reg(c, R_BP, os));
         uint32_t frame = c->r[R_SP] & sm;
         if (level > 0) {
             for (uint32_t i = 1; i < level; i++) {
                 uint32_t bp = (x86_get_reg(c, R_BP, os) - os) & sm;
                 x86_set_reg(c, R_BP, os, bp);
-                push(c, os, x86_rd(c, c->seg[S_SS].base, bp, wrapmask(c, sm), os));
+                if (chk && bp + os - 1 > lim) { c->r[R_SP] = sp0; c->r[R_BP] = bp0; x86_fault(c, vec, 0); }
+                ENTER_PUSH(x86_rd(c, base, bp, wrapmask(c, sm), os));
             }
-            push(c, os, frame);
+            ENTER_PUSH(frame);
         }
+#undef ENTER_PUSH
         x86_set_reg(c, R_BP, os, frame);
-        x86_set_reg(c, R_SP, os, (c->r[R_SP] - fsize) & sm);
+        uint32_t nsp = (c->r[R_SP] - fsize) & sm;
+        c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | nsp) : nsp;
         break;
     }
     case OP_LEAVE: {
-        int os = in->opsize;
-        limit_check(c, S_SS, x86_get_reg(c, R_BP, os) & stkmask(c), os);   /* fault with SP intact */
-        x86_set_reg(c, R_SP, os, x86_get_reg(c, R_BP, os));
+        int os = in->opsize, ss = c->seg[S_SS].big ? 4 : 2;   /* SP <- BP copies at the stack address size (measured) */
+        limit_check(c, S_SS, x86_get_reg(c, R_BP, ss) & stkmask(c), os);   /* fault with SP intact */
+        x86_set_reg(c, R_SP, ss, x86_get_reg(c, R_BP, ss));
         x86_set_reg(c, R_BP, os, pop(c, os));
         break;
     }
@@ -795,13 +863,14 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_JMP:
         a = rd_op(c, in, 0, ea);
         if (in->ops[0].kind == OPK_IMM) a += c->eip;
-        set_ip(c, a);
+        check_target(c, a, in->opsize);
+        set_ip(c, a, in->opsize);
         break;
     case OP_JCC:
-        if (x86_cond(c->eflags, in->cond)) set_ip(c, c->eip + in->ops[0].imm);
+        if (x86_cond(c->eflags, in->cond)) set_ip(c, c->eip + in->ops[0].imm, in->opsize);
         break;
     case OP_JCXZ:
-        if ((c->r[R_CX] & admask(in)) == 0) set_ip(c, c->eip + in->ops[0].imm);
+        if ((c->r[R_CX] & admask(in)) == 0) set_ip(c, c->eip + in->ops[0].imm, in->opsize);
         break;
     case OP_LOOP: case OP_LOOPE: case OP_LOOPNE: {
         uint32_t am = admask(in);
@@ -809,14 +878,15 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         c->r[R_CX] = am == 0xFFFF ? ((c->r[R_CX] & 0xFFFF0000u) | cx) : cx;
         int zf = (c->eflags & X86_ZF) != 0;
         int go = cx != 0 && (in->op == OP_LOOP || (in->op == OP_LOOPE ? zf : !zf));
-        if (go) set_ip(c, c->eip + in->ops[0].imm);
+        if (go) set_ip(c, c->eip + in->ops[0].imm, in->opsize);
         break;
     }
     case OP_CALL:
         a = rd_op(c, in, 0, ea);
         if (in->ops[0].kind == OPK_IMM) a += c->eip;
+        check_target(c, a, in->opsize);
         push(c, in->opsize, c->eip);
-        set_ip(c, a);
+        set_ip(c, a, in->opsize);
         break;
     case OP_CALLF: case OP_JMPF: {
         uint32_t off, sel;
@@ -825,34 +895,41 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             off = mrd(c, in, in->seg, ea, in->opsize);
             sel = mrd(c, in, in->seg, (ea + in->opsize) & admask(in), 2);
         }
+        check_target(c, off, in->opsize);        /* real mode: the new CS has the same 64K limit */
         if (in->op == OP_CALLF) {
             push(c, in->opsize, c->seg[S_CS].sel);
             push(c, in->opsize, c->eip);
         }
         load_seg(c, S_CS, sel);
-        set_ip(c, off);
+        set_ip(c, off, in->opsize);
         break;
     }
     case OP_RET:
+        check_target(c, peek(c, 0, in->opsize), in->opsize);
         a = pop(c, in->opsize);
         if (in->ops[0].kind == OPK_IMM) x86_set_reg(c, R_SP, stkmask(c) == 0xFFFF ? 2 : 4, c->r[R_SP] + in->ops[0].imm);
-        set_ip(c, a);
+        set_ip(c, a, in->opsize);
         break;
     case OP_RETF: {
+        check_target(c, peek(c, 0, in->opsize), in->opsize);
+        peek(c, in->opsize, in->opsize);                 /* whole frame checked before SP moves */
         a = pop(c, in->opsize);
         b = pop(c, in->opsize);
         if (in->ops[0].kind == OPK_IMM) x86_set_reg(c, R_SP, stkmask(c) == 0xFFFF ? 2 : 4, c->r[R_SP] + in->ops[0].imm);
         load_seg(c, S_CS, b);
-        set_ip(c, a);
+        set_ip(c, a, in->opsize);
         break;
     }
     case OP_IRET: {
+        check_target(c, peek(c, 0, in->opsize), in->opsize);
+        peek(c, in->opsize, in->opsize);
+        peek(c, 2 * in->opsize, in->opsize);
         a = pop(c, in->opsize);
         b = pop(c, in->opsize);
         uint32_t f = pop(c, in->opsize);
         uint32_t m = in->opsize == 2 ? 0xFFFF : 0xFFFFFFFFu;
         load_seg(c, S_CS, b);
-        set_ip(c, a);
+        set_ip(c, a, in->opsize);
         c->eflags = x86_flags_fixup(c, (c->eflags & ~m) | (f & m));
         break;
     }
@@ -924,12 +1001,19 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
     case OP_SHLD: case OP_SHRD: {
         uint32_t cnt = (in->imm2 == 0xFFFFFFFFu ? x86_get_r8(c, R_CL) : in->imm2) & 0x1F;
-        if (cnt == 0) break;
         int bits = size * 8;
         a = rd_op(c, in, 0, ea) & szmask(size); b = rd_op(c, in, 1, ea) & szmask(size);
-        if (cnt > (uint32_t)bits) break;                 /* CONTRACT: undefined → no-op */
+        if (cnt == 0) break;                             /* the operand fetch (and its fault) happens regardless */
         uint32_t cf;
-        if (in->op == OP_SHLD) {
+        if (cnt > (uint32_t)bits) {
+            /* 16-bit operand, count 17-31 (measured on the 386): the
+             * result is a 32-bit rotate of the SOURCE replicated in both
+             * halves; the destination's bits do not survive at all. */
+            uint32_t t = (b << 16) | b;
+            if (in->op == OP_SHLD) { t = (t << cnt) | (t >> (32 - cnt)); cf = t & 1; }
+            else { t = (t >> cnt) | (t << (32 - cnt)); cf = t >> 31; }
+            r = t & 0xFFFF;
+        } else if (in->op == OP_SHLD) {
             cf = (a >> (bits - cnt)) & 1;
             r = (cnt == (uint32_t)bits) ? b : ((a << cnt) | (b >> (bits - cnt))) & szmask(size);
         } else {
@@ -963,7 +1047,9 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
 
     /* System instructions: Phase B (DPMI host). */
-    case OP_LAR: case OP_LSL: case OP_CLTS: case OP_SGDT: case OP_SIDT: case OP_LGDT: case OP_LIDT:
+    case OP_CLTS:
+        break;                                  /* CR0.TS: no CR0 yet (Phase B); legal at CPL 0 */
+    case OP_LAR: case OP_LSL: case OP_SGDT: case OP_SIDT: case OP_LGDT: case OP_LIDT:
     case OP_SLDT: case OP_STR: case OP_LLDT: case OP_LTR: case OP_VERR: case OP_VERW:
     case OP_SMSW: case OP_LMSW: case OP_MOVCR: case OP_MOVDR: case OP_MOVTR:
     case OP_UD:
@@ -1008,24 +1094,33 @@ int x86_step(x86_cpu *c) {
 
     uint8_t buf[16];
     x86_insn in;
-    fetch_bytes(c, buf);
-    x86_dec_ctx ctx = { buf, c->model, c->seg[S_CS].big };
     uint32_t start_ip = c->eip;
+    int is386 = c->model >= X86_MODEL_386;
 
-    if (!x86_decode(&ctx, &in)) {
-        /* > 15 bytes of prefixes: the 8086 just keeps going; 386 #GP.
-         * Treat as #UD-ish for now. */
-        c->exc = X86_EXC_UD;
+    if (is386 && start_ip > c->seg[S_CS].limit) {
+        /* 386: EIP past the code limit (e.g. after HLT at FFFF) faults on
+         * the fetch; the 286 wrapped IP instead. */
+        c->exc = X86_EXC_GP;
     } else {
-        set_ip(c, c->eip + in.len);
-        c->int_inhibit = 0;
-        c->fault_armed = 1;
-        if (setjmp(c->fault_jb) == 0) {
-            /* 286: instructions longer than 10 bytes (prefix padding) are #GP */
-            if (c->model == X86_MODEL_286 && in.len > 10) x86_fault(c, X86_EXC_GP, 0);
-            execute(c, &in, start_ip);
+        fetch_bytes(c, buf);
+        x86_dec_ctx ctx = { buf, c->model, c->seg[S_CS].big };
+        if (!x86_decode(&ctx, &in)) {
+            /* > 15 bytes of prefixes: the 8086 just keeps going; 386 #GP.
+             * Treat as #UD-ish for now. */
+            c->exc = X86_EXC_UD;
+        } else if (is386 && start_ip + in.len - 1 > c->seg[S_CS].limit) {
+            c->exc = X86_EXC_GP;                      /* instruction straddles the code limit */
+        } else {
+            c->eip = is386 ? start_ip + in.len : ((start_ip + in.len) & 0xFFFF);
+            c->int_inhibit = 0;
+            c->fault_armed = 1;
+            if (setjmp(c->fault_jb) == 0) {
+                /* 286: instructions longer than 10 bytes (prefix padding) are #GP */
+                if (c->model == X86_MODEL_286 && in.len > 10) x86_fault(c, X86_EXC_GP, 0);
+                execute(c, &in, start_ip);
+            }
+            c->fault_armed = 0;
         }
-        c->fault_armed = 0;
     }
     c->insn_count++;
 
@@ -1035,7 +1130,7 @@ int x86_step(x86_cpu *c) {
         /* Faults on 286+ push the faulting IP. The 8086/186 divide
          * error (and everything else it can raise) pushes the next IP. */
         int trap_semantics = c->model < X86_MODEL_286;
-        if (!trap_semantics) set_ip(c, start_ip);
+        if (!trap_semantics) c->eip = start_ip;
         if (vec == X86_EXC_UD && c->model == X86_MODEL_8086) return -1;   /* cannot happen; be loud */
         x86_interrupt(c, vec, 0);
     }

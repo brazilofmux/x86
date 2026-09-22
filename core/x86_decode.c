@@ -241,6 +241,13 @@ static void decode_modrm(cursor *c, x86_insn *in) {
             } else {
                 in->base = bas;
                 ss_default = (bas == R_SP || bas == R_BP);
+                /* CONTRACT (386, measured): with no index register the
+                 * scale field is not ignored — it scales the base
+                 * ([ebp*4+disp8] for SIB A5). Later parts drop this. */
+                if (idx == 4 && in->scale && c->model == X86_MODEL_386) {
+                    in->index = bas;
+                    in->base = -1;
+                }
             }
         } else if (rm == 5 && in->mod == 0) {
             in->disp = (int32_t)fetch32(c);
@@ -466,6 +473,23 @@ done_prefix:
 
     /* SETCC / 0F Jcc already have cond; Jcc in the primary map too */
     if (in->op == OP_SETCC) in->cond = in->opcode2 & 15;
+
+    /* 386+: LOCK is only legal on the read-modify-write ALU ops with a
+     * memory destination (and XCHG with a memory operand); anywhere
+     * else it is #UD. Earlier parts treat it as a no-op prefix. */
+    if (in->lock && model >= X86_MODEL_386 && in->op != OP_UD) {
+        int ok = 0;
+        switch (in->op) {
+        case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR:
+        case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
+        case OP_BTS: case OP_BTR: case OP_BTC: case OP_XADD: case OP_CMPXCHG:
+            ok = in->ops[0].kind == OPK_MEM; break;
+        case OP_XCHG:
+            ok = in->ops[0].kind == OPK_MEM || in->ops[1].kind == OPK_MEM; break;
+        default: break;
+        }
+        if (!ok) in->op = OP_UD;
+    }
 
 out:
     if (c.pos > X86_MAX_INSN) return 0;
