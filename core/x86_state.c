@@ -42,7 +42,9 @@ uint32_t x86_flags_fixup(x86_cpu *c, uint32_t f) {
     case X86_MODEL_286:
         if (!c->pmode) f &= 0x0FFF; else f &= 0x7FFF; break;
     default:
-        f &= 0x00037FFF;                          /* RF/VM allowed, 15 and 18+ clear */
+        /* 386: bit 15 clear, RF/VM allowed; bits 18-31 are reserved and
+         * read back as whatever they were (the 386EX shows them set) */
+        f &= ~0x8000u;
         if (!c->pmode) f &= ~X86_VM;
         break;
     }
