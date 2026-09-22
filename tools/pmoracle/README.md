@@ -42,11 +42,24 @@ that is the interesting list, and it gets adjudicated against the Intel
 manual rather than by majority vote. The kernel is deliberately written
 as a plain boot sector so it also runs on a real 386 if one ever turns up.
 
-## Running both
+## Running it
 
-    make -C ../.. test-pm            # QEMU
-    python3 pmbochs.py               # Bochs
-    python3 compare.py               # both, diffed case by case
+    make -C ../.. test-pm            # QEMU alone
+    python3 pmbochs.py               # Bochs alone
+    python3 pmours.py                # our own interpreter
+    make -C ../.. test-pm-compare    # all three, against what we require
+
+The comparison prints four columns — `qemu`, `bochs`, `ours`, `wanted`.
+`ours` is blank for cases our interpreter has not reached yet, which is
+the point: it is the protected-mode work list, ordered by the same case
+table, and it fills in as the implementation lands.
+
+Our interpreter runs the same image through `dos-monster -boot`, which
+loads sector one at 7C00 in real mode and serves the rest through
+INT 13h, and emits machine state under `-pmtrace LO:HI` in the shape
+QEMU's `-d cpu` uses, so one parser reads all three. The trace is
+budgeted: a kernel that faults in a loop would otherwise write gigabytes
+before anyone noticed it was stuck.
 
 Bochs needs `brew install bochs`; the build Homebrew ships has the
 internal debugger, which is what `pmbochs.py` drives (a physical

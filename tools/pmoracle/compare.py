@@ -7,7 +7,7 @@ the useful output: it names a case to settle against the Intel manual.
 import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import pmrun, pmbochs
+import pmrun, pmbochs, pmours
 from expected import EXPECT
 
 def key(r):
@@ -21,16 +21,18 @@ spec = pmcases.cases(IMG)
 q = pmrun.records()
 under, after, fault, n = pmrun.footer(IMG)
 b = pmbochs.run(IMG, under, fault, n, spec)
+o = pmours.run(IMG)          # our own interpreter, via -boot and -pmtrace
 
 def verdict(r):
     if r["faulted"] is None: return "?"
     if r["faulted"]: return ("#%02X" % r["vec"]) if "vec" in r else "fault"
     return "ok"
 
-print("QEMU %d cases, Bochs %d cases\n" % (len(q), len(b)))
-print("  case               qemu   bochs  wanted")
+print("QEMU %d, Bochs %d, ours %d of %d cases\n" % (len(q), len(b), len(o), len(spec)))
+print("  case               qemu   bochs  ours   wanted")
 agree = soft = hard = strict = unlisted = accessed = 0
-for x, y in zip(q, b):
+ours_bad = []
+for idx, (x, y) in enumerate(zip(q, b)):
     if (x["target"], x["sel"]) != (y["target"], y["sel"]):
         print("  cases out of step (%s %04X vs %s %04X)" % (x["target"], x["sel"], y["target"], y["sel"])); break
     vq, vb = verdict(x), verdict(y)
@@ -60,12 +62,18 @@ for x, y in zip(q, b):
     else:
         agree += 1
     tag = "%04X" % x["sel"] + (("/%04X" % x["aux"]) if x["aux"] else "")
-    print("  cpl%d %-5s <- %-9s %-6s %-6s %-6s %s" % (x["cpl"], x["target"], tag, vq, vb, ve, note))
+    # "ours" is blank where our interpreter has not got that far yet.
+    vo = verdict(o[idx]) if idx < len(o) else "-"
+    if idx < len(o) and exp and not same(ve, vo):
+        ours_bad.append((x, ve, vo))
+    print("  cpl%d %-5s <- %-9s %-6s %-6s %-6s %-6s %s"
+          % (x["cpl"], x["target"], tag, vq, vb, vo, ve, note))
 
 print("\n%d as expected, %d encoding-only, %d where we are deliberately stricter than both references,"
       % (agree, soft, strict))
 print("%d unexpected, %d with no expectation recorded, %d accessed-bit differences."
       % (hard, unlisted, accessed))
+print("ours: %d of %d cases reached, %d of those wrong." % (len(o), len(spec), len(ours_bad)))
 if strict:
     print("\nThe stricter cases are a decision, not a measurement: see expected.py for the")
     print("reasoning. They are the ones to revisit first if a real client ever misbehaves.")

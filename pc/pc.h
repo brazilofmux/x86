@@ -50,6 +50,8 @@ typedef struct pc_state {
     uint64_t now_ns;                 /* clock read by the last pc_poll, for reuse */
     uint64_t blocked_ns;             /* host time spent deliberately idle (waiting on stdin, honouring a guest delay) */
     uint64_t blocked_calls;
+    const uint8_t *boot_img;         /* -boot: the raw image, served by INT 13h */
+    size_t   boot_len;
     int      eof_seen;
 
     /* Timer */

@@ -1130,6 +1130,7 @@ int x86_step(x86_cpu *c) {
         /* Faults on 286+ push the faulting IP. The 8086/186 divide
          * error (and everything else it can raise) pushes the next IP. */
         int trap_semantics = c->model < X86_MODEL_286;
+        if (c->trace_exc) c->trace_exc(c, vec, c->exc_err);
         if (!trap_semantics) c->eip = start_ip;
         if (vec == X86_EXC_UD && c->model == X86_MODEL_8086) return -1;   /* cannot happen; be loud */
         x86_interrupt(c, vec, 0);

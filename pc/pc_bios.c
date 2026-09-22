@@ -141,6 +141,28 @@ static void bios_int12(x86_cpu *c, int vector) {
 
 static void a20_set(x86_cpu *c, int on);
 
+/* INT 13h AH=02, enough of it to let a boot sector load the rest of itself.
+ * The image is addressed as a 1.44M floppy: 18 sectors per track, 2 heads. */
+static void bios_int13(x86_cpu *c, int vector) {
+    (void)vector;
+    if (x86_get_r8(c, R_AH) != 0x02 || !pc.boot_img) {
+        x86_set_r8(c, R_AH, 0x01);
+        c->eflags |= X86_CF;
+        return;
+    }
+    int count = x86_get_r8(c, R_AL);
+    int sector = x86_get_r8(c, R_CL) & 0x3F;                 /* 1-based */
+    long lba = ((long)x86_get_r8(c, R_CH) * 2 + x86_get_r8(c, R_DH)) * 18 + (sector - 1);
+    uint32_t dst = ((uint32_t)c->seg[S_ES].sel << 4) + x86_get_r16(c, R_BX);
+    for (long b = 0; b < (long)count * 512; b++) {
+        long off = lba * 512 + b;
+        x86_phys_wr8(c, dst + (uint32_t)b, off < (long)pc.boot_len ? pc.boot_img[off] : 0);
+    }
+    x86_set_r8(c, R_AH, 0);
+    x86_set_r8(c, R_AL, (uint8_t)count);
+    c->eflags &= ~X86_CF;
+}
+
 static void bios_int15(x86_cpu *c, int vector) {
     (void)vector;
     switch (x86_get_r8(c, R_AH)) {
@@ -363,6 +385,10 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         }
         pc.kbc_cmd = 0;                          /* keyboard commands (LEDs, typematic): swallowed */
         break;
+    case 0xF4:                                   /* isa-debug-exit, as QEMU offers it:
+                                                  * a boot image can say it is done */
+        if (pc.boot_img) { pc.exit_requested = 1; pc.exit_code = (int)((val << 1) | 1); c->halted = 1; }
+        break;
     case 0x92:
         a20_set(c, (val >> 1) & 1);
         if (val & 1) fprintf(stderr, "pc: port 92h fast reset requested; ignored\n");
@@ -408,6 +434,7 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     pc_set_service(0x08, bios_int8, HLE_RET_IRET);
     pc_set_service(0x11, bios_int11, HLE_RET_FLAGS);
     pc_set_service(0x12, bios_int12, HLE_RET_FLAGS);
+    pc_set_service(0x13, bios_int13, HLE_RET_FLAGS);
     pc_set_service(0x15, bios_int15, HLE_RET_FLAGS);
     pc_set_service(0x1A, bios_int1a, HLE_RET_FLAGS);
     pc_set_service(0x10, pc_video_int10, HLE_RET_FLAGS);
