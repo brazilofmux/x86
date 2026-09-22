@@ -91,8 +91,8 @@ def records(img=None):
     run_qemu(img)
     out = []
     for i, (pre, post) in enumerate(cases(parse(LOG), under)):
-        tgt, sel = (spec[i][0], spec[i][1]) if i < len(spec) else ("?", 0)
-        r = {"target": tgt, "sel": sel}
+        tgt, sel, cpl = (spec[i][0], spec[i][1], spec[i][3]) if i < len(spec) else ("?", 0, 0)
+        r = {"target": tgt, "sel": sel, "cpl": cpl}
         if pre["exc"]:
             r.update(faulted=True, vec=pre["exc"][0], err=pre["exc"][1])
         elif post is None:
@@ -109,10 +109,10 @@ def show(recs, title):
     for r in recs:
         if r["faulted"]:
             extra = "  #%02X err=%04X" % (r["vec"], r["err"]) if "vec" in r else ""
-            print("  %s <- %04X  fault%s" % (r["target"], r["sel"], extra))
+            print("  cpl%d %s <- %04X  fault%s" % (r["cpl"], r["target"], r["sel"], extra))
         else:
-            print("  %s <- %04X  ok  %04X base=%08X limit=%08X ar=%06X"
-                  % (r["target"], r["sel"], r["seg"], r["base"], r["limit"], r["ar"]))
+            print("  cpl%d %s <- %04X  ok  %04X base=%08X limit=%08X ar=%06X"
+                  % (r["cpl"], r["target"], r["sel"], r["seg"], r["base"], r["limit"], r["ar"]))
 
 if __name__ == "__main__":
     show(records(), "QEMU:")

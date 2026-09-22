@@ -17,7 +17,7 @@ def footer(img):
     return dict(slot=slot, after=after, fault=fault, n=n, cases=cases, width=width)
 
 def cases(img):
-    """[(key, selector, instruction-bytes)] in execution order."""
+    """[(key, selector, instruction-bytes, cpl)] in execution order."""
     d = open(img, "rb").read()
     f = footer(img)
     out = []
@@ -25,10 +25,11 @@ def cases(img):
         off = f["cases"] - LOAD_ADDR + i * f["width"]
         raw = d[off:off + 8]
         sel = struct.unpack_from("<H", d, off + 8)[0]
+        ring = struct.unpack_from("<H", d, off + 10)[0]
         instr = raw.rstrip(b"\x90") or raw[:2]
         if raw[0] in FAR:
             sel = struct.unpack_from("<H", raw, 5)[0]
-            out.append((FAR[raw[0]], sel, bytes(raw[:7])))
+            out.append((FAR[raw[0]], sel, bytes(raw[:7]), ring))
         else:
-            out.append((TARGET.get(bytes(instr[:2]), instr[:2].hex()), sel, bytes(instr)))
+            out.append((TARGET.get(bytes(instr[:2]), instr[:2].hex()), sel, bytes(instr), ring))
     return out

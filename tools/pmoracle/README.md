@@ -56,14 +56,17 @@ display.
 
 ## What it covers so far
 
-38 cases: segment-register loads (DS, SS, ES) against every descriptor
-shape, and far JMP/CALL at CPL 0 against code, data, gates and junk.
-33 match our expectations under both references, 2 differ only in cache
-encoding, 2 are the LDTR case below, 1 is an accessed-bit difference,
-and none are unexpected.
+47 cases: segment-register loads (DS, SS, ES) against every descriptor
+shape, far JMP/CALL against code, data, gates and junk, and the same
+instructions again at **CPL 3**, reached by IRET to a ring-3 code
+segment and returned from through a DPL 3 trap gate with a TSS supplying
+the inbound stack.
 
-The SS rules are worth seeing side by side, because they differ from DS
-on every axis:
+39 match our expectations under both references, 2 differ only in cache
+encoding, 2 are the LDTR case, 3 are accessed-bit differences, and none
+are unexpected.
+
+The SS rules differ from DS on every axis:
 
     case          DS     SS
     0020 absent   #0B    #0C     a not-present stack segment is #SS, not #NP
@@ -72,14 +75,28 @@ on every axis:
     0000 null     ok     #0D     null is legal in DS, not in SS
 
 Loading SS with `001B` faults with **error code `0018`**: the low three
-bits of an exception error code are the EXT/IDT/TI flags, so RPL never
-appears there.
+bits of an error code are the EXT/IDT/TI flags, so RPL never appears
+there. A gate whose *target* is bad reports the **target** selector, not
+the gate's: `callf 0068` faults with `err=0010`.
 
-Far transfers behave as the manual describes, including the parts that
-are easy to get backwards: a not-present *gate* raises #NP while a gate
-pointing at a data segment raises #GP, and JMP is allowed through a call
-gate, after which CS holds the gate's target rather than the selector
-the instruction named.
+At CPL 3 the returned CS says whether privilege actually changed,
+because its RPL is the new CPL:
+
+    cpl3 jmpf  0048 -> ok, CS=004B   conforming code: reachable, CPL stays 3
+    cpl3 jmpf  0070 -> ok, CS=0073   DPL 3 code: stays at ring 3
+    cpl3 callf 0080 -> ok, CS=0008   DPL 3 gate: CPL becomes 0, stack switches
+    cpl3 callf 0058 -> #GP           DPL 0 gate is unusable from ring 3
+    cpl3 jmpf  0008 -> #GP           non-conforming DPL 0 code is out of reach
+
+### A trap the kernel itself fell into
+
+An inter-privilege IRET nulls any data segment the new CPL cannot reach.
+The sweep keeps its case table behind FS at DPL 0, so the first transfer
+out to ring 3 nulled FS and every later read of the table faulted — an
+endless fault loop that looked like the harness hanging. `next_case`
+now reloads FS. Worth remembering when writing the interpreter: this is
+a real rule that is easy to forget precisely because it costs nothing
+until privilege changes.
 
 ### Divergence: the accessed bit
 
@@ -87,7 +104,7 @@ the instruction named.
 
 Both emulators set the accessed bit when CS is loaded with a
 *non-conforming* code segment; QEMU does not set it for a *conforming*
-one. The bit is architectural — hardware sets it and writes it back to
+one, nor for a DPL 3 one entered from ring 3. The bit is architectural — hardware sets it and writes it back to
 the descriptor in memory — so `compare.py` reports it separately from
 cosmetic encoding noise. Bochs looks right here.
 

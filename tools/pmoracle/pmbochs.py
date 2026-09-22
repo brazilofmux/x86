@@ -4,7 +4,8 @@ that pmrun.py gets from QEMU, so the two can be diffed."""
 import re, subprocess, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STUB_BASE, STUB_STRIDE = 0x6400, 16   # must match pmtest.asm
+STUB_BASE, STUB_STRIDE, NVEC = 0x6400, 16, 0x31   # must match pmtest.asm
+RET_VEC = 0x30
 
 RE_RAX = re.compile(r"^rax: [0-9a-f]{8}_([0-9a-f]{8})")
 RE_RIP = re.compile(r"^rip: [0-9a-f]{8}_([0-9a-f]{8})")
@@ -14,7 +15,7 @@ RE_DEC = re.compile(r"base=0x([0-9a-f]+), limit=0x([0-9a-f]+)")
 
 def run(img, under, fault, ncases, spec=None):
     cmds = ["pb 0x%x" % under]
-    for _ in range(ncases):
+    for _ in range(ncases + 2):        # a couple spare: the kernel wraps, so extra is safe
         cmds += ["c", "r", "s", "r", "sreg"]
     cmds.append("q")
     out = subprocess.run(["bochs", "-q", "-f", os.path.join(HERE, "bochsrc"), "-debugger"],
@@ -58,6 +59,7 @@ def run(img, under, fault, ncases, spec=None):
             if line.startswith("gdtr:"):                 # end of the sreg block
                 i = len(recs)
                 tgt = spec[i][0] if spec and i < len(spec) else "ds"
+                cpl = spec[i][3] if spec and i < len(spec) else 0
                 if spec and i < len(spec):
                     sel = spec[i][1]          # a far transfer carries it in the instruction
                 reg = "cs" if tgt in ("jmpf", "callf") else tgt
@@ -65,15 +67,19 @@ def run(img, under, fault, ncases, spec=None):
                 # Landing on stub i *is* the vector: one stub per vector, fixed
                 # stride. Reading it from a register would be a step too early,
                 # since the post-step dump is taken before the stub runs.
-                faulted = STUB_BASE <= rip_post < STUB_BASE + 32 * STUB_STRIDE
-                r = {"target": tgt, "sel": sel, "faulted": faulted,
+                faulted = STUB_BASE <= rip_post < STUB_BASE + NVEC * STUB_STRIDE
+                r = {"target": tgt, "sel": sel, "cpl": cpl, "faulted": faulted,
                      "seg": v[0], "base": v[2], "limit": v[3],
                      "ar": (v[1] >> 8) & 0xFFFFFF}
                 if faulted:
-                    r["vec"] = (rip_post - STUB_BASE) // STUB_STRIDE
+                    v = (rip_post - STUB_BASE) // STUB_STRIDE
+                    if v == RET_VEC:            # the deliberate return, not a fault
+                        r["faulted"] = False
+                    else:
+                        r["vec"] = v
                 recs.append(r)
                 segs, ebp, state = {}, None, "pre_rax"
-    return recs
+    return recs[:ncases]
 
 if __name__ == "__main__":
     sys.path.insert(0, HERE)

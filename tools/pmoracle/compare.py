@@ -28,13 +28,13 @@ def verdict(r):
     return "ok"
 
 print("QEMU %d cases, Bochs %d cases\n" % (len(q), len(b)))
-print("  case        qemu   bochs  wanted")
+print("  case               qemu   bochs  wanted")
 agree = soft = hard = strict = unlisted = accessed = 0
 for x, y in zip(q, b):
     if (x["target"], x["sel"]) != (y["target"], y["sel"]):
         print("  cases out of step (%s %04X vs %s %04X)" % (x["target"], x["sel"], y["target"], y["sel"])); break
     vq, vb = verdict(x), verdict(y)
-    exp = EXPECT.get((x["target"], x["sel"]))
+    exp = EXPECT.get((x["cpl"], x["target"], x["sel"]))
     ve = exp[0] if exp else "-"
     # Bochs' harness reports only "fault", so compare fault-vs-not there.
     def same(a, c): return a == c or (a.startswith("#") and c == "fault") or (c.startswith("#") and a == "fault")
@@ -59,7 +59,7 @@ for x, y in zip(q, b):
             note = "cache-encoding difference only (ar %06X vs %06X)" % (x["ar"], y["ar"])
     else:
         agree += 1
-    print("  %-3s <- %04X  %-6s %-6s %-6s %s" % (x["target"], x["sel"], vq, vb, ve, note))
+    print("  cpl%d %-5s <- %04X  %-6s %-6s %-6s %s" % (x["cpl"], x["target"], x["sel"], vq, vb, ve, note))
 
 print("\n%d as expected, %d encoding-only, %d where we are deliberately stricter than both references,"
       % (agree, soft, strict))
