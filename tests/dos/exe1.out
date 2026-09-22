@@ -1,0 +1,4 @@
+exe1: MZ loaded, data segment relocated
+file content
+found: TEST1.TXT
+sum: 8000

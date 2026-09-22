@@ -1026,6 +1026,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         dbt_emit_trampoline(dbt);
     }
 
+    /* HLE stub segment: the interpreter step dispatches the host service. */
+    if (cpu->hle && cpu->seg[S_CS].sel == cpu->hle_seg) return NULL;
+
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;
 

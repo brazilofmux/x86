@@ -218,7 +218,17 @@ int dbt_run(x86_dbt *dbt) {
     }
 
     uint64_t runs = 0;
+    uint32_t poll_countdown = 0;
     for (;;) {
+        /* Host events (timer tick, keys, screen) between block runs —
+         * every time the JIT hands control back after a quantum or a
+         * fallback, rate-limited on the fallback path. Anything the poll
+         * did to the cpu (an IRQ delivered, HLT ended) is a host-side
+         * change the shadow must copy. */
+        if (dbt->poll && (cpu->halted || poll_countdown-- == 0)) {
+            poll_countdown = 256;
+            if (dbt->poll(cpu) && dbt->verify) shadow_resync(dbt);
+        }
         if (cpu->halted) return 0;
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
 
@@ -277,6 +287,7 @@ int dbt_run(x86_dbt *dbt) {
             }
             dbt->jit_block_entries++;
             trampoline(cpu, cpu->mem, code, dbt->aux, dbt->quantum);
+            poll_countdown = 0;
             continue;
         }
 

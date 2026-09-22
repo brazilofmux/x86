@@ -156,6 +156,7 @@ typedef struct {
      * host events (timer, keyboard) when it comes back. */
     uint64_t quantum;
     uint64_t insn_limit;           /* stop (rc 0) once insn_count passes this; 0 = never */
+    int    (*poll)(x86_cpu *);     /* host events between block runs; returns 1 if it changed cpu state */
 
     /* Stats */
     uint64_t blocks_translated;

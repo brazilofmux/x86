@@ -886,6 +886,10 @@ void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
 
 int x86_step(x86_cpu *c) {
     if (c->halted) return 1;
+    if (c->hle && c->seg[S_CS].sel == c->hle_seg) {
+        c->hle(c, (int)(c->eip & 0xFF));
+        return c->halted ? 1 : 0;
+    }
 
     uint8_t buf[16];
     x86_insn in;

@@ -104,6 +104,15 @@ typedef struct x86_cpu {
     void     (*io_write)(struct x86_cpu *, uint16_t port, uint32_t val, int size);
     void     *io_ctx;
 
+    /* High-level emulation trap: every IVT entry initially points at
+     * hle_seg:vector, a segment of IRETs. Executing there calls hle()
+     * instead of fetching, so BIOS/DOS services live in the host and a
+     * guest that hooks a vector and chains still reaches them. The hook
+     * performs the return itself (see pc/pc_bios.c). */
+    uint16_t hle_seg;
+    void   (*hle)(struct x86_cpu *, int vector);
+    void    *hle_ctx;
+
     /* Stats */
     uint64_t insn_count;
 } x86_cpu;
