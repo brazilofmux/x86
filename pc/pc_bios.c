@@ -156,7 +156,24 @@ static void deliver(x86_cpu *c, int vector) {
     c->halted = 0;
 }
 
+/* The run loop calls this between block runs AND after every interpreter
+ * fallback — hundreds of thousands of times a second — so the common
+ * case has to be nearly free. Everything periodic here is already
+ * rate-limited well below 1 kHz (key feed 20 ms, repaint 16 ms, PIT
+ * tick 55 ms, scancode latch 2 ms), so it runs off a deadline and costs
+ * one clock read to skip. Only IRQ delivery is considered on every
+ * call, and only when one could actually be taken — which is what makes
+ * it affordable to poll at every interrupt boundary. */
+#define PC_POLL_PERIOD_NS 1000000ull        /* 1 ms: finer than anything below needs */
+
 int pc_poll(x86_cpu *c) {
+    uint64_t now = pc_now_ns();
+    pc.now_ns = now;
+    int deliverable = pc.irq_pending && (c->eflags & X86_IF) && !c->int_inhibit;
+    if (!deliverable && !c->halted && now < pc.next_slow_ns) return 0;
+
+    if (c->halted || now >= pc.next_slow_ns) {
+    pc.next_slow_ns = now + PC_POLL_PERIOD_NS;
     pc_kbd_poll(c);
     pc_kbd_idle_poll(c);
     pc_video_flush(0);
@@ -168,7 +185,6 @@ int pc_poll(x86_cpu *c) {
      * best; handlers (WP's) rely on having finished with one before the
      * next arrives, beyond what the PIC's in-service gating guarantees. */
     static uint64_t last_code_ns;
-    uint64_t now = pc_now_ns();
     if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
         uint8_t code;
         pc_kbd_raw_next(&code);
@@ -178,23 +194,24 @@ int pc_poll(x86_cpu *c) {
         last_code_ns = now;
     }
 
-    uint64_t expected = (pc_now_ns() - pc.t0_ns) / TICK_NS;
+    uint64_t expected = (now - pc.t0_ns) / TICK_NS;
     if (pc.ticks_delivered + 18 < expected) pc.ticks_delivered = expected - 1;   /* don't storm after a stall */
     if (pc.ticks_delivered < expected) pc.irq_pending |= 1 << 8;
 
     if (c->halted && (c->eflags & X86_IF) && !pc.irq_pending) {
         /* HLT with interrupts on: the guest is idling for the next tick. */
         uint64_t next = pc.t0_ns + (pc.ticks_delivered + 1) * TICK_NS;
-        uint64_t now = pc_now_ns();
-        if (next > now) usleep((useconds_t)((next - now) / 1000 + 1));
+        uint64_t hnow = pc_now_ns();
+        if (next > hnow) usleep((useconds_t)((next - hnow) / 1000 + 1));
         pc.irq_pending |= 1 << 8;
+    }
     }
     if (pc.debug > 2) { static int n; if ((n++ & 1023) == 0) fprintf(stderr, "[poll] pending %X isr %X IF %d inhibit %d @%llu\n", pc.irq_pending, pc.irq_in_service, (c->eflags & X86_IF) != 0, c->int_inhibit, (unsigned long long)c->insn_count); }
     if (!pc.irq_pending || !(c->eflags & X86_IF) || c->int_inhibit) return 0;
     /* 8259 priority: nothing while an equal-or-higher IRQ is in service
      * (until its EOI). A handler that never EOIs would hang a real PC;
      * we forgive it after 200 ms of wall clock. */
-    if (pc.irq_in_service && pc_now_ns() - pc.irq_service_ns > 200000000ull) pc.irq_in_service = 0;
+    if (pc.irq_in_service && now - pc.irq_service_ns > 200000000ull) pc.irq_in_service = 0;
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1)) {
         pc.irq_pending &= ~(1 << 8);
         pc.ticks_delivered++;

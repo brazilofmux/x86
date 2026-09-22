@@ -44,7 +44,7 @@ static int host_poll(x86_cpu *c) {
     if (rate < 0) rate = getenv("X86_RATE") != NULL;
     if (rate) {
         static uint64_t li, ln, lf;
-        uint64_t now = pc_now_ns();
+        uint64_t now = pc.now_ns;                 /* pc_poll just read the clock */
         if (now - ln > 500000000ull) {
             if (ln) fprintf(stderr, "[rate] %.1f MIPS  fallbacks %llu\n",
                             (double)(c->insn_count - li) / (double)(now - ln) * 1e3,
@@ -53,7 +53,7 @@ static int host_poll(x86_cpu *c) {
         }
     }
     if (pc.tty_mode) {
-        uint64_t now = pc_now_ns();
+        uint64_t now = pc.now_ns;
         if (now - g_last_ns > 1000000000ull) {
             double bips = (double)(c->insn_count - g_last_insns) / (double)(now - g_last_ns);
             char hud[128];

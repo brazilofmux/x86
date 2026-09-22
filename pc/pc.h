@@ -46,6 +46,8 @@ typedef struct pc_state {
     uint8_t  kbc_out_full;
     int      kbd_raw;                /* host terminal is in raw mode */
     uint64_t kbd_reads;              /* guest keyboard reads/polls; paces scripted input */
+    uint64_t next_slow_ns;           /* pc_poll: when its periodic work is next due */
+    uint64_t now_ns;                 /* clock read by the last pc_poll, for reuse */
     int      eof_seen;
 
     /* Timer */
