@@ -22,6 +22,10 @@
 
 #define DOS_SEG          0x0060      /* kernel data: InDOS flag, default DTA, scratch */
 #define DOS_FIRST_MCB    0x0100      /* start of the arena; conventional memory ends at A000 */
+#define DOS_OWNER_SYS    0x0008      /* MCB owner for a block DOS holds on a process's behalf:
+                                      * an environment built before its PSP exists. Owner 0 is
+                                      * *free* to the allocator, so a block parked there would be
+                                      * handed straight back out. */
 #define DOS_TOP_SEG      0xA000
 #define DOS_MAX_HANDLES  64
 #define DOS_MAX_PATH     260
@@ -115,6 +119,11 @@ int  dos_errno(void);
 void dpmi_init(x86_cpu *c);
 void dpmi_int2f_1687(x86_cpu *c);
 void dpmi_mode_switch(x86_cpu *c, int vector);
+void dpmi_rm_return(x86_cpu *c, int vector);
+void dpmi_callback(x86_cpu *c, int vector);
+void dpmi_cb_return(x86_cpu *c, int vector);
+int  dpmi_pm_exception(x86_cpu *c, int vector);
+void dpmi_exc_return(x86_cpu *c, int vector);
 void dpmi_int31(x86_cpu *c, int vector);
 
 /* dos_int21.c */

@@ -34,7 +34,9 @@
  * helper reads and reload everything after.
  *
  * Block key = (cs_sel << 32) | linear, linear = (CS.base + IP) & a20.
- * The cache is direct-mapped 1:1 on linear (X86_MEM_SIZE entries), so
+ * The cache is direct-mapped 1:1 on linear over low memory
+ * (X86_LOW_SIZE entries; the JIT refuses protected mode, so nothing is
+ * translated from extended memory yet), so
  * the span-gated SMC sweep from z80 carries over unchanged; the 64-bit
  * tag keeps two CS values that alias one linear address apart (the
  * translation bakes in IP-relative constants).
@@ -71,7 +73,7 @@ typedef struct {
 } x86_block_entry;
 _Static_assert(sizeof(x86_block_entry) == 16, "x86_block_entry must be 16 bytes");
 
-#define BLOCK_CACHE_SIZE   X86_MEM_SIZE
+#define BLOCK_CACHE_SIZE   X86_LOW_SIZE
 #define BLOCK_EMPTY_KEY    0xFFFFFFFFFFFFFFFFull
 #define BLOCK_REFUSED_BIT  0x8000000000000000ull
 

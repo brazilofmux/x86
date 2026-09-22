@@ -104,6 +104,13 @@ typedef struct x86_cpu {
     void   (*smc_hook)(struct x86_cpu *, uint32_t phys);   /* DBT: a store hit code */
     void   (*a20_hook)(struct x86_cpu *, int on);          /* DBT: the A20 gate changed */
     void   (*trace_exc)(struct x86_cpu *, int vec, uint32_t err);   /* oracle tracing */
+
+    /* Set while the very next HLE trap is the delivery of a CPU exception
+     * rather than an interrupt or an INT instruction. The two are
+     * indistinguishable once the gate has been taken — vector 8 is both
+     * #DF and the timer IRQ — and a DPMI host must tell them apart, since
+     * only a fault belongs to the client's exception handler. */
+    uint8_t  exc_delivered;
     void    *dbt;           /* owning translator, NULL when interpreting only */
     void    *jit_aux;       /* DBT aux block base, reloaded by helper-call sequences */
     uint64_t jit_budget;    /* insn budget handed to the trampoline (exit stub math) */
@@ -199,9 +206,16 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
         x86_phys_wr8(c, base + ((off + i) & offmask), (uint8_t)(v >> (8 * i)));
 }
 
-/* Guest memory geometry: 1 MB + 64 KB HMA, plus readable slack so the
- * decoder and straddling accesses at the top never fault. */
-#define X86_MEM_SIZE  0x110000u
+/* Guest memory geometry. Low memory is 1 MB + the 64 KB HMA — everything
+ * real mode can address, and the range the block cache is indexed on.
+ * Extended memory sits above it, contiguous, for the DPMI host to hand
+ * out; with no paging (CLAUDE.md) linear == physical, so a client's flat
+ * selector is just an offset into this buffer. X86_MEM_SLACK is readable
+ * slack past the end so a decode or a straddling access at the top never
+ * faults. */
+#define X86_LOW_SIZE  0x110000u
+#define X86_EXT_SIZE  0x1000000u                     /* 16 MB, enough for DOS/4GW-era clients */
+#define X86_MEM_SIZE  (X86_LOW_SIZE + X86_EXT_SIZE)
 #define X86_MEM_SLACK 0x10000u
 
 int  x86_mem_alloc(x86_cpu *c);

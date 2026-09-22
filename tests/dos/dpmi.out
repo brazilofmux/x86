@@ -1,1 +1,8 @@
 hello from protected mode
+environment selector ok
+timer tick ok
+real-mode excursion ok
+extended memory ok
+exception handler ok
+interrupt handler ok
+chained INT 21h ok

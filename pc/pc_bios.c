@@ -26,21 +26,23 @@ void pc_set_service(int vector, pc_service_fn fn, int ret_mode) {
 /* Pop the INT frame. FLAGS mode is MS-DOS's RETF 2: the caller gets the
  * handler's flags (CF/ZF results) but keeps its own IF/TF. */
 void pc_hle_return(x86_cpu *c, int mode) {
-    /* In protected mode the frame a gate pushed is three dwords, not three
-     * words, and the stack segment is addressed through its base. */
-    int w = c->pmode ? 4 : 2;
-    uint32_t base = c->seg[S_SS].base, sp = c->r[R_SP];
-    if (!c->pmode) sp &= 0xFFFF;
-    uint32_t ip = x86_rd(c, base, sp, 0xFFFFFFFFu, w);
-    uint16_t cs = (uint16_t)x86_rd(c, base, sp + w, 0xFFFFFFFFu, w);
-    uint32_t fl = x86_rd(c, base, sp + 2 * w, 0xFFFFFFFFu, w);
-    if (c->pmode) c->r[R_SP] = sp + 3 * w;
-    else c->r[R_SP] = (c->r[R_SP] & 0xFFFF0000u) | ((sp + 6) & 0xFFFF);
+    /* The frame is as wide as the way in: a real-mode INT pushes words, a
+     * protected-mode gate pushes words or dwords as the gate is 16- or
+     * 32-bit, and the trap segment it leads to has the matching D bit — so
+     * does a 16-bit handler's PUSHF / CALL FAR chain to the vector it read
+     * back. The stack is addressed at SS's own width, wrapping like the CPU. */
+    int w = c->pmode && X86_AR_DB(c->seg[S_CS].attr) ? 4 : 2;
+    uint32_t m = c->pmode && X86_AR_DB(c->seg[S_SS].attr) ? 0xFFFFFFFFu : 0xFFFFu;
+    uint32_t base = c->seg[S_SS].base, sp = c->r[R_SP] & m;
+    uint32_t ip = x86_rd(c, base, sp, m, w);
+    uint16_t cs = (uint16_t)x86_rd(c, base, (sp + (uint32_t)w) & m, m, w);
+    uint32_t fl = x86_rd(c, base, (sp + 2u * (uint32_t)w) & m, m, w);
+    c->r[R_SP] = (c->r[R_SP] & ~m) | ((sp + 3u * (uint32_t)w) & m);
     pc.returned = 1;
     x86_load_seg(c, S_CS, cs);
     c->eip = ip;
     if (mode == HLE_RET_IRET)
-        c->eflags = x86_flags_fixup(c, (c->eflags & 0xFFFF0000u) | fl);
+        c->eflags = x86_flags_fixup(c, w == 4 ? fl : (c->eflags & 0xFFFF0000u) | fl);
     else
         c->eflags = x86_flags_fixup(c, (c->eflags & ~(uint32_t)(X86_IF | X86_TF)) | (fl & (X86_IF | X86_TF)));
 }
@@ -67,8 +69,35 @@ void pc_svcprof_dump(FILE *out) {
     }
 }
 
+/* A CPU exception that reaches the HLE segment in protected mode has no
+ * handler: the client never installed one through INT 31h 0203, and
+ * IRETing would just re-run the faulting instruction forever. Say what it
+ * was and stop, which is what a DPMI host does to a client that faults.
+ * Only a real fault, mind: an interrupt with the same vector — the timer
+ * is INT 8, its user hook INT 1Ch — is not a fault and just IRETs. */
+static void unhandled_exception(x86_cpu *c, int vector) {
+    static const char *name[] = { "#DE", "#DB", "NMI", "#BP", "#OF", "#BR", "#UD", "#NM",
+                                  "#DF", "---", "#TS", "#NP", "#SS", "#GP", "#PF", "---",
+                                  "#MF", "#AC", "#MC", "#XM" };
+    uint32_t sp = c->r[R_SP], base = c->seg[S_SS].base;
+    uint32_t ip = x86_rd(c, base, sp, 0xFFFFFFFFu, 4);
+    uint16_t cs = (uint16_t)x86_rd(c, base, sp + 4, 0xFFFFFFFFu, 4);
+    fprintf(stderr, "dpmi: unhandled %s at %04X:%08X, bytes",
+            vector < 20 ? name[vector] : "exception", cs, ip);
+    x86_cpu probe = *c;                          /* load CS without disturbing the real one */
+    x86_load_seg(&probe, S_CS, cs);
+    for (int i = 0; i < 8; i++)
+        fprintf(stderr, " %02X", (unsigned)x86_rd(&probe, probe.seg[S_CS].base, ip + i, 0xFFFFFFFFu, 1));
+    fprintf(stderr, "\n");
+    c->halted = 1;
+}
+
 static void hle_dispatch(x86_cpu *c, int vector) {
     pc_service_fn fn = pc.service[vector];
+    if (c->pmode && c->exc_delivered && vector < 0x20) {
+        if (pc.pm_exception && pc.pm_exception(c, vector)) return;
+        if (!fn) { unhandled_exception(c, vector); return; }
+    }
     int mode = fn ? pc.ret_mode[vector] : HLE_RET_IRET;
     pc.returned = 0;
     if (svc_prof_on < 0) svc_prof_on = getenv("X86_SVCPROF") != NULL;

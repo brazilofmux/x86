@@ -16,10 +16,13 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "a20.com $mode"   tests/dos/a20.out   ./dos-monster $mode tests/dos/a20.com
     check "smcpush $mode"   tests/dos/smcpush.out ./dos-monster $mode tests/dos/smcpush.com
 done
-# The DPMI client only makes sense on a 386, and exits 0 when every service
-# it asked for behaved.
+# The DPMI clients only make sense on a 386: one source, assembled as a
+# 16-bit client (dpmi.com) and a 32-bit one (dpmi32.com), since the host
+# shapes every gate and frame by the client's width. Each prints a line per
+# stage, so the expected output also says which stage broke.
 for mode in -i -j -V; do
-    check "dpmi $mode" tests/dos/dpmi.out ./dos-monster $mode -m 386 -L 20000000 tests/dos/dpmi.com
+    check "dpmi $mode"   tests/dos/dpmi.out ./dos-monster $mode -m 386 -L 20000000 tests/dos/dpmi.com
+    check "dpmi32 $mode" tests/dos/dpmi.out ./dos-monster $mode -m 386 -L 20000000 tests/dos/dpmi32.com
 done
 
 if [ -f disks/tp55/TPC.EXE ]; then
@@ -39,5 +42,18 @@ if [ -f disks/WP51/WP.EXE ]; then
     got=$( (sleep 2; printf 'The quick brown fox.'; sleep 2) | ./dos-monster -L 20000000000 -C disks -D - disks/WP51/WP.EXE 2>/dev/null)
     case "$got" in *"The quick brown fox."*"Doc 1 Pg 1"*) echo "ok   wp51 typing";; *) echo "FAIL wp51 typing"; fail=1;; esac
     rm -f 'disks/WP51/WP}WP{'* 2>/dev/null
+fi
+if [ -f disks/djgpp/bin/djecho.exe ]; then
+    # DJGPP v2.05 (tests/dos/fetch-djgpp.sh): real DPMI clients. djecho is the
+    # whole host in one breath — mode switch, LDT, extended and DOS memory,
+    # real-mode excursions, a callback, exception handlers and the 387
+    # emulator's #NM path. stubedit reads a file through the transfer buffer.
+    # The JIT refuses protected mode, so -j and -V exercise the fallback.
+    for mode in -i -j -V; do
+        got=$(./dos-monster $mode -m 386 -L 20000000000 disks/djgpp/bin/djecho.exe hello from djgpp 2>&1)
+        [ "$got" = "hello from djgpp" ] && echo "ok   djecho $mode" || { echo "FAIL djecho $mode"; echo "$got" | head -5; fail=1; }
+    done
+    got=$(./dos-monster -i -m 386 -L 20000000000 -C disks/djgpp/bin disks/djgpp/bin/stubedit.exe -v djecho.exe 2>&1)
+    case "$got" in *"CWSDPMI.EXE"*"Program to load"*) echo "ok   stubedit -v";; *) echo "FAIL stubedit -v"; echo "$got" | head -5; fail=1;; esac
 fi
 exit $fail

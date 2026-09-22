@@ -137,6 +137,11 @@ void dos_init(x86_cpu *cpu, const char *root) {
     pc_set_service(0x2F, dos_int2f, HLE_RET_FLAGS);
     pc_set_service(0x31, dpmi_int31, HLE_RET_FLAGS);
     pc_set_service(PC_HLE_DPMI_ENTRY, dpmi_mode_switch, HLE_RET_FLAGS);
+    pc_set_service(PC_HLE_DPMI_RMRET, dpmi_rm_return, HLE_RET_FLAGS);
+    pc_set_service(PC_HLE_DPMI_CB,    dpmi_callback,  HLE_RET_FLAGS);
+    pc_set_service(PC_HLE_DPMI_CBRET, dpmi_cb_return, HLE_RET_FLAGS);
+    pc_set_service(PC_HLE_DPMI_EXCRET, dpmi_exc_return, HLE_RET_FLAGS);
+    pc.pm_exception = dpmi_pm_exception;
     dpmi_init(cpu);
 }
 
@@ -310,7 +315,7 @@ static uint16_t make_env(x86_cpu *c, uint16_t parent_env, const char *dos_full) 
     env[el++] = 1; env[el++] = 0;
     el += 1 + (size_t)snprintf(env + el, sizeof env - el, "%s", dos_full);
     uint16_t paras = (uint16_t)((el + 15) / 16);
-    uint16_t seg = dos_mem_alloc(paras, 0, NULL);
+    uint16_t seg = dos_mem_alloc(paras, DOS_OWNER_SYS, NULL);
     if (!seg) return 0;
     for (size_t i = 0; i < el; i++) pc_wr8(c, seg, (uint16_t)i, (uint8_t)env[i]);
     return seg;
@@ -336,7 +341,7 @@ static int create_process(x86_cpu *c, const uint8_t *img, size_t size, const cha
     uint16_t psp = dos_mem_alloc(alloc, 0, NULL);
     if (!psp) return DE_NO_MEMORY;
     pc_wr16(c, psp - 1, 1, psp);
-    if (env_seg && mcb_owner(c, (uint16_t)(env_seg - 1)) == 0) pc_wr16(c, env_seg - 1, 1, psp);   /* our copy: the child owns it */
+    if (env_seg && mcb_owner(c, (uint16_t)(env_seg - 1)) == DOS_OWNER_SYS) pc_wr16(c, env_seg - 1, 1, psp);   /* our copy: the child owns it */
     const char *base = strrchr(dos_full, '\\'); base = base ? base + 1 : dos_full;
     for (int i = 0; i < 8; i++) pc_wr8(c, (uint16_t)(psp - 1), (uint16_t)(8 + i), (uint8_t)(i < (int)strcspn(base, ".") ? toupper((unsigned char)base[i]) : 0));
     uint16_t top = (uint16_t)(psp + alloc);
@@ -435,7 +440,7 @@ int dos_exec(x86_cpu *c, const char *dos_path, int mode, uint16_t pb_seg, uint16
     e = create_process(c, img, size, full, tail, env_seg, parent, mode == 0, &o_ss, &o_sp, &o_cs, &o_ip);
     free(img);
     if (e) {
-        if (mcb_owner(c, (uint16_t)(env_seg - 1)) == 0) dos_mem_free(env_seg);   /* our unowned copy */
+        if (mcb_owner(c, (uint16_t)(env_seg - 1)) == DOS_OWNER_SYS) dos_mem_free(env_seg);   /* our copy, never handed over */
         pc_wr16(c, 0, 0x22 * 4, pc_rd16(c, parent, 0x0A));                  /* INT 22h back */
         pc_wr16(c, 0, 0x22 * 4 + 2, pc_rd16(c, parent, 0x0C));
         return e;

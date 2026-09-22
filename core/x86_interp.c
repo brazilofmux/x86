@@ -262,7 +262,12 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     push_on(c, &stack, &sp, gate32 ? 4 : 2, flags);
     push_on(c, &stack, &sp, gate32 ? 4 : 2, oldcs);
     push_on(c, &stack, &sp, gate32 ? 4 : 2, oldeip);
-    if (vec_has_err(vector) && !is_sw) push_on(c, &stack, &sp, gate32 ? 4 : 2, err);
+    /* Only a CPU exception pushes an error code. An external interrupt on
+     * the same vector does not — and in protected mode they collide, since
+     * the PIC's IRQ0 is INT 8 and INT 8 is also #DF: the timer used to
+     * arrive with #DF's error code on top, and every IRET came back one
+     * dword short. */
+    if (vec_has_err(vector) && !is_sw && c->exc_delivered) push_on(c, &stack, &sp, gate32 ? 4 : 2, err);
 
     load_cs_pm(c, gsel, newcpl);
     c->seg[S_SS] = stack;
@@ -1267,6 +1272,10 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_NOP: case OP_WAIT: case OP_LOCK_ONLY:
         break;
     case OP_ESC:
+        /* CR0.EM makes every coprocessor instruction trap instead, so
+         * software can emulate one; INT 31h 0E01h is how a DPMI client
+         * asks for that, and DJGPP's emu387 then does the arithmetic. */
+        if (c->cr0 & 0x4) RAISE(X86_EXC_NM);
         /* No coprocessor: the 8088 still performs the operand bus read;
          * the 286 limit-checks a word (measured). */
         if (in->ops[0].kind == OPK_MEM) (void)mrd(c, in, in->seg, ea, c->model >= X86_MODEL_286 ? 2 : 1);
@@ -1344,8 +1353,53 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
     }
 
-    /* System instructions still to come. */
-    case OP_LAR: case OP_LSL: case OP_VERR: case OP_VERW:
+    /* LAR/LSL/VERR/VERW: ask a question about a selector and answer in ZF
+     * rather than faulting. Common shape — the selector must be non-null,
+     * inside its table, of a type the instruction accepts, and visible at
+     * the current privilege; conforming code is exempt from the privilege
+     * test for the three that read, since it is reachable from anywhere.
+     * Every other flag is left alone. */
+    case OP_LAR: case OP_LSL: case OP_VERR: case OP_VERW: {
+        if (!c->pmode) RAISE(X86_EXC_UD);
+        int src = in->op == OP_LAR || in->op == OP_LSL ? 1 : 0;
+        uint16_t lsel = (uint16_t)rd_op(c, in, src, ea);
+        uint32_t dlo = 0, dhi = 0;
+        int good = (lsel & 0xFFFC) != 0 && x86_read_desc(c, lsel, &dlo, &dhi);
+        uint16_t dattr = (uint16_t)(((dhi >> 8) & 0xFF) | (((dhi >> 20) & 0x0F) << 8));
+        int dtype = X86_AR_TYPE(dattr), sys = !X86_AR_S(dattr);
+        if (good) switch (in->op) {
+        case OP_LAR:                                   /* gates yes, except interrupt/trap gates */
+            good = !sys || dtype == 0x1 || dtype == 0x2 || dtype == 0x3 || dtype == 0x4
+                        || dtype == 0x5 || dtype == 0x9 || dtype == 0xB || dtype == 0xC;
+            break;
+        case OP_LSL:                                   /* only things that have a limit */
+            good = !sys || dtype == 0x1 || dtype == 0x2 || dtype == 0x3 || dtype == 0x9 || dtype == 0xB;
+            break;
+        case OP_VERR:                                  /* data always, code only if readable */
+            good = !sys && (!(dtype & 0x8) || (dtype & 0x2));
+            break;
+        default:                                       /* VERW: writable data only */
+            good = !sys && !(dtype & 0x8) && (dtype & 0x2);
+            break;
+        }
+        if (good) {
+            /* Conforming code is reachable from any privilege; VERW never
+             * sees one, since it rejected every code segment above. */
+            int conforming = !sys && (dtype & 0x8) && (dtype & 0x4);
+            int need = x86_cpl(c) > (lsel & 3) ? x86_cpl(c) : (lsel & 3);
+            if (!conforming && X86_AR_DPL(dattr) < need) good = 0;
+        }
+        if (good && in->op == OP_LAR) {
+            uint32_t rights = dhi & 0x00F0FF00u;
+            wr_op(c, in, 0, ea, in->opsize == 2 ? (rights & 0xFF00) : rights);
+        } else if (good && in->op == OP_LSL) {
+            uint32_t limit = (dlo & 0xFFFF) | (dhi & 0x000F0000u);
+            if (X86_AR_G(dattr)) limit = (limit << 12) | 0xFFF;
+            wr_op(c, in, 0, ea, limit);
+        }
+        c->eflags = (c->eflags & ~(uint32_t)X86_ZF) | (good ? X86_ZF : 0);
+        break;
+    }
     case OP_MOVDR: case OP_MOVTR:
     case OP_UD:
     default:
@@ -1377,6 +1431,7 @@ void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
 void x86_deliver_exception(x86_cpu *c) {
     int vec = c->exc;
     c->exc = -1;
+    c->exc_delivered = 1;
     x86_interrupt(c, vec, 0);
 }
 
@@ -1387,8 +1442,10 @@ int x86_step(x86_cpu *c) {
      * same linear address traps exactly as the real-mode IVT does. */
     if (c->hle && c->seg[S_CS].base == ((uint32_t)c->hle_seg << 4)) {
         c->hle(c, (int)(c->eip & 0xFF));
+        c->exc_delivered = 0;
         return c->halted ? 1 : 0;
     }
+    c->exc_delivered = 0;
 
     uint8_t buf[16];
     x86_insn in;
@@ -1431,6 +1488,7 @@ int x86_step(x86_cpu *c) {
         if (c->trace_exc) c->trace_exc(c, vec, c->exc_err);
         if (!trap_semantics) c->eip = start_ip;
         if (vec == X86_EXC_UD && c->model == X86_MODEL_8086) return -1;   /* cannot happen; be loud */
+        c->exc_delivered = 1;
         x86_interrupt(c, vec, 0);
     }
     return 0;

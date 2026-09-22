@@ -110,7 +110,7 @@ void dbt_cleanup(x86_dbt *dbt) {
     if (dbt->cpu) {
         dbt->cpu->dbt = NULL;
         dbt->cpu->smc_hook = NULL;
-        memset(dbt->cpu->code_bitmap, 0, X86_MEM_SIZE);
+        memset(dbt->cpu->code_bitmap, 0, X86_LOW_SIZE);
     }
     if (dbt->code_buf && dbt->code_buf != MAP_FAILED) munmap(dbt->code_buf, CODE_BUF_SIZE);
     if (dbt->shadow_live) x86_free(&dbt->shadow);
@@ -169,7 +169,7 @@ static void verify_first_diff(const x86_cpu *jit, const x86_cpu *interp) {
 
 static void dump_mem_diff(const uint8_t *a, const uint8_t *b, const char *na, const char *nb) {
     int shown = 0;
-    for (uint32_t i = 0; i < X86_MEM_SIZE && shown < 8; i++) {
+    for (uint32_t i = 0; i < X86_LOW_SIZE && shown < 8; i++) {
         if (a[i] != b[i]) {
             fprintf(stderr, "    mem[%06X] differs: %s=%02X %s=%02X\n", i, na, a[i], nb, b[i]);
             shown++;
@@ -206,7 +206,7 @@ static void shadow_resync(x86_dbt *dbt) {
      * or the real HMA bytes land in the shadow's low 64 KB (or vice versa). */
     sh->a20_mask = sh_a20;
     x86_set_a20(sh, cpu->a20_mask != 0xFFFFFu);
-    memcpy(sh->mem, cpu->mem, X86_MEM_SIZE);
+    memcpy(sh->mem, cpu->mem, X86_LOW_SIZE);   /* low memory only: the JIT refuses PM, so nothing above it moves */
 }
 
 typedef void (*trampoline_fn)(x86_cpu *cpu, uint8_t *mem, void *block, void *aux, uint64_t budget);
@@ -236,16 +236,25 @@ int dbt_run(x86_dbt *dbt) {
         if (cpu->halted) return 0;
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
 
-        uint64_t key = dbt_cpu_key(cpu);
-        x86_block_entry *be = dbt_cache_lookup(dbt, key);
-        uint8_t *code = be ? be->code : NULL;
-
-        if (!be) {
-            dbt_jit_writable_begin();
-            code = dbt_translate_block(dbt, key);
-            dbt_jit_writable_end();
-            dbt_cache_insert(dbt, key, code);
-            if (code) dbt->blocks_translated++;
+        /* The block cache is indexed 1:1 on a linear address in low memory,
+         * which is all real mode can reach. Protected mode is both outside
+         * the backend's repertoire and outside that index — a DPMI client
+         * runs from extended memory — so it never reaches a lookup, and
+         * every instruction goes to the interpreter below. */
+        x86_block_entry *be = NULL;
+        uint8_t *code = NULL;
+        uint64_t key = 0;
+        if (!cpu->pmode) {
+            key = dbt_cpu_key(cpu);
+            be = dbt_cache_lookup(dbt, key);
+            code = be ? be->code : NULL;
+            if (!be) {
+                dbt_jit_writable_begin();
+                code = dbt_translate_block(dbt, key);
+                dbt_jit_writable_end();
+                dbt_cache_insert(dbt, key, code);
+                if (code) dbt->blocks_translated++;
+            }
         }
 
         if (code) {
@@ -281,7 +290,7 @@ int dbt_run(x86_dbt *dbt) {
                 int regs_ok = cpu_regs_equal(cpu, &dbt->shadow);
                 int mem_ok = 1;
                 if (dbt->verify_mem_every <= 1 || (runs % (uint64_t)dbt->verify_mem_every) == 0)
-                    mem_ok = memcmp(cpu->mem, dbt->shadow.mem, X86_MEM_SIZE) == 0;
+                    mem_ok = memcmp(cpu->mem, dbt->shadow.mem, X86_LOW_SIZE) == 0;
                 if (!regs_ok || !mem_ok) {
                     fprintf(stderr, "\n[verify] divergence after JIT run from %04X:%04X (%llu insns)\n",
                             pre.seg[S_CS].sel, pre.eip, (unsigned long long)jit_insns);
@@ -305,7 +314,7 @@ int dbt_run(x86_dbt *dbt) {
         /* Refused: one interpreter step. Timed (sampled 1 in 16) since on
          * a running system these are the host-service traps. */
         dbt->interp_fallback_insns++;
-        if (cpu->seg[S_CS].sel != cpu->hle_seg) {
+        if (!cpu->pmode && cpu->seg[S_CS].sel != cpu->hle_seg) {
             /* dynamic histogram: what did we hand to the interpreter? */
             uint8_t fb[16];
             for (int k = 0; k < 16; k++) fb[k] = x86_phys_rd8(cpu, cpu->seg[S_CS].base + ((cpu->eip + k) & 0xFFFF));

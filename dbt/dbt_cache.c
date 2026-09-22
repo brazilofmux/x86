@@ -2,7 +2,8 @@
  * registry, and span-gated SMC invalidation.
  *
  * Lifted from ~/z80/dbt/block_cache.c. The cache is 1:1 on the guest
- * linear address (X86_MEM_SIZE entries), which the SMC sweep relies on:
+ * linear address over low memory (X86_LOW_SIZE entries), which the SMC
+ * sweep relies on:
  * the slot for linear p can only ever hold the block starting at p, so
  * its span says exactly whether that block covers a stored byte. Two CS
  * values aliasing one linear address (different 64-bit keys) conflict
@@ -59,7 +60,7 @@ void dbt_cache_invalidate_all(x86_dbt *dbt) {
     }
     dbt->link_used = 0;
     dbt->link_free = LINK_NONE;
-    memset(dbt->cpu->code_bitmap, 0, X86_MEM_SIZE);
+    memset(dbt->cpu->code_bitmap, 0, X86_LOW_SIZE);
     dbt->max_block_bytes = 0;
     dbt->insn_used = 0;
 }
@@ -111,7 +112,7 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     uint32_t bytes = end - start;
     if (bytes > dbt->max_block_bytes) dbt->max_block_bytes = bytes;
     dbt->last_block_bytes = bytes;
-    uint8_t *bm = dbt->cpu->code_bitmap;    /* slack past X86_MEM_SIZE absorbs top-of-memory blocks */
+    uint8_t *bm = dbt->cpu->code_bitmap;    /* extended memory past X86_LOW_SIZE absorbs top-of-low-memory blocks */
     for (uint32_t a = start; a < end; a++) bm[a] = 1;
 }
 

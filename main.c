@@ -22,14 +22,19 @@ static void usage(const char *prog) {
     printf("  -V          JIT with lockstep verification against the interpreter\n");
     printf("  -S          with -V: verify after every block (no chaining)\n");
     printf("  -M N        with -V: compare guest memory every N block runs (default 1)\n");
-    printf("  -m MODEL    cpu model: 86, 186, 286 (default 286)\n");
+    printf("  -m MODEL    cpu model: 86, 186, 286, 386 (default 286; DPMI clients need 386)\n");
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
     printf("  -s          print statistics on exit\n");
-    printf("  -d          trace DOS calls\n");
+    printf("  -d          trace DOS and DPMI calls (-d -d: every call, with registers)\n");
     printf("  -L N        stop after N instructions\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
+    printf("  -boot IMG   boot a disk image instead (sector 1 at 7C00; INT 13h serves the rest)\n");
+    printf("  -pmtrace LO:HI  -i: dump state before each instruction in [LO,HI], QEMU -d cpu format\n");
+    printf("  -pmring     -i: on the first exception, or a fetch outside memory, print the\n");
+    printf("              last 400 CS:EIP and stop\n");
+    printf("  -pmstop LIN -i: the same, on reaching linear address LIN\n");
     printf("  -h          this help\n");
 }
 
@@ -112,11 +117,71 @@ static void pm_trace(x86_cpu *c) {
     fprintf(stderr, "CR0=%08x CR2=00000000 CR3=00000000 CR4=00000000\n", c->pmode ? 0x11u : 0x10u);
 }
 
+/* -pmring: a ring of the last executed CS:EIP, dumped when the run stops.
+ * A client that walks into garbage without faulting leaves no other trace
+ * of where it left its own code. */
+#define PMRING 400
+static int g_pmring;
+static uint32_t g_pmstop;
+static struct { uint16_t cs, ss; uint32_t eip, lin, esp; } pmring[PMRING];
+static uint64_t pmring_n;
+
+static void pmring_dump(x86_cpu *c) {
+    if (!g_pmring) return;
+    fprintf(stderr, "last %d instructions:\n", PMRING);
+    uint64_t first = pmring_n > PMRING ? pmring_n - PMRING : 0;
+    for (uint64_t i = first; i < pmring_n; i++) {
+        int k = (int)(i % PMRING);
+        fprintf(stderr, "  %04X:%08X sp %04X:%08X ", pmring[k].cs, pmring[k].eip, pmring[k].ss, pmring[k].esp);
+        for (int b = 0; b < 8; b++)
+            fprintf(stderr, " %02X", (unsigned)x86_rd(c, pmring[k].lin, (uint32_t)b, 0xFFFFFFFFu, 1));
+        fprintf(stderr, "\n");
+    }
+}
+
+/* With -pmring, the first protected-mode exception is the interesting one:
+ * a client that installs its own handler turns every later one into noise. */
+static void pmring_exc(x86_cpu *c, int vec, uint32_t err) {
+    if (g_pmstop) return;                  /* -pmstop wants the run-up to its address, not this */
+    fprintf(stderr, "pmring: exception %02X err %04X at %04X:%08X\n",
+            vec, err, c->seg[S_CS].sel, c->eip);
+    fprintf(stderr, "  EAX=%08X ECX=%08X EDX=%08X EBX=%08X ESP=%08X EBP=%08X ESI=%08X EDI=%08X\n",
+            c->r[R_AX], c->r[R_CX], c->r[R_DX], c->r[R_BX], c->r[R_SP], c->r[R_BP], c->r[R_SI], c->r[R_DI]);
+    fprintf(stderr, "  ES=%04X CS=%04X SS=%04X DS=%04X FS=%04X GS=%04X\n",
+            c->seg[S_ES].sel, c->seg[S_CS].sel, c->seg[S_SS].sel,
+            c->seg[S_DS].sel, c->seg[S_FS].sel, c->seg[S_GS].sel);
+    fprintf(stderr, "  [ebp]:");
+    for (int k = 0; k < 24; k += 4)
+        fprintf(stderr, " +%X=%08X", k, x86_rd(c, c->seg[S_SS].base, c->r[R_BP] + (uint32_t)k, 0xFFFFFFFFu, 4));
+    fprintf(stderr, "\n");
+    pmring_dump(c);
+    c->halted = 1;
+}
+
 static int run_interp(x86_cpu *c, uint64_t limit) {
     uint32_t n = 0;
     for (;;) {
+        if (g_pmring) {
+            int k = (int)(pmring_n++ % PMRING);
+            pmring[k].cs = c->seg[S_CS].sel; pmring[k].eip = c->eip;
+            pmring[k].lin = c->seg[S_CS].base + c->eip;
+            pmring[k].ss = c->seg[S_SS].sel; pmring[k].esp = c->r[R_SP];
+            /* Fetching from open bus means the guest already lost control;
+             * the interesting part is the run-up, not the wreck. */
+            if (g_pmstop && pmring[k].lin == g_pmstop) {
+                fprintf(stderr, "pmring: reached %08X\n", g_pmstop);
+                pmring_dump(c);
+                return 0;
+            }
+            if (pmring[k].lin >= c->mem_size) {
+                fprintf(stderr, "pmring: fetch outside memory at %04X:%08X (linear %08X)\n",
+                        pmring[k].cs, pmring[k].eip, pmring[k].lin);
+                pmring_dump(c);
+                return 0;
+            }
+        }
         if ((n++ & 4095) == 0 || c->halted) { host_poll(c); if (c->halted) return 0; }
-        if (limit && c->insn_count >= limit) return 0;
+        if (limit && c->insn_count >= limit) { pmring_dump(c); return 0; }
         if (g_pmtrace_hi) {
             uint32_t lin = c->seg[S_CS].base + c->eip;
             if (lin >= g_pmtrace_lo && lin <= g_pmtrace_hi) pm_trace(c);
@@ -160,6 +225,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "-M") && i + 1 < argc) mem_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
+        else if (!strcmp(argv[i], "-pmring")) g_pmring = 1;
+        else if (!strcmp(argv[i], "-pmstop") && i + 1 < argc) { g_pmring = 1; g_pmstop = (uint32_t)strtoul(argv[++i], NULL, 0); }
         else if (!strcmp(argv[i], "-pmtrace") && i + 1 < argc) {
             const char *a = argv[++i];
             g_pmtrace_lo = (uint32_t)strtoul(a, NULL, 0);
@@ -193,7 +260,6 @@ int main(int argc, char **argv) {
         cpu.eip = 0x7C00;
         cpu.r[R_SP] = 0x7C00;
         cpu.r[R_DX] = 0;                       /* boot drive */
-        if (g_pmtrace_hi) cpu.trace_exc = pm_trace_exc;
     } else {
         if (i >= argc) { usage(argv[0]); return 2; }
         prog = argv[i++];
@@ -263,6 +329,9 @@ int main(int argc, char **argv) {
         use_jit = 0;
     }
     if (strict) setenv("X86_VERIFY_STRICT", "1", 1);
+
+    if (g_pmtrace_hi) cpu.trace_exc = pm_trace_exc;
+    else if (g_pmring) cpu.trace_exc = pmring_exc;
 
     uint64_t t0 = pc_now_ns();
     g_last_ns = t0;

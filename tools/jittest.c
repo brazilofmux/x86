@@ -217,7 +217,7 @@ static int run_prog(int n, int model, int verify, int strict, int stats) {
     x86_init(&ref, model);
     { uint8_t *m = ref.mem, *bm = ref.code_bitmap; int fd = ref.mem_fd; uint8_t mm = ref.mem_mirrored;
       ref = cpu; ref.mem = m; ref.code_bitmap = bm; ref.mem_fd = fd; ref.mem_mirrored = mm; }
-    memcpy(ref.mem, cpu.mem, X86_MEM_SIZE);
+    memcpy(ref.mem, cpu.mem, X86_LOW_SIZE);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     while (!ref.halted && ref.insn_count < 10000000) if (x86_step(&ref) < 0) break;
@@ -235,7 +235,7 @@ static int run_prog(int n, int model, int verify, int strict, int stats) {
     double jit_s = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
     if (stats) dbt_print_stats(&dbt, stderr);
     int same = rc == 0 && (!verify || (ref.insn_count == cpu.insn_count && memcmp(ref.r, cpu.r, sizeof ref.r) == 0
-               && ref.eflags == cpu.eflags && ref.eip == cpu.eip && memcmp(ref.mem, cpu.mem, X86_MEM_SIZE) == 0));
+               && ref.eflags == cpu.eflags && ref.eip == cpu.eip && memcmp(ref.mem, cpu.mem, X86_LOW_SIZE) == 0));
     printf("prog %d (%s): %s — %llu insns, rc=%d, jit %.3fs (%.0f MIPS)",
            n, progs[n], same ? "OK" : "MISMATCH", (unsigned long long)cpu.insn_count, rc,
            jit_s, (double)cpu.insn_count / jit_s / 1e6);

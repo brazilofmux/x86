@@ -126,6 +126,7 @@ static int is_device_name(const char *dos_path, uint8_t *dev) {
  * 2 create new (fail if exists), 3 create temp. */
 static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int attr) {
     (void)attr;
+    trace(c, "open \"%s\" mode %d%s", dos_path, mode, create ? " create" : "");
     int h = new_handle();
     if (h < 0) { err(c, DE_TOO_MANY_OPEN); return; }
     dos_handle *dh = &dos.handles[h];
@@ -649,6 +650,17 @@ void dos_int21(x86_cpu *c, int vector) {
         }
         break;
     }
+    case 0x71:
+        /* The long-filename API. Saying "no" here is not the same as saying
+         * "invalid function": callers distinguish the two by whether AH is
+         * still 71h on return, and a client told merely "invalid" concludes
+         * that LFN works and this one call happened to fail. DJGPP then
+         * opens every file through 716Ch and finds nothing. */
+        trace(c, "no LFN support for INT 21h AX=%02X%02X", AH, AL);
+        dos.last_error = DE_INVALID_FN;
+        SET_AX(0x7100);
+        c->eflags |= X86_CF;
+        break;
     default:
         trace(c, "unsupported INT 21h AH=%02X", AH);
         err(c, DE_INVALID_FN);

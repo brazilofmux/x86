@@ -28,6 +28,10 @@
 /* Return convention of a service after pc_hle_dispatch ran it. */
 enum { HLE_RET_FLAGS, HLE_RET_IRET };
 #define PC_HLE_DPMI_ENTRY 0x00FD   /* offset in the HLE segment; the trap vector is eip & FFh */
+#define PC_HLE_DPMI_RMRET 0x00FC   /* a real-mode excursion (INT 31h 0300-0302) has returned here */
+#define PC_HLE_DPMI_CBRET 0x00FA   /* a real-mode callback's client procedure IRETed to here */
+#define PC_HLE_DPMI_CB    0x00FB   /* real-mode callback n lives at PC_HLE_SEG:(n << 8 | FBh) */
+#define PC_HLE_DPMI_EXCRET 0x00F9  /* a DPMI exception handler far-returned to here */
 
 typedef void (*pc_service_fn)(x86_cpu *c, int vector);
 
@@ -64,6 +68,10 @@ typedef struct pc_state {
 
     /* Services by vector; NULL = plain IRET stub. */
     pc_service_fn service[256];
+    /* Protected-mode exceptions get first refusal here: a DPMI client's own
+     * handler wants the frame DPMI specifies, not the one the CPU pushed.
+     * Returns nonzero if it took the exception. */
+    int (*pm_exception)(x86_cpu *c, int vector);
     uint8_t       ret_mode[256];
 
     int returned;                    /* the running service popped its own frame */

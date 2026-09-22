@@ -1,6 +1,7 @@
 /* x86_mem.c — guest memory with an A20-aware mirror above 1 MB
  *
- * Guest physical memory is 1 MB plus the 64 KB HMA (X86_MEM_SIZE). The
+ * Guest physical memory is 1 MB plus the 64 KB HMA (X86_LOW_SIZE), and
+ * then X86_EXT_SIZE of extended memory above that for the DPMI host. The
  * interpreter masks every address with a20_mask, so with A20 gated off
  * FFFF:0010 reads byte 0. Translated code cannot afford that mask on
  * every access, so the 64 KB window at 0x100000 is a second MAPPING of
@@ -44,6 +45,8 @@ static uint8_t *reserve(size_t len) {
 static int map_region(x86_cpu *c, uint8_t *base, off_t obj_off, int a20_on) {
     if (map_fixed(c->mem_fd, base, HMA_OFF, obj_off) < 0) return -1;
     if (map_fixed(c->mem_fd, base + HMA_OFF, HMA_SIZE, obj_off + (a20_on ? HMA_OFF : 0)) < 0) return -1;
+    /* Extended memory is never aliased — only the HMA window moves with A20. */
+    if (map_fixed(c->mem_fd, base + X86_LOW_SIZE, X86_MEM_SIZE - X86_LOW_SIZE, obj_off + X86_LOW_SIZE) < 0) return -1;
     void *s = mmap(base + X86_MEM_SIZE, X86_MEM_SLACK, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     return s == (void *)(base + X86_MEM_SIZE) ? 0 : -1;
