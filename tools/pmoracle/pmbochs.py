@@ -10,7 +10,8 @@ RET_VEC = 0x30
 RE_RAX = re.compile(r"^rax: [0-9a-f]{8}_([0-9a-f]{8})")
 RE_RIP = re.compile(r"^rip: [0-9a-f]{8}_([0-9a-f]{8})")
 RE_RBP = re.compile(r"^rbp: [0-9a-f]{8}_([0-9a-f]{8})")
-RE_SEG = re.compile(r"^(ds|ss|es|fs|gs|cs):0x([0-9a-f]{4}), dh=0x([0-9a-f]{8}), dl=0x([0-9a-f]{8}), valid=(\d+)")
+RE_RSP = re.compile(r"^rsp: [0-9a-f]{8}_([0-9a-f]{8})")
+RE_SEG = re.compile(r"^(ds|ss|es|fs|gs|cs|ldtr|tr):0x([0-9a-f]{4}), dh=0x([0-9a-f]{8}), dl=0x([0-9a-f]{8}), valid=(\d+)")
 RE_DEC = re.compile(r"base=0x([0-9a-f]+), limit=0x([0-9a-f]+)")
 
 def run(img, under, fault, ncases, spec=None):
@@ -24,7 +25,7 @@ def run(img, under, fault, ncases, spec=None):
 
     # Each case emits: r (pre), s, r (post), sreg. Both r blocks print rax
     # and rip, so the two have to be told apart explicitly.
-    recs, sel, rip_post, ebp = [], None, None, None
+    recs, sel, rip_post, ebp, esp = [], None, None, None, None
     segs, last = {}, None
     state = "pre_rax"
     for line in out.splitlines():
@@ -34,6 +35,10 @@ def run(img, under, fault, ncases, spec=None):
                 sel = int(m.group(1), 16) & 0xFFFF; state = "pre_rip"
             elif state == "post_rax":
                 state = "post_rip"
+            continue
+        m = RE_RSP.match(line)
+        if m and state == "post_rip":
+            esp = int(m.group(1), 16)
             continue
         m = RE_RBP.match(line)
         if m and state == "post_rip":
@@ -62,7 +67,7 @@ def run(img, under, fault, ncases, spec=None):
                 cpl = spec[i][3] if spec and i < len(spec) else 0
                 if spec and i < len(spec):
                     sel = spec[i][1]          # a far transfer carries it in the instruction
-                reg = "cs" if tgt in ("jmpf", "callf") else tgt
+                reg = {"jmpf": "cs", "callf": "cs", "lldt": "ldtr", "ltr": "tr"}.get(tgt, tgt)
                 v = segs.get(reg, [0, 0, 0, 0])
                 # Landing on stub i *is* the vector: one stub per vector, fixed
                 # stride. Reading it from a register would be a step too early,
@@ -70,7 +75,8 @@ def run(img, under, fault, ncases, spec=None):
                 faulted = STUB_BASE <= rip_post < STUB_BASE + NVEC * STUB_STRIDE
                 r = {"target": tgt, "sel": sel, "cpl": cpl, "faulted": faulted,
                      "seg": v[0], "base": v[2], "limit": v[3],
-                     "ar": (v[1] >> 8) & 0xFFFFFF}
+                     "ar": (v[1] >> 8) & 0xFFFFFF,
+                     "esp": esp or 0, "ss": segs.get("ss", [0])[0]}
                 if faulted:
                     v = (rip_post - STUB_BASE) // STUB_STRIDE
                     if v == RET_VEC:            # the deliberate return, not a fault
@@ -78,7 +84,7 @@ def run(img, under, fault, ncases, spec=None):
                     else:
                         r["vec"] = v
                 recs.append(r)
-                segs, ebp, state = {}, None, "pre_rax"
+                segs, ebp, esp, state = {}, None, None, "pre_rax"
     return recs[:ncases]
 
 if __name__ == "__main__":
@@ -91,5 +97,5 @@ if __name__ == "__main__":
         if r["faulted"]:
             print("  %s <- %04X  #%02X" % (r["target"], r["sel"], r.get("vec", 0xFF)))
         else:
-            print("  %s <- %04X  ok  %04X base=%08X limit=%08X ar=%06X"
-                  % (r["target"], r["sel"], r["seg"], r["base"], r["limit"], r["ar"]))
+            print("  %s <- %04X  ok  %04X ar=%06X  ss:esp=%04X:%08X"
+                  % (r["target"], r["sel"], r["seg"], r["ar"], r["ss"], r["esp"]))

@@ -221,7 +221,23 @@ tssdesc: dw 103, tss                                    ; 78 TSS, 32-bit, availa
 gate80: dw far_target, SEL_CODE                         ; 80 call gate DPL 3 -> 08:far_target
         db 0, 0xEC
         dw 0
+ldtdesc: dw ldt_end - ldt - 1, ldt                      ; 88 the LDT itself
+        db 0, 0x82, 0x00, 0
 gdt_end:
+
+; A small LDT, so selectors with TI=1 become real once LLDT has run.
+; Everything before that case in the table still sees LDTR unloaded.
+        align 8
+ldt:
+        dw 0xFFFF, 0
+        db 0, 0x92, 0xCF, 0                             ; 04 (TI=1 index 0) data r/w
+        dw 0xFFFF, 0
+        db 0, 0x92, 0xCF, 0                             ; 0C data r/w
+        dw 0xFFFF, 0
+        db 0, 0x12, 0xCF, 0                             ; 14 data, NOT PRESENT
+        dw 0xFFFF, 0
+        db 0, 0x9A, 0xCF, 0                             ; 1C code32 r/x
+ldt_end:
 
 ; Only ESP0/SS0 matter here: they are the stack an inward transfer lands on.
         align 4
@@ -276,7 +292,7 @@ cases:
         CASE {MOV_DS}, 0x00F0      ; GDT index past the limit
         CASE {MOV_DS}, 0x0084      ; TI=1, LDTR never loaded
         CASE {MOV_DS}, 0x00F8      ; GDT index past the limit
-        CASE {MOV_DS}, 0x000C      ; TI=1, LDTR never loaded
+        CASE {MOV_DS}, 0x008C      ; TI=1, LDTR never loaded
         CASE {MOV_DS}, 0x0040      ; read-only data is a legal DS
         ; ---- SS: stricter. must be writable data, and DPL = RPL = CPL
         CASE {MOV_SS}, 0x0010      ; the one that should work
@@ -315,6 +331,14 @@ cases:
         FARCASE 0x9A, 0x0058, 3    ; call gate DPL 0, called from ring 3
         FARCASE 0x9A, 0x0080, 3    ; call gate DPL 3: the way in
         FARCASE 0xEA, 0x0070, 3    ; DPL 3 code, staying at ring 3
+        ; ---- load an LDT, then the same TI=1 selectors mean something
+        CASE {0x0F, 0x00, 0xD0}, 0x0088   ; lldt ax
+        CASE {MOV_DS}, 0x0004      ; TI=1 index 0: is that null, or LDT entry 0?
+        CASE {MOV_DS}, 0x000C      ; LDT data r/w
+        CASE {MOV_DS}, 0x0014      ; LDT entry not present
+        CASE {MOV_DS}, 0x001C      ; LDT code, readable
+        CASE {MOV_DS}, 0x00FC      ; TI=1 index past the LDT limit
+        FARCASE 0xEA, 0x001C       ; far jump to an LDT code segment
 cases_end:
 NCASES  equ (cases_end - cases) / CASE_BYTES
 

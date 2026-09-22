@@ -36,7 +36,8 @@ def run_qemu(img):
 RE_EXC  = re.compile(r"^\s*\d+:\s+v=([0-9a-f]{2}) e=([0-9a-f]{4})")
 RE_GPR  = re.compile(r"\b(E[A-Z][A-Z])=([0-9a-f]{8})")
 RE_EIP  = re.compile(r"^EIP=([0-9a-f]{8}) EFL=([0-9a-f]{8})")
-RE_SEG  = re.compile(r"^(ES|CS|SS|DS|FS|GS|LDT|TR) =([0-9a-f]{4}) ([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8})")
+# QEMU pads the two-letter names ("ES =") but not "LDT=", so the space is optional.
+RE_SEG  = re.compile(r"^(ES|CS|SS|DS|FS|GS|LDT|TR) ?=([0-9a-f]{4}) ([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8})")
 
 def parse(path):
     """One record per CPU dump, in order, each carrying any exception
@@ -98,9 +99,10 @@ def records(img=None):
         elif post is None:
             r.update(faulted=None)
         else:
-            reg = "CS" if tgt in ("jmpf", "callf") else tgt.upper()
+            reg = {"jmpf": "CS", "callf": "CS", "lldt": "LDT", "ltr": "TR"}.get(tgt, tgt.upper())
             d = post["segs"].get(reg, (0, 0, 0, 0))
-            r.update(faulted=False, seg=d[0], base=d[1], limit=d[2], ar=d[3] >> 8)
+            r.update(faulted=False, seg=d[0], base=d[1], limit=d[2], ar=d[3] >> 8,
+                     esp=post["regs"].get("ESP", 0), ss=post["segs"].get("SS", (0,))[0])
         out.append(r)
     return out
 
@@ -111,8 +113,8 @@ def show(recs, title):
             extra = "  #%02X err=%04X" % (r["vec"], r["err"]) if "vec" in r else ""
             print("  cpl%d %s <- %04X  fault%s" % (r["cpl"], r["target"], r["sel"], extra))
         else:
-            print("  cpl%d %s <- %04X  ok  %04X base=%08X limit=%08X ar=%06X"
-                  % (r["cpl"], r["target"], r["sel"], r["seg"], r["base"], r["limit"], r["ar"]))
+            print("  cpl%d %s <- %04X  ok  %04X ar=%06X  ss:esp=%04X:%08X"
+                  % (r["cpl"], r["target"], r["sel"], r["seg"], r["ar"], r["ss"], r["esp"]))
 
 if __name__ == "__main__":
     show(records(), "QEMU:")

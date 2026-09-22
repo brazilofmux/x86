@@ -56,13 +56,13 @@ display.
 
 ## What it covers so far
 
-47 cases: segment-register loads (DS, SS, ES) against every descriptor
-shape, far JMP/CALL against code, data, gates and junk, and the same
-instructions again at **CPL 3**, reached by IRET to a ring-3 code
+54 cases: segment-register loads (DS, SS, ES) against every descriptor
+shape, far JMP/CALL against code, data, gates and junk, the same
+instructions again at **CPL 3**, and an LDT, reached by IRET to a ring-3 code
 segment and returned from through a DPL 3 trap gate with a TSS supplying
 the inbound stack.
 
-39 match our expectations under both references, 2 differ only in cache
+47 match our expectations under both references, 2 differ only in cache
 encoding, 2 are the LDTR case, 3 are accessed-bit differences, and none
 are unexpected.
 
@@ -80,13 +80,39 @@ there. A gate whose *target* is bad reports the **target** selector, not
 the gate's: `callf 0068` faults with `err=0010`.
 
 At CPL 3 the returned CS says whether privilege actually changed,
-because its RPL is the new CPL:
+because its RPL is the new CPL, and SS:ESP says what happened to the
+stack:
 
-    cpl3 jmpf  0048 -> ok, CS=004B   conforming code: reachable, CPL stays 3
-    cpl3 jmpf  0070 -> ok, CS=0073   DPL 3 code: stays at ring 3
-    cpl3 callf 0080 -> ok, CS=0008   DPL 3 gate: CPL becomes 0, stack switches
-    cpl3 callf 0058 -> #GP           DPL 0 gate is unusable from ring 3
-    cpl3 jmpf  0008 -> #GP           non-conforming DPL 0 code is out of reach
+    cpl0 callf 0008 -> CS=0008  ss:esp=0010:6FF8   same privilege, CS:EIP pushed
+    cpl0 callf 0058 -> CS=0008  ss:esp=0010:6FF8   a gate at the same privilege pushes no more
+    cpl3 jmpf  0048 -> CS=004B  ss:esp=001B:5000   conforming: CPL stays 3, stack untouched
+    cpl3 jmpf  0070 -> CS=0073  ss:esp=001B:5000   DPL 3 code, still ring 3
+    cpl3 callf 0080 -> CS=0008  ss:esp=0010:6FF0   gate inward: stack switched to the TSS
+                                                   SS0:ESP0, sixteen bytes pushed
+    cpl3 callf 0058 -> #GP                         DPL 0 gate is unusable from ring 3
+    cpl3 jmpf  0008 -> #GP                         non-conforming DPL 0 is out of reach
+
+The last inward case is the whole call-gate mechanism in one row: the
+stack came from the TSS, and 0x7000 - 0x6FF0 is four dwords — SS, ESP,
+CS, EIP of the interrupted ring-3 context.
+
+### The LDT
+
+`LLDT` is itself a case, so everything before it in the table runs with
+LDTR unloaded and everything after sees a real LDT. That keeps the
+"LDTR never loaded" probes meaningful while still testing TI=1
+selectors for real:
+
+    lldt 0088 -> LDTR=0088 base=00007FB8 limit=1F
+    ds   0004 -> ok     TI=1 index 0 is LDT entry 0, NOT null
+    ds   0014 -> #0B    LDT entry not present, error code keeps the TI bit
+    ds   00FC -> #0D    index past the LDT limit
+    jmpf 001C -> ok     a far jump may target code in the LDT
+
+That answers a question worth having measured: only a TI=0 selector with
+index 0 is the null selector. With TI=1, index 0 is an ordinary LDT
+entry. This matters for Phase B, because DPMI hands its clients LDT
+descriptors.
 
 ### A trap the kernel itself fell into
 

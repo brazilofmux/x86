@@ -31,7 +31,7 @@ EXPECT = {
     (0, "ds", 0x00F0): ("#0D", "both",    "GDT index past the table limit -> #GP, error code = selector"),
     (0, "ds", 0x00F8): ("#0D", "both",    "GDT index past the table limit -> #GP"),
     (0, "ds", 0x0084): ("#0D", "neither", "TI=1 with LDTR never loaded -> #GP (LDTR is null out of reset)"),
-    (0, "ds", 0x000C): ("#0D", "neither", "TI=1 with LDTR never loaded -> #GP"),
+    (0, "ds", 0x008C): ("#0D", "neither", "TI=1 with LDTR never loaded -> #GP"),
 
     # ---- SS: stricter than DS on every axis, and its own fault vector
     (0, "ss", 0x0010): ("ok",  "both",    "writable data at DPL = RPL = CPL is the only thing SS accepts"),
@@ -57,6 +57,16 @@ EXPECT = {
     (0, "callf", 0x0050): ("#0B", "both", "code segment not present -> #NP"),
     (0, "callf", 0x0010): ("#0D", "both", "data segment as a call target -> #GP"),
     (0, "callf", 0x0068): ("#0D", "both", "gate whose target is data -> #GP, error code is the TARGET (0010), not the gate"),
+
+    # ---- once LLDT has run, TI=1 selectors are real. Everything above this
+    #      point in the table still ran with LDTR unloaded.
+    (0, "lldt", 0x0088): ("ok",  "both", "load LDTR from a GDT descriptor of type 2 (available LDT)"),
+    (0, "ds",   0x0004): ("ok",  "both", "TI=1 index 0 is LDT entry 0, not null: only TI=0 index 0 is the null selector"),
+    (0, "ds",   0x000C): ("ok",  "both", "LDT read/write data"),
+    (0, "ds",   0x0014): ("#0B", "both", "LDT entry not present -> #NP, error code = selector (TI bit included)"),
+    (0, "ds",   0x001C): ("ok",  "both", "LDT readable code is a legal DS"),
+    (0, "ds",   0x00FC): ("#0D", "both", "index past the LDT limit -> #GP"),
+    (0, "jmpf", 0x001C): ("ok",  "both", "a far jump may target a code segment in the LDT"),
 
     # ---- the same instructions at CPL 3. The CS that comes back says whether
     #      privilege changed: its RPL is the new CPL.

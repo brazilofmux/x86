@@ -13,7 +13,7 @@ from expected import EXPECT
 def key(r):
     if r["faulted"] is None: return ("truncated",)
     if r["faulted"]: return ("fault",)
-    return ("ok", r["ds"], r["base"], r["limit"], r["ar"])
+    return ("ok", r["seg"], r["base"], r["limit"], r["ar"], r.get("ss"), r.get("esp"))
 
 import pmcases
 IMG = os.path.join(HERE, "pmtest.img")
