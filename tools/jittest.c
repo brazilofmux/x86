@@ -284,8 +284,25 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
         /* Bias toward short, common encodings: sometimes force a simple opcode byte. */
         x86_dec_ctx c2 = { tmp, model, 0 };
         if (!x86_decode(&c2, &in) || in.len > 8 || !fuzz_accept(&in)) continue;
-        /* 1 in 6: precede it with a Jcc that skips exactly this insn */
-        if ((rnd() % 6) == 0) { prog[plen++] = (uint8_t)(0x70 + (rnd() & 15)); prog[plen++] = (uint8_t)in.len; i++; }
+        /* 1 in 6: precede it with a conditional that skips exactly this
+         * insn. Sometimes two in a row, and sometimes a LOOP/JCXZ rather
+         * than a Jcc: a conditional directly after another conditional,
+         * or after a compare with a LOOP in between, is where a backend
+         * that reuses host condition flags gets caught out. */
+        if ((rnd() % 6) == 0) {
+            static const uint8_t cc[] = { 0xE0, 0xE1, 0xE2, 0xE3 };   /* LOOPNE/LOOPE/LOOP/JCXZ */
+            int dbl = (rnd() % 3) == 0;
+            if (dbl) {
+                uint32_t r = rnd();
+                prog[plen++] = (r & 3) ? (uint8_t)(0x70 + ((r >> 4) & 15)) : cc[(r >> 4) & 3];
+                prog[plen++] = (uint8_t)(2 + in.len);
+                i++;
+            }
+            uint32_t r2 = rnd();
+            prog[plen++] = (r2 & 3) ? (uint8_t)(0x70 + ((r2 >> 4) & 15)) : cc[(r2 >> 4) & 3];
+            prog[plen++] = (uint8_t)in.len;
+            i++;
+        }
         memcpy(prog + plen, tmp, in.len); plen += in.len; i++;
     }
     prog[plen++] = 0xF4;

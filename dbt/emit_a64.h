@@ -1263,6 +1263,22 @@ static inline void emit_subs_w32(emit_t *e, a64_reg_t rd, a64_reg_t rn, a64_reg_
     emit_addsub_shifted(e, 0, 1, 1, rd, rn, rm, 0, 0);
 }
 
+/* ADDS/SUBS Wd, Wn, #imm, using the plain or shifted-by-12 immediate
+ * form. Returns 0 when the value fits neither and the caller must
+ * materialise it in a register. */
+static inline int emit_addsubs_w32_imm_any(emit_t *e, int sub, a64_reg_t rd, a64_reg_t rn, uint32_t v) {
+    uint32_t base = sub ? 0x71000000u : 0x31000000u;
+    if (v < 4096) {
+        emit_inst(e, base | (v << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));
+        return 1;
+    }
+    if ((v & 0xFFFu) == 0 && (v >> 12) < 4096) {
+        emit_inst(e, base | (1u << 22) | ((v >> 12) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));
+        return 1;
+    }
+    return 0;
+}
+
 /* ADDS/SUBS Wd, Wn, #imm12 */
 static inline void emit_adds_w32_imm(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_t imm12) {
     emit_inst(e, 0x31000000u | ((imm12 & 0xFFFu) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));

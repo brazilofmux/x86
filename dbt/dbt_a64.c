@@ -451,24 +451,33 @@ static void emit_wrap_slow_chunks(emit_t *e) {
     s_nwrap = 0;
 }
 
+/* Set while a word read has already wrap-checked this exact EA earlier in
+ * the same instruction. On 286+ that check faults, so a read-modify-write
+ * can never reach its store with a straddling offset and the store's own
+ * check is unreachable code. The 8086/186 wrap instead: there the store
+ * really does have to split, so both checks stay. */
+static int s_ea_checked;
+
 static void emit_read_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t dst) {
     if (size == 1) { emit_ldrb_reg_uxtw(e, dst, ea->segp, ea->off); return; }
     emit_wrap_check(e, ea->segp, ea->off, dst, 0, 0);
     emit_ldrh_reg_uxtw(e, dst, ea->segp, ea->off);
     emit_wrap_back(e);
+    if (!s_wrap_exact) s_ea_checked = 1;
 }
 
 /* Store + inline SMC check. Clobbers W_T2, W_T3, X0..X4 on the slow path. */
 static void emit_write_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t src) {
+    int check = size == 2 && !s_ea_checked;
     if (size == 1) {
         emit_strb_reg_uxtw(e, src, ea->segp, ea->off);
     } else {
-        emit_wrap_check(e, ea->segp, ea->off, src, 1, 1);
+        if (check) emit_wrap_check(e, ea->segp, ea->off, src, 1, 1);
         emit_strh_reg_uxtw(e, src, ea->segp, ea->off);
     }
     emit_add_x64_w32_uxtw(e, W_T3, ea->segp, ea->off);
     emit_smc_check_x3(e);
-    if (size == 2) emit_wrap_back(e);
+    if (check) emit_wrap_back(e);
 }
 
 /* Read operand i (canonical). Memory operands need the EA computed. */
@@ -519,6 +528,45 @@ static void emit_flag_af(emit_t *e, a64_reg_t a, a64_reg_t b, a64_reg_t res) {
 
 /* Set host NZCV so that B.<returned cond> is taken iff x86 condition cc
  * holds on R_F. Clobbers W_T0. */
+/* NZCV left intact by the immediately preceding arithmetic. The flag
+ * tail after an ADDS/SUBS (mrs, table load, the OR-ins for CF/PF/AF)
+ * writes no condition flags, and neither does the tail prologue, so a
+ * conditional branch that follows such an op can test NZCV directly
+ * instead of waiting on the table load that builds R_F. R_F is still
+ * built — the exit needs it — but nothing on the branch's dependency
+ * chain does. Only set for ops with a register destination: a memory
+ * destination emits the SMC check, whose helper call would clobber NZCV. */
+typedef struct { int valid, table, logical; } nzcv_state;
+static nzcv_state s_nzcv;
+
+/* Map a guest condition onto the host NZCV, or -1 if it does not map.
+ * N is SF, Z is ZF and V is OF for every table we emit. The carry and
+ * the signed pairs only line up for SUB/CMP, where ARM's "no borrow"
+ * carry is exactly what its LO/LS/LT/LE are defined against. */
+static int fuse_cond(int cc, int table, int logical) {
+    switch (cc) {
+    case 4:  return A64_COND_EQ;
+    case 5:  return A64_COND_NE;
+    case 8:  return A64_COND_MI;
+    case 9:  return A64_COND_PL;
+    case 0:  return logical ? -1 : A64_COND_VS;   /* logicals force OF = 0 */
+    case 1:  return logical ? -1 : A64_COND_VC;
+    default: break;
+    }
+    if (logical || table != T_SUB) return -1;
+    switch (cc) {
+    case 2:  return A64_COND_CC;   /* B  (x86 CF = borrow = !C) */
+    case 3:  return A64_COND_CS;   /* AE */
+    case 6:  return A64_COND_LS;   /* BE */
+    case 7:  return A64_COND_HI;   /* A  */
+    case 12: return A64_COND_LT;
+    case 13: return A64_COND_GE;
+    case 14: return A64_COND_LE;
+    case 15: return A64_COND_GT;
+    default: return -1;
+    }
+}
+
 static a64_cond_t emit_test_cond(emit_t *e, int cc) {
     switch (cc >> 1) {
     case 0: (void)emit_tst_w32_imm(e, R_F, X86_OF); break;
@@ -652,16 +700,20 @@ static void emit_incdec(emit_t *e, int is_inc, int size, a64_reg_t a, a64_reg_t 
     if ((fmask & X86_AF) && res == a) { emit_mov_w32_w32(e, W_T2, a); a_keep = W_T2; }
     (void)emit_and_w32_imm(e, W_T3, R_F, X86_CF);         /* old CF */
     emit_lsl_w32_imm(e, W_T0, a, sh);
-    emit_movz_w32(e, W_T1, (uint16_t)(1u << (sh - 16)), 16);
-    if (is_inc) emit_adds_w32(e, W_T0, W_T0, W_T1); else emit_subs_w32(e, W_T0, W_T0, W_T1);
+    if (!emit_addsubs_w32_imm_any(e, !is_inc, W_T0, W_T0, 1u << sh)) {
+        emit_movz_w32(e, W_T1, (uint16_t)(1u << (sh - 16)), 16);
+        if (is_inc) emit_adds_w32(e, W_T0, W_T0, W_T1); else emit_subs_w32(e, W_T0, W_T0, W_T1);
+    }
     emit_flags_from_nzcv(e, is_inc ? T_INC : T_DEC);
     emit_orr_w32(e, R_F, R_F, W_T3);
     emit_lsr_w32_imm(e, res, W_T0, sh);
     if (fmask & X86_PF) emit_flag_pf(e, res);
     if (fmask & X86_AF) {
-        emit_movz_w32(e, W_T1, 1, 0);
-        emit_eor_w32(e, W_T1, W_T1, a_keep);
-        emit_eor_w32(e, W_T1, W_T1, res);
+        /* AF = (a ^ 1 ^ res) & 10h, and bit 4 of the 1 is zero, so the
+         * operand xor drops out: (a ^ res) & 10h. (Recovering a from res
+         * instead would save the copy but put two more ops on the
+         * dependency chain after res, which measured slower.) */
+        emit_eor_w32(e, W_T1, a_keep, res);
         (void)emit_and_w32_imm(e, W_T1, W_T1, X86_AF);
         emit_orr_w32(e, R_F, R_F, W_T1);
     }
@@ -850,6 +902,7 @@ static void emit_helper_op(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
 }
 
 static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32_t fmask) {
+    s_nzcv.valid = 0;                   /* only the op just emitted can leave NZCV usable */
     if (cls == C_HELPER) { emit_helper_op(dbt, e, in); return; }
 
     ea_t ea = { 0, 0 };
@@ -867,6 +920,14 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         a64_reg_t res = (wr && d->kind == OPK_REG && d->size == 2) ? a : W_VAL;
         emit_alu(e, in->op, size, a, b, res, fmask);
         if (wr && res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
+        /* ADC/SBB fix OF up after the table, so their NZCV is not the
+         * guest's; a memory destination would clobber NZCV in the SMC
+         * helper. Everything else leaves it usable for a following Jcc. */
+        if (in->op != OP_ADC && in->op != OP_SBB && d->kind != OPK_MEM) {
+            s_nzcv.valid = 1;
+            s_nzcv.table = (in->op == OP_SUB || in->op == OP_CMP) ? T_SUB : T_ADD;
+            s_nzcv.logical = in->op == OP_AND || in->op == OP_TEST || in->op == OP_OR || in->op == OP_XOR;
+        }
         break;
     }
     case OP_INC: case OP_DEC: {
@@ -874,6 +935,11 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         a64_reg_t res = (d->kind == OPK_REG && d->size == 2) ? a : W_VAL;
         emit_incdec(e, in->op == OP_INC, size, a, res, fmask);
         if (res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
+        if (d->kind != OPK_MEM) {
+            s_nzcv.valid = 1;
+            s_nzcv.table = in->op == OP_INC ? T_INC : T_DEC;   /* CF untouched: no carry conditions */
+            s_nzcv.logical = 0;
+        }
         break;
     }
     case OP_NOT: {
@@ -984,9 +1050,15 @@ static void emit_dynamic_key(emit_t *e, const x86_cpu *cpu, a64_reg_t ip) {
  * arm. Returns the B.cond offset to patch. */
 static uint32_t emit_cond_side_branch(emit_t *e, const x86_insn *in) {
     uint32_t patch;
+    /* This emitter writes NZCV itself (the TST in the unfused JCC path and
+     * in LOOPE/LOOPNE), and the LOOP family does not go through emit_op,
+     * which is what normally clears the flag. Snapshot and invalidate. */
+    nzcv_state nz = s_nzcv;
+    s_nzcv.valid = 0;
     switch (in->op) {
     case OP_JCC: {
-        a64_cond_t c = emit_test_cond(e, in->cond);
+        int fused = nz.valid ? fuse_cond(in->cond, nz.table, nz.logical) : -1;
+        a64_cond_t c = fused >= 0 ? (a64_cond_t)fused : emit_test_cond(e, in->cond);
         patch = emit_pos(e);
         emit_b_cond(e, c, 0);
         break;
@@ -1264,6 +1336,8 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     s_cur_lin = dbt_key_lin(key);
     s_wrap_exact = cpu->model < X86_MODEL_286;
     s_nwrap = 0;
+    s_nzcv.valid = 0;                 /* nothing carries into a block: its first op may be a Jcc */
+    s_ea_checked = 0;
     uint32_t budget_patch = emit_pos(&e);
     emit_tbnz_x64(&e, R_CNT, 63, 0);
 
@@ -1276,6 +1350,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         s_cur_ip_after = ip_afters[i];
         s_cur_ip_start = ip_afters[i] - in->len;
         s_cur_n_done = i + 1;
+        s_ea_checked = 0;                 /* per instruction: never leaks to the next */
         if (is_uncond_ender(in->op) || (is_cond_ender(in->op) && i == n_ops - 1)) {
             emit_tail_prologue(&e, n_ops);
             emit_branch_ender(dbt, &e, in, ip_afters[i]);
