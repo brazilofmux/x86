@@ -35,6 +35,16 @@
 #define SET_DX(v) x86_set_r16(c, R_DX, (uint16_t)(v))
 #define SET_SI(v) x86_set_r16(c, R_SI, (uint16_t)(v))
 
+/* A pointer the client handed us, resolved through the segment's cached
+ * base: sel<<4 in real mode, the descriptor's base in protected mode. */
+static uint32_t cp(x86_cpu *c, int segreg, uint32_t off) { return c->seg[segreg].base + off; }
+#define P_DS(off) cp(c, S_DS, (off))
+#define P_ES(off) cp(c, S_ES, (off))
+#define LRD8(lin)      x86_phys_rd8(c, (lin))
+#define LWR8(lin, v)   x86_phys_wr8(c, (lin), (uint8_t)(v))
+#define LRD16(lin)     ((uint16_t)x86_rd(c, (lin), 0, 0xFFFFFFFFu, 2))
+#define LWR16(lin, v)  x86_wr(c, (lin), 0, 0xFFFFFFFFu, 2, (uint16_t)(v))
+
 static void ok(x86_cpu *c) { c->eflags &= ~X86_CF; }
 static void err(x86_cpu *c, int code) { dos.last_error = code; SET_AX(code); c->eflags |= X86_CF; }
 
@@ -67,7 +77,7 @@ static uint8_t con_in(x86_cpu *c, int echo) {
 /* AH=0A: buffered line input into DS:DX (max, count, chars, CR). */
 static void buffered_input(x86_cpu *c) {
     uint16_t buf = DX;
-    int max = pc_rd8(c, DS, buf);
+    int max = LRD8(P_DS(buf));
     if (max == 0) return;
     int n = 0;
     for (;;) {
@@ -79,12 +89,12 @@ static void buffered_input(x86_cpu *c) {
         }
         if (ch == 0x1A && pc.eof_seen) break;
         if (ch == 0 || n >= max - 1) { con_out(c, 7); continue; }
-        pc_wr8(c, DS, (uint16_t)(buf + 2 + n), ch);
+        LWR8(P_DS(buf + 2 + n), ch);
         n++;
         con_out(c, ch);
     }
-    pc_wr8(c, DS, (uint16_t)(buf + 1), (uint8_t)n);
-    pc_wr8(c, DS, (uint16_t)(buf + 2 + n), 0x0D);
+    LWR8(P_DS(buf + 1), n);
+    LWR8(P_DS(buf + 2 + n), 0x0D);
 }
 
 /* ---- Handles ------------------------------------------------------------- */
@@ -151,14 +161,14 @@ static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int 
     SET_AX(h); ok(c);
 }
 
-static void do_read(x86_cpu *c, int h, uint16_t seg, uint16_t off, uint16_t len) {
+static void do_read(x86_cpu *c, int h, uint32_t lin, uint16_t len) {
     dos_handle *dh = handle(c, h);
     if (!dh) { err(c, DE_INVALID_HANDLE); return; }
     if (dh->dev == 1) {
         /* Console: cooked line input unless binary mode. */
         uint16_t n = 0;
         if (dh->binary) {
-            while (n < len) { uint8_t ch = con_in(c, 0); pc_wr8(c, seg, (uint16_t)(off + n), ch); n++; if (pc_kbd_buffer_empty(c)) break; }
+            while (n < len) { uint8_t ch = con_in(c, 0); x86_phys_wr8(c, lin + n, ch); n++; if (pc_kbd_buffer_empty(c)) break; }
         } else if (len) {
             static uint8_t line[258]; static int line_len, line_pos;
             if (line_pos >= line_len) {
@@ -171,7 +181,7 @@ static void do_read(x86_cpu *c, int h, uint16_t seg, uint16_t off, uint16_t len)
                     if (ch && line_len < 254) { line[line_len++] = ch; con_out(c, ch); }
                 }
             }
-            while (n < len && line_pos < line_len) pc_wr8(c, seg, (uint16_t)(off + n++), line[line_pos++]);
+            while (n < len && line_pos < line_len) x86_phys_wr8(c, lin + n++, line[line_pos++]);
             if (n && line[line_pos - 1] == 0x1A) n--;   /* Ctrl-Z terminates */
         }
         SET_AX(n); ok(c);
@@ -181,16 +191,16 @@ static void do_read(x86_cpu *c, int h, uint16_t seg, uint16_t off, uint16_t len)
     uint8_t *buf = malloc(len ? len : 1);
     ssize_t n = read(dh->fd, buf, len);
     if (n < 0) { free(buf); err(c, dos_errno()); return; }
-    for (ssize_t i = 0; i < n; i++) x86_phys_wr8(c, (((uint32_t)seg << 4) + ((off + (uint32_t)i) & 0xFFFF)), buf[i]);
+    for (ssize_t i = 0; i < n; i++) x86_phys_wr8(c, lin + (uint32_t)i, buf[i]);
     free(buf);
     SET_AX(n); ok(c);
 }
 
-static void do_write(x86_cpu *c, int h, uint16_t seg, uint16_t off, uint16_t len) {
+static void do_write(x86_cpu *c, int h, uint32_t lin, uint16_t len) {
     dos_handle *dh = handle(c, h);
     if (!dh) { err(c, DE_INVALID_HANDLE); return; }
     if (dh->dev == 1) {
-        for (uint16_t i = 0; i < len; i++) con_out(c, pc_rd8(c, seg, (uint16_t)(off + i)));
+        for (uint16_t i = 0; i < len; i++) con_out(c, x86_phys_rd8(c, lin + i));
         SET_AX(len); ok(c);
         return;
     }
@@ -201,7 +211,7 @@ static void do_write(x86_cpu *c, int h, uint16_t seg, uint16_t off, uint16_t len
         SET_AX(0); ok(c); return;
     }
     uint8_t *buf = malloc(len);
-    for (uint16_t i = 0; i < len; i++) buf[i] = pc_rd8(c, seg, (uint16_t)(off + i));
+    for (uint16_t i = 0; i < len; i++) buf[i] = x86_phys_rd8(c, lin + i);
     ssize_t n = write(dh->fd, buf, len);
     free(buf);
     if (n < 0) { err(c, dos_errno()); return; }
@@ -230,8 +240,8 @@ static void find_next_into_dta(x86_cpu *c, uint16_t id, int search_attr) {
     ok(c);
 }
 
-static void get_path(x86_cpu *c, uint16_t seg, uint16_t off, char *out, size_t n) {
-    dos_read_str(c, seg, off, out, n);
+static void get_path(x86_cpu *c, uint32_t lin, char *out, size_t n) {
+    dos_read_str(c, lin, out, n);
 }
 
 static uint16_t bcd(int v) { return (uint16_t)v; }
@@ -272,7 +282,7 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x07: case 0x08: SET_AL(con_in(c, 0)); break;
     case 0x09: {
         uint16_t p = DX;
-        for (int i = 0; i < 65536; i++) { uint8_t ch = pc_rd8(c, DS, (uint16_t)(p + i)); if (ch == '$') break; con_out(c, ch); }
+        for (uint32_t i = 0; i < 65536; i++) { uint8_t ch = LRD8(P_DS(p + i)); if (ch == '$') break; con_out(c, ch); }
         SET_AL('$');
         break;
     }
@@ -291,7 +301,7 @@ void dos_int21(x86_cpu *c, int vector) {
         SET_AL(5);
         break;
     case 0x19: SET_AL(dos.cur_drive); break;
-    case 0x1A: dos.dta_seg = DS; dos.dta_off = DX; break;
+    case 0x1A: dos.dta_seg = DS; dos.dta_off = DX; dos.dta_lin = P_DS(DX); break;
     case 0x1B: case 0x1C:
         if (AH == 0x1C) { int dr = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
                           if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { SET_AL(0xFF); break; } }
@@ -364,12 +374,12 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x38: {                                            /* country info → DS:DX */
         if (DX == 0xFFFF) { ok(c); break; }
         static const uint8_t us[34] = { 1,0, '$',0,0,0,0, ',',0, '.',0, '-',0, ':',0, 0, 2, 0, 0,0,0,0, ':',0 };
-        for (int i = 0; i < 34; i++) pc_wr8(c, DS, (uint16_t)(DX + i), us[i]);
+        for (uint32_t i = 0; i < 34; i++) LWR8(P_DS(DX + i), us[i]);
         SET_BX(1); ok(c);
         break;
     }
     case 0x39: case 0x3A: {
-        get_path(c, DS, DX, path, sizeof path);
+        get_path(c, P_DS(DX), path, sizeof path);
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e) { err(c, e); break; }
         if (AH == 0x39) { if (exists) { err(c, DE_ACCESS_DENIED); break; } if (mkdir(host, 0755) < 0) { err(c, dos_errno()); break; } }
@@ -378,7 +388,7 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     }
     case 0x3B: {
-        get_path(c, DS, DX, path, sizeof path);
+        get_path(c, P_DS(DX), path, sizeof path);
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e || !exists || !is_dir) { err(c, DE_PATH_NOT_FOUND); break; }
         /* store the canonical DOS form: host path relative to root, uppercased */
@@ -392,8 +402,8 @@ void dos_int21(x86_cpu *c, int vector) {
         ok(c);
         break;
     }
-    case 0x3C: get_path(c, DS, DX, path, sizeof path); do_open(c, path, 2, 1, CX); break;
-    case 0x3D: get_path(c, DS, DX, path, sizeof path); do_open(c, path, AL, 0, 0); break;
+    case 0x3C: get_path(c, P_DS(DX), path, sizeof path); do_open(c, path, 2, 1, CX); break;
+    case 0x3D: get_path(c, P_DS(DX), path, sizeof path); do_open(c, path, AL, 0, 0); break;
     case 0x3E: {
         dos_handle *dh = handle(c, BX);
         if (!dh) { err(c, DE_INVALID_HANDLE); break; }
@@ -401,10 +411,10 @@ void dos_int21(x86_cpu *c, int vector) {
         ok(c);
         break;
     }
-    case 0x3F: do_read(c, BX, DS, DX, CX); break;
-    case 0x40: do_write(c, BX, DS, DX, CX); break;
+    case 0x3F: do_read(c, BX, P_DS(DX), CX); break;
+    case 0x40: do_write(c, BX, P_DS(DX), CX); break;
     case 0x41: {
-        get_path(c, DS, DX, path, sizeof path);
+        get_path(c, P_DS(DX), path, sizeof path);
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e) { err(c, e); break; }
         if (!exists) { err(c, DE_FILE_NOT_FOUND); break; }
@@ -423,7 +433,7 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     }
     case 0x43: {
-        get_path(c, DS, DX, path, sizeof path);
+        get_path(c, P_DS(DX), path, sizeof path);
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e || !exists) { err(c, e ? e : DE_FILE_NOT_FOUND); break; }
         if (AL == 0) {
@@ -500,7 +510,7 @@ void dos_int21(x86_cpu *c, int vector) {
         int drive = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
         if (drive < 0 || drive >= 26 || !dos.drives[drive].root[0]) { err(c, DE_INVALID_DRIVE); break; }
         const char *cw = dos.drives[drive].cwd;
-        dos_write_str(c, DS, SI, cw[0] == '\\' ? cw + 1 : cw);
+        dos_write_str(c, P_DS(SI), cw[0] == '\\' ? cw + 1 : cw);
         SET_AX(0x100); ok(c);
         break;
     }
@@ -521,7 +531,7 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     }
     case 0x4B:
-        get_path(c, DS, DX, path, sizeof path);
+        get_path(c, P_DS(DX), path, sizeof path);
         e = dos_exec(c, path, AL, ES, BX);
         if (e) { trace(c, "EXEC %s failed: %d", path, e); err(c, e); }
         else if (!pc.returned) ok(c);
@@ -529,7 +539,7 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x4C: dos_terminate(c, AL, 0); break;
     case 0x4D: SET_AX(dos.return_code); ok(c); break;
     case 0x4E: {
-        get_path(c, DS, DX, path, sizeof path);
+        get_path(c, P_DS(DX), path, sizeof path);
         uint16_t id;
         e = dos_search_first(path, CX, &id);
         trace(c, "findfirst %s attr %02X → %d", path, CX, e);
@@ -538,8 +548,8 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     }
     case 0x4F: {
-        if (pc_rd8(c, dos.dta_seg, (uint16_t)(dos.dta_off + 3)) != 0xC4) { err(c, DE_NO_MORE_FILES); break; }
-        find_next_into_dta(c, pc_rd16(c, dos.dta_seg, dos.dta_off), pc_rd8(c, dos.dta_seg, (uint16_t)(dos.dta_off + 2)));
+        if (LRD8(dos.dta_lin + 3) != 0xC4) { err(c, DE_NO_MORE_FILES); break; }
+        find_next_into_dta(c, LRD16(dos.dta_lin), LRD8(dos.dta_lin + 2));
         break;
     }
     case 0x50: dos.psp = BX; ok(c); break;
@@ -548,8 +558,8 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x54: SET_AL(dos.verify); break;
     case 0x56: {
         char dst[DOS_MAX_PATH], hdst[DOS_MAX_PATH];
-        get_path(c, DS, DX, path, sizeof path);
-        get_path(c, ES, DI, dst, sizeof dst);
+        get_path(c, P_DS(DX), path, sizeof path);
+        get_path(c, P_ES(DI), dst, sizeof dst);
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e || !exists) { err(c, e ? e : DE_FILE_NOT_FOUND); break; }
         int e2, d2;
@@ -583,7 +593,7 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     case 0x59: SET_AX(dos.last_error); x86_set_r8(c, R_BH, 1); x86_set_r8(c, R_BL, 1); x86_set_r8(c, R_CH, 1); break;
     case 0x5A: {
-        get_path(c, DS, DX, path, sizeof path);
+        get_path(c, P_DS(DX), path, sizeof path);
         char full[DOS_MAX_PATH];
         for (int i = 0; i < 1000; i++) {
             snprintf(full, sizeof full, "%s%sTMP%05d.$$$", path, (path[0] && path[strlen(path) - 1] != '\\') ? "\\" : "", i);
@@ -591,16 +601,16 @@ void dos_int21(x86_cpu *c, int vector) {
             if (e) { err(c, e); goto done; }
             if (!exists) break;
         }
-        dos_write_str(c, DS, DX, full);
+        dos_write_str(c, P_DS(DX), full);
         do_open(c, full, 2, 2, CX);
         break;
     }
-    case 0x5B: get_path(c, DS, DX, path, sizeof path); do_open(c, path, 2, 2, CX); break;
+    case 0x5B: get_path(c, P_DS(DX), path, sizeof path); do_open(c, path, 2, 2, CX); break;
     case 0x5C: ok(c); break;
     case 0x5D: if (AL == 6) { x86_load_seg(c, S_DS, DOS_SEG); SET_SI(0x100); SET_CX(0x80); SET_DX(0x1A); ok(c); } else err(c, DE_INVALID_FN); break;
     case 0x5E: case 0x5F: err(c, DE_INVALID_FN); break;
     case 0x60: {                                            /* truename */
-        get_path(c, DS, SI, path, sizeof path);
+        get_path(c, P_DS(SI), path, sizeof path);
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e) { err(c, e); break; }
         int dr = dos_path_drive(path);
@@ -609,14 +619,14 @@ void dos_int21(x86_cpu *c, int vector) {
         for (const char *p = rel; *p && n + 1 < sizeof out; p++) out[n++] = (char)(*p == '/' ? '\\' : toupper((unsigned char)*p));
         if (n == 2) out[n++] = '\\';
         out[n] = 0;
-        dos_write_str(c, ES, DI, out);
+        dos_write_str(c, P_ES(DI), out);
         ok(c);
         break;
     }
     case 0x63: err(c, DE_INVALID_FN); break;
     case 0x65:
         if (AL == 1 && CX >= 5) {
-            pc_wr8(c, ES, DI, 1); pc_wr16(c, ES, (uint16_t)(DI + 1), 38);
+            LWR8(P_ES(DI), 1); LWR16(P_ES(DI + 1), 38);
             pc_wr16(c, ES, (uint16_t)(DI + 3), 1); pc_wr16(c, ES, (uint16_t)(DI + 5), 437);
             ok(c);
         } else err(c, DE_INVALID_FN);
@@ -625,7 +635,7 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x67: ok(c); break;
     case 0x68: ok(c); break;
     case 0x6C: {
-        get_path(c, DS, SI, path, sizeof path);
+        get_path(c, P_DS(SI), path, sizeof path);
         int action = DX, mode = BX & 0x7F;
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e) { err(c, e); break; }

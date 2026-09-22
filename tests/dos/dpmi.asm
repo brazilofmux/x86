@@ -41,6 +41,11 @@ inpm:
         jne     bad
         cmp     dx, 3400h
         jne     bad
+        ; DS here is a protected-mode selector, so this only prints if the
+        ; DOS layer resolved the pointer through the descriptor's base.
+        mov     dx, msg_pm
+        mov     ah, 9
+        int     21h
         mov     ax, 4C00h               ; success
         int     21h
 bad:    mov     ax, 4C01h
@@ -52,5 +57,6 @@ bail:   mov     ah, 9
         int     21h
 
 entry   dd      0
+msg_pm   db     'hello from protected mode', 13, 10, '$'
 msg_none db     'no DPMI host', 13, 10, '$'
 msg_fail db     'mode switch failed', 13, 10, '$'

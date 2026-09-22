@@ -66,7 +66,8 @@ typedef struct {
     #define dos_cwd  (dos.drives[dos.cur_drive].cwd)
     uint16_t psp;                     /* current PSP segment */
     uint16_t root_psp;                /* the program we loaded; its exit ends the run */
-    uint16_t dta_seg, dta_off;
+    uint16_t dta_seg, dta_off;       /* as the client gave them, for function 2Fh */
+    uint32_t dta_lin;                /* and resolved, for our own use */
     uint8_t  alloc_strategy;
     uint8_t  verify;
     uint8_t  break_flag;
@@ -123,7 +124,7 @@ void dos_int29(x86_cpu *c, int vector);
 void dos_int2f(x86_cpu *c, int vector);
 
 /* Guest string helpers */
-void dos_read_str(x86_cpu *c, uint16_t seg, uint16_t off, char *out, size_t n);   /* ASCIIZ */
-void dos_write_str(x86_cpu *c, uint16_t seg, uint16_t off, const char *s);
+void dos_read_str(x86_cpu *c, uint32_t lin, char *out, size_t n);   /* ASCIIZ at a linear address */
+void dos_write_str(x86_cpu *c, uint32_t lin, const char *s);
 
 #endif /* DOS_H */

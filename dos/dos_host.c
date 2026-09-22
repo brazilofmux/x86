@@ -278,18 +278,21 @@ void dos_search_close(uint16_t id) {
     searches[id].in_use = 0;
 }
 
-void dos_read_str(x86_cpu *c, uint16_t seg, uint16_t off, char *out, size_t n) {
+/* Client pointers are taken through the segment's cached base, which is
+ * sel<<4 in real mode and the descriptor's base in protected mode. The DOS
+ * layer therefore never has to know which mode it is serving. */
+void dos_read_str(x86_cpu *c, uint32_t lin, char *out, size_t n) {
     size_t i = 0;
     for (; i + 1 < n; i++) {
-        uint8_t ch = pc_rd8(c, seg, (uint16_t)(off + i));
+        uint8_t ch = x86_phys_rd8(c, lin + (uint32_t)i);
         if (!ch) break;
         out[i] = (char)ch;
     }
     out[i] = 0;
 }
-void dos_write_str(x86_cpu *c, uint16_t seg, uint16_t off, const char *s) {
+void dos_write_str(x86_cpu *c, uint32_t lin, const char *s) {
     for (size_t i = 0; ; i++) {
-        pc_wr8(c, seg, (uint16_t)(off + i), (uint8_t)s[i]);
+        x86_phys_wr8(c, lin + (uint32_t)i, (uint8_t)s[i]);
         if (!s[i]) break;
     }
 }

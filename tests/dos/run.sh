@@ -19,8 +19,7 @@ done
 # The DPMI client only makes sense on a 386, and exits 0 when every service
 # it asked for behaved.
 for mode in -i -j -V; do
-    if ./dos-monster $mode -m 386 -L 20000000 tests/dos/dpmi.com >/dev/null 2>&1
-    then echo "ok   dpmi $mode"; else echo "FAIL dpmi $mode"; fail=1; fi
+    check "dpmi $mode" tests/dos/dpmi.out ./dos-monster $mode -m 386 -L 20000000 tests/dos/dpmi.com
 done
 
 if [ -f disks/tp55/TPC.EXE ]; then
