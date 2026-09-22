@@ -1,0 +1,7 @@
+parent: exec
+Hello from dos-monster!
+*
+parent: child returned 07
+Hello from dos-monster!
+*
+B8

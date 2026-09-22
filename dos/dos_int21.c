@@ -522,8 +522,9 @@ void dos_int21(x86_cpu *c, int vector) {
     }
     case 0x4B:
         get_path(c, DS, DX, path, sizeof path);
-        fprintf(stderr, "dos: EXEC %s not supported yet\n", path);
-        err(c, DE_INVALID_FN);
+        e = dos_exec(c, path, AL, ES, BX);
+        if (e) { trace(c, "EXEC %s failed: %d", path, e); err(c, e); }
+        else if (!pc.returned) ok(c);
         break;
     case 0x4C: dos_terminate(c, AL, 0); break;
     case 0x4D: SET_AX(dos.return_code); ok(c); break;

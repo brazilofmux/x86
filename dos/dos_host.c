@@ -117,6 +117,14 @@ static int canon(const char *in, char *out, size_t n, int *drive) {
 /* Resolve a DOS path to a host path. The final component need not
  * exist (creation); *exists / *is_dir describe what was found. Returns
  * a DOS error code, 0 on success (even when the leaf is missing). */
+/* "X:\DIR\NAME" form of a guest path, as DOS would print it. */
+int dos_fullname(const char *dos_path, char *out, size_t n) {
+    char abs[DOS_MAX_PATH]; int drive;
+    if (!canon(dos_path, abs, sizeof abs, &drive)) return DE_INVALID_DRIVE;
+    snprintf(out, n, "%c:%s", 'A' + drive, abs);
+    return DE_OK;
+}
+
 int dos_resolve(const char *dos_path, char *host, size_t n, int *exists, int *is_dir) {
     char abs[DOS_MAX_PATH]; int drive;
     if (!canon(dos_path, abs, sizeof abs, &drive)) return DE_INVALID_DRIVE;

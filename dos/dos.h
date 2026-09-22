@@ -73,6 +73,10 @@ typedef struct {
     int      last_error;
     int      return_code;             /* of the last terminated child (4D) */
     int      terminated;
+    /* Processes created by 4Bh: their exit pops the parent's EXEC frame
+     * and restores the registers DOS 3+ preserves (all but AX). */
+    struct { uint16_t psp, ds, es; uint32_t r[8]; } exec_save[16];
+    int      n_exec;
     dos_handle handles[DOS_MAX_HANDLES];
 } dos_state;
 
@@ -83,6 +87,10 @@ void dos_init(x86_cpu *cpu, const char *root);
 int  dos_mount(int drive, const char *dirs);            /* "dir" or "dir1:dir2:..." for a diskette sequence */
 int  dos_swap_disk(void);                              /* next diskette in the current removable drive(s); 1 if swapped */
 int  dos_load_program(x86_cpu *cpu, const char *host_path, const char *dos_name, const char *args);
+/* INT 21h/4Bh. mode 0 runs, 1 loads only (SS:SP/CS:IP into the parameter
+ * block), 3 loads an overlay. env 0 = copy the parent's. Returns a DOS
+ * error code. */
+int  dos_exec(x86_cpu *cpu, const char *dos_path, int mode, uint16_t pblk_seg, uint16_t pblk_off);
 uint16_t dos_mem_alloc(uint16_t paras, uint16_t owner, uint16_t *largest);
 int  dos_mem_free(uint16_t seg);
 int  dos_mem_resize(uint16_t seg, uint16_t paras, uint16_t *largest);
@@ -92,6 +100,7 @@ void dos_make_child_psp(x86_cpu *c, uint16_t seg, uint16_t top);
 
 /* dos_host.c */
 int  dos_resolve(const char *dos_path, char *host_out, size_t n, int *exists, int *is_dir);
+int  dos_fullname(const char *dos_path, char *out, size_t n);          /* "C:\\DIR\\NAME.EXT" */
 int  dos_path_drive(const char *dos_path);              /* drive index of a path (current drive if none) */
 void dos_shortname(const char *host_name, char *out13);      /* 8.3 upper-case, "" if not representable */
 int  dos_match(const char *pattern83, const char *name83);

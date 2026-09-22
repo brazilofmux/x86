@@ -173,7 +173,7 @@ int dos_swap_disk(void) {
 }
 
 /* ---- PSP ------------------------------------------------------------------ */
-static void build_psp(x86_cpu *c, uint16_t psp, uint16_t env, uint16_t top, const char *args) {
+static void build_psp(x86_cpu *c, uint16_t psp, uint16_t parent, uint16_t env, uint16_t top, const char *args) {
     for (int i = 0; i < 256; i++) pc_wr8(c, psp, (uint16_t)i, 0);
     pc_wr8(c, psp, 0, 0xCD); pc_wr8(c, psp, 1, 0x20);
     pc_wr16(c, psp, 2, top);
@@ -184,8 +184,11 @@ static void build_psp(x86_cpu *c, uint16_t psp, uint16_t env, uint16_t top, cons
         pc_wr16(c, psp, (uint16_t)(0x0A + i * 4), pc_rd16(c, 0, (uint16_t)((0x22 + i) * 4)));
         pc_wr16(c, psp, (uint16_t)(0x0C + i * 4), pc_rd16(c, 0, (uint16_t)((0x22 + i) * 4 + 2)));
     }
-    pc_wr16(c, psp, 0x16, psp);                         /* parent: self (we are the shell) */
-    for (int i = 0; i < 20; i++) pc_wr8(c, psp, (uint16_t)(0x18 + i), (uint8_t)(i < 5 ? (i == 3 ? 3 : i == 4 ? 4 : 1) : 0xFF));
+    pc_wr16(c, psp, 0x16, parent);
+    /* Job file table: inherited from the parent, or the five standard handles */
+    for (int i = 0; i < 20; i++)
+        pc_wr8(c, psp, (uint16_t)(0x18 + i), parent != psp ? pc_rd8(c, parent, (uint16_t)(0x18 + i))
+                                                          : (uint8_t)(i < 5 ? (i == 3 ? 3 : i == 4 ? 4 : 1) : 0xFF));
     pc_wr16(c, psp, 0x2C, env);
     pc_wr16(c, psp, 0x32, 20);
     pc_wr16(c, psp, 0x34, 0x18); pc_wr16(c, psp, 0x36, psp);
@@ -226,88 +229,232 @@ void dos_make_child_psp(x86_cpu *c, uint16_t seg, uint16_t top) {
 /* ---- Loader --------------------------------------------------------------- */
 static void set_seg(x86_cpu *c, int s, uint16_t v) { x86_load_seg(c, s, v); }
 
-int dos_load_program(x86_cpu *c, const char *host_path, const char *dos_name, const char *args) {
+typedef struct {
+    int      is_exe;
+    uint32_t hdr, code_len;              /* header bytes to skip, image bytes to load */
+    uint16_t min_alloc, max_alloc;       /* paragraphs beyond the image */
+    uint16_t ss, sp, cs, ip;             /* relative to the load segment */
+    uint16_t nrel, relofs;
+} exe_info;
+
+static uint8_t *read_image(const char *host_path, size_t *size) {
     int fd = open(host_path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "dos: cannot open %s\n", host_path); return -1; }
+    if (fd < 0) return NULL;
     struct stat st; fstat(fd, &st);
-    size_t size = (size_t)st.st_size;
-    uint8_t *img = malloc(size + 16);
-    if (read(fd, img, size) != (ssize_t)size) { close(fd); free(img); return -1; }
+    *size = (size_t)st.st_size;
+    uint8_t *img = malloc(*size + 16);
+    if (read(fd, img, *size) != (ssize_t)*size) { close(fd); free(img); return NULL; }
     close(fd);
+    return img;
+}
 
-    /* Environment block: PATH, COMSPEC, then the program's full name. */
-    char env[512]; size_t el = 0;
-    el += 1 + (size_t)sprintf(env + el, "PATH=C:\\");
-    el += 1 + (size_t)sprintf(env + el, "COMSPEC=C:\\COMMAND.COM");
-    el += 1 + (size_t)sprintf(env + el, "PROMPT=$P$G");
-    env[el++] = 0;
+static void parse_image(const uint8_t *img, size_t size, exe_info *e) {
+    memset(e, 0, sizeof *e);
+    e->is_exe = size >= 0x1C && ((img[0] == 'M' && img[1] == 'Z') || (img[0] == 'Z' && img[1] == 'M'));
+    if (!e->is_exe) {
+        e->code_len = (uint32_t)(size > 0xFF00 ? 0xFF00 : size);
+        e->max_alloc = 0xFFFF;
+        return;
+    }
+    uint16_t hdr_paras = img[8] | (img[9] << 8);
+    e->hdr = (uint32_t)hdr_paras * 16;
+    uint16_t pages = img[4] | (img[5] << 8), last = img[2] | (img[3] << 8);
+    uint32_t image = (uint32_t)pages * 512 - (last ? 512 - last : 0);
+    if (image > size) image = (uint32_t)size;
+    e->code_len = image > e->hdr ? image - e->hdr : 0;
+    e->min_alloc = img[0x0A] | (img[0x0B] << 8);
+    e->max_alloc = img[0x0C] | (img[0x0D] << 8);
+    e->ss = img[0x0E] | (img[0x0F] << 8); e->sp = img[0x10] | (img[0x11] << 8);
+    e->ip = img[0x14] | (img[0x15] << 8); e->cs = img[0x16] | (img[0x17] << 8);
+    e->nrel = img[6] | (img[7] << 8); e->relofs = img[0x18] | (img[0x19] << 8);
+}
+
+/* Copy the image to segment `load` and relocate it by `reloc` (the same
+ * as `load` for a program, the caller's factor for an overlay). */
+static void place_image(x86_cpu *c, const uint8_t *img, size_t size, const exe_info *e, uint16_t load, uint16_t reloc) {
+    uint32_t base = (uint32_t)load << 4;
+    for (uint32_t i = 0; i < e->code_len; i++) x86_phys_wr8(c, base + i, img[e->hdr + i]);
+    for (uint16_t i = 0; i < e->nrel; i++) {
+        uint32_t p = e->relofs + (uint32_t)i * 4;
+        if (p + 4 > size) break;
+        uint16_t off = img[p] | (img[p + 1] << 8), seg = img[p + 2] | (img[p + 3] << 8);
+        uint32_t a = base + ((uint32_t)seg << 4) + off;
+        uint16_t v = (uint16_t)(x86_phys_rd8(c, a) | (x86_phys_rd8(c, a + 1) << 8));
+        v = (uint16_t)(v + reloc);
+        x86_phys_wr8(c, a, (uint8_t)v); x86_phys_wr8(c, a + 1, (uint8_t)(v >> 8));
+    }
+}
+
+/* Environment for a new process: either a fresh one (the root program)
+ * or a copy of the parent's strings, followed as DOS does by the count
+ * word 1 and the program's full name. Returns the segment, 0 = no memory. */
+static uint16_t make_env(x86_cpu *c, uint16_t parent_env, const char *dos_full) {
+    char env[2048]; size_t el = 0;
+    if (parent_env) {
+        for (uint32_t i = 0;; i++) {
+            uint8_t b = pc_rd8(c, parent_env, (uint16_t)i);
+            if (el + 4 >= sizeof env) break;
+            env[el++] = (char)b;
+            if (b == 0 && (i == 0 || pc_rd8(c, parent_env, (uint16_t)(i - 1)) == 0)) break;   /* double NUL */
+        }
+        if (el == 1) env[el++] = 0;                                   /* empty parent env: still "\0\0" */
+    } else {
+        el += 1 + (size_t)sprintf(env + el, "PATH=C:\\");
+        el += 1 + (size_t)sprintf(env + el, "COMSPEC=C:\\COMMAND.COM");
+        el += 1 + (size_t)sprintf(env + el, "PROMPT=$P$G");
+        env[el++] = 0;
+    }
     env[el++] = 1; env[el++] = 0;
-    el += 1 + (size_t)sprintf(env + el, "%c:%s%s", 'A' + dos.cur_drive, dos_name[0] == '\\' ? "" : "\\", dos_name);
-    uint16_t env_paras = (uint16_t)((el + 15) / 16);
-    uint16_t env_seg = dos_mem_alloc(env_paras, 0, NULL);
-    for (size_t i = 0; i < el; i++) pc_wr8(c, env_seg, (uint16_t)i, (uint8_t)env[i]);
+    el += 1 + (size_t)snprintf(env + el, sizeof env - el, "%s", dos_full);
+    uint16_t paras = (uint16_t)((el + 15) / 16);
+    uint16_t seg = dos_mem_alloc(paras, 0, NULL);
+    if (!seg) return 0;
+    for (size_t i = 0; i < el; i++) pc_wr8(c, seg, (uint16_t)i, (uint8_t)env[i]);
+    return seg;
+}
 
-    int is_exe = size >= 0x1C && img[0] == 'M' && img[1] == 'Z';
-    if (!is_exe && size >= 0x1C && img[0] == 'Z' && img[1] == 'M') is_exe = 1;
+/* Create a process from an image: PSP, memory, environment ownership,
+ * registers. `parent` is the creating process (the PSP itself for the
+ * root program). On success the new PSP is current; with `run` clear
+ * the entry state is returned instead of being loaded into the CPU. */
+static int create_process(x86_cpu *c, const uint8_t *img, size_t size, const char *dos_full, const char *tail,
+                          uint16_t env_seg, uint16_t parent, int run,
+                          uint16_t *o_ss, uint16_t *o_sp, uint16_t *o_cs, uint16_t *o_ip) {
+    exe_info e; parse_image(img, size, &e);
     uint16_t largest = 0;
     dos_mem_alloc(0xFFFF, 0, &largest);              /* probe: how much is there */
-    uint16_t psp = dos_mem_alloc(largest, 0, NULL);  /* programs get everything, like COMMAND.COM does */
-    if (!psp) { free(img); return -1; }
-    pc_wr16(c, env_seg - 1, 1, psp);                 /* env owned by the program */
+    uint32_t code_paras = (e.code_len + 15) / 16;
+    uint32_t need = 0x10 + code_paras + (e.is_exe ? e.min_alloc : 1);
+    uint32_t want = 0x10 + code_paras + (e.is_exe ? e.max_alloc : 0xFFFF);
+    if (want > 0xFFFF) want = 0xFFFF;
+    if (want < need) want = need;
+    if (need > largest) { if (pc.debug) fprintf(stderr, "[dos] load: need %u paragraphs, %u free\n", need, largest); return DE_NO_MEMORY; }
+    uint16_t alloc = (uint16_t)(want > largest ? largest : want);
+    uint16_t psp = dos_mem_alloc(alloc, 0, NULL);
+    if (!psp) return DE_NO_MEMORY;
     pc_wr16(c, psp - 1, 1, psp);
-    const char *base = strrchr(dos_name, '\\'); base = base ? base + 1 : dos_name;
-    for (int i = 0; i < 8; i++) pc_wr8(c, (uint16_t)(psp - 1), (uint16_t)(8 + i), (uint8_t)(i < (int)strcspn(base, ".") && i < 8 ? toupper((unsigned char)base[i]) : 0));
-    uint16_t top = (uint16_t)(psp + largest);
-    build_psp(c, psp, env_seg, top, args);
+    if (env_seg && mcb_owner(c, (uint16_t)(env_seg - 1)) == 0) pc_wr16(c, env_seg - 1, 1, psp);   /* our copy: the child owns it */
+    const char *base = strrchr(dos_full, '\\'); base = base ? base + 1 : dos_full;
+    for (int i = 0; i < 8; i++) pc_wr8(c, (uint16_t)(psp - 1), (uint16_t)(8 + i), (uint8_t)(i < (int)strcspn(base, ".") ? toupper((unsigned char)base[i]) : 0));
+    uint16_t top = (uint16_t)(psp + alloc);
+    build_psp(c, psp, parent == 0 ? psp : parent, env_seg, top, tail);
     dos.psp = psp;
-    dos.root_psp = psp;
     dos.dta_seg = psp; dos.dta_off = 0x80;
 
-    if (!is_exe) {
-        uint16_t load = (uint16_t)(psp + 0x10);
-        if (size > 0xFF00) size = 0xFF00;
-        for (size_t i = 0; i < size; i++) pc_wr8(c, psp, (uint16_t)(0x100 + i), img[i]);
-        (void)load;
-        set_seg(c, S_CS, psp); set_seg(c, S_DS, psp); set_seg(c, S_ES, psp); set_seg(c, S_SS, psp);
-        c->eip = 0x100;
-        c->r[R_SP] = 0xFFFE;
-        pc_wr16(c, psp, 0xFFFE, 0);                  /* RET to PSP:0 → INT 20h */
-        c->r[R_AX] = 0;                              /* AL/AH: drive validity of FCB args */
-        c->r[R_BX] = c->r[R_CX] = c->r[R_DX] = c->r[R_SI] = c->r[R_DI] = c->r[R_BP] = 0;
+    uint16_t load = (uint16_t)(psp + 0x10);
+    uint16_t ss, sp, cs, ip;
+    if (!e.is_exe) {
+        place_image(c, img, size, &e, load, load);
+        ss = cs = psp; ip = 0x100; sp = 0xFFFE;
+        if (alloc < 0x1000) sp = (uint16_t)((alloc << 4) - 2);      /* small block: stack at its top */
+        pc_wr16(c, psp, sp, 0);                      /* RET to PSP:0 → INT 20h */
     } else {
-        uint16_t hdr_paras = img[8] | (img[9] << 8);
-        uint32_t hdr = (uint32_t)hdr_paras * 16;
-        uint16_t pages = img[4] | (img[5] << 8), last = img[2] | (img[3] << 8);
-        uint32_t image = (uint32_t)pages * 512 - (last ? 512 - last : 0);
-        if (image > size) image = (uint32_t)size;
-        uint32_t code_len = image > hdr ? image - hdr : 0;
-        uint16_t min_alloc = img[0x0A] | (img[0x0B] << 8);
-        uint16_t load = (uint16_t)(psp + 0x10);
-        uint32_t need = (code_len + 15) / 16 + min_alloc + 0x10;
-        if (need > largest) { fprintf(stderr, "dos: program needs %u paragraphs, %u free\n", need, largest); free(img); return -1; }
-        uint32_t base = (uint32_t)load << 4;
-        for (uint32_t i = 0; i < code_len; i++) x86_phys_wr8(c, base + i, img[hdr + i]);
-        uint16_t nrel = img[6] | (img[7] << 8), relofs = img[0x18] | (img[0x19] << 8);
-        for (uint16_t i = 0; i < nrel; i++) {
-            uint32_t p = relofs + (uint32_t)i * 4;
-            if (p + 4 > size) break;
-            uint16_t off = img[p] | (img[p + 1] << 8), seg = img[p + 2] | (img[p + 3] << 8);
-            uint32_t a = base + ((uint32_t)seg << 4) + off;
-            uint16_t v = (uint16_t)(x86_phys_rd8(c, a) | (x86_phys_rd8(c, a + 1) << 8));
-            v = (uint16_t)(v + load);
-            x86_phys_wr8(c, a, (uint8_t)v); x86_phys_wr8(c, a + 1, (uint8_t)(v >> 8));
-        }
-        uint16_t ss = img[0x0E] | (img[0x0F] << 8), sp = img[0x10] | (img[0x11] << 8);
-        uint16_t ip = img[0x14] | (img[0x15] << 8), cs = img[0x16] | (img[0x17] << 8);
-        set_seg(c, S_CS, (uint16_t)(cs + load)); set_seg(c, S_SS, (uint16_t)(ss + load));
+        place_image(c, img, size, &e, load, load);
+        cs = (uint16_t)(e.cs + load); ip = e.ip;
+        ss = (uint16_t)(e.ss + load); sp = e.sp;
+    }
+    if (o_ss) { *o_ss = ss; *o_sp = sp; *o_cs = cs; *o_ip = ip; }
+    if (run) {
+        set_seg(c, S_CS, cs); set_seg(c, S_SS, ss);
         set_seg(c, S_DS, psp); set_seg(c, S_ES, psp);
         c->eip = ip; c->r[R_SP] = sp;
-        c->r[R_AX] = 0;
+        c->r[R_AX] = 0;                              /* AL/AH: drive validity of FCB args */
         c->r[R_BX] = c->r[R_CX] = c->r[R_DX] = c->r[R_SI] = c->r[R_DI] = c->r[R_BP] = 0;
+        c->eflags |= X86_IF;
+        c->halted = 0;
     }
+    return DE_OK;
+}
+
+int dos_load_program(x86_cpu *c, const char *host_path, const char *dos_name, const char *args) {
+    size_t size;
+    uint8_t *img = read_image(host_path, &size);
+    if (!img) { fprintf(stderr, "dos: cannot open %s\n", host_path); return -1; }
+    char full[DOS_MAX_PATH];
+    snprintf(full, sizeof full, "%c:%s%s", 'A' + dos.cur_drive, dos_name[0] == '\\' ? "" : "\\", dos_name);
+    uint16_t env = make_env(c, 0, full);
+    int e = create_process(c, img, size, full, args, env, 0, 1, NULL, NULL, NULL, NULL);
     free(img);
-    c->halted = 0;
+    if (e) { fprintf(stderr, "dos: cannot load %s (error %d)\n", dos_name, e); return -1; }
+    dos.root_psp = dos.psp;
     return 0;
+}
+
+/* INT 21h/4Bh. The caller's INT frame is still on its stack and its
+ * SS:SP already sit in its PSP:2Eh (the dispatcher stores them on every
+ * call); INT 22h is pointed at the return address so the child's exit
+ * comes back right after the INT 21h, frame popped, CF clear. */
+int dos_exec(x86_cpu *c, const char *dos_path, int mode, uint16_t pb_seg, uint16_t pb_off) {
+    char host[DOS_MAX_PATH], full[DOS_MAX_PATH];
+    int exists, is_dir;
+    int e = dos_resolve(dos_path, host, sizeof host, &exists, &is_dir);
+    if (e) return e;
+    if (!exists || is_dir) return DE_FILE_NOT_FOUND;
+    dos_fullname(dos_path, full, sizeof full);
+    size_t size;
+    uint8_t *img = read_image(host, &size);
+    if (!img) return DE_ACCESS_DENIED;
+
+    if (mode == 3) {                                  /* overlay: raw image at a segment, no PSP */
+        uint16_t load = pc_rd16(c, pb_seg, pb_off), reloc = pc_rd16(c, pb_seg, (uint16_t)(pb_off + 2));
+        exe_info ei; parse_image(img, size, &ei);
+        if (pc.debug) fprintf(stderr, "[dos] EXEC overlay %s at %04X (reloc %04X)\n", full, load, reloc);
+        place_image(c, img, size, &ei, load, reloc);
+        free(img);
+        return DE_OK;
+    }
+    if (mode != 0 && mode != 1) { free(img); return DE_INVALID_FN; }
+
+    uint16_t env_seg = pc_rd16(c, pb_seg, pb_off);
+    uint16_t tail_off = pc_rd16(c, pb_seg, (uint16_t)(pb_off + 2)), tail_seg = pc_rd16(c, pb_seg, (uint16_t)(pb_off + 4));
+    char tail[128]; int n = pc_rd8(c, tail_seg, tail_off);
+    if (n > 126) n = 126;
+    for (int i = 0; i < n; i++) tail[i] = (char)pc_rd8(c, tail_seg, (uint16_t)(tail_off + 1 + i));
+    tail[n] = 0;
+    if (pc.debug) fprintf(stderr, "[dos] EXEC %s [%s] mode %d env %04X from PSP %04X\n", full, tail, mode, env_seg, dos.psp);
+
+    if (env_seg == 0) {
+        env_seg = make_env(c, pc_rd16(c, dos.psp, 0x2C), full);
+        if (!env_seg) { free(img); return DE_NO_MEMORY; }
+    }
+    /* INT 22h ← the caller's return address (top of its INT frame) */
+    uint16_t sp = (uint16_t)c->r[R_SP], ss = c->seg[S_SS].sel;
+    uint16_t parent = dos.psp;
+    pc_wr16(c, 0, 0x22 * 4, pc_rd16(c, ss, sp));
+    pc_wr16(c, 0, 0x22 * 4 + 2, pc_rd16(c, ss, (uint16_t)(sp + 2)));
+
+    /* the parent's registers, restored when the child exits (DOS 3+ keeps all but AX) */
+    if (dos.n_exec < 16) {
+        dos.exec_save[dos.n_exec].ds = c->seg[S_DS].sel; dos.exec_save[dos.n_exec].es = c->seg[S_ES].sel;
+        memcpy(dos.exec_save[dos.n_exec].r, c->r, sizeof dos.exec_save[dos.n_exec].r);
+    }
+    uint16_t o_ss, o_sp, o_cs, o_ip;
+    e = create_process(c, img, size, full, tail, env_seg, parent, mode == 0, &o_ss, &o_sp, &o_cs, &o_ip);
+    free(img);
+    if (e) {
+        if (mcb_owner(c, (uint16_t)(env_seg - 1)) == 0) dos_mem_free(env_seg);   /* our unowned copy */
+        pc_wr16(c, 0, 0x22 * 4, pc_rd16(c, parent, 0x0A));                  /* INT 22h back */
+        pc_wr16(c, 0, 0x22 * 4 + 2, pc_rd16(c, parent, 0x0C));
+        return e;
+    }
+    uint16_t psp = dos.psp;
+    if (dos.n_exec < 16) dos.exec_save[dos.n_exec++].psp = psp;
+    /* FCBs from the parameter block (pointers may be null) */
+    for (int f = 0; f < 2; f++) {
+        uint16_t po = pc_rd16(c, pb_seg, (uint16_t)(pb_off + 6 + f * 4)), ps = pc_rd16(c, pb_seg, (uint16_t)(pb_off + 8 + f * 4));
+        if (!po && !ps) continue;
+        for (int i = 0; i < 16; i++) pc_wr8(c, psp, (uint16_t)((f ? 0x6C : 0x5C) + i), pc_rd8(c, ps, (uint16_t)(po + i)));
+    }
+    if (mode == 1) {
+        pc_wr16(c, pb_seg, (uint16_t)(pb_off + 0x0E), o_sp); pc_wr16(c, pb_seg, (uint16_t)(pb_off + 0x10), o_ss);
+        pc_wr16(c, pb_seg, (uint16_t)(pb_off + 0x12), o_ip); pc_wr16(c, pb_seg, (uint16_t)(pb_off + 0x14), o_cs);
+        /* the entry AX (FCB drive validity) goes on the child's stack, as DOS does */
+        pc_wr16(c, o_ss, (uint16_t)(o_sp - 2), 0);
+        pc_wr16(c, pb_seg, (uint16_t)(pb_off + 0x0E), (uint16_t)(o_sp - 2));
+        return DE_OK;
+    }
+    pc.returned = 1;                                  /* control is now the child's */
+    return DE_OK;
 }
 
 /* Terminate the current process. A child (its PSP is not the program we
@@ -322,7 +469,8 @@ void dos_terminate(x86_cpu *c, int code, int keep_paras) {
         if (dos.handles[i].fd >= 0 && !dos.handles[i].dev && dos.handles[i].owner_psp == psp) { close(dos.handles[i].fd); dos.handles[i].fd = -1; }
         else if (dos.handles[i].fd == -2 && dos.handles[i].owner_psp == psp) dos.handles[i].fd = -1;
     if (!keep_paras) dos_mem_free_owner(psp);
-    dos.return_code = code;
+    else dos_mem_resize(psp, keep_paras, NULL);   /* TSR: keep this much of the program block */
+    dos.return_code = code | (keep_paras ? 0x300 : 0);   /* 4Dh: AH = termination type */
     uint16_t parent = pc_rd16(c, psp, 0x16);
     if (psp == dos.root_psp || parent == psp || parent == 0) {
         dos.terminated = 1;
@@ -344,5 +492,18 @@ void dos_terminate(x86_cpu *c, int code, int keep_paras) {
     x86_load_seg(c, S_CS, cs);
     c->eip = ip;
     c->eflags |= X86_IF;
+    if (dos.n_exec && dos.exec_save[dos.n_exec - 1].psp == psp) {
+        /* Back from INT 21h/4Bh: the parent's INT frame is at its saved
+         * SS:SP; pop it (RETF 2 style), restore its registers, CF clear. */
+        dos.n_exec--;
+        uint32_t ax = c->r[R_AX], sp2 = c->r[R_SP];
+        memcpy(c->r, dos.exec_save[dos.n_exec].r, sizeof c->r);
+        c->r[R_AX] = ax; c->r[R_SP] = sp2;
+        x86_load_seg(c, S_DS, dos.exec_save[dos.n_exec].ds);
+        x86_load_seg(c, S_ES, dos.exec_save[dos.n_exec].es);
+        c->eflags &= ~X86_CF;
+        pc_hle_return(c, HLE_RET_FLAGS);
+        c->eflags &= ~X86_CF;
+    }
     pc.returned = 1;                 /* we transferred control ourselves */
 }
