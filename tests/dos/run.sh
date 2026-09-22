@@ -27,9 +27,10 @@ if [ -f disks/tp55/TPC.EXE ]; then
     done
 fi
 if [ -f disks/WP51/WP.EXE ]; then
-    # WordPerfect 5.1 (installed by its own INSTALL.EXE under dos-monster): type a line
+    # WordPerfect 5.1 (installed by its own INSTALL.EXE under dos-monster): type a line.
+    # -L only bounds a runaway: WP idles near 1 BIPS, so it must not double as a timer.
     rm -f 'disks/WP51/WP}WP{'* 2>/dev/null
-    got=$( (sleep 2; printf 'The quick brown fox.'; sleep 2) | ./dos-monster -L 600000000 -C disks -D - disks/WP51/WP.EXE 2>/dev/null)
+    got=$( (sleep 2; printf 'The quick brown fox.'; sleep 2) | ./dos-monster -L 20000000000 -C disks -D - disks/WP51/WP.EXE 2>/dev/null)
     case "$got" in *"The quick brown fox."*"Doc 1 Pg 1"*) echo "ok   wp51 typing";; *) echo "FAIL wp51 typing"; fail=1;; esac
     rm -f 'disks/WP51/WP}WP{'* 2>/dev/null
 fi

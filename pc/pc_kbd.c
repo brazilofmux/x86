@@ -268,9 +268,18 @@ static int next_key(x86_cpu *c, int blocking) {
  * since the last, and at most one per 20 ms. A terminal's keys are
  * taken as they come. */
 void pc_kbd_poll(x86_cpu *c) {
-    static uint64_t next_ok, reads_at_last;
-    if (raw_active) { while (next_key(c, 0)) { } return; }
+    static uint64_t next_ok, next_probe, reads_at_last;
     uint64_t now = pc_now_ns();
+    /* next_key() probes stdin with poll(2) whenever its own buffer is
+     * empty, and INT 16h status calls land here on every pass of a
+     * program's idle loop. Rate-limit the probe itself, not just a
+     * successful feed: WordPerfect polls the keyboard two million times
+     * in a 17 s run, and one syscall apiece was 11 s of it. */
+    if (!npending) {
+        if (now < next_probe) return;
+        next_probe = now + 1000000ull;                    /* 1 kHz is plenty for a keyboard */
+    }
+    if (raw_active) { while (next_key(c, 0)) { } return; }
     /* "Idle-polling" = several keyboard queries since the last key; a
      * single poll is often a flush, and a key fed then is lost. */
     if (now < next_ok || pc.kbd_reads < reads_at_last + 8) return;
@@ -327,7 +336,13 @@ void pc_kbd_wait(x86_cpu *c) {
             return;
         }
         pc.kbd_reads++;
-        if (host_readable(50)) pc_kbd_poll(c);
+        /* Waiting on the host, not emulating: charged separately so it
+          * is not mistaken for the cost of running the service. */
+        uint64_t w0 = pc_now_ns();
+        int ready = host_readable(50);
+        pc.blocked_ns += pc_now_ns() - w0;
+        pc.blocked_calls++;
+        if (ready) pc_kbd_poll(c);
     }
 }
 

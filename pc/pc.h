@@ -48,6 +48,8 @@ typedef struct pc_state {
     uint64_t kbd_reads;              /* guest keyboard reads/polls; paces scripted input */
     uint64_t next_slow_ns;           /* pc_poll: when its periodic work is next due */
     uint64_t now_ns;                 /* clock read by the last pc_poll, for reuse */
+    uint64_t blocked_ns;             /* host time spent deliberately idle (waiting on stdin, honouring a guest delay) */
+    uint64_t blocked_calls;
     int      eof_seen;
 
     /* Timer */
@@ -96,6 +98,7 @@ void pc_video_dump(x86_cpu *c, FILE *f);                 /* the text buffer as 2
 /* pc_kbd.c */
 void pc_kbd_init(void);
 void pc_kbd_shutdown(void);
+void pc_svcprof_dump(FILE *out);                         /* X86_SVCPROF: host time per service */
 void pc_kbd_poll(x86_cpu *c);                            /* host keys → BIOS buffer */
 int  pc_kbd_buffer_empty(x86_cpu *c);
 int  pc_kbd_peek(x86_cpu *c, uint16_t *key);             /* ascii | scancode<<8 */

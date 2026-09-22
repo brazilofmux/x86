@@ -206,9 +206,18 @@ int main(int argc, char **argv) {
     }
     if (g_stats) {
         double s = (double)(t1 - t0) / 1e9;
+        double blocked = (double)pc.blocked_ns / 1e9;
         fprintf(stderr, "insns: %llu in %.3fs = %.1f MIPS\n", (unsigned long long)cpu.insn_count, s,
                 (double)cpu.insn_count / s / 1e6);
+        /* Time spent deliberately idle (waiting on stdin, honouring a guest
+         * delay) is not emulation cost: the rate excluding it is the one
+         * that says how fast we actually run. */
+        if (pc.blocked_ns)
+            fprintf(stderr, "  host idle:              %.3fs in %llu waits  → %.1f MIPS while running\n",
+                    blocked, (unsigned long long)pc.blocked_calls,
+                    s > blocked ? (double)cpu.insn_count / (s - blocked) / 1e6 : 0.0);
         if (use_jit) dbt_print_stats(&g_dbt, stderr);
+        pc_svcprof_dump(stderr);
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);
     }
     if (use_jit) dbt_cleanup(&g_dbt);

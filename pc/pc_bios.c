@@ -3,6 +3,7 @@
  */
 #include "pc.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -39,10 +40,40 @@ void pc_hle_return(x86_cpu *c, int mode) {
         c->eflags = x86_flags_fixup(c, (c->eflags & ~(uint32_t)(X86_IF | X86_TF)) | (fl & (X86_IF | X86_TF)));
 }
 
+/* X86_SVCPROF=1: host time and call count per (vector, AH), dumped at
+ * exit. Two clock reads per service call, so it stays behind the env
+ * check; the point is to find which service the guest actually lives in. */
+static struct { uint64_t ns, calls; } svc_prof[256][256];
+static int svc_prof_on = -1;
+
+void pc_svcprof_dump(FILE *out) {
+    if (svc_prof_on <= 0) return;
+    fprintf(out, "  service profile (host time by INT/AH):\n");
+    for (int n = 0; n < 12; n++) {
+        int bv = -1, ba = -1; uint64_t best = 0;
+        for (int v = 0; v < 256; v++)
+            for (int a = 0; a < 256; a++)
+                if (svc_prof[v][a].ns > best) { best = svc_prof[v][a].ns; bv = v; ba = a; }
+        if (bv < 0) break;
+        fprintf(out, "    INT %02Xh AH=%02X  %8.1f ms  %9llu calls  %6.0f ns/call\n",
+                bv, ba, (double)best / 1e6, (unsigned long long)svc_prof[bv][ba].calls,
+                (double)best / (double)svc_prof[bv][ba].calls);
+        svc_prof[bv][ba].ns = 0;
+    }
+}
+
 static void hle_dispatch(x86_cpu *c, int vector) {
     pc_service_fn fn = pc.service[vector];
     int mode = fn ? pc.ret_mode[vector] : HLE_RET_IRET;
     pc.returned = 0;
+    if (svc_prof_on < 0) svc_prof_on = getenv("X86_SVCPROF") != NULL;
+    if (svc_prof_on) {
+        int ah = x86_get_r8(c, R_AH);
+        uint64_t t0 = pc_now_ns();
+        if (fn) fn(c, vector);
+        svc_prof[vector & 0xFF][ah].ns += pc_now_ns() - t0;
+        svc_prof[vector & 0xFF][ah].calls++;
+    } else
     if (fn) fn(c, vector);
     /* A service that transferred control itself (program exit, exec,
      * INT 8 chaining to 1Ch) has already done its own return. */
@@ -135,7 +166,7 @@ static void bios_int15(x86_cpu *c, int vector) {
         break;
     case 0x86: {                                 /* wait CX:DX microseconds */
         uint32_t us = ((uint32_t)x86_get_r16(c, R_CX) << 16) | x86_get_r16(c, R_DX);
-        if (us) usleep(us);
+        if (us) { uint64_t w0 = pc_now_ns(); usleep(us); pc.blocked_ns += pc_now_ns() - w0; pc.blocked_calls++; }
         c->eflags &= ~X86_CF;
         break;
     }
@@ -202,7 +233,7 @@ int pc_poll(x86_cpu *c) {
         /* HLT with interrupts on: the guest is idling for the next tick. */
         uint64_t next = pc.t0_ns + (pc.ticks_delivered + 1) * TICK_NS;
         uint64_t hnow = pc_now_ns();
-        if (next > hnow) usleep((useconds_t)((next - hnow) / 1000 + 1));
+        if (next > hnow) { usleep((useconds_t)((next - hnow) / 1000 + 1)); pc.blocked_ns += pc_now_ns() - hnow; pc.blocked_calls++; }
         pc.irq_pending |= 1 << 8;
     }
     }
