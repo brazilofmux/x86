@@ -1382,7 +1382,10 @@ void x86_deliver_exception(x86_cpu *c) {
 
 int x86_step(x86_cpu *c) {
     if (c->halted) return 1;
-    if (c->hle && c->seg[S_CS].sel == c->hle_seg) {
+    /* The HLE trap is recognised by where CS points, not by its selector
+     * value, so a protected-mode IDT gate into a descriptor based at the
+     * same linear address traps exactly as the real-mode IVT does. */
+    if (c->hle && c->seg[S_CS].base == ((uint32_t)c->hle_seg << 4)) {
         c->hle(c, (int)(c->eip & 0xFF));
         return c->halted ? 1 : 0;
     }

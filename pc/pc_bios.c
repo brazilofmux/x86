@@ -26,11 +26,16 @@ void pc_set_service(int vector, pc_service_fn fn, int ret_mode) {
 /* Pop the INT frame. FLAGS mode is MS-DOS's RETF 2: the caller gets the
  * handler's flags (CF/ZF results) but keeps its own IF/TF. */
 void pc_hle_return(x86_cpu *c, int mode) {
-    uint32_t sp = c->r[R_SP] & 0xFFFF;
-    uint16_t ip = pc_rd16(c, c->seg[S_SS].sel, (uint16_t)sp);
-    uint16_t cs = pc_rd16(c, c->seg[S_SS].sel, (uint16_t)(sp + 2));
-    uint16_t fl = pc_rd16(c, c->seg[S_SS].sel, (uint16_t)(sp + 4));
-    c->r[R_SP] = (c->r[R_SP] & 0xFFFF0000u) | ((sp + 6) & 0xFFFF);
+    /* In protected mode the frame a gate pushed is three dwords, not three
+     * words, and the stack segment is addressed through its base. */
+    int w = c->pmode ? 4 : 2;
+    uint32_t base = c->seg[S_SS].base, sp = c->r[R_SP];
+    if (!c->pmode) sp &= 0xFFFF;
+    uint32_t ip = x86_rd(c, base, sp, 0xFFFFFFFFu, w);
+    uint16_t cs = (uint16_t)x86_rd(c, base, sp + w, 0xFFFFFFFFu, w);
+    uint32_t fl = x86_rd(c, base, sp + 2 * w, 0xFFFFFFFFu, w);
+    if (c->pmode) c->r[R_SP] = sp + 3 * w;
+    else c->r[R_SP] = (c->r[R_SP] & 0xFFFF0000u) | ((sp + 6) & 0xFFFF);
     pc.returned = 1;
     x86_load_seg(c, S_CS, cs);
     c->eip = ip;

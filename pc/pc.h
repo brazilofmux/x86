@@ -27,6 +27,7 @@
 
 /* Return convention of a service after pc_hle_dispatch ran it. */
 enum { HLE_RET_FLAGS, HLE_RET_IRET };
+#define PC_HLE_DPMI_ENTRY 0x00FD   /* offset in the HLE segment; the trap vector is eip & FFh */
 
 typedef void (*pc_service_fn)(x86_cpu *c, int vector);
 

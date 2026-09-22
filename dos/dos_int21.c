@@ -662,7 +662,8 @@ void dos_int2f(x86_cpu *c, int vector) {
     (void)vector;
     uint16_t ax = x86_get_r16(c, R_AX);
     switch (ax >> 8) {
-    case 0x16:                                              /* Windows: not running */
+    case 0x16:                                              /* Windows / DPMI */
+        if ((ax & 0xFF) == 0x87) { dpmi_int2f_1687(c); break; }
         if ((ax & 0xFF) == 0x00 || (ax & 0xFF) == 0x0A) SET_AL(0);
         break;
     case 0x43:                                              /* XMS: not installed */

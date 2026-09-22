@@ -110,6 +110,12 @@ int  dos_search_next(uint16_t id, char *name13, int *attr, uint32_t *size, time_
 void dos_search_close(uint16_t id);
 int  dos_errno(void);
 
+/* dos_dpmi.c — the DPMI host */
+void dpmi_init(x86_cpu *c);
+void dpmi_int2f_1687(x86_cpu *c);
+void dpmi_mode_switch(x86_cpu *c, int vector);
+void dpmi_int31(x86_cpu *c, int vector);
+
 /* dos_int21.c */
 void dos_int21(x86_cpu *c, int vector);
 void dos_int20(x86_cpu *c, int vector);

@@ -16,6 +16,13 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "a20.com $mode"   tests/dos/a20.out   ./dos-monster $mode tests/dos/a20.com
     check "smcpush $mode"   tests/dos/smcpush.out ./dos-monster $mode tests/dos/smcpush.com
 done
+# The DPMI client only makes sense on a 386, and exits 0 when every service
+# it asked for behaved.
+for mode in -i -j -V; do
+    if ./dos-monster $mode -m 386 -L 20000000 tests/dos/dpmi.com >/dev/null 2>&1
+    then echo "ok   dpmi $mode"; else echo "FAIL dpmi $mode"; fail=1; fi
+done
+
 if [ -f disks/tp55/TPC.EXE ]; then
     rm -f disks/tp55/HELLO.EXE
     check "tpc -V" tests/dos/tpc.out ./dos-monster -V disks/tp55/TPC.EXE hello.pas

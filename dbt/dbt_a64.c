@@ -1325,7 +1325,14 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     }
 
     /* HLE stub segment: the interpreter step dispatches the host service. */
-    if (cpu->hle && cpu->seg[S_CS].sel == cpu->hle_seg) return NULL;
+    if (cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4)) return NULL;
+
+    /* Protected mode is interpreter-only for now. Everything the backend
+     * inlines for control transfers — the interrupt frame, the IVT read, a
+     * far target's base from its selector — is real-mode reasoning, and it
+     * is wrong the moment descriptors exist. Refusing here costs speed and
+     * keeps -V honest; teaching the backend protected mode is its own job. */
+    if (cpu->pmode) return NULL;
 
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;

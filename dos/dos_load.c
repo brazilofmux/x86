@@ -135,6 +135,9 @@ void dos_init(x86_cpu *cpu, const char *root) {
     pc_set_service(0x27, dos_int20, HLE_RET_FLAGS);
     pc_set_service(0x29, dos_int29, HLE_RET_IRET);
     pc_set_service(0x2F, dos_int2f, HLE_RET_FLAGS);
+    pc_set_service(0x31, dpmi_int31, HLE_RET_FLAGS);
+    pc_set_service(PC_HLE_DPMI_ENTRY, dpmi_mode_switch, HLE_RET_FLAGS);
+    dpmi_init(cpu);
 }
 
 /* Mount host directory/directories on a drive. A colon-separated list
