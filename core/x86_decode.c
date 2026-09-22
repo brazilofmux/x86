@@ -283,7 +283,7 @@ static int fill_operand(cursor *c, x86_insn *in, x86_operand *o, int form) {
         o->kind = OPK_SREG; o->size = 2;
         o->reg = c->model < X86_MODEL_286 ? (in->reg & 3) : in->reg;
         if (c->model == X86_MODEL_286 && in->reg >= 4) return 0;
-        if (in->reg >= 6) return 0;                                   /* 386: no segment register 6/7 */
+        if (o->reg >= 6) return 0;                                    /* 386: no segment register 6/7 */
         break;
     case F_Ib:  o->kind = OPK_IMM; o->size = 1; o->imm = fetch8(c); break;
     case F_Iw:  o->kind = OPK_IMM; o->size = 2; o->imm = fetch16(c); break;

@@ -156,13 +156,22 @@ static void load_seg(x86_cpu *c, int s, uint32_t sel) {
     if (s == S_SS) c->int_inhibit = 1;
 }
 
-/* Real-mode interrupt delivery: 16-bit pushes, vector from the IVT at 0. */
+/* Real-mode interrupt delivery: 16-bit pushes, vector from the IVT at 0.
+ * The frame pushes are unchecked: a limit fault while delivering a
+ * fault is a shutdown on real hardware (SP odd and below 6); we push
+ * linearly so the interpreter and the JIT agree on something. */
+static void push_raw(x86_cpu *c, uint32_t v) {
+    uint32_t m = stkmask(c);
+    uint32_t sp = (c->r[R_SP] - 2) & m;
+    x86_wr(c, c->seg[S_SS].base, sp, wrapmask(c, m), 2, v);
+    c->r[R_SP] = m == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
+}
 void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
     (void)is_sw;
-    push(c, 2, c->eflags & 0xFFFF);
+    push_raw(c, c->eflags & 0xFFFF);
     c->eflags &= ~(X86_IF | X86_TF);
-    push(c, 2, c->seg[S_CS].sel);
-    push(c, 2, c->eip & 0xFFFF);
+    push_raw(c, c->seg[S_CS].sel);
+    push_raw(c, c->eip & 0xFFFF);
     uint32_t off = x86_rd(c, 0, vector * 4, 0xFFFFFFFFu, 2);
     uint32_t sel = x86_rd(c, 0, vector * 4 + 2, 0xFFFFFFFFu, 2);
     load_seg(c, S_CS, sel);
@@ -974,9 +983,20 @@ static void fetch_bytes(x86_cpu *c, uint8_t *buf) {
 }
 
 void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
+    uint32_t start_ip = c->eip - in->len;
     c->fault_armed = 1;
-    if (setjmp(c->fault_jb) == 0) execute(c, in, c->eip - in->len);
+    if (setjmp(c->fault_jb) == 0) execute(c, in, start_ip);
     c->fault_armed = 0;
+    /* A fault (286+) or a trap-style exception restarts at the instruction
+     * or continues after it, as x86_step would; the caller delivers it. */
+    if (c->exc >= 0 && c->model >= X86_MODEL_286) c->eip = start_ip;
+}
+
+/* Deliver an exception left pending by translated code. */
+void x86_deliver_exception(x86_cpu *c) {
+    int vec = c->exc;
+    c->exc = -1;
+    x86_interrupt(c, vec, 0);
 }
 
 int x86_step(x86_cpu *c) {

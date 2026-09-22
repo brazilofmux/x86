@@ -70,11 +70,12 @@
 #define OFF_JIT_CNTSAVE offsetof(x86_cpu, jit_cnt_save)
 #define OFF_JIT_CUR_LIN offsetof(x86_cpu, jit_cur_lin)
 #define OFF_JIT_CUR_HIT offsetof(x86_cpu, jit_cur_hit)
+#define OFF_EXC         offsetof(x86_cpu, exc)
 
 #define ARITH  X86_ARITH_FLAGS   /* 0x8D5 — not a logical immediate, load it */
 
-/* Thunk offsets in the code buffer (emitted with the trampoline). */
-static uint32_t s_exec_thunk_off, s_smc_thunk_off;
+/* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
+static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_fault_stub_off, s_fault_exit_off;
 
 /* -V strict mode: every block returns to dbt_run (no links, no probe). */
 static int s_strict_exit = -1;
@@ -155,6 +156,19 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_ldp_post_sp(&e, A64_W29, A64_W30, 96);
     emit_ret(&e);
 
+    /* ---- Fault stub: B here with W3 = ip of the faulting instruction,
+     * W4 = instructions to charge (including it), W5 = vector. Records
+     * the exception for the run loop and exits at that instruction. ---- */
+    s_fault_stub_off = e.offset;
+    emit_str_w32_imm(&e, A64_W5, R_CPU, OFF_EXC);
+    s_fault_exit_off = e.offset;
+    emit_sub_x64(&e, R_CNT, R_CNT, A64_W4);
+    emit_ldr_w32_imm(&e, W_T1, R_CPU, OFF_SEG_BASE(S_CS));
+    emit_add_w32(&e, A64_W0, W_T1, A64_W3);
+    emit_ldrh_imm(&e, W_T1, R_CPU, OFF_SEG_SEL(S_CS));
+    emit_orr_x64_lsl(&e, A64_W0, A64_W0, W_T1, 32);
+    emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
+
     /* ---- Thunks. Both are entered by BL from a block with
      *   X0 = cpu, W2 = the block's linear address, W3 = ip after the
      *   current instruction, W4 = instructions executed so far in the
@@ -195,6 +209,17 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
         }
         emit_ldp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
         emit_ldp_post_sp(&e, A64_W29, A64_W30, 96);
+        if (is_exec) {
+            /* The interpreter faulted inside the helper op: cpu->exc is
+             * set and eip points at the instruction. Charge it, leave. */
+            emit_ldr_w32_imm(&e, W_T1, R_CPU, OFF_EXC);
+            emit_add_w32_imm(&e, W_T1, W_T1, 1);
+            uint32_t nofault = emit_pos(&e);
+            emit_cbz_w32(&e, W_T1, 0);
+            emit_ldr_w32_imm(&e, A64_W3, R_CPU, OFF_EIP);
+            emit_b(&e, (int32_t)s_fault_exit_off - (int32_t)emit_pos(&e));
+            emit_patch_cond19(&e, nofault, emit_pos(&e));
+        }
         emit_ldr_w32_imm(&e, W_T1, R_CPU, OFF_JIT_CUR_HIT);
         uint32_t cont = emit_pos(&e);
         emit_cbnz_w32(&e, W_T1, 0);
@@ -344,8 +369,8 @@ static void emit_write_reg(emit_t *e, int reg, int size, a64_reg_t src) {
 
 /* Where in the block we are, for the thunks' "block invalidated under
  * us" exit: set per instruction by the block emitter. */
-static uint32_t s_cur_lin, s_cur_ip_after, s_cur_n_done;
-static int s_wrap_exact;   /* model < 286: word accesses at offset FFFF wrap in-segment */
+static uint32_t s_cur_lin, s_cur_ip_after, s_cur_ip_start, s_cur_n_done;
+static int s_wrap_exact;   /* model < 286: word accesses at offset FFFF wrap in-segment; 286+: #GP */
 
 static void emit_thunk_args(emit_t *e) {
     emit_mov_w32_imm32(e, A64_W2, s_cur_lin);
@@ -366,23 +391,26 @@ static void emit_smc_check_x3(emit_t *e) {
     emit_patch_cond19(e, skip, emit_pos(e));
 }
 
-/* ---- Segment-wrap slow paths (8086/186 only) ----
- * A 16-bit access whose offset is FFFF touches base+FFFF and base+0.
- * The fast path tests the offset (EOR #FFFF; CBZ) and the rare case
- * runs an out-of-line chunk emitted after the block body. */
+/* ---- Segment-limit slow paths ----
+ * A 16-bit access whose offset is FFFF wraps in-segment on the 8086/186
+ * and is #GP on the 286+ (CONTRACT, measured). The fast path tests the
+ * offset (EOR #FFFF; CBZ) and the rare case runs an out-of-line chunk
+ * emitted after the block body: the split access, or a jump to the
+ * fault stub with the instruction's start IP (nothing of it committed:
+ * every check precedes its instruction's first state change). */
 typedef struct {
     uint32_t patch_off, back_off;
-    uint8_t  is_store;
+    uint8_t  is_store, smc;      /* smc: run the code-bitmap check on the split store (not for stack pushes) */
     a64_reg_t segp, reg;         /* reg: destination (load) or value (store) */
-    uint32_t ip_after, n_done;   /* thunk context at the access */
+    uint32_t ip_after, ip_start, n_done;   /* thunk context at the access */
 } wrap_slow_t;
 static wrap_slow_t s_wrap[256];
 static uint32_t s_nwrap;
 
-static void emit_wrap_check(emit_t *e, a64_reg_t segp, a64_reg_t off, a64_reg_t reg, int is_store) {
+static void emit_wrap_check(emit_t *e, a64_reg_t segp, a64_reg_t off, a64_reg_t reg, int is_store, int smc) {
     (void)emit_eor_w32_imm(e, W_T3, off, 0xFFFF);
     if (s_nwrap < 256) {
-        s_wrap[s_nwrap] = (wrap_slow_t){ emit_pos(e), 0, (uint8_t)is_store, segp, reg, s_cur_ip_after, s_cur_n_done };
+        s_wrap[s_nwrap] = (wrap_slow_t){ emit_pos(e), 0, (uint8_t)is_store, (uint8_t)smc, segp, reg, s_cur_ip_after, s_cur_ip_start, s_cur_n_done };
         emit_cbz_w32(e, W_T3, 0);
         s_wrap[s_nwrap].back_off = 0;   /* filled by the caller after the fast access */
         s_nwrap++;
@@ -396,6 +424,14 @@ static void emit_wrap_slow_chunks(emit_t *e) {
     for (uint32_t k = 0; k < s_nwrap; k++) {
         wrap_slow_t *w = &s_wrap[k];
         emit_patch_cond19(e, w->patch_off, emit_pos(e));
+        if (!s_wrap_exact) {
+            /* 286+: #GP at this instruction; it counts as executed like x86_step's */
+            emit_movz_w32(e, A64_W3, (uint16_t)w->ip_start, 0);
+            emit_movz_w32(e, A64_W4, (uint16_t)w->n_done, 0);
+            emit_movz_w32(e, A64_W5, X86_EXC_GP, 0);
+            emit_b(e, (int32_t)s_fault_stub_off - (int32_t)emit_pos(e));
+            continue;
+        }
         emit_movz_w32(e, W_T3, 0xFFFF, 0);
         if (!w->is_store) {
             emit_ldrb_reg_uxtw(e, w->reg, w->segp, W_T3);
@@ -404,12 +440,10 @@ static void emit_wrap_slow_chunks(emit_t *e) {
         } else {
             s_cur_ip_after = w->ip_after; s_cur_n_done = w->n_done;
             emit_strb_reg_uxtw(e, w->reg, w->segp, W_T3);
-            emit_add_x64_w32_uxtw(e, W_T3, w->segp, W_T3);
-            emit_smc_check_x3(e);
+            if (w->smc) { emit_add_x64_w32_uxtw(e, W_T3, w->segp, W_T3); emit_smc_check_x3(e); }
             emit_lsr_w32_imm(e, W_T1, w->reg, 8);
             emit_strb_imm(e, W_T1, w->segp, 0);
-            emit_mov_x64_x64(e, W_T3, w->segp);
-            emit_smc_check_x3(e);
+            if (w->smc) { emit_mov_x64_x64(e, W_T3, w->segp); emit_smc_check_x3(e); }
         }
         emit_b(e, (int32_t)w->back_off - (int32_t)emit_pos(e));
     }
@@ -418,9 +452,9 @@ static void emit_wrap_slow_chunks(emit_t *e) {
 
 static void emit_read_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t dst) {
     if (size == 1) { emit_ldrb_reg_uxtw(e, dst, ea->segp, ea->off); return; }
-    if (s_wrap_exact) emit_wrap_check(e, ea->segp, ea->off, dst, 0);
+    emit_wrap_check(e, ea->segp, ea->off, dst, 0, 0);
     emit_ldrh_reg_uxtw(e, dst, ea->segp, ea->off);
-    if (s_wrap_exact) emit_wrap_back(e);
+    emit_wrap_back(e);
 }
 
 /* Store + inline SMC check. Clobbers W_T2, W_T3, X0..X4 on the slow path. */
@@ -428,12 +462,12 @@ static void emit_write_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t src) {
     if (size == 1) {
         emit_strb_reg_uxtw(e, src, ea->segp, ea->off);
     } else {
-        if (s_wrap_exact) emit_wrap_check(e, ea->segp, ea->off, src, 1);
+        emit_wrap_check(e, ea->segp, ea->off, src, 1, 1);
         emit_strh_reg_uxtw(e, src, ea->segp, ea->off);
     }
     emit_add_x64_w32_uxtw(e, W_T3, ea->segp, ea->off);
     emit_smc_check_x3(e);
-    if (size == 2 && s_wrap_exact) emit_wrap_back(e);
+    if (size == 2) emit_wrap_back(e);
 }
 
 /* Read operand i (canonical). Memory operands need the EA computed. */
@@ -676,16 +710,18 @@ static void emit_shift_imm(emit_t *e, int op, int size, uint32_t cnt, a64_reg_t 
 /* Stack pushes skip the SMC check (the stack essentially never
  * overlaps code) but keep the 8086 wrap check: PUSH at SP=1 exists. */
 static void emit_push16(emit_t *e, a64_reg_t val) {
-    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 2);
-    (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
-    if (s_wrap_exact) emit_wrap_check(e, R_SSP, R_GPR(R_SP), val, 1);
-    emit_strh_reg_uxtw(e, val, R_SSP, R_GPR(R_SP));
-    if (s_wrap_exact) emit_wrap_back(e);
+    /* new SP in a temp until the store is known to succeed (fault: SP intact) */
+    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
+    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+    emit_wrap_check(e, R_SSP, W_T2, val, 1, 0);
+    emit_strh_reg_uxtw(e, val, R_SSP, W_T2);
+    emit_wrap_back(e);
+    emit_mov_w32_w32(e, R_GPR(R_SP), W_T2);
 }
 static void emit_pop16(emit_t *e, a64_reg_t dst) {
-    if (s_wrap_exact) emit_wrap_check(e, R_SSP, R_GPR(R_SP), dst, 0);
+    emit_wrap_check(e, R_SSP, R_GPR(R_SP), dst, 0, 0);
     emit_ldrh_reg_uxtw(e, dst, R_SSP, R_GPR(R_SP));
-    if (s_wrap_exact) emit_wrap_back(e);
+    emit_wrap_back(e);
     emit_add_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 2);
     (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
 }
@@ -879,8 +915,9 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     case OP_PUSH: {
         a64_reg_t v = emit_read_operand(e, in, 0, &ea, W_VAL);
         /* 8086 PUSH SP stores the decremented value; 286+ the old one. */
-        if (d->kind == OPK_REG && d->reg == R_SP && dbt->cpu->model > X86_MODEL_8086) {
-            emit_mov_w32_w32(e, W_VAL, R_GPR(R_SP));
+        if (d->kind == OPK_REG && d->reg == R_SP && dbt->cpu->model == X86_MODEL_8086) {
+            emit_sub_w32_imm(e, W_VAL, R_GPR(R_SP), 2);
+            (void)emit_and_w32_imm(e, W_VAL, W_VAL, 0xFFFF);
             v = W_VAL;
         }
         emit_push16(e, v);
@@ -1048,6 +1085,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         if (!x86_decode(&ctx, in)) break;
         if (ip + in->len > 0x10000) break;             /* IP wrap: leave it to the interp */
         int c = classify(in);
+        if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
         if (c == C_REFUSE) {
             dbt->refused_by_op[in->op]++;
             break;
@@ -1088,6 +1126,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
 
     for (uint32_t i = 0; i < n_ops; i++) {
         const x86_insn *in = &decs[i];
+        s_cur_ip_after = ip_afters[i];
+        s_cur_ip_start = ip_afters[i] - in->len;
+        s_cur_n_done = i + 1;
         if (is_uncond_ender(in->op) || (is_cond_ender(in->op) && i == n_ops - 1)) {
             emit_tail_prologue(&e, n_ops);
             emit_branch_ender(dbt, &e, in, ip_afters[i]);
@@ -1101,8 +1142,6 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             n_sides++;
             continue;
         }
-        s_cur_ip_after = ip_afters[i];
-        s_cur_n_done = i + 1;
         emit_op(dbt, &e, in, cls[i], fmask[i]);
     }
 

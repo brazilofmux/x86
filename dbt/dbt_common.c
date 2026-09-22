@@ -262,10 +262,15 @@ int dbt_run(x86_dbt *dbt) {
                 dbt->jit_block_entries++;
                 trampoline(cpu, cpu->mem, code, dbt->aux, dbt->quantum);
                 poll_countdown = 0;
+                if (cpu->exc >= 0) x86_deliver_exception(cpu);
                 uint64_t jit_insns = cpu->insn_count - insns_before;
 
-                for (uint64_t i = 0; i < jit_insns; i++)
+                static int vtrace = -1;
+                if (vtrace < 0) vtrace = getenv("X86_VTRACE") != NULL;
+                for (uint64_t i = 0; i < jit_insns; i++) {
+                    if (vtrace) { fprintf(stderr, "[shadow exc=%d armed=%d] ", dbt->shadow.exc, dbt->shadow.fault_armed); x86_dump(&dbt->shadow, stderr); }
                     if (x86_step(&dbt->shadow) != 0) break;
+                }
                 dbt->verify_blocks_checked++;
                 runs++;
 
@@ -289,6 +294,7 @@ int dbt_run(x86_dbt *dbt) {
             dbt->jit_block_entries++;
             trampoline(cpu, cpu->mem, code, dbt->aux, dbt->quantum);
             poll_countdown = 0;
+            if (cpu->exc >= 0) x86_deliver_exception(cpu);
             continue;
         }
 

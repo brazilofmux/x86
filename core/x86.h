@@ -206,6 +206,7 @@ int  x86_step(x86_cpu *c);
  * or dispatch exceptions; the caller has excluded anything that raises. */
 struct x86_insn;
 void x86_exec_decoded(x86_cpu *c, const struct x86_insn *in);
+void x86_deliver_exception(x86_cpu *c);   /* cpu->exc pending after a JIT run */
 
 /* Deliver interrupt/exception vector n (pushes flags/CS/IP, loads vector). */
 void x86_interrupt(x86_cpu *c, int vector, int is_sw);
