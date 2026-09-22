@@ -121,7 +121,7 @@ static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int 
     dos_handle *dh = &dos.handles[h];
     uint8_t dev;
     if (is_device_name(dos_path, &dev)) {
-        dh->fd = dev == 1 ? 0 : -2;
+        dh->fd = -2;                                  /* devices own no host fd (never close(0)!) */
         dh->dev = dev; dh->binary = 0; dh->mode = (uint8_t)mode; dh->owner_psp = dos.psp;
         snprintf(dh->path, sizeof dh->path, "%s", dos_path);
         trace(c, "open device %s → %d", dos_path, h);
@@ -145,6 +145,7 @@ static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int 
     if (fd < 0 && (flags & O_ACCMODE) != O_RDONLY && errno == EACCES) fd = open(host, O_RDONLY);
     if (fd < 0) { err(c, dos_errno()); return; }
     dh->fd = fd; dh->dev = 0; dh->binary = 1; dh->mode = (uint8_t)mode; dh->owner_psp = dos.psp;
+    dh->drive = (uint8_t)dos_path_drive(dos_path);
     snprintf(dh->path, sizeof dh->path, "%s", host);
     if (pc.debug) trace(c, "open %s (%s) mode %02X create %d → %d", dos_path, host, mode, create, h);
     SET_AX(h); ok(c);
@@ -285,10 +286,15 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     }
     case 0x0D: break;
-    case 0x0E: SET_AL(5); break;                            /* select disk: LASTDRIVE = E */
+    case 0x0E:                                              /* select disk; AL = LASTDRIVE */
+        if (x86_get_r8(c, R_DL) < 26 && dos.drives[x86_get_r8(c, R_DL)].root[0]) dos.cur_drive = x86_get_r8(c, R_DL);
+        SET_AL(5);
+        break;
     case 0x19: SET_AL(dos.cur_drive); break;
     case 0x1A: dos.dta_seg = DS; dos.dta_off = DX; break;
     case 0x1B: case 0x1C:
+        if (AH == 0x1C) { int dr = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
+                          if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { SET_AL(0xFF); break; } }
         SET_AL(8); SET_CX(512); SET_DX(0xFFF0);
         pc_wr8(c, DOS_SEG, 0x10, 0xF8);
         x86_load_seg(c, S_DS, DOS_SEG); SET_BX(0x10);
@@ -342,7 +348,9 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     case 0x36: {
         struct statvfs vs;
-        if (statvfs(dos.root, &vs) == 0) {
+        int dr = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
+        if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { SET_AX(0xFFFF); break; }
+        if (statvfs(dos.drives[dr].root, &vs) == 0) {
             uint64_t total = (uint64_t)vs.f_blocks * vs.f_frsize, avail = (uint64_t)vs.f_bavail * vs.f_frsize;
             uint64_t cl = 32768;
             uint32_t tc = (uint32_t)(total / cl), fc = (uint32_t)(avail / cl);
@@ -374,12 +382,13 @@ void dos_int21(x86_cpu *c, int vector) {
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e || !exists || !is_dir) { err(c, DE_PATH_NOT_FOUND); break; }
         /* store the canonical DOS form: host path relative to root, uppercased */
-        const char *rel = host + strlen(dos.root);
+        dos_drive *dv = &dos.drives[dos_path_drive(path)];
+        const char *rel = host + strlen(dv->root);
         char cwd[DOS_MAX_PATH]; size_t n = 0; cwd[0] = 0;
         for (const char *p = rel; *p && n + 1 < sizeof cwd; p++) cwd[n++] = (char)(*p == '/' ? '\\' : toupper((unsigned char)*p));
         cwd[n] = 0;
-        snprintf(dos.cwd, sizeof dos.cwd, "%s", cwd[0] ? cwd : "\\");
-        trace(c, "chdir %s → %s", path, dos.cwd);
+        snprintf(dv->cwd, sizeof dv->cwd, "%s", cwd[0] ? cwd : "\\");
+        trace(c, "chdir %s → %s", path, dv->cwd);
         ok(c);
         break;
     }
@@ -388,7 +397,7 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x3E: {
         dos_handle *dh = handle(c, BX);
         if (!dh) { err(c, DE_INVALID_HANDLE); break; }
-        if (BX >= 5) { if (dh->fd >= 0) close(dh->fd); dh->fd = -1; }
+        if (BX >= 5) { if (dh->fd >= 0 && !dh->dev) close(dh->fd); dh->fd = -1; }
         ok(c);
         break;
     }
@@ -432,7 +441,7 @@ void dos_int21(x86_cpu *c, int vector) {
         case 0x00:
             if (!dh) { err(c, DE_INVALID_HANDLE); break; }
             if (dh->dev) SET_DX(0x80C0 | (dh->dev == 1 ? 0x03 : 0) | (dh->binary ? 0x20 : 0));
-            else SET_DX(0x0002);                                /* drive C:, not written */
+            else SET_DX(dh->drive);                             /* drive number, not written */
             SET_AX(DX); ok(c);
             break;
         case 0x01:
@@ -447,8 +456,18 @@ void dos_int21(x86_cpu *c, int vector) {
             ok(c);
             break;
         case 0x07: SET_AL(0xFF); ok(c); break;
-        case 0x08: SET_AX(1); ok(c); break;                    /* fixed disk */
-        case 0x09: SET_DX(0); ok(c); break;                    /* local */
+        case 0x08: {                                          /* removable? BL = drive (0 = current) */
+            int dr = x86_get_r8(c, R_BL) ? x86_get_r8(c, R_BL) - 1 : dos.cur_drive;
+            if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { err(c, DE_INVALID_DRIVE); break; }
+            SET_AX(dr < 2 ? 0 : 1); ok(c);
+            break;
+        }
+        case 0x09: {                                          /* local/remote? BL = drive */
+            int dr = x86_get_r8(c, R_BL) ? x86_get_r8(c, R_BL) - 1 : dos.cur_drive;
+            if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { err(c, DE_INVALID_DRIVE); break; }
+            SET_DX(0); ok(c);
+            break;
+        }
         case 0x0A: SET_DX(0); ok(c); break;
         case 0x0E: case 0x0F: SET_AL(0); ok(c); break;
         default: err(c, DE_INVALID_FN); break;
@@ -470,7 +489,7 @@ void dos_int21(x86_cpu *c, int vector) {
         int t = CX;
         if (!dh || t < 0 || t >= DOS_MAX_HANDLES) { err(c, DE_INVALID_HANDLE); break; }
         if (t != (int)BX) {
-            if (dos.handles[t].fd >= 0 && t >= 5) close(dos.handles[t].fd);
+            if (dos.handles[t].fd >= 0 && t >= 5 && !dos.handles[t].dev) close(dos.handles[t].fd);
             dos.handles[t] = *dh;
             if (!dh->dev) dos.handles[t].fd = dup(dh->fd);
         }
@@ -478,9 +497,10 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     }
     case 0x47: {
-        int drive = x86_get_r8(c, R_DL);
-        if (drive != 0 && drive != 3) { err(c, DE_INVALID_DRIVE); break; }
-        dos_write_str(c, DS, SI, dos.cwd[0] == '\\' ? dos.cwd + 1 : dos.cwd);
+        int drive = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
+        if (drive < 0 || drive >= 26 || !dos.drives[drive].root[0]) { err(c, DE_INVALID_DRIVE); break; }
+        const char *cw = dos.drives[drive].cwd;
+        dos_write_str(c, DS, SI, cw[0] == '\\' ? cw + 1 : cw);
         SET_AX(0x100); ok(c);
         break;
     }
@@ -582,8 +602,9 @@ void dos_int21(x86_cpu *c, int vector) {
         get_path(c, DS, SI, path, sizeof path);
         e = dos_resolve(path, host, sizeof host, &exists, &is_dir);
         if (e) { err(c, e); break; }
-        const char *rel = host + strlen(dos.root);
-        char out[DOS_MAX_PATH]; size_t n = (size_t)snprintf(out, sizeof out, "C:");
+        int dr = dos_path_drive(path);
+        const char *rel = host + strlen(dos.drives[dr].root);
+        char out[DOS_MAX_PATH]; size_t n = (size_t)snprintf(out, sizeof out, "%c:", 'A' + dr);
         for (const char *p = rel; *p && n + 1 < sizeof out; p++) out[n++] = (char)(*p == '/' ? '\\' : toupper((unsigned char)*p));
         if (n == 2) out[n++] = '\\';
         out[n] = 0;

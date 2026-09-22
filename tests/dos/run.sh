@@ -23,4 +23,11 @@ if [ -f disks/tp55/TPC.EXE ]; then
         case "$got" in *exhausted*) echo "FAIL ide $mode (did not quit)"; fail=1;; *) echo "ok   ide $mode";; esac
     done
 fi
+if [ -f disks/WP51/WP.EXE ]; then
+    # WordPerfect 5.1 (installed by its own INSTALL.EXE under dos-monster): type a line
+    rm -f 'disks/WP51/WP}WP{'* 2>/dev/null
+    got=$( (sleep 2; printf 'The quick brown fox.'; sleep 2) | ./dos-monster -L 600000000 -C disks -D - disks/WP51/WP.EXE 2>/dev/null)
+    case "$got" in *"The quick brown fox."*"Doc 1 Pg 1"*) echo "ok   wp51 typing";; *) echo "FAIL wp51 typing"; fail=1;; esac
+    rm -f 'disks/WP51/WP}WP{'* 2>/dev/null
+fi
 exit $fail

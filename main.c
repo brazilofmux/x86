@@ -21,8 +21,10 @@ static void usage(const char *prog) {
     printf("  -j          JIT (default)\n");
     printf("  -V          JIT with lockstep verification against the interpreter\n");
     printf("  -S          with -V: verify after every block (no chaining)\n");
+    printf("  -M N        with -V: compare guest memory every N block runs (default 1)\n");
     printf("  -m MODEL    cpu model: 86, 186, 286 (default 286)\n");
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
+    printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
     printf("  -s          print statistics on exit\n");
     printf("  -d          trace DOS calls\n");
@@ -68,7 +70,8 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
 int main(int argc, char **argv) {
     int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0;
     uint64_t limit = 0;
-    const char *root = NULL, *prog = NULL, *dump = NULL;
+    int mem_every = 1;
+    const char *root = NULL, *prog = NULL, *dump = NULL, *drive_a = NULL, *drive_b = NULL;
     int i;
     for (i = 1; i < argc; i++) {
         if (argv[i][0] != '-' || !strcmp(argv[i], "-")) break;
@@ -85,8 +88,11 @@ int main(int argc, char **argv) {
             model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 286 ? X86_MODEL_286 : X86_MODEL_386;
         }
         else if (!strcmp(argv[i], "-C") && i + 1 < argc) root = argv[++i];
+        else if (!strcmp(argv[i], "-A") && i + 1 < argc) drive_a = argv[++i];
+        else if (!strcmp(argv[i], "-B") && i + 1 < argc) drive_b = argv[++i];
         else if (!strcmp(argv[i], "-L") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) dump = argv[++i];
+        else if (!strcmp(argv[i], "-M") && i + 1 < argc) mem_every = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); usage(argv[0]); return 2; }
     }
     if (i >= argc) { usage(argv[0]); return 2; }
@@ -126,7 +132,31 @@ int main(int argc, char **argv) {
     pc_init(&cpu, tty);
     pc.debug = debug;
     dos_init(&cpu, root_abs);
-    if (dos_load_program(&cpu, host_prog, dos_name, args) < 0) return 1;
+    if (drive_a && dos_mount(0, drive_a) < 0) return 1;
+    if (drive_b && dos_mount(1, drive_b) < 0) return 1;
+    pc.swap_disk = dos_swap_disk;
+    /* Start on the drive and in the directory that hold the program (A:
+     * for an installer, C:\WP51 for WP), so the PSP environment names it
+     * the way DOS would: C:\WP51\WP.EXE. */
+    char dos_path[DOS_MAX_PATH];
+    snprintf(dos_path, sizeof dos_path, "%s", dos_name);
+    {
+        char pd[PATH_MAX];
+        if (realpath(progdir, pd))
+            for (int d = 0; d < 26; d++) {
+                const char *r = dos.drives[d].root;
+                size_t rl = strlen(r);
+                if (!r[0] || strncmp(pd, r, rl) != 0 || (pd[rl] && pd[rl] != '/')) continue;
+                dos.cur_drive = d;
+                char cwd[DOS_MAX_PATH]; size_t n = 0;
+                for (const char *p = pd + rl; *p && n + 1 < sizeof cwd; p++) cwd[n++] = (char)(*p == '/' ? '\\' : toupper((unsigned char)*p));
+                cwd[n] = 0;
+                snprintf(dos.drives[d].cwd, sizeof dos.drives[d].cwd, "%s", cwd[0] ? cwd : "\\");
+                snprintf(dos_path, sizeof dos_path, "%s\\%s", cwd, dos_name);
+                break;
+            }
+    }
+    if (dos_load_program(&cpu, host_prog, dos_path, args) < 0) return 1;
 
     if (use_jit && !dbt_jit_available(&cpu)) {
         fprintf(stderr, "dos-monster: JIT unavailable for this model/host; using the interpreter\n");
@@ -140,6 +170,7 @@ int main(int argc, char **argv) {
     if (use_jit) {
         if (dbt_init(&g_dbt, &cpu) < 0) return 1;
         g_dbt.verify = verify;
+        g_dbt.verify_mem_every = mem_every;
         g_dbt.insn_limit = limit;
         g_dbt.poll = host_poll;
         rc = dbt_run(&g_dbt);

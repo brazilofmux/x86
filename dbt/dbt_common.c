@@ -261,6 +261,7 @@ int dbt_run(x86_dbt *dbt) {
 
                 dbt->jit_block_entries++;
                 trampoline(cpu, cpu->mem, code, dbt->aux, dbt->quantum);
+                poll_countdown = 0;
                 uint64_t jit_insns = cpu->insn_count - insns_before;
 
                 for (uint64_t i = 0; i < jit_insns; i++)

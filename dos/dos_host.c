@@ -70,19 +70,24 @@ static int find_component(const char *dir, const char *comp, char *found, size_t
     return ok;
 }
 
+int dos_path_drive(const char *p) {
+    while (*p == ' ') p++;
+    if (isalpha((unsigned char)p[0]) && p[1] == ':') return toupper((unsigned char)p[0]) - 'A';
+    return dos.cur_drive;
+}
+
 /* Normalise a DOS path (drive, relative/absolute, . and ..) into an
  * absolute DOS path "\A\B\C" without drive. Returns 0 on a bad drive. */
-static int canon(const char *in, char *out, size_t n) {
+static int canon(const char *in, char *out, size_t n, int *drive) {
     char comps[32][64]; int nc = 0;
     const char *p = in;
     while (*p == ' ') p++;
-    if (isalpha((unsigned char)p[0]) && p[1] == ':') {
-        if (toupper((unsigned char)p[0]) != 'C') return 0;
-        p += 2;
-    }
+    *drive = dos_path_drive(p);
+    if (*drive < 0 || *drive >= 26 || !dos.drives[*drive].root[0]) return 0;
+    if (isalpha((unsigned char)p[0]) && p[1] == ':') p += 2;
     if (*p != '\\' && *p != '/') {
-        /* relative: start from cwd */
-        const char *c = dos.cwd;
+        /* relative: start from that drive's cwd */
+        const char *c = dos.drives[*drive].cwd;
         while (*c) {
             while (*c == '\\') c++;
             if (!*c) break;
@@ -113,9 +118,9 @@ static int canon(const char *in, char *out, size_t n) {
  * exist (creation); *exists / *is_dir describe what was found. Returns
  * a DOS error code, 0 on success (even when the leaf is missing). */
 int dos_resolve(const char *dos_path, char *host, size_t n, int *exists, int *is_dir) {
-    char abs[DOS_MAX_PATH];
-    if (!canon(dos_path, abs, sizeof abs)) return DE_INVALID_DRIVE;
-    snprintf(host, n, "%s", dos.root);
+    char abs[DOS_MAX_PATH]; int drive;
+    if (!canon(dos_path, abs, sizeof abs, &drive)) return DE_INVALID_DRIVE;
+    snprintf(host, n, "%s", dos.drives[drive].root);
     *exists = 1; *is_dir = 1;
     const char *p = abs;
     while (*p) {

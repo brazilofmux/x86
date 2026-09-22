@@ -65,28 +65,55 @@ void pc_kbd_shutdown(void) {
 }
 
 /* ---- Raw scancode stream ------------------------------------------------
- * Programs that take the keyboard over (INT 9 + port 60h: Borland's
- * IDEs, games) see what a keyboard would send: shift make, key make,
- * key break, shift break. One code is latched per INT 9; pc_poll raises
- * the next after the guest's handler has returned. */
-static uint8_t rawq[256];
+ * Every host key becomes what a keyboard would send: shift make, key
+ * make, key break, shift break. pc_poll latches one code at port 60h
+ * and raises INT 9; the next code waits until the guest's handler has
+ * read the port. Whoever owns INT 9 translates: a program's own handler
+ * (WP, games) does its thing, and the BIOS default (bios_int9 below)
+ * pushes the (ascii, scancode) pair we remembered for the make code
+ * into the ring buffer at 40:1E. */
+typedef struct { uint8_t code, ascii; } rawkey;
+static rawkey rawq[256];
 static int rawq_head, rawq_tail;
-static void raw_enqueue(uint8_t code) {
+static uint8_t latched_ascii;
+static void raw_enqueue(uint8_t code, uint8_t ascii) {
+    if (pc.debug > 1) fprintf(stderr, "[kbd] raw %02X (ascii %02X)\n", code, ascii);
     int next = (rawq_tail + 1) & 255;
     if (next == rawq_head) return;
-    rawq[rawq_tail] = code; rawq_tail = next;
-}
-static int raw_dequeue(uint8_t *code) {
-    if (rawq_head == rawq_tail) return 0;
-    *code = rawq[rawq_head]; rawq_head = (rawq_head + 1) & 255;
-    return 1;
+    rawq[rawq_tail] = (rawkey){ code, ascii }; rawq_tail = next;
 }
 int pc_kbd_raw_pending(void) { return rawq_head != rawq_tail; }
-int pc_kbd_raw_next(uint8_t *code) { return raw_dequeue(code); }
+int pc_kbd_raw_next(uint8_t *code) {
+    if (rawq_head == rawq_tail) return 0;
+    *code = rawq[rawq_head].code; latched_ascii = rawq[rawq_head].ascii;
+    rawq_head = (rawq_head + 1) & 255;
+    return 1;
+}
 
 static int needs_shift(uint8_t ascii) {
     if (ascii >= 'A' && ascii <= 'Z') return 1;
     return ascii < 0x7F && strchr("!@#$%^&*()_+{}|:\"<>?~", ascii) != NULL;
+}
+
+/* Queue a host key as scancodes. */
+static void key_to_raw(uint8_t ascii, uint8_t scancode) {
+    if (!scancode) return;
+    int shift = ascii && needs_shift(ascii), ctrl = ascii >= 1 && ascii <= 26 && ascii != 8 && ascii != 9 && ascii != 13;
+    int ext = ascii == 0 && (scancode == 0x48 || scancode == 0x50 || scancode == 0x4B || scancode == 0x4D ||
+                             scancode == 0x47 || scancode == 0x4F || scancode == 0x49 || scancode == 0x51 ||
+                             scancode == 0x52 || scancode == 0x53);
+    /* ascii 0 on an ordinary key = Alt+key (ESC-letter in the script) */
+    int alt = ascii == 0 && !ext && scancode < 0x3B && scancode != 0x01;
+    if (shift) raw_enqueue(0x2A, 0);
+    if (ctrl) raw_enqueue(0x1D, 0);
+    if (alt) raw_enqueue(0x38, 0);
+    if (ext) raw_enqueue(0xE0, 0);
+    raw_enqueue(scancode, ascii);
+    if (ext) raw_enqueue(0xE0, 0);
+    raw_enqueue((uint8_t)(scancode | 0x80), 0);
+    if (alt) raw_enqueue(0xB8, 0);
+    if (ctrl) raw_enqueue(0x9D, 0);
+    if (shift) raw_enqueue(0xAA, 0);
 }
 
 /* ---- BIOS ring buffer ---------------------------------------------------- */
@@ -97,20 +124,32 @@ void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode) {
     if (next == head) return;                        /* full: drop */
     pc_wr16(c, BDA, tail, (uint16_t)((scancode << 8) | ascii));
     pc_wr16(c, BDA, 0x1C, next);
-    if (!scancode) return;
-    int shift = ascii && needs_shift(ascii), ctrl = ascii >= 1 && ascii <= 26 && ascii != 8 && ascii != 9 && ascii != 13;
-    int ext = ascii == 0 && (scancode == 0x48 || scancode == 0x50 || scancode == 0x4B || scancode == 0x4D ||
-                             scancode == 0x47 || scancode == 0x4F || scancode == 0x49 || scancode == 0x51 ||
-                             scancode == 0x52 || scancode == 0x53);
-    if (shift) raw_enqueue(0x2A);
-    if (ctrl) raw_enqueue(0x1D);
-    if (ext) raw_enqueue(0xE0);
-    raw_enqueue(scancode);
-    if (ext) raw_enqueue(0xE0);
-    raw_enqueue((uint8_t)(scancode | 0x80));
-    if (ctrl) raw_enqueue(0x9D);
-    if (shift) raw_enqueue(0xAA);
 }
+
+/* Default INT 9: the code latched at port 60h was ours, so the make
+ * code's (ascii, scancode) goes into the buffer. Shift/ctrl makes and
+ * all breaks are dropped; E0-prefixed keys keep ascii 0. */
+void pc_kbd_int9(x86_cpu *c, int vector) {
+    (void)vector;
+    pc.irq9_busy = 0;
+    pc.irq_in_service &= ~2;                     /* the BIOS handler's EOI */
+    uint8_t code = pc.last_scancode;
+    /* shift state → BDA 40:17 (bit 0 rshift, 1 lshift, 2 ctrl, 3 alt) */
+    uint8_t flags = pc_rd8(c, BDA, 0x17);
+    int down = !(code & 0x80);
+    switch (code & 0x7F) {
+    case 0x2A: flags = (uint8_t)(down ? flags | 2 : flags & ~2); pc_wr8(c, BDA, 0x17, flags); return;
+    case 0x36: flags = (uint8_t)(down ? flags | 1 : flags & ~1); pc_wr8(c, BDA, 0x17, flags); return;
+    case 0x1D: flags = (uint8_t)(down ? flags | 4 : flags & ~4); pc_wr8(c, BDA, 0x17, flags); return;
+    case 0x38: flags = (uint8_t)(down ? flags | 8 : flags & ~8); pc_wr8(c, BDA, 0x17, flags); return;
+    }
+    if (!down || code == 0xE0) return;
+    if (flags & 8) { pc_kbd_push(c, 0, code); return; }              /* Alt+key */
+    if (!latched_ascii && !(code >= 0x3B && code <= 0x44) && !(code >= 0x47 && code <= 0x53) && code != 0x85 && code != 0x86 && code != 0x01) return;
+    pc_kbd_push(c, latched_ascii, code);
+}
+
+static void drain_raw_here(x86_cpu *c);
 
 int pc_kbd_buffer_empty(x86_cpu *c) {
     pc.kbd_reads++;
@@ -119,6 +158,7 @@ int pc_kbd_buffer_empty(x86_cpu *c) {
 
 int pc_kbd_peek(x86_cpu *c, uint16_t *key) {
     pc.kbd_reads++;
+    drain_raw_here(c);
     uint16_t head = pc_rd16(c, BDA, 0x1A);
     if (head == pc_rd16(c, BDA, 0x1C)) return 0;
     *key = pc_rd16(c, BDA, head);
@@ -182,6 +222,11 @@ static int next_key(x86_cpu *c, int blocking) {
             }
         }
         if (!sc) { ascii = 0x1B; sc = 0x01; used = 1; }
+    } else if (b == 0x1B && npending >= 2 && pending[1] == '+') {
+        /* ESC + : change diskettes (next directory of a removable drive) */
+        memmove(pending, pending + 2, (size_t)(npending - 2)); npending -= 2;
+        if (pc.swap_disk) pc.swap_disk();
+        return 1;
     } else if (b == 0x1B && npending >= 2 && ((pending[1] >= 'a' && pending[1] <= 'z') || (pending[1] >= '0' && pending[1] <= '9'))) {
         /* ESC letter/digit: Alt+key, as xterm sends it (ascii 0, key scancode) */
         ascii = 0; sc = scancode_for(pending[1]); used = 2;
@@ -192,7 +237,8 @@ static int next_key(x86_cpu *c, int blocking) {
     }
     memmove(pending, pending + used, (size_t)(npending - used));
     npending -= used;
-    pc_kbd_push(c, ascii, sc);
+    (void)c;
+    key_to_raw(ascii, sc);
     return 1;
 }
 
@@ -217,21 +263,34 @@ void pc_kbd_poll(x86_cpu *c) {
 void pc_kbd_idle_poll(x86_cpu *c) {
     static uint64_t deadline; static int fed_eof;
     if (!pc.eof_seen || isatty(STDIN_FILENO)) return;
-    if (!fed_eof) { fed_eof = 1; pc_kbd_push(c, 0x1A, 0x2C); deadline = pc_now_ns() + 2000000000ull; return; }
+    if (!fed_eof) { fed_eof = 1; key_to_raw(0x1A, 0x2C); deadline = pc_now_ns() + 2000000000ull; return; }
     if (pc_now_ns() < deadline) return;
     fprintf(stderr, "dos-monster: input exhausted, program still running\n");
     pc.exit_requested = 1; pc.exit_code = 1;
     c->halted = 1;
 }
 
+/* Inside a blocking BIOS/DOS read no INT 9 can run: move queued codes
+ * straight through the default translation when INT 9 is ours. (A
+ * program with its own INT 9 handler never blocks in INT 16h/00 with
+ * an empty buffer unless it wants to sleep until its handler fills it,
+ * which we cannot do from here — it gets the keys when it returns.) */
+static void drain_raw_here(x86_cpu *c) {
+    if (pc_rd16(c, 0, 9 * 4 + 2) != PC_HLE_SEG) return;
+    uint8_t code;
+    while (pc_kbd_raw_next(&code)) { pc.last_scancode = code; pc_kbd_int9(c, 9); }
+}
+
 void pc_kbd_wait(x86_cpu *c) {
     while (pc_kbd_buffer_empty(c)) {
         pc_video_flush(1);
+        drain_raw_here(c);
+        if (!pc_kbd_buffer_empty(c)) break;
         if (pc.eof_seen) {
             /* Scripted input ran out: hand the program a Ctrl-Z once,
              * then treat further waits as "nothing more will happen". */
             static int fed_eof;
-            if (!fed_eof) { fed_eof = 1; pc_kbd_push(c, 0x1A, 0x2C); return; }
+            if (!fed_eof) { fed_eof = 1; key_to_raw(0x1A, 0x2C); return; }
             fprintf(stderr, "dos-monster: input exhausted while waiting for a key\n");
             pc.exit_requested = 1; pc.exit_code = 1;
             c->halted = 1;

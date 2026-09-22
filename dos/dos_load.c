@@ -116,14 +116,11 @@ void dos_mem_free_owner(uint16_t owner) {
 void dos_init(x86_cpu *cpu, const char *root) {
     memset(&dos, 0, sizeof dos);
     dos.cpu = cpu;
-    snprintf(dos.root, sizeof dos.root, "%s", root);
-    size_t l = strlen(dos.root);
-    while (l > 1 && dos.root[l - 1] == '/') dos.root[--l] = 0;
-    strcpy(dos.cwd, "\\");
     dos.cur_drive = 2;
+    dos_mount(2, root);
     for (int i = 0; i < DOS_MAX_HANDLES; i++) dos.handles[i].fd = -1;
     for (int i = 0; i < 5; i++) {
-        dos.handles[i].fd = i < 3 ? i : -2;
+        dos.handles[i].fd = -2;
         dos.handles[i].dev = i < 3 ? 1 : (i == 3 ? 2 : 3);
         strcpy(dos.handles[i].path, i < 3 ? "CON" : i == 3 ? "AUX" : "PRN");
     }
@@ -138,6 +135,41 @@ void dos_init(x86_cpu *cpu, const char *root) {
     pc_set_service(0x27, dos_int20, HLE_RET_FLAGS);
     pc_set_service(0x29, dos_int29, HLE_RET_IRET);
     pc_set_service(0x2F, dos_int2f, HLE_RET_FLAGS);
+}
+
+/* Mount host directory/directories on a drive. A colon-separated list
+ * is a diskette sequence: the first is in the drive, dos_swap_disk
+ * moves to the next. */
+int dos_mount(int drive, const char *dirs) {
+    if (drive < 0 || drive >= 26) return -1;
+    dos_drive *d = &dos.drives[drive];
+    memset(d, 0, sizeof *d);
+    char *list = strdup(dirs);
+    for (char *tok = strtok(list, ":"); tok; tok = strtok(NULL, ":")) {
+        d->disks = realloc(d->disks, sizeof(char *) * (size_t)(d->ndisks + 1));
+        char *abs = realloc(NULL, DOS_MAX_PATH);
+        if (!realpath(tok, abs)) { fprintf(stderr, "dos: %s: no such directory\n", tok); free(list); return -1; }
+        d->disks[d->ndisks++] = abs;
+    }
+    free(list);
+    if (!d->ndisks) return -1;
+    snprintf(d->root, sizeof d->root, "%s", d->disks[0]);
+    strcpy(d->cwd, "\\");
+    return 0;
+}
+
+int dos_swap_disk(void) {
+    int swapped = 0;
+    for (int i = 0; i < 2; i++) {
+        dos_drive *d = &dos.drives[i];
+        if (d->ndisks < 2) continue;
+        d->cur_disk = (d->cur_disk + 1) % d->ndisks;
+        snprintf(d->root, sizeof d->root, "%s", d->disks[d->cur_disk]);
+        strcpy(d->cwd, "\\");
+        fprintf(stderr, "dos: drive %c: now %s\n", 'A' + i, d->root);
+        swapped = 1;
+    }
+    return swapped;
 }
 
 /* ---- PSP ------------------------------------------------------------------ */
@@ -210,7 +242,7 @@ int dos_load_program(x86_cpu *c, const char *host_path, const char *dos_name, co
     el += 1 + (size_t)sprintf(env + el, "PROMPT=$P$G");
     env[el++] = 0;
     env[el++] = 1; env[el++] = 0;
-    el += 1 + (size_t)sprintf(env + el, "C:\\%s", dos_name);
+    el += 1 + (size_t)sprintf(env + el, "%c:%s%s", 'A' + dos.cur_drive, dos_name[0] == '\\' ? "" : "\\", dos_name);
     uint16_t env_paras = (uint16_t)((el + 15) / 16);
     uint16_t env_seg = dos_mem_alloc(env_paras, 0, NULL);
     for (size_t i = 0; i < el; i++) pc_wr8(c, env_seg, (uint16_t)i, (uint8_t)env[i]);
@@ -223,7 +255,8 @@ int dos_load_program(x86_cpu *c, const char *host_path, const char *dos_name, co
     if (!psp) { free(img); return -1; }
     pc_wr16(c, env_seg - 1, 1, psp);                 /* env owned by the program */
     pc_wr16(c, psp - 1, 1, psp);
-    for (int i = 0; i < 8; i++) pc_wr8(c, (uint16_t)(psp - 1), (uint16_t)(8 + i), (uint8_t)(i < (int)strcspn(dos_name, ".") && i < 8 ? toupper((unsigned char)dos_name[i]) : 0));
+    const char *base = strrchr(dos_name, '\\'); base = base ? base + 1 : dos_name;
+    for (int i = 0; i < 8; i++) pc_wr8(c, (uint16_t)(psp - 1), (uint16_t)(8 + i), (uint8_t)(i < (int)strcspn(base, ".") && i < 8 ? toupper((unsigned char)base[i]) : 0));
     uint16_t top = (uint16_t)(psp + largest);
     build_psp(c, psp, env_seg, top, args);
     dos.psp = psp;
@@ -286,7 +319,8 @@ void dos_terminate(x86_cpu *c, int code, int keep_paras) {
     uint16_t psp = dos.psp;
     if (pc.debug) fprintf(stderr, "[dos] terminate code %d, PSP %04X (root %04X)\n", code, psp, dos.root_psp);
     for (int i = 5; i < DOS_MAX_HANDLES; i++)
-        if (dos.handles[i].fd >= 0 && dos.handles[i].owner_psp == psp) { close(dos.handles[i].fd); dos.handles[i].fd = -1; }
+        if (dos.handles[i].fd >= 0 && !dos.handles[i].dev && dos.handles[i].owner_psp == psp) { close(dos.handles[i].fd); dos.handles[i].fd = -1; }
+        else if (dos.handles[i].fd == -2 && dos.handles[i].owner_psp == psp) dos.handles[i].fd = -1;
     if (!keep_paras) dos_mem_free_owner(psp);
     dos.return_code = code;
     uint16_t parent = pc_rd16(c, psp, 0x16);

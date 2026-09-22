@@ -43,15 +43,27 @@ typedef struct {
     uint8_t  dev;            /* 0 file, 1 CON, 2 AUX/NUL, 3 PRN */
     uint8_t  binary;         /* IOCTL raw mode on a device */
     uint8_t  mode;           /* open mode byte */
+    uint8_t  drive;
     uint16_t owner_psp;
     char     path[DOS_MAX_PATH];
 } dos_handle;
 
+/* A drive letter mapped to a host directory. Removable drives (A:, B:)
+ * can carry a list of directories standing in for successive diskettes;
+ * the swap key (see pc_kbd.c) advances to the next one. */
+typedef struct {
+    char     root[DOS_MAX_PATH];      /* host directory that is X:\ ; "" = no such drive */
+    char     cwd[DOS_MAX_PATH];       /* current directory, "\\DIR" form without drive */
+    char   **disks;                   /* removable: the diskette directories */
+    int      ndisks, cur_disk;
+} dos_drive;
+
 typedef struct {
     x86_cpu *cpu;
-    char     root[DOS_MAX_PATH];      /* host directory that is C:\ */
-    char     cwd[DOS_MAX_PATH];       /* DOS current directory on C:, "\\" form without drive */
-    int      cur_drive;               /* 2 = C: */
+    dos_drive drives[26];
+    int      cur_drive;               /* 0 = A:, 2 = C: */
+    #define dos_root (dos.drives[dos.cur_drive].root)
+    #define dos_cwd  (dos.drives[dos.cur_drive].cwd)
     uint16_t psp;                     /* current PSP segment */
     uint16_t root_psp;                /* the program we loaded; its exit ends the run */
     uint16_t dta_seg, dta_off;
@@ -68,6 +80,8 @@ extern dos_state dos;
 
 /* dos_load.c */
 void dos_init(x86_cpu *cpu, const char *root);
+int  dos_mount(int drive, const char *dirs);            /* "dir" or "dir1:dir2:..." for a diskette sequence */
+int  dos_swap_disk(void);                              /* next diskette in the current removable drive(s); 1 if swapped */
 int  dos_load_program(x86_cpu *cpu, const char *host_path, const char *dos_name, const char *args);
 uint16_t dos_mem_alloc(uint16_t paras, uint16_t owner, uint16_t *largest);
 int  dos_mem_free(uint16_t seg);
@@ -78,6 +92,7 @@ void dos_make_child_psp(x86_cpu *c, uint16_t seg, uint16_t top);
 
 /* dos_host.c */
 int  dos_resolve(const char *dos_path, char *host_out, size_t n, int *exists, int *is_dir);
+int  dos_path_drive(const char *dos_path);              /* drive index of a path (current drive if none) */
 void dos_shortname(const char *host_name, char *out13);      /* 8.3 upper-case, "" if not representable */
 int  dos_match(const char *pattern83, const char *name83);
 uint16_t dos_ftime(time_t t, uint16_t *date);

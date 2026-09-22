@@ -53,6 +53,7 @@ static void hle_dispatch(x86_cpu *c, int vector) {
 /* ---- Timer ------------------------------------------------------------- */
 static void bios_int8(x86_cpu *c, int vector) {
     (void)vector;
+    pc.irq_in_service &= ~1;                     /* the BIOS handler's EOI */
     uint32_t t = pc_rd16(c, PC_BDA_SEG, 0x6C) | ((uint32_t)pc_rd16(c, PC_BDA_SEG, 0x6E) << 16);
     t++;
     if (t >= 0x1800B0) { t = 0; pc_wr8(c, PC_BDA_SEG, 0x70, 1); }
@@ -136,6 +137,10 @@ static void bios_int15(x86_cpu *c, int vector) {
 
 /* ---- IRQ delivery ------------------------------------------------------ */
 static void deliver(x86_cpu *c, int vector) {
+    pc.irq_in_service |= 1 << (vector - 8);
+    pc.irq_service_ns = pc_now_ns();
+    if (pc.debug > 1) fprintf(stderr, "[irq] INT %02X → %04X:%04X @%llu\n", vector,
+                              pc_rd16(c, 0, (uint16_t)(vector * 4 + 2)), pc_rd16(c, 0, (uint16_t)(vector * 4)), (unsigned long long)c->insn_count);
     x86_interrupt(c, vector, 0);
     c->halted = 0;
 }
@@ -148,11 +153,18 @@ int pc_poll(x86_cpu *c) {
 
     /* Keyboard: latch the next raw code and raise INT 9 once the previous
      * one has been taken (the guest's handler has returned). */
-    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && pc_kbd_raw_pending()) {
+    /* A keyboard delivers a scancode every couple of milliseconds at
+     * best; handlers (WP's) rely on having finished with one before the
+     * next arrives, beyond what the PIC's in-service gating guarantees. */
+    static uint64_t last_code_ns;
+    uint64_t now = pc_now_ns();
+    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
         uint8_t code;
         pc_kbd_raw_next(&code);
         pc.last_scancode = code;
         pc.irq_pending |= 1 << 9;
+        pc.irq9_busy = 1;                        /* until the handler reads port 60h */
+        last_code_ns = now;
     }
 
     uint64_t expected = (pc_now_ns() - pc.t0_ns) / TICK_NS;
@@ -166,24 +178,65 @@ int pc_poll(x86_cpu *c) {
         if (next > now) usleep((useconds_t)((next - now) / 1000 + 1));
         pc.irq_pending |= 1 << 8;
     }
+    if (pc.debug > 2) { static int n; if ((n++ & 1023) == 0) fprintf(stderr, "[poll] pending %X isr %X IF %d inhibit %d @%llu\n", pc.irq_pending, pc.irq_in_service, (c->eflags & X86_IF) != 0, c->int_inhibit, (unsigned long long)c->insn_count); }
     if (!pc.irq_pending || !(c->eflags & X86_IF) || c->int_inhibit) return 0;
-    if (pc.irq_pending & (1 << 8)) {
+    /* 8259 priority: nothing while an equal-or-higher IRQ is in service
+     * (until its EOI). A handler that never EOIs would hang a real PC;
+     * we forgive it after 200 ms of wall clock. */
+    if (pc.irq_in_service && pc_now_ns() - pc.irq_service_ns > 200000000ull) pc.irq_in_service = 0;
+    if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1)) {
         pc.irq_pending &= ~(1 << 8);
         pc.ticks_delivered++;
         deliver(c, 8);
-    } else if (pc.irq_pending & (1 << 9)) {
+        return 1;
+    }
+    if ((pc.irq_pending & (1 << 9)) && !(pc.irq_in_service & 3)) {
         pc.irq_pending &= ~(1 << 9);
         deliver(c, 9);
+        return 1;
     }
-    return 1;
+    return 0;
 }
 
-/* ---- Ports ------------------------------------------------------------- */
+/* ---- Ports -------------------------------------------------------------
+ * 8253 PIT channel 0 (WP 5.1 and games calibrate delays against it):
+ * the counter runs at 1193182 Hz from wall clock, counting down from
+ * the reload value; OUT 43h with a latch command captures it for the
+ * next two reads of port 40h. Channel 2 (speaker) behaves the same so
+ * timing loops on it work; no sound. PIC mask register at 21h is just
+ * stored. */
+#define PIT_HZ 1193182ull
+static struct { uint16_t reload; uint16_t latch; int latched, rw_phase, mode_rw; } pit[3];
+static uint8_t pic_mask = 0xB8, pit_speaker;
+
+static uint16_t pit_now(int ch) {
+    uint64_t ticks = (pc_now_ns() - pc.t0_ns) * PIT_HZ / 1000000000ull;
+    uint32_t reload = pit[ch].reload ? pit[ch].reload : 65536;
+    return (uint16_t)(reload - (ticks % reload));
+}
+
 static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
-    (void)c; (void)size;
+    (void)size;
+    if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
+        fprintf(stderr, "[port] in %02X → %02X @%llu\n", port, port == 0x60 ? pc.last_scancode : port == 0x61 ? pit_speaker : 0x14, (unsigned long long)c->insn_count);
     switch (port) {
-    case 0x60: return pc.last_scancode;
-    case 0x61: return 0x00;
+    case 0x40: case 0x41: case 0x42: {
+        int ch = port - 0x40;
+        uint16_t v = pit[ch].latched ? pit[ch].latch : pit_now(ch);
+        int rw = pit[ch].mode_rw ? pit[ch].mode_rw : 3;
+        uint8_t b;
+        if (rw == 1) b = (uint8_t)v;
+        else if (rw == 2) b = (uint8_t)(v >> 8);
+        else { b = pit[ch].rw_phase ? (uint8_t)(v >> 8) : (uint8_t)v; pit[ch].rw_phase ^= 1; }
+        if (!pit[ch].rw_phase || rw != 3) pit[ch].latched = 0;
+        return b;
+    }
+    case 0x43: return 0xFF;
+    case 0x20: return 0;
+    case 0x21: return pic_mask;
+    case 0x60: pc.irq9_busy = 0; return pc.last_scancode;
+    case 0x61: return pit_speaker;
+    case 0x64: return 0x14;                      /* 8042 status: not busy, no output */
     case 0x3DA: {                                /* CGA status: toggle retrace bits */
         static uint8_t t; t ^= 0x09; return t;
     }
@@ -191,7 +244,35 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     }
 }
 static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
-    (void)c; (void)port; (void)val; (void)size;
+    (void)size;
+    if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61 || port == 0x20))
+        fprintf(stderr, "[port] out %02X ← %02X @%llu\n", port, val & 0xFF, (unsigned long long)c->insn_count);
+    switch (port) {
+    case 0x43: {
+        int ch = (val >> 6) & 3;
+        if (ch == 3) break;                      /* read-back: unsupported */
+        int rw = (val >> 4) & 3;
+        if (rw == 0) { pit[ch].latch = pit_now(ch); pit[ch].latched = 1; pit[ch].rw_phase = 0; }
+        else { pit[ch].mode_rw = rw; pit[ch].rw_phase = 0; }
+        break;
+    }
+    case 0x40: case 0x41: case 0x42: {
+        int ch = port - 0x40;
+        int rw = pit[ch].mode_rw ? pit[ch].mode_rw : 3;
+        if (rw == 1) pit[ch].reload = (uint16_t)((pit[ch].reload & 0xFF00) | (val & 0xFF));
+        else if (rw == 2) pit[ch].reload = (uint16_t)((pit[ch].reload & 0x00FF) | ((val & 0xFF) << 8));
+        else if (pit[ch].rw_phase == 0) { pit[ch].reload = (uint16_t)((pit[ch].reload & 0xFF00) | (val & 0xFF)); pit[ch].rw_phase = 1; }
+        else { pit[ch].reload = (uint16_t)((pit[ch].reload & 0x00FF) | ((val & 0xFF) << 8)); pit[ch].rw_phase = 0; }
+        break;
+    }
+    case 0x21: pic_mask = (uint8_t)val; break;
+    case 0x20:                                   /* EOI: non-specific clears the highest in service */
+        if ((val & 0xE0) == 0x60) pc.irq_in_service &= ~(1 << (val & 7));
+        else if (val == 0x20) for (int i = 0; i < 8; i++) if (pc.irq_in_service & (1 << i)) { pc.irq_in_service &= ~(1 << i); break; }
+        break;
+    case 0x61: pit_speaker = (uint8_t)(val & 0x0F); break;
+    default: break;
+    }
 }
 
 /* ---- Boot -------------------------------------------------------------- */
@@ -235,6 +316,7 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     pc_set_service(0x1A, bios_int1a, HLE_RET_FLAGS);
     pc_set_service(0x10, pc_video_int10, HLE_RET_FLAGS);
     pc_set_service(0x16, pc_kbd_int16, HLE_RET_FLAGS);
+    pc_set_service(0x09, pc_kbd_int9, HLE_RET_IRET);
 
     pc_video_init(cpu);
     pc_kbd_init();

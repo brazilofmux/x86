@@ -49,12 +49,15 @@ typedef struct pc_state {
     uint64_t t0_ns;                  /* wall clock at boot */
     uint64_t ticks_delivered;        /* INT 8s raised so far */
     int      irq_pending;            /* bitmask: 1<<8 timer, 1<<9 keyboard */
+    int      irq_in_service;         /* 8259 ISR: bits set from delivery until EOI */
+    uint64_t irq_service_ns;         /* when the in-service IRQ was delivered (stuck-handler guard) */
 
     /* Services by vector; NULL = plain IRET stub. */
     pc_service_fn service[256];
     uint8_t       ret_mode[256];
 
     int returned;                    /* the running service popped its own frame */
+    int (*swap_disk)(void);          /* ESC-+ : next diskette (dos layer) */
     int exit_requested;              /* DOS asked to terminate */
     int exit_code;
     int debug;
@@ -95,6 +98,7 @@ int  pc_kbd_get(x86_cpu *c, uint16_t *key);
 void pc_kbd_wait(x86_cpu *c);                            /* block until a key is in the buffer */
 void pc_kbd_idle_poll(x86_cpu *c);                       /* DOS-level "is a key ready" polls */
 void pc_kbd_int16(x86_cpu *c, int vector);
+void pc_kbd_int9(x86_cpu *c, int vector);                /* default INT 9: latched code → BIOS buffer */
 void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode);
 int  pc_kbd_raw_pending(void);
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
