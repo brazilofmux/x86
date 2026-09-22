@@ -25,3 +25,8 @@ tests/*.exe
 tests/*.com
 tests/*.bin
 tests/*.json
+
+# Test-suite data (tests/sst8088/fetch.sh)
+tests/sst8088/*.MOO.gz
+tests/sst8088/metadata.json
+tools/sst8088
