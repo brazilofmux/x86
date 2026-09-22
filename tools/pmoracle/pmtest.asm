@@ -142,6 +142,22 @@ next_case:
         movzx eax, word [fs:esi + 8]
         movzx edi, word [fs:esi + 10]          ; 0 = run at CPL 0, 3 = at CPL 3
         inc ebx
+        ; IRET is the one instruction that needs its operand built on the
+        ; stack. The case names the CS to return through, and an SS if the
+        ; return is meant to change privilege (the processor decides that
+        ; from CS.RPL, so a mismatched frame is itself worth testing).
+        cmp byte [slot], 0xCF
+        jne .noframe
+        movzx ebp, word [fs:esi + 12]
+        test ebp, ebp
+        jz  .sameprivilege
+        push ebp                               ; SS
+        push dword RING3_STACK                 ; ESP
+.sameprivilege:
+        push dword 2                           ; EFLAGS
+        push eax                               ; CS
+        push dword far_target                  ; EIP
+.noframe:
         mov ecx, 0xC0DEC0DE        ; a recognisable pattern in the registers the
         mov edx, 0xDA7ADA7A        ; instruction should not be touching
         test edi, edi
@@ -252,12 +268,13 @@ idtr:   dw NVEC * 8 - 1
         dd IDT_BASE
 
 ; Each case: 8 bytes of instruction (NOP-padded), then the AX it runs with.
-%macro CASE 2-3 0                  ; %1 = instruction bytes, %2 = ax, %3 = CPL
+%macro CASE 2-4 0, 0               ; %1 = instruction bytes, %2 = ax, %3 = CPL, %4 = frame SS
         %%s: db %1
         times 8 - ($ - %%s) db 0x90
         dw %2
         dw %3
-        dw 0, 0
+        dw %4
+        dw 0
 %endmacro
 
 %define MOV_DS 0x8E, 0xD8           ; mov ds, ax
@@ -339,6 +356,14 @@ cases:
         CASE {MOV_DS}, 0x001C      ; LDT code, readable
         CASE {MOV_DS}, 0x00FC      ; TI=1 index past the LDT limit
         FARCASE 0xEA, 0x001C       ; far jump to an LDT code segment
+        ; ---- IRET, the way back down. The frame is built by the loop above.
+        CASE {0xCF}, 0x0008, 0, 0x0000   ; same privilege: pops EIP, CS, EFLAGS only
+        CASE {0xCF}, 0x0048, 0, 0x0000   ; conforming code, RPL 0: still same privilege
+        CASE {0xCF}, 0x0073, 0, 0x001B   ; down to ring 3: also pops ESP and SS
+        CASE {0xCF}, 0x0010, 0, 0x0000   ; a data segment as the return CS
+        CASE {0xCF}, 0x0050, 0, 0x0000   ; return CS not present
+        CASE {0xCF}, 0x0000, 0, 0x0000   ; null return CS
+        CASE {0xCF}, 0x0073, 0, 0x0010   ; ring 3 CS with a ring 0 SS in the frame
 cases_end:
 NCASES  equ (cases_end - cases) / CASE_BYTES
 

@@ -56,13 +56,13 @@ display.
 
 ## What it covers so far
 
-54 cases: segment-register loads (DS, SS, ES) against every descriptor
+61 cases: segment-register loads (DS, SS, ES) against every descriptor
 shape, far JMP/CALL against code, data, gates and junk, the same
-instructions again at **CPL 3**, and an LDT, reached by IRET to a ring-3 code
+instructions again at **CPL 3**, an LDT, and IRET, reached by IRET to a ring-3 code
 segment and returned from through a DPL 3 trap gate with a TSS supplying
 the inbound stack.
 
-47 match our expectations under both references, 2 differ only in cache
+52 match our expectations under both references, 2 differ only in cache
 encoding, 2 are the LDTR case, 3 are accessed-bit differences, and none
 are unexpected.
 
@@ -95,6 +95,27 @@ stack:
 The last inward case is the whole call-gate mechanism in one row: the
 stack came from the TSS, and 0x7000 - 0x6FF0 is four dwords — SS, ESP,
 CS, EIP of the interrupted ring-3 context.
+
+### IRET
+
+IRET is the only instruction here whose operand is a stack frame, so the
+sweep builds one from the case: the CS to return through, and an SS if
+the return is meant to change privilege. The processor decides that for
+itself from CS.RPL, which is why a *mismatched* frame is worth testing.
+
+The returned SS:ESP is the evidence of which kind of return happened:
+
+    iret 0008      -> CS=0008  ss:esp=0010:7000   same privilege: EIP, CS, EFLAGS only
+    iret 0048      -> CS=0048  ss:esp=0010:7000   conforming at RPL 0: still same privilege
+    iret 0073/001B -> CS=0073  ss:esp=001B:5000   CS.RPL 3 > CPL: ESP and SS popped too
+    iret 0010      -> #GP      a data segment as the return CS
+    iret 0050      -> #NP      return CS not present
+    iret 0000      -> #GP(0)   null return CS
+    iret 0073/0010 -> #GP      SS.RPL must match CS.RPL
+
+The last one is worth the measurement: the error code is **0010**, the
+offending SS, not the CS the frame named. A fault during a return is
+attributed to the selector that was actually wrong.
 
 ### The LDT
 

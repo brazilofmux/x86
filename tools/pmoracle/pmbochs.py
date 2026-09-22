@@ -65,15 +65,16 @@ def run(img, under, fault, ncases, spec=None):
                 i = len(recs)
                 tgt = spec[i][0] if spec and i < len(spec) else "ds"
                 cpl = spec[i][3] if spec and i < len(spec) else 0
+                aux = spec[i][4] if spec and i < len(spec) else 0
                 if spec and i < len(spec):
                     sel = spec[i][1]          # a far transfer carries it in the instruction
-                reg = {"jmpf": "cs", "callf": "cs", "lldt": "ldtr", "ltr": "tr"}.get(tgt, tgt)
+                reg = {"jmpf": "cs", "callf": "cs", "iret": "cs", "lldt": "ldtr", "ltr": "tr"}.get(tgt, tgt)
                 v = segs.get(reg, [0, 0, 0, 0])
                 # Landing on stub i *is* the vector: one stub per vector, fixed
                 # stride. Reading it from a register would be a step too early,
                 # since the post-step dump is taken before the stub runs.
                 faulted = STUB_BASE <= rip_post < STUB_BASE + NVEC * STUB_STRIDE
-                r = {"target": tgt, "sel": sel, "cpl": cpl, "faulted": faulted,
+                r = {"target": tgt, "sel": sel, "cpl": cpl, "aux": aux, "faulted": faulted,
                      "seg": v[0], "base": v[2], "limit": v[3],
                      "ar": (v[1] >> 8) & 0xFFFFFF,
                      "esp": esp or 0, "ss": segs.get("ss", [0])[0]}

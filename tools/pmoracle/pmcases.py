@@ -19,7 +19,7 @@ def footer(img):
     return dict(slot=slot, after=after, fault=fault, n=n, cases=cases, width=width)
 
 def cases(img):
-    """[(key, selector, instruction-bytes, cpl)] in execution order."""
+    """[(key, selector, instruction-bytes, cpl, aux)] in execution order."""
     d = open(img, "rb").read()
     f = footer(img)
     out = []
@@ -28,12 +28,15 @@ def cases(img):
         raw = d[off:off + 8]
         sel = struct.unpack_from("<H", d, off + 8)[0]
         ring = struct.unpack_from("<H", d, off + 10)[0]
+        aux  = struct.unpack_from("<H", d, off + 12)[0]   # IRET frame SS; 0 otherwise
         instr = raw.rstrip(b"\x90") or raw[:2]
-        if raw[0] == 0x0F and raw[1] == 0x00:
-            out.append((GRP6.get((raw[2] >> 3) & 7, "grp6"), sel, bytes(raw[:3]), ring))
+        if raw[0] == 0xCF:
+            out.append(("iret", sel, b"\xcf", ring, aux))
+        elif raw[0] == 0x0F and raw[1] == 0x00:
+            out.append((GRP6.get((raw[2] >> 3) & 7, "grp6"), sel, bytes(raw[:3]), ring, aux))
         elif raw[0] in FAR:
             sel = struct.unpack_from("<H", raw, 5)[0]
-            out.append((FAR[raw[0]], sel, bytes(raw[:7]), ring))
+            out.append((FAR[raw[0]], sel, bytes(raw[:7]), ring, aux))
         else:
-            out.append((TARGET.get(bytes(instr[:2]), instr[:2].hex()), sel, bytes(instr), ring))
+            out.append((TARGET.get(bytes(instr[:2]), instr[:2].hex()), sel, bytes(instr), ring, aux))
     return out

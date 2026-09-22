@@ -92,14 +92,14 @@ def records(img=None):
     run_qemu(img)
     out = []
     for i, (pre, post) in enumerate(cases(parse(LOG), under)):
-        tgt, sel, cpl = (spec[i][0], spec[i][1], spec[i][3]) if i < len(spec) else ("?", 0, 0)
-        r = {"target": tgt, "sel": sel, "cpl": cpl}
+        tgt, sel, cpl, aux = (spec[i][0], spec[i][1], spec[i][3], spec[i][4]) if i < len(spec) else ("?", 0, 0, 0)
+        r = {"target": tgt, "sel": sel, "cpl": cpl, "aux": aux}
         if pre["exc"]:
             r.update(faulted=True, vec=pre["exc"][0], err=pre["exc"][1])
         elif post is None:
             r.update(faulted=None)
         else:
-            reg = {"jmpf": "CS", "callf": "CS", "lldt": "LDT", "ltr": "TR"}.get(tgt, tgt.upper())
+            reg = {"jmpf": "CS", "callf": "CS", "iret": "CS", "lldt": "LDT", "ltr": "TR"}.get(tgt, tgt.upper())
             d = post["segs"].get(reg, (0, 0, 0, 0))
             r.update(faulted=False, seg=d[0], base=d[1], limit=d[2], ar=d[3] >> 8,
                      esp=post["regs"].get("ESP", 0), ss=post["segs"].get("SS", (0,))[0])
