@@ -59,26 +59,39 @@ a cache that is unusable anyway (a null selector, or the garbage below),
 which is an internal encoding rather than behaviour. `compare.py`
 reports those separately from behavioural differences.
 
-### The one that matters
+### Where we are deliberately stricter
 
-**Neither emulator faults on a selector with TI=1 when LDTR has never
-been loaded.** Both hold a reset LDTR whose cache has the present bit
-set (`ldtr:0x0000, dh=0x00008200, valid=1` in Bochs; `LDT=0000 00000000
-0000ffff 00008200` in QEMU), so both read a "descriptor" from linear
-address 0 and load whatever is there. They disagree only about the
-garbage, because the garbage is IVT contents and their BIOSes differ:
+`expected.py` records what the *architecture* requires, per case, with a
+rationale and a note on whether the references corroborate it.
+`compare.py` prints it as a third column, so a case where we knowingly
+differ from both emulators is a tracked decision rather than something
+to rediscover:
 
-    sel 0084  qemu  ok DS=0084 base=F053F000 limit=0000FF53
-              bochs ok DS=0084 base=F053F000 limit=0000FF53 (different ar)
-    sel 000C  qemu  ok DS=000C base=F053F000 limit=0000E2C3
-              bochs ok DS=000C base=F053F000 limit=0000FF53
+      sel   qemu   bochs  wanted
+      0084  ok     ok     #0D    deliberately stricter: TI=1 with LDTR never loaded -> #GP
+      0088  #0D    fault  #0D
 
-Real hardware holds LDTR null out of reset, and a selector with TI=1
-should raise #GP with the selector as the error code — as both get right
-for a GDT index past the limit (`sel 0088 -> #0D err=0088`).
+Neither emulator faults on a selector with TI=1 when LDTR has never been
+loaded. Both hold a reset LDTR whose cache has the present bit set, so
+both read a "descriptor" from linear address 0 and load whatever is
+there — and they disagree about *which* garbage, because it is IVT
+contents and their BIOSes differ.
 
-**Do not copy this into the interpreter.** It is the worked example of
-why two references are not a vote: they agree here and are, on the
-manual's reading, both wrong. Settle cases like this against the manual,
-and if the ambiguity ever matters enough, against a real 386 — which the
-kernel can boot on unchanged.
+We take the manual's reading and fault, for three reasons:
+
+* the permissive behaviour is **not reproducible** — it depends on BIOS
+  contents, and lockstep verification needs determinism;
+* permissiveness is **unfalsifiable in the bad direction**: if we are lax
+  and wrong, nothing ever tells us, whereas if we are strict and wrong a
+  real program breaks loudly and we learn something;
+* it **masks our own bugs**: when the DPMI host hands out a stale LDT
+  selector, a lax CPU turns that into a wrong answer ten thousand
+  instructions later, and a strict one faults at the instruction that
+  caused it.
+
+"No real software does that" is not a reason to be lax. The value of an
+oracle is in the cases nobody intended.
+
+These are decisions, not measurements. They are the first things to
+revisit if a real client ever misbehaves, and the distinction from a
+silicon-measured contract should stay visible in the interpreter too.

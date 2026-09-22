@@ -8,6 +8,7 @@ import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import pmrun, pmbochs
+from expected import EXPECT
 
 def key(r):
     if r["faulted"] is None: return ("truncated",)
@@ -18,29 +19,40 @@ q = pmrun.records()
 under, after, fault, n = pmrun.footer(os.path.join(HERE, "pmtest.img"))
 b = pmbochs.run(os.path.join(HERE, "pmtest.img"), under, fault, n)
 
-print("QEMU %d cases, Bochs %d cases" % (len(q), len(b)))
-agree = soft = hard = 0
-for i, (x, y) in enumerate(zip(q, b)):
+def verdict(r):
+    if r["faulted"] is None: return "?"
+    if r["faulted"]: return "#%02X" % r["vec"] if "vec" in r else "fault"
+    return "ok"
+
+print("QEMU %d cases, Bochs %d cases\n" % (len(q), len(b)))
+print("  sel   qemu   bochs  wanted  ")
+agree = soft = hard = strict = unlisted = 0
+for x, y in zip(q, b):
     if x["sel"] != y["sel"]:
-        print("  case %d: selectors out of step (%04X vs %04X)" % (i, x["sel"], y["sel"])); break
-    if key(x) == key(y):
-        agree += 1; continue
-    def desc(r):
-        return "fault" if r["faulted"] else ("ok DS=%04X base=%08X limit=%08X ar=%06X"
-               % (r["ds"], r["base"], r["limit"], r["ar"]))
-    # Both loaded, same visible selector and geometry, only the access-rights
-    # word of an unusable cache differs: an internal encoding, not behaviour.
-    same_shape = (not x["faulted"] and not y["faulted"]
-                  and (x["ds"], x["base"], x["limit"]) == (y["ds"], y["base"], y["limit"]))
-    if same_shape:
-        soft += 1
-        print("  sel %04X  differ in cache encoding only (ar %06X vs %06X)"
-              % (x["sel"], x["ar"], y["ar"]))
-        continue
-    hard += 1
-    print("  sel %04X  DISAGREE" % x["sel"])
-    print("      qemu  %s" % desc(x))
-    print("      bochs %s" % desc(y))
-print("%d agree, %d encoding-only, %d behavioural" % (agree, soft, hard))
-if hard == 0 and soft:
-    print("note: agreement is evidence, not proof — both are software.")
+        print("  selectors out of step (%04X vs %04X)" % (x["sel"], y["sel"])); break
+    vq, vb = verdict(x), verdict(y)
+    exp = EXPECT.get(x["sel"])
+    ve = exp[0] if exp else "-"
+    # Bochs' harness reports only "fault", so compare fault-vs-not there.
+    def same(a, c): return a == c or (a.startswith("#") and c == "fault") or (c.startswith("#") and a == "fault")
+    note = ""
+    if exp is None:
+        unlisted += 1; note = "no expectation recorded"
+    elif not same(ve, vq) or not same(ve, vb):
+        if exp[1] == "neither":
+            strict += 1; note = "deliberately stricter: " + exp[2]
+        else:
+            hard += 1; note = "UNEXPECTED: " + exp[2]
+    elif not x["faulted"] and not y["faulted"] and \
+         (x["ds"], x["base"], x["limit"]) == (y["ds"], y["base"], y["limit"]) and x["ar"] != y["ar"]:
+        soft += 1; note = "cache-encoding difference only (ar %06X vs %06X)" % (x["ar"], y["ar"])
+    else:
+        agree += 1
+    print("  %04X  %-6s %-6s %-6s  %s" % (x["sel"], vq, vb, ve, note))
+
+print("\n%d as expected, %d encoding-only, %d where we are deliberately stricter than both references,"
+      % (agree, soft, strict))
+print("%d unexpected, %d with no expectation recorded." % (hard, unlisted))
+if strict:
+    print("\nThe stricter cases are a decision, not a measurement: see expected.py for the")
+    print("reasoning. They are the ones to revisit first if a real client ever misbehaves.")
