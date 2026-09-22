@@ -266,14 +266,15 @@ void dbt_arch_patch_link(x86_dbt *dbt, uint32_t site_off, uint8_t *target) {
  * ---------------------------------------------------------------------- */
 
 /* Dynamic tail. X0 = next key. Probe the cache through the aux base:
- *   X3 = aux + AUX_CACHE + lin*16 ; LDP key,code ; CMP ; BR or exit. */
+ *   X3 = aux + AUX_CACHE + slot(lin)*16 ; LDP key,code ; CMP ; BR or exit. */
 static void emit_dynamic_tail(emit_t *e, uint32_t exit_stub_off) {
     if (s_strict_exit > 0) {
         emit_b(e, (int32_t)exit_stub_off - (int32_t)emit_pos(e));
         return;
     }
+    (void)emit_and_w32_imm(e, W_T2, A64_W0, BLOCK_CACHE_MASK);
     emit_add_x64_imm_lsl12(e, W_T3, R_AUX, AUX_CACHE >> 12);
-    emit_add_x64_w32_uxtw_lsl(e, W_T3, W_T3, A64_W0, 4);
+    emit_add_x64_w32_uxtw_lsl(e, W_T3, W_T3, W_T2, 4);
     emit_ldp_x64_off(e, W_T1, W_T2, W_T3, 0);
     emit_cmp_x64_x64(e, W_T1, A64_W0);
     uint32_t miss = emit_pos(e);
@@ -294,11 +295,10 @@ static void emit_edge(x86_dbt *dbt, emit_t *e, uint64_t key) {
         emit_dynamic_tail(e, dbt->exit_stub_off);
         return;
     }
-    uint32_t lin = dbt_key_lin(key);
     uint32_t site = e->offset;
     int linked = 0;
-    if (dbt_link_record(dbt, lin, site)) {
-        x86_block_entry *be = &dbt->aux->cache[lin];
+    if (dbt_link_record(dbt, key, site)) {
+        x86_block_entry *be = &dbt->aux->cache[dbt_slot(dbt_key_lin(key))];
         if (be->key == key && be->code) {
             emit_b(e, (int32_t)(be->code - (e->buf + site)));
             linked = 1;

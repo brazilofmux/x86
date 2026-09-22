@@ -33,13 +33,15 @@
  * X11..X17 are caller-saved: helper-call sequences spill what the
  * helper reads and reload everything after.
  *
- * Block key = (cs_sel << 32) | linear, linear = (CS.base + IP) & a20.
- * The cache is direct-mapped 1:1 on linear over low memory
- * (X86_LOW_SIZE entries; the JIT refuses protected mode, so nothing is
- * translated from extended memory yet), so
- * the span-gated SMC sweep from z80 carries over unchanged; the 64-bit
- * tag keeps two CS values that alias one linear address apart (the
- * translation bakes in IP-relative constants).
+ * Block key = mode bits | (cs_sel << 32) | linear, linear =
+ * (CS.base + EIP) & a20 (see dbt_key). The cache is direct-mapped on
+ * linear & (BLOCK_CACHE_SIZE-1): 1:1 over low memory, so real mode never
+ * aliases, while extended memory folds onto it. A slot therefore only
+ * ever holds a block starting at one of the addresses that fold there,
+ * and everything that walks slots by address (the SMC sweep, the link
+ * registry) checks the entry's own linear address. The 64-bit tag keeps
+ * two CS values that alias one linear address apart (the translation
+ * bakes in IP-relative constants).
  */
 #ifndef DBT_H
 #define DBT_H
@@ -73,22 +75,35 @@ typedef struct {
 } x86_block_entry;
 _Static_assert(sizeof(x86_block_entry) == 16, "x86_block_entry must be 16 bytes");
 
-#define BLOCK_CACHE_SIZE   X86_LOW_SIZE
+#define BLOCK_CACHE_BITS   21
+#define BLOCK_CACHE_SIZE   (1u << BLOCK_CACHE_BITS)   /* covers low memory 1:1 */
+#define BLOCK_CACHE_MASK   (BLOCK_CACHE_SIZE - 1)
+_Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in the block cache");
 #define BLOCK_EMPTY_KEY    0xFFFFFFFFFFFFFFFFull
 #define BLOCK_REFUSED_BIT  0x8000000000000000ull
 
+/* Key bits above the selector: how the bytes at `linear` decode. A
+ * translation is only valid for the mode it was made in, and in
+ * protected mode for the code segment's default size. */
+#define KEY_PMODE          (1ull << 48)
+#define KEY_BIG            (1ull << 49)   /* CS D bit: 32-bit default operand/address size */
+
 static inline uint64_t dbt_key(uint32_t cs_sel, uint32_t lin) { return ((uint64_t)cs_sel << 32) | lin; }
 static inline uint32_t dbt_key_lin(uint64_t key) { return (uint32_t)key; }
+static inline uint32_t dbt_slot(uint32_t lin) { return lin & BLOCK_CACHE_MASK; }
 
 #ifndef MAX_BLOCK_INSNS
 #define MAX_BLOCK_INSNS    64
 #endif
 
 /* Direct block linking (see dbt_cache.c): every static edge is a
- * patchable B recorded here by target linear address. */
+ * patchable B recorded here under its target's cache slot, with the
+ * full target key — slots are shared, and a site must only ever be
+ * patched to the block it names. */
 #define LINK_POOL_SIZE   (512 * 1024)
 #define LINK_NONE        0xFFFFFFFFu
 typedef struct {
+    uint64_t key;
     uint32_t site_off;
     uint32_t next;
 } x86_link;
@@ -133,13 +148,13 @@ _Static_assert(offsetof(x86_jit_aux, cache)   == AUX_CACHE,   "aux cache offset"
 
 typedef struct {
     x86_cpu *cpu;
-    x86_jit_aux *aux;              /* calloc'd: ~17 MB, lazily committed */
+    x86_jit_aux *aux;              /* calloc'd: ~32 MB, lazily committed */
 
     /* Byte span of each cached block, parallel to aux->cache. Read only
      * by the C-side SMC sweeps; 0xFFFFFFFF for refused sentinels. */
     uint32_t *span;
 
-    /* Direct-link registry, keyed by target linear address. */
+    /* Direct-link registry, one list per cache slot. */
     uint32_t *link_head;           /* BLOCK_CACHE_SIZE entries */
     x86_link *link_pool;
     uint32_t  link_used;
@@ -204,8 +219,8 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out);
 x86_block_entry *dbt_cache_lookup(x86_dbt *dbt, uint64_t key);
 void             dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code);
 void             dbt_cache_invalidate_all(x86_dbt *dbt);
-int  dbt_link_record(x86_dbt *dbt, uint32_t lin, uint32_t site_off);
-void dbt_links_repatch(x86_dbt *dbt, uint32_t lin, uint8_t *code);
+int  dbt_link_record(x86_dbt *dbt, uint64_t key, uint32_t site_off);
+void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code);
 void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end);
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys);          /* cpu->smc_hook */
 void dbt_clear_code_bits(x86_cpu *cpu);                   /* forget translations, keep device marks */

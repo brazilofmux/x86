@@ -1,19 +1,21 @@
 /* dbt_cache.c — direct-mapped translated-block cache, direct-link
  * registry, and span-gated SMC invalidation.
  *
- * Lifted from ~/z80/dbt/block_cache.c. The cache is 1:1 on the guest
- * linear address over low memory (X86_LOW_SIZE entries), which the SMC
- * sweep relies on:
- * the slot for linear p can only ever hold the block starting at p, so
- * its span says exactly whether that block covers a stored byte. Two CS
- * values aliasing one linear address (different 64-bit keys) conflict
- * on the slot and evict each other — rare, and the eviction unlinks.
+ * Lifted from ~/z80/dbt/block_cache.c. The cache is indexed on the guest
+ * linear address modulo BLOCK_CACHE_SIZE: 1:1 over low memory, folded
+ * over extended memory. The SMC sweep relies on the slot for linear p
+ * holding, if anything of p's, the block starting at p, so its span says
+ * exactly whether that block covers a stored byte — as long as the entry
+ * is checked to really start at p and not at an address folding onto the
+ * same slot. Two keys sharing a slot (another CS at the same linear
+ * address, or another folded address) conflict and evict each other;
+ * the eviction unlinks.
  */
 #include "dbt.h"
 #include <string.h>
 
 x86_block_entry *dbt_cache_lookup(x86_dbt *dbt, uint64_t key) {
-    x86_block_entry *e = &dbt->aux->cache[dbt_key_lin(key)];
+    x86_block_entry *e = &dbt->aux->cache[dbt_slot(dbt_key_lin(key))];
     if (e->key == key || e->key == (key | BLOCK_REFUSED_BIT)) {
         dbt->cache_hits++;
         return e;
@@ -22,30 +24,31 @@ x86_block_entry *dbt_cache_lookup(x86_dbt *dbt, uint64_t key) {
     return NULL;
 }
 
-/* Drop the block in slot `lin` (if any): clear the entry and unlink
- * every site that branches straight to it. */
-static void evict_slot(x86_dbt *dbt, uint32_t lin) {
-    x86_block_entry *e = &dbt->aux->cache[lin];
+/* Drop the block in `slot` (if any): clear the entry and unlink every
+ * site that branches straight to it. */
+static void evict_slot(x86_dbt *dbt, uint32_t slot) {
+    x86_block_entry *e = &dbt->aux->cache[slot];
     if (e->key == BLOCK_EMPTY_KEY) return;
+    uint64_t old = e->key & ~BLOCK_REFUSED_BIT;
     e->key  = BLOCK_EMPTY_KEY;
     e->code = NULL;
-    dbt_links_repatch(dbt, lin, NULL);
+    dbt_links_repatch(dbt, old, NULL);
 }
 
 void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
-    uint32_t lin = dbt_key_lin(key);
-    x86_block_entry *e = &dbt->aux->cache[lin];
-    /* A different CS aliasing this linear address: the old block's
-     * direct links would otherwise keep running it with the wrong CS. */
+    uint32_t slot = dbt_slot(dbt_key_lin(key));
+    x86_block_entry *e = &dbt->aux->cache[slot];
+    /* Another key in this slot: the old block's direct links would
+     * otherwise keep running it after the probe stopped finding it. */
     if (e->key != BLOCK_EMPTY_KEY && (e->key & ~BLOCK_REFUSED_BIT) != key)
-        evict_slot(dbt, lin);
+        evict_slot(dbt, slot);
     e->key  = code ? key : (key | BLOCK_REFUSED_BIT);
     /* Refusal is decided from the bytes at lin without tracking how
      * many were looked at — treat the sentinel as covering any store in
      * the window so it is always retried. */
-    dbt->span[lin] = code ? dbt->last_block_bytes : 0xFFFFFFFFu;
+    dbt->span[slot] = code ? dbt->last_block_bytes : 0xFFFFFFFFu;
     e->code = code;
-    dbt_links_repatch(dbt, lin, code);
+    dbt_links_repatch(dbt, key, code);
 }
 
 /* NOTE: every caller also rewinds the code buffer (dbt_init; the
@@ -65,8 +68,8 @@ void dbt_cache_invalidate_all(x86_dbt *dbt) {
     dbt->insn_used = 0;
 }
 
-int dbt_link_record(x86_dbt *dbt, uint32_t lin, uint32_t site_off) {
-    uint32_t i;
+int dbt_link_record(x86_dbt *dbt, uint64_t key, uint32_t site_off) {
+    uint32_t i, slot = dbt_slot(dbt_key_lin(key));
     if (dbt->link_free != LINK_NONE) {
         i = dbt->link_free;
         dbt->link_free = dbt->link_pool[i].next;
@@ -75,35 +78,38 @@ int dbt_link_record(x86_dbt *dbt, uint32_t lin, uint32_t site_off) {
     } else {
         return 0;
     }
+    dbt->link_pool[i].key      = key;
     dbt->link_pool[i].site_off = site_off;
-    dbt->link_pool[i].next     = dbt->link_head[lin];
-    dbt->link_head[lin] = i;
+    dbt->link_pool[i].next     = dbt->link_head[slot];
+    dbt->link_head[slot] = i;
     dbt->links_created++;
     return 1;
 }
 
-void dbt_links_repatch(x86_dbt *dbt, uint32_t lin, uint8_t *code) {
-    uint32_t i = dbt->link_head[lin];
-    if (i == LINK_NONE) return;
+/* Point every site that names `key` at `code`, or, with code == NULL
+ * (the block is gone), unlink those sites and free their records. Sites
+ * naming other keys that share the slot are left alone either way. */
+void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code) {
+    uint32_t *pi = &dbt->link_head[dbt_slot(dbt_key_lin(key))];
+    if (*pi == LINK_NONE) return;
     dbt_jit_writable_begin();
-    if (code) {
-        for (; i != LINK_NONE; i = dbt->link_pool[i].next) {
-            dbt_arch_patch_link(dbt, dbt->link_pool[i].site_off, code);
+    while (*pi != LINK_NONE) {
+        x86_link *l = &dbt->link_pool[*pi];
+        if (l->key != key) { pi = &l->next; continue; }
+        dbt_arch_patch_link(dbt, l->site_off, code);
+        if (code) {
             dbt->links_patched++;
-        }
-    } else {
-        /* Unlink AND free the list: an invalidated target's sites almost
-         * always belong to blocks dying in the same SMC wave, and their
-         * re-translations re-record fresh sites. */
-        while (i != LINK_NONE) {
-            uint32_t next = dbt->link_pool[i].next;
-            dbt_arch_patch_link(dbt, dbt->link_pool[i].site_off, NULL);
-            dbt->link_pool[i].next = dbt->link_free;
+            pi = &l->next;
+        } else {
+            /* Unlink AND free: an invalidated target's sites almost
+             * always belong to blocks dying in the same SMC wave, and
+             * their re-translations re-record fresh sites. */
+            uint32_t i = *pi;
+            *pi = l->next;
+            l->next = dbt->link_free;
             dbt->link_free = i;
             dbt->links_unpatched++;
-            i = next;
         }
-        dbt->link_head[lin] = LINK_NONE;
     }
     dbt_jit_writable_end();
 }
@@ -112,7 +118,7 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     uint32_t bytes = end - start;
     if (bytes > dbt->max_block_bytes) dbt->max_block_bytes = bytes;
     dbt->last_block_bytes = bytes;
-    uint8_t *bm = dbt->cpu->code_bitmap;    /* extended memory past X86_LOW_SIZE absorbs top-of-low-memory blocks */
+    uint8_t *bm = dbt->cpu->code_bitmap;    /* X86_MEM_SLACK past mem_size absorbs a block at the very top */
     for (uint32_t a = start; a < end; a++) bm[a] |= X86_BM_CODE;
 }
 
@@ -124,12 +130,13 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
 static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
     uint32_t window = dbt->max_block_bytes;
     for (uint32_t k = 0; k < window && k <= phys; k++) {
-        uint32_t p = phys - k;
-        x86_block_entry *e = &dbt->aux->cache[p];
-        if (e->key == BLOCK_EMPTY_KEY || k >= dbt->span[p]) continue;
+        uint32_t p = phys - k, slot = dbt_slot(p);
+        x86_block_entry *e = &dbt->aux->cache[slot];
+        if (e->key == BLOCK_EMPTY_KEY || dbt_key_lin(e->key) != p || k >= dbt->span[slot]) continue;
+        uint64_t old = e->key & ~BLOCK_REFUSED_BIT;
         e->key  = BLOCK_EMPTY_KEY;
         e->code = NULL;
-        dbt_links_repatch(dbt, p, NULL);
+        dbt_links_repatch(dbt, old, NULL);
         /* The block that is executing right now (a JIT store or a helper
          * op inside it): the thunk sees this flag and leaves the block
          * before its next, now stale, instruction. */
@@ -148,7 +155,7 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
 /* Forget every translated byte, keeping device marks. */
 void dbt_clear_code_bits(x86_cpu *cpu) {
     uint8_t *bm = cpu->code_bitmap;
-    for (uint32_t i = 0; i < X86_LOW_SIZE; i++) bm[i] &= (uint8_t)~X86_BM_CODE;
+    for (uint32_t i = 0; i < cpu->mem_size; i++) bm[i] &= (uint8_t)~X86_BM_CODE;
 }
 
 /* cpu->a20_hook. Every block key and every baked far-transfer mask is
