@@ -1,0 +1,27 @@
+# Build artifacts
+*.o
+*.d
+*.dSYM/
+dos-monster
+tools/mk*
+!**/*.c
+!**/*.h
+
+# Editor / OS noise
+.DS_Store
+*~
+*.swp
+.idea/
+.vscode/
+
+# Runtime outputs
+*.log
+*.trace
+perf.data*
+
+# DOS software stays local — bring your own copies.
+disks/
+tests/*.exe
+tests/*.com
+tests/*.bin
+tests/*.json
