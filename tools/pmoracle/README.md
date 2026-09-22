@@ -6,12 +6,19 @@ privilege we have to make our own reference. This is the generator.
 
 ## How it works
 
-`pmtest.asm` is a boot sector, not a test program. It builds an IDT whose
+`pmtest.asm` is a two-stage boot image, not a test program. It builds an IDT whose
 every gate abandons the frame and resumes the sweep, enters 32-bit
 protected mode with a GDT holding one descriptor of each interesting
-shape, and then executes **the instruction under test at a fixed address**
-once per case. It asserts nothing: what the machine does is whatever the
-log says it did.
+shape, and then runs a table of cases. Each case carries the **bytes** of the
+instruction under test, which are copied into a fixed slot and executed
+there — so the harness always finds the instruction at one address, and
+the case decides what the instruction is. It asserts nothing: what the
+machine does is whatever the log says it did.
+
+The image is self-describing. A footer at offset 496 carries the magic
+`PS`, the slot address, the address after it, the fault handler, the
+case count, and the address and stride of the case table, so the
+harnesses and `expected.py` all read the cases from one source.
 
 `pmrun.py` runs the image under QEMU with `-d cpu,int` and
 `-accel tcg,one-insn-per-tb=on`, and pairs up the dumps: the one at the
@@ -47,17 +54,33 @@ breakpoint on the instruction under test, then `r`/`s`/`r`/`sreg` per
 case, fed on stdin). `bochsrc` here is a floppy-only machine with no
 display.
 
-## First results
+## What it covers so far
 
-Ten of fourteen cases agree exactly. A not-present descriptor gives #NP
-with the selector as the error code, execute-only code loaded into DS
-gives #GP, a GDT index past the limit gives #GP, and the loaded
-descriptor caches match down to the byte-granular `limit=0FFF`.
+Segment-register loads against every descriptor shape, for DS, SS and
+ES: 24 cases, of which 20 match our expectations under both references,
+two differ only in cache encoding, and two are the LDTR case below.
 
-Of the four that differ, three differ only in the access-rights word of
-a cache that is unusable anyway (a null selector, or the garbage below),
-which is an internal encoding rather than behaviour. `compare.py`
-reports those separately from behavioural differences.
+The SS rules are the interesting part, because they differ from DS on
+every axis and the oracle shows it plainly:
+
+    case          DS     SS
+    0020 absent   #0B    #0C     a not-present stack segment is #SS, not #NP
+    0040 r/o data ok     #0D     SS must be writable
+    0018 DPL 3    ok     #0D     SS requires DPL = CPL
+    0000 null     ok     #0D     null is legal in DS, not in SS
+
+and one detail worth having measured rather than remembered: loading SS
+with `001B` faults with **error code `0018`**. The low three bits of an
+exception error code are the EXT/IDT/TI flags, so the RPL does not
+appear in it.
+
+### A limitation of the Bochs side
+
+`pmbochs.py` reports fault-versus-not, not the vector: it infers a fault
+from landing on the handler. QEMU's `-d int` gives the vector and error
+code, so those columns come from QEMU alone and Bochs corroborates only
+the decision. Recording the vector guest-side would need per-vector IDT
+stubs, which is worth doing when the case set grows.
 
 ### Where we are deliberately stricter
 

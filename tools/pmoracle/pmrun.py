@@ -8,6 +8,8 @@ than one and treat a disagreement as the interesting output rather than
 as a failure of the tool.
 """
 import re, struct, subprocess, sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pmcases
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = "/tmp/pmoracle.log"
@@ -26,7 +28,7 @@ def run_qemu(img):
                     "-display", "none", "-no-reboot",
                     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
                     "-accel", "tcg,one-insn-per-tb=on",
-                    "-dfilter", "0x7c00..0x7fff",
+                    "-dfilter", "0x7c00..0x8fff",
                     "-d", "cpu,int", "-D", LOG],
                    timeout=180, check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -85,19 +87,20 @@ def records(img=None):
     """Per-case results from QEMU, in the shape pmbochs.py also returns."""
     img = img or os.path.join(HERE, "pmtest.img")
     under, after, fault, ncases = footer(img)
+    spec = pmcases.cases(img)
     run_qemu(img)
     out = []
-    for pre, post in cases(parse(LOG), under):
-        sel = pre["regs"].get("EAX", 0) & 0xFFFF
+    for i, (pre, post) in enumerate(cases(parse(LOG), under)):
+        tgt, sel = (spec[i][0], spec[i][1]) if i < len(spec) else ("?", 0)
+        r = {"target": tgt, "sel": sel}
         if pre["exc"]:
-            v, err = pre["exc"]
-            out.append({"sel": sel, "faulted": True, "vec": v, "err": err})
+            r.update(faulted=True, vec=pre["exc"][0], err=pre["exc"][1])
         elif post is None:
-            out.append({"sel": sel, "faulted": None})
+            r.update(faulted=None)
         else:
-            d = post["segs"].get("DS", (0, 0, 0, 0))
-            out.append({"sel": sel, "faulted": False, "ds": d[0],
-                        "base": d[1], "limit": d[2], "ar": d[3] >> 8})
+            d = post["segs"].get(tgt.upper(), (0, 0, 0, 0))
+            r.update(faulted=False, seg=d[0], base=d[1], limit=d[2], ar=d[3] >> 8)
+        out.append(r)
     return out
 
 def show(recs, title):
@@ -105,10 +108,10 @@ def show(recs, title):
     for r in recs:
         if r["faulted"]:
             extra = "  #%02X err=%04X" % (r["vec"], r["err"]) if "vec" in r else ""
-            print("  sel %04X  ->  fault%s" % (r["sel"], extra))
+            print("  %s <- %04X  fault%s" % (r["target"], r["sel"], extra))
         else:
-            print("  sel %04X  ->  ok  DS=%04X base=%08X limit=%08X ar=%06X"
-                  % (r["sel"], r["ds"], r["base"], r["limit"], r["ar"]))
+            print("  %s <- %04X  ok  %04X base=%08X limit=%08X ar=%06X"
+                  % (r["target"], r["sel"], r["seg"], r["base"], r["limit"], r["ar"]))
 
 if __name__ == "__main__":
     show(records(), "QEMU:")

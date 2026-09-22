@@ -15,23 +15,26 @@ def key(r):
     if r["faulted"]: return ("fault",)
     return ("ok", r["ds"], r["base"], r["limit"], r["ar"])
 
+import pmcases
+IMG = os.path.join(HERE, "pmtest.img")
+spec = pmcases.cases(IMG)
 q = pmrun.records()
-under, after, fault, n = pmrun.footer(os.path.join(HERE, "pmtest.img"))
-b = pmbochs.run(os.path.join(HERE, "pmtest.img"), under, fault, n)
+under, after, fault, n = pmrun.footer(IMG)
+b = pmbochs.run(IMG, under, fault, n, spec)
 
 def verdict(r):
     if r["faulted"] is None: return "?"
-    if r["faulted"]: return "#%02X" % r["vec"] if "vec" in r else "fault"
+    if r["faulted"]: return ("#%02X" % r["vec"]) if "vec" in r else "fault"
     return "ok"
 
 print("QEMU %d cases, Bochs %d cases\n" % (len(q), len(b)))
-print("  sel   qemu   bochs  wanted  ")
+print("  case        qemu   bochs  wanted")
 agree = soft = hard = strict = unlisted = 0
 for x, y in zip(q, b):
-    if x["sel"] != y["sel"]:
-        print("  selectors out of step (%04X vs %04X)" % (x["sel"], y["sel"])); break
+    if (x["target"], x["sel"]) != (y["target"], y["sel"]):
+        print("  cases out of step (%s %04X vs %s %04X)" % (x["target"], x["sel"], y["target"], y["sel"])); break
     vq, vb = verdict(x), verdict(y)
-    exp = EXPECT.get(x["sel"])
+    exp = EXPECT.get((x["target"], x["sel"]))
     ve = exp[0] if exp else "-"
     # Bochs' harness reports only "fault", so compare fault-vs-not there.
     def same(a, c): return a == c or (a.startswith("#") and c == "fault") or (c.startswith("#") and a == "fault")
@@ -44,11 +47,11 @@ for x, y in zip(q, b):
         else:
             hard += 1; note = "UNEXPECTED: " + exp[2]
     elif not x["faulted"] and not y["faulted"] and \
-         (x["ds"], x["base"], x["limit"]) == (y["ds"], y["base"], y["limit"]) and x["ar"] != y["ar"]:
+         (x["seg"], x["base"], x["limit"]) == (y["seg"], y["base"], y["limit"]) and x["ar"] != y["ar"]:
         soft += 1; note = "cache-encoding difference only (ar %06X vs %06X)" % (x["ar"], y["ar"])
     else:
         agree += 1
-    print("  %04X  %-6s %-6s %-6s  %s" % (x["sel"], vq, vb, ve, note))
+    print("  %-3s <- %04X  %-6s %-6s %-6s %s" % (x["target"], x["sel"], vq, vb, ve, note))
 
 print("\n%d as expected, %d encoding-only, %d where we are deliberately stricter than both references,"
       % (agree, soft, strict))
