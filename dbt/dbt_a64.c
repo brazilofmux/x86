@@ -709,14 +709,23 @@ static void emit_shift_imm(emit_t *e, int op, int size, uint32_t cnt, a64_reg_t 
  * ---------------------------------------------------------------------- */
 /* Stack pushes skip the SMC check (the stack essentially never
  * overlaps code) but keep the 8086 wrap check: PUSH at SP=1 exists. */
+/* A push is a store like any other and can land on translated code: a
+ * .COM has SS = CS, and an interrupt frame goes wherever SP points. So
+ * it carries the same code-bitmap check as any other store. SP is
+ * re-derived from the pinned register afterwards rather than carried in
+ * a temp, because the SMC helper call clobbers every scratch register
+ * and the wrap chunk rejoins here. */
 static void emit_push16(emit_t *e, a64_reg_t val) {
     /* new SP in a temp until the store is known to succeed (fault: SP intact) */
     emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
     (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
-    emit_wrap_check(e, R_SSP, W_T2, val, 1, 0);
+    emit_wrap_check(e, R_SSP, W_T2, val, 1, 1);
     emit_strh_reg_uxtw(e, val, R_SSP, W_T2);
+    emit_add_x64_w32_uxtw(e, W_T3, R_SSP, W_T2);
+    emit_smc_check_x3(e);
     emit_wrap_back(e);
-    emit_mov_w32_w32(e, R_GPR(R_SP), W_T2);
+    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 2);
+    (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
 }
 static void emit_pop16(emit_t *e, a64_reg_t dst) {
     emit_wrap_check(e, R_SSP, R_GPR(R_SP), dst, 0, 0);

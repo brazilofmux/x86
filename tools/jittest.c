@@ -258,13 +258,15 @@ static int fuzz_accept(const x86_insn *in) {
     if (in->seg_override == S_CS) return 0;
     switch (in->op) {
     case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
-    case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INT: case OP_INT3: case OP_INTO:
+    case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INTO:
     case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_POPF: case OP_HLT:
         return 0;
     case OP_POP: case OP_PUSH:
         return in->ops[0].kind != OPK_SREG;
     case OP_IN: case OP_OUT:
         return 1;
+    case OP_INT: case OP_INT3:
+        return 1;                    /* every vector points at the IRET stub below */
     default:
         return dbt_classify_op(in) != 0;
     }
@@ -299,6 +301,14 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
     cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
     cpu.eip = 0x100;
     memcpy(cpu.mem + 0x10100, prog, plen);
+    /* Interrupt landing zone: every vector points at 9000:0000, an IRET
+     * back to the instruction after the INT. Exercises the frame push,
+     * the CS load and the return edge under -V. */
+    for (int v = 0; v < 256; v++) {
+        cpu.mem[v * 4 + 0] = 0x00; cpu.mem[v * 4 + 1] = 0x00;
+        cpu.mem[v * 4 + 2] = 0x00; cpu.mem[v * 4 + 3] = 0x90;
+    }
+    cpu.mem[0x90000] = 0xCF;
     for (int i = 0; i < 0x30000; i++) cpu.mem[0x30000 + i] = (uint8_t)rnd();
     for (int i = 0; i < 0x10000; i++) cpu.mem[0x70000 + i] = (uint8_t)rnd();
 
@@ -316,7 +326,7 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
         fprintf(stderr, "%s seed=%llu model=%d len=%d:", rc ? "FAIL" : "ok", (unsigned long long)seed, model, len);
         for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
         fprintf(stderr, "\n");
-        if (rc) {
+        if (rc || verbose) {
             uint32_t ip = 0x100; uint8_t buf[16]; x86_insn in; char d[128];
             while (ip < 0x100u + (uint32_t)plen) {
                 memcpy(buf, prog + (ip - 0x100), 16);
