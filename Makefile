@@ -16,7 +16,7 @@ DOS_OBJS  = $(DOS_SRCS:.c=.o)
 
 TARGET = dos-monster
 
-.PHONY: all clean test-sst test-jit test-dos
+.PHONY: test-pm all clean test-sst test-jit test-dos
 
 all: $(TARGET) tools/sst tools/jittest
 
@@ -50,6 +50,9 @@ test-jit: tools/jittest
 # DOS-level smoke tests (tests/dos/run.sh; uses disks/tp55 when present)
 test-dos: $(TARGET)
 	tests/dos/run.sh
+
+test-pm:
+	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 pmrun.py
 
 clean:
 	rm -f $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(DBT_OBJS) $(DBT_OBJS:.o=.d) \

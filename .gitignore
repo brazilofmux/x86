@@ -37,3 +37,4 @@ tests/sst*/README.md
 tools/sst
 tools/jittest
 .venv/
+tools/pmoracle/pmtest.img
