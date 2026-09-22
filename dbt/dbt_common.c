@@ -51,6 +51,11 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->cpu = cpu;
     dbt->quantum = 1u << 20;
     dbt->verify_mem_every = 1;
+    if (getenv("X86_PMPROF")) {
+        dbt->pmprof = 1;
+        dbt->pmprof_after = strtoull(getenv("X86_PMPROF"), NULL, 0);
+        dbt->pm_hits = calloc(X86_MEM_SIZE >> 4, sizeof(uint32_t));
+    }
 
     dbt->aux       = calloc(1, sizeof(x86_jit_aux));
     dbt->span      = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));
@@ -235,7 +240,7 @@ int dbt_run(x86_dbt *dbt) {
          * change the shadow must copy. */
         if (dbt->poll && (cpu->halted || poll_countdown-- == 0)) {
             poll_countdown = 256;
-            if (dbt->poll(cpu) && dbt->verify) shadow_resync(dbt);
+            if (dbt->poll(cpu) && dbt->verify) dbt->shadow_stale = 1;
         }
         if (cpu->halted) return 0;
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
@@ -263,6 +268,7 @@ int dbt_run(x86_dbt *dbt) {
 
         if (code) {
             if (dbt->verify) {
+                if (dbt->shadow_stale) { shadow_resync(dbt); dbt->shadow_stale = 0; }
                 uint64_t insns_before = cpu->insn_count;
                 x86_cpu pre = *cpu;
 
@@ -318,6 +324,20 @@ int dbt_run(x86_dbt *dbt) {
         /* Refused: one interpreter step. Timed (sampled 1 in 16) since on
          * a running system these are the host-service traps. */
         dbt->interp_fallback_insns++;
+        if (dbt->pmprof && cpu->insn_count >= dbt->pmprof_after && cpu->pmode && !(cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4))) {
+            uint32_t lin = cpu->seg[S_CS].base + cpu->eip;
+            uint8_t fb[16];
+            for (int k = 0; k < 16; k++) fb[k] = x86_phys_rd8(cpu, lin + (uint32_t)k);
+            x86_dec_ctx dc = { fb, cpu->model, (uint8_t)X86_AR_DB(cpu->seg[S_CS].attr) }; x86_insn di;
+            if (x86_decode(&dc, &di)) {
+                dbt->pm_ops[di.op][di.opsize == 4][di.adsize == 4]++;
+                dbt->pm_insns++;
+                if (di.ea_valid) { dbt->pm_mem++; if (di.index >= 0 || (di.adsize == 4 && di.rm == 4 && di.mod != 3)) dbt->pm_sib++; }
+                if (di.seg_override != S_NONE) dbt->pm_segovr++;
+                if (di.rep) dbt->pm_rep++;
+            }
+            if (lin < cpu->mem_size) dbt->pm_hits[lin >> 4]++;
+        }
         if (!cpu->pmode && cpu->seg[S_CS].sel != cpu->hle_seg) {
             /* dynamic histogram: what did we hand to the interpreter? */
             uint8_t fb[16];
@@ -341,8 +361,11 @@ int dbt_run(x86_dbt *dbt) {
         if (dbt->verify) {
             /* The fallback ran on the reference interpreter — nothing to
              * verify, and it may have been a host service whose side
-             * effects must not happen twice. Re-sync the shadow. */
-            shadow_resync(dbt);
+             * effects must not happen twice. The shadow is re-synced, but
+             * only when a translated block next needs it: a run of
+             * fallbacks — all of protected mode, today — would otherwise
+             * copy low memory once per instruction. */
+            dbt->shadow_stale = 1;
         }
         /* Poll after the step as well, not just after a translated block.
          * A fallback is nearly always an HLE service, and the instant it
@@ -357,7 +380,66 @@ int dbt_run(x86_dbt *dbt) {
     }
 }
 
+static int cmp_u64_desc(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* X86_PMPROF: the protected-mode work list. */
+static void print_pmprof(x86_dbt *dbt, FILE *out) {
+    if (!dbt->pmprof || !dbt->pm_insns) return;
+    double n = (double)dbt->pm_insns;
+    fprintf(out, "  protected mode: %llu insns; memory operand %.1f%%, SIB %.1f%%, seg override %.1f%%, REP %.1f%%\n",
+            (unsigned long long)dbt->pm_insns, 100.0 * (double)dbt->pm_mem / n, 100.0 * (double)dbt->pm_sib / n,
+            100.0 * (double)dbt->pm_segovr / n, 100.0 * (double)dbt->pm_rep / n);
+    uint64_t w[2][2] = {{0}};
+    for (int i = 0; i < OP__COUNT; i++)
+        for (int o = 0; o < 2; o++) for (int a = 0; a < 2; a++) w[o][a] += dbt->pm_ops[i][o][a];
+    fprintf(out, "    operand/address size: 16/16 %.1f%%  16/32 %.1f%%  32/16 %.1f%%  32/32 %.1f%%\n",
+            100.0 * (double)w[0][0] / n, 100.0 * (double)w[0][1] / n, 100.0 * (double)w[1][0] / n, 100.0 * (double)w[1][1] / n);
+    fprintf(out, "    ops (cumulative %%):");
+    double cum = 0;
+    for (int k = 0; k < 40; k++) {
+        int best = -1; uint64_t bv = 0;
+        for (int i = 0; i < OP__COUNT; i++) {
+            uint64_t v = dbt->pm_ops[i][0][0] + dbt->pm_ops[i][0][1] + dbt->pm_ops[i][1][0] + dbt->pm_ops[i][1][1];
+            if (v > bv) { bv = v; best = i; }
+        }
+        if (best < 0) break;
+        cum += (double)bv / n;
+        x86_insn tmp = { .op = (uint8_t)best };
+        char buf[64];
+        fprintf(out, "%s %s %.1f", k % 8 ? "" : "\n     ", x86_disasm(&tmp, buf, sizeof buf), 100.0 * cum);
+        memset(dbt->pm_ops[best], 0, sizeof dbt->pm_ops[best]);
+    }
+    fprintf(out, "\n");
+    /* How concentrated: the share of execution in the hottest 16-byte lines. */
+    size_t lines = X86_MEM_SIZE >> 4, used = 0;
+    uint64_t *v = malloc(lines * sizeof *v);
+    for (size_t i = 0; i < lines; i++) if (dbt->pm_hits[i]) v[used++] = dbt->pm_hits[i];
+    qsort(v, used, sizeof *v, cmp_u64_desc);
+    fprintf(out, "    code lines touched: %zu (%zu KB);", used, used * 16 / 1024);
+    uint64_t acc = 0; size_t marks[] = { 10, 50, 100, 500, 1000, 5000 };
+    for (size_t i = 0, m = 0; i < used && m < 6; i++) {
+        acc += v[i];
+        if (i + 1 == marks[m]) { fprintf(out, " top %zu: %.1f%%", marks[m], 100.0 * (double)acc / n); m++; }
+    }
+    fprintf(out, "\n");
+    /* ...and where they are, with their bytes. */
+    for (int k = 0; k < 12; k++) {
+        size_t bi = 0; uint32_t bv = 0;
+        for (size_t i = 0; i < lines; i++) if (dbt->pm_hits[i] > bv) { bv = dbt->pm_hits[i]; bi = i; }
+        if (!bv) break;
+        fprintf(out, "      %08zX %5.1f%% ", bi << 4, 100.0 * (double)bv / n);
+        for (int b = 0; b < 16; b++) fprintf(out, " %02X", x86_phys_rd8(dbt->cpu, (uint32_t)(bi << 4) + (uint32_t)b));
+        fprintf(out, "\n");
+        dbt->pm_hits[bi] = 0;
+    }
+    free(v);
+}
+
 void dbt_print_stats(x86_dbt *dbt, FILE *out) {
+    print_pmprof(dbt, out);
     fprintf(out, "  blocks translated:      %llu\n", (unsigned long long)dbt->blocks_translated);
     fprintf(out, "  cache hits/misses:      %llu / %llu\n",
             (unsigned long long)dbt->cache_hits, (unsigned long long)dbt->cache_misses);

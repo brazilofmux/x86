@@ -65,6 +65,7 @@ typedef struct pc_state {
     /* Timer */
     uint64_t t0_ns;                  /* wall clock at boot */
     uint64_t ticks_delivered;        /* INT 8s raised so far */
+    uint64_t next_tick_ns;           /* when IRQ 0 is next due, at PIT channel 0's rate */
     int      irq_pending;            /* bitmask: 1<<8 timer, 1<<9 keyboard */
     int      irq_in_service;         /* 8259 ISR: bits set from delivery until EOI */
     uint64_t irq_service_ns;         /* when the in-service IRQ was delivered (stuck-handler guard) */

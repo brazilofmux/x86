@@ -63,7 +63,7 @@ if [ -f disks/doom/inst/DOOMS/DOOM.EXE ]; then
     # init — and into mode 13h, drawing through the planar VGA; -G proves a
     # frame exists. It must also be told the truth about free memory (0500).
     D=disks/doom/inst/DOOMS
-    for mode in -i -j; do
+    for mode in -i -j -V; do
         rm -f disks/doom/check.png
         got=$(./dos-monster $mode -m 386 -W -C $D -L 150000000 -G disks/doom/check.png $D/DOOM.EXE </dev/null 2>&1)
         case "$got" in

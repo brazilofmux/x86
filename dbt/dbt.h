@@ -173,12 +173,20 @@ typedef struct {
     uint64_t links_created, links_patched, links_unpatched;
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
     uint64_t fallback_by_op[OP__COUNT];  /* which op the interpreter actually ran (dynamic) */
+    /* X86_PMPROF=1: what protected-mode code actually executes, to decide
+     * what the backend learns first. Indexed [op][opsize==4][adsize==4]. */
+    int      pmprof;
+    uint64_t pmprof_after;              /* X86_PMPROF=N: start counting at instruction N */
+    uint64_t pm_ops[OP__COUNT][2][2];
+    uint64_t pm_insns, pm_mem, pm_sib, pm_segovr, pm_rep;
+    uint32_t *pm_hits;                  /* per 16-byte line of linear memory */
     uint32_t max_block_bytes;
     uint32_t last_block_bytes;
     int      flush_pending;         /* A20 changed under running code: rewind the code buffer at the next translate */
 
     int trace;
     int verify;                    /* -V: lockstep interp shadow, diff each block run */
+    int shadow_stale;              /* the machine moved without the shadow; resync before the next check */
     int verify_mem_every;          /* compare guest memory every N block runs (0 = each) */
 
     x86_cpu shadow;                /* verify only; has its own memory */

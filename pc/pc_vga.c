@@ -52,8 +52,11 @@ static void refresh_view(x86_cpu *c) {
     memcpy(c->mem + WIN, vga.plane[rp], WLEN);
 }
 
+uint64_t pc_vga_stores;
+
 static void vga_store(x86_cpu *c, uint32_t p) {
     uint32_t off = p - WIN;
+    pc_vga_stores++;
     uint8_t v = c->mem[p];
     uint8_t mode = vga.gc[5] & 3, mask = vga.gc[8], func = (vga.gc[3] >> 3) & 3;
     uint8_t rot = vga.gc[3] & 7;

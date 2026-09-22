@@ -383,7 +383,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  host idle:              %.3fs in %llu waits  → %.1f MIPS while running\n",
                     blocked, (unsigned long long)pc.blocked_calls,
                     s > blocked ? (double)cpu.insn_count / (s - blocked) / 1e6 : 0.0);
+        fprintf(stderr, "  timer: %llu IRQ 0s, %.1f Hz average\n", (unsigned long long)pc.ticks_delivered,
+                s > 0 ? (double)pc.ticks_delivered / s : 0.0);
         if (use_jit) dbt_print_stats(&g_dbt, stderr);
+        { extern uint64_t pc_vga_stores; if (pc_vga_stores) fprintf(stderr, "  VGA planar stores:      %llu\n", (unsigned long long)pc_vga_stores); }
         pc_svcprof_dump(stderr);
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);
     }

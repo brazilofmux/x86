@@ -10,7 +10,6 @@
 
 pc_state pc;
 
-#define TICK_NS 54925493ull          /* 1193182 Hz / 65536 */
 
 uint64_t pc_now_ns(void) {
     struct timespec ts;
@@ -262,6 +261,8 @@ static void deliver(x86_cpu *c, int vector) {
  * it affordable to poll at every interrupt boundary. */
 #define PC_POLL_PERIOD_NS 1000000ull        /* 1 ms: finer than anything below needs */
 
+static uint64_t irq0_period_ns(void);
+
 int pc_poll(x86_cpu *c) {
     uint64_t now = pc_now_ns();
     pc.now_ns = now;
@@ -291,13 +292,21 @@ int pc_poll(x86_cpu *c) {
         last_code_ns = now;
     }
 
-    uint64_t expected = (now - pc.t0_ns) / TICK_NS;
-    if (pc.ticks_delivered + 18 < expected) pc.ticks_delivered = expected - 1;   /* don't storm after a stall */
-    if (pc.ticks_delivered < expected) pc.irq_pending |= 1 << 8;
+    /* IRQ 0 comes at whatever rate PIT channel 0 was programmed for — the
+     * BIOS's 18.2 Hz until a program reloads it. DOOM's sound library sets
+     * 140 Hz and counts game time in those interrupts; delivering 18.2 Hz
+     * regardless ran its clock at an eighth of real time, and the game
+     * spent its CPU waiting for tics. */
+    uint64_t period = irq0_period_ns();
+    if (!pc.next_tick_ns) pc.next_tick_ns = pc.t0_ns + period;
+    if (now >= pc.next_tick_ns) {
+        if (now - pc.next_tick_ns > 18 * period) pc.next_tick_ns = now;   /* don't storm after a stall */
+        pc.irq_pending |= 1 << 8;
+    }
 
     if (c->halted && (c->eflags & X86_IF) && !pc.irq_pending) {
         /* HLT with interrupts on: the guest is idling for the next tick. */
-        uint64_t next = pc.t0_ns + (pc.ticks_delivered + 1) * TICK_NS;
+        uint64_t next = pc.next_tick_ns;
         uint64_t hnow = pc_now_ns();
         if (next > hnow) { usleep((useconds_t)((next - hnow) / 1000 + 1)); pc.blocked_ns += pc_now_ns() - hnow; pc.blocked_calls++; }
         pc.irq_pending |= 1 << 8;
@@ -312,6 +321,7 @@ int pc_poll(x86_cpu *c) {
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1)) {
         pc.irq_pending &= ~(1 << 8);
         pc.ticks_delivered++;
+        pc.next_tick_ns += irq0_period_ns();
         deliver(c, 8);
         return 1;
     }
@@ -333,6 +343,12 @@ int pc_poll(x86_cpu *c) {
 #define PIT_HZ 1193182ull
 static struct { uint16_t reload; uint16_t latch; int latched, rw_phase, mode_rw; } pit[3];
 static uint8_t pic_mask = 0xB8, pit_speaker;
+
+/* Channel 0's period: reload 0 means 65536, the BIOS's 54.9 ms. */
+static uint64_t irq0_period_ns(void) {
+    uint64_t reload = pit[0].reload ? pit[0].reload : 65536;
+    return reload * 1000000000ull / PIT_HZ;
+}
 
 static uint16_t pit_now(int ch) {
     uint64_t ticks = (pc_now_ns() - pc.t0_ns) * PIT_HZ / 1000000000ull;
