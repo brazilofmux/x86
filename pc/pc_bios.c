@@ -195,9 +195,10 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
 }
 
 /* ---- Boot -------------------------------------------------------------- */
-void pc_init(x86_cpu *cpu) {
+void pc_init(x86_cpu *cpu, int tty_mode) {
     memset(&pc, 0, sizeof pc);
     pc.cpu = cpu;
+    pc.tty_mode = tty_mode;
     pc.t0_ns = pc_now_ns();
 
     cpu->hle_seg = PC_HLE_SEG;

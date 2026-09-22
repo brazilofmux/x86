@@ -123,8 +123,7 @@ int main(int argc, char **argv) {
 
     x86_cpu cpu;
     x86_init(&cpu, model);
-    pc.tty_mode = tty;
-    pc_init(&cpu);
+    pc_init(&cpu, tty);
     pc.debug = debug;
     dos_init(&cpu, root_abs);
     if (dos_load_program(&cpu, host_prog, dos_name, args) < 0) return 1;

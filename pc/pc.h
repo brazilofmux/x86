@@ -63,7 +63,7 @@ typedef struct pc_state {
 extern pc_state pc;
 
 /* pc_bios.c */
-void pc_init(x86_cpu *cpu);              /* IVT, BDA, stub segment, services */
+void pc_init(x86_cpu *cpu, int tty_mode); /* IVT, BDA, stub segment, services */
 void pc_set_service(int vector, pc_service_fn fn, int ret_mode);
 void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
