@@ -230,20 +230,29 @@ static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t l
 
 /* The mode 13h screen as an 8-bit RGB PNG: 0, or -1 if the screen is not in
  * mode 13h or the file cannot be written. */
-int pc_video_png(x86_cpu *c, const char *path) {
+/* The current mode 13h picture as 320x200 RGB24 rows: 0, or -1 if the
+ * screen is not in mode 13h. The window and the PNG writer both use it. */
+int pc_vga_frame(x86_cpu *c, uint8_t *rgb) {
     if (!mode13(c)) return -1;
-    enum { W = 320, H = 200 };
-    static uint8_t raw[H * (1 + W * 3)];
-    for (int y = 0; y < H; y++) {
-        uint8_t *row = raw + y * (1 + W * 3);
-        row[0] = 0;                                      /* filter: none */
-        for (int x = 0; x < W; x++) {
-            uint8_t px = pixel(c, x, y);
-            for (int k = 0; k < 3; k++) {
-                uint8_t v = vga.dac[px][k];
-                row[1 + x * 3 + k] = (uint8_t)((v << 2) | (v >> 4));   /* 6 bits to 8 */
-            }
+    uint8_t lut[256][3];
+    for (int i = 0; i < 256; i++)
+        for (int k = 0; k < 3; k++) {
+            uint8_t v = vga.dac[i][k];
+            lut[i][k] = (uint8_t)((v << 2) | (v >> 4));  /* 6 bits to 8 */
         }
+    for (int y = 0; y < 200; y++)
+        for (int x = 0; x < 320; x++)
+            memcpy(rgb + (y * 320 + x) * 3, lut[pixel(c, x, y)], 3);
+    return 0;
+}
+
+int pc_video_png(x86_cpu *c, const char *path) {
+    enum { W = 320, H = 200 };
+    static uint8_t rgb[W * H * 3], raw[H * (1 + W * 3)];
+    if (pc_vga_frame(c, rgb) < 0) return -1;
+    for (int y = 0; y < H; y++) {
+        raw[y * (1 + W * 3)] = 0;                        /* filter: none */
+        memcpy(raw + y * (1 + W * 3) + 1, rgb + y * W * 3, W * 3);
     }
     uLongf zlen = compressBound(sizeof raw);
     uint8_t *z = malloc(zlen);

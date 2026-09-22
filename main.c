@@ -31,6 +31,7 @@ static void usage(const char *prog) {
     printf("  -L N        stop after N instructions\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
     printf("  -G FILE     write the mode 13h screen to FILE as a PNG on exit\n");
+    printf("  -w / -W     do / do not open a window for graphics modes (default: if stdout is a terminal)\n");
     printf("  -boot IMG   boot a disk image instead (sector 1 at 7C00; INT 13h serves the rest)\n");
     printf("  -pmtrace LO:HI  -i: dump state before each instruction in [LO,HI], QEMU -d cpu format\n");
     printf("  -pmring     -i: on the first exception, or a fetch outside memory, print the\n");
@@ -203,6 +204,7 @@ int main(int argc, char **argv) {
     uint64_t limit = 0;
     int mem_every = 1;
     const char *root = NULL, *prog = NULL, *dump = NULL, *gdump = NULL, *drive_a = NULL, *drive_b = NULL;
+    int window = -1;                         /* -w / -W; -1: a window if stdout is a terminal */
     const char *boot_img = NULL;
     int i;
     for (i = 1; i < argc; i++) {
@@ -225,6 +227,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-L") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "-G") && i + 1 < argc) gdump = argv[++i];
+        else if (!strcmp(argv[i], "-w")) window = 1;
+        else if (!strcmp(argv[i], "-W")) window = 0;
         else if (!strcmp(argv[i], "-M") && i + 1 < argc) mem_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
         else if (!strcmp(argv[i], "-pmring")) g_pmring = 1;
@@ -332,6 +336,7 @@ int main(int argc, char **argv) {
     }
     if (strict) setenv("X86_VERIFY_STRICT", "1", 1);
 
+    pc_sdl_allow(window >= 0 ? window : isatty(1), prog ? prog : boot_img);
     if (g_pmtrace_hi) cpu.trace_exc = pm_trace_exc;
     else if (g_pmring) cpu.trace_exc = pmring_exc;
 
@@ -352,6 +357,7 @@ int main(int argc, char **argv) {
 
     pc_video_flush(1);
     pc_video_shutdown();
+    pc_sdl_shutdown();
     pc_kbd_shutdown();
     if (!tty) fflush(stdout);
     if (dump) {

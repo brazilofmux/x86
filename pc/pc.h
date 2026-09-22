@@ -129,5 +129,10 @@ void pc_kbd_int9(x86_cpu *c, int vector);                /* default INT 9: latch
 void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode);
 int  pc_kbd_raw_pending(void);
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
+void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */
+int  pc_vga_frame(x86_cpu *c, uint8_t *rgb);              /* 320x200 RGB24; -1 if not in mode 13h */
+void pc_sdl_allow(int on, const char *prog);              /* may a window open for graphics modes */
+void pc_sdl_poll(x86_cpu *c, uint64_t now_ns);            /* frames at 70 Hz, window events */
+void pc_sdl_shutdown(void);
 
 #endif /* PC_H */

@@ -23,7 +23,7 @@ static const uint8_t parity_even[256] = { P6(1), P6(0), P6(0), P6(1) };
 void x86_fault(x86_cpu *c, int vector, uint32_t err) {
     c->exc = vector;
     c->exc_err = err;
-    if (c->fault_armed) longjmp(c->fault_jb, 1);
+    if (c->fault_armed) _longjmp(c->fault_jb, 1);
 }
 
 static inline uint32_t szmask(int size) { return size == 1 ? 0xFF : size == 2 ? 0xFFFF : 0xFFFFFFFFu; }
@@ -1491,7 +1491,7 @@ static void fetch_bytes(x86_cpu *c, uint8_t *buf) {
 void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
     uint32_t start_ip = c->eip - in->len;
     c->fault_armed = 1;
-    if (setjmp(c->fault_jb) == 0) execute(c, in, start_ip);
+    if (_setjmp(c->fault_jb) == 0) execute(c, in, start_ip);
     c->fault_armed = 0;
     /* A fault (286+) or a trap-style exception restarts at the instruction
      * or continues after it, as x86_step would; the caller delivers it. */
@@ -1540,7 +1540,7 @@ int x86_step(x86_cpu *c) {
             c->eip = is386 ? start_ip + in.len : ((start_ip + in.len) & 0xFFFF);
             c->int_inhibit = 0;
             c->fault_armed = 1;
-            if (setjmp(c->fault_jb) == 0) {
+            if (_setjmp(c->fault_jb) == 0) {
                 /* 286: instructions longer than 10 bytes (prefix padding) are #GP */
                 if (c->model == X86_MODEL_286 && in.len > 10) x86_fault(c, X86_EXC_GP, 0);
                 execute(c, &in, start_ip);

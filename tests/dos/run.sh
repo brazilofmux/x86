@@ -58,13 +58,19 @@ if [ -f disks/djgpp/bin/djecho.exe ]; then
 fi
 if [ -f disks/doom/inst/DOOMS/DOOM.EXE ]; then
     # Shareware DOOM 1.9 (tests/dos/fetch-doom.sh): DOS/4GW bound into the
-    # game, a raw-switching DPMI client at ring 3. 60M instructions takes it
+    # game, a raw-switching DPMI client at ring 3. 150M instructions takes it
     # through its whole startup — WAD, refresh, DPMI, keyboard, timer, sound
-    # init — to the status bar; the next thing it does is draw.
+    # init — and into mode 13h, drawing through the planar VGA; -G proves a
+    # frame exists. It must also be told the truth about free memory (0500).
     D=disks/doom/inst/DOOMS
     for mode in -i -j; do
-        got=$(./dos-monster $mode -m 386 -C $D -L 60000000 $D/DOOM.EXE </dev/null 2>&1)
-        case "$got" in *"ST_Init: Init status bar."*) echo "ok   doom startup $mode";; *) echo "FAIL doom startup $mode"; echo "$got" | tail -5; fail=1;; esac
+        rm -f disks/doom/check.png
+        got=$(./dos-monster $mode -m 386 -W -C $D -L 150000000 -G disks/doom/check.png $D/DOOM.EXE </dev/null 2>&1)
+        case "$got" in
+        *"DPMI memory: 0x0,"*) echo "FAIL doom $mode (host reported no free memory)"; fail=1;;
+        *"ST_Init: Init status bar."*) [ -s disks/doom/check.png ] && echo "ok   doom $mode" || { echo "FAIL doom $mode (never reached mode 13h)"; fail=1; };;
+        *) echo "FAIL doom $mode"; echo "$got" | tail -5; fail=1;;
+        esac
     done
 fi
 exit $fail

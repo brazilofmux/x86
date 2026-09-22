@@ -273,6 +273,7 @@ int pc_poll(x86_cpu *c) {
     pc_kbd_poll(c);
     pc_kbd_idle_poll(c);
     pc_video_flush(0);
+    pc_sdl_poll(c, now);
     if (c->halted && pc.exit_requested) return 1;
 
     /* Keyboard: latch the next raw code and raise INT 9 once the previous

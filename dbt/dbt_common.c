@@ -349,8 +349,11 @@ int dbt_run(x86_dbt *dbt) {
          * returns is when IF comes back: with INT inlined, every block in
          * a poll loop ends with the INT that cleared IF, so a block-only
          * poll never sees interrupts enabled and pending IRQs would never
-         * be delivered. Affordable since pc_poll became a clock read. */
-        poll_countdown = 0;
+         * be delivered. Affordable since pc_poll became a clock read —
+         * but not per instruction: in protected mode, which the backend does
+         * not translate, every instruction is a fallback, and a clock read
+         * each was a fifth of DOOM's time. There the countdown runs on. */
+        if (!cpu->pmode) poll_countdown = 0;
     }
 }
 

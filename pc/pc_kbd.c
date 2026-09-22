@@ -83,6 +83,7 @@ static void raw_enqueue(uint8_t code, uint8_t ascii) {
     rawq[rawq_tail] = (rawkey){ code, ascii }; rawq_tail = next;
 }
 int pc_kbd_raw_pending(void) { return rawq_head != rawq_tail; }
+void pc_kbd_raw_key(uint8_t code, uint8_t ascii) { raw_enqueue(code, ascii); }
 int pc_kbd_raw_next(uint8_t *code) {
     if (rawq_head == rawq_tail) return 0;
     *code = rawq[rawq_head].code; latched_ascii = rawq[rawq_head].ascii;
@@ -282,8 +283,13 @@ void pc_kbd_poll(x86_cpu *c) {
     if (raw_active) { while (next_key(c, 0)) { } return; }
     /* "Idle-polling" = several keyboard queries since the last key; a
      * single poll is often a flush, and a key fed then is lost. */
-    if (now < next_ok || pc.kbd_reads < reads_at_last + 8) return;
-    if (next_key(c, 0)) { next_ok = now + 20000000ull; reads_at_last = pc.kbd_reads; }
+    /* A program that takes its keys from IRQ 1 and port 60h (DOOM) never
+     * polls the BIOS at all; after a second of that silence, feed anyway. */
+    static uint64_t last_fed;
+    int polled = pc.kbd_reads >= reads_at_last + 8;
+    int silent = pc.kbd_reads == reads_at_last && now - last_fed >= 1000000000ull;
+    if (now < next_ok || !(polled || silent)) return;
+    if (next_key(c, 0)) { next_ok = now + 20000000ull; reads_at_last = pc.kbd_reads; last_fed = now; }
 }
 
 /* Scripted stdin ran dry: hand the guest one Ctrl-Z, and if it is still
@@ -291,10 +297,17 @@ void pc_kbd_poll(x86_cpu *c) {
  * the run — a headless test would otherwise spin forever in whatever
  * idle loop the program has. Called from pc_poll. */
 void pc_kbd_idle_poll(x86_cpu *c) {
-    static uint64_t deadline; static int fed_eof;
+    static uint64_t deadline, reads_at_eof; static int fed_eof;
     if (!pc.eof_seen || isatty(STDIN_FILENO)) return;
-    if (!fed_eof) { fed_eof = 1; key_to_raw(0x1A, 0x2C); deadline = pc_now_ns() + 2000000000ull; return; }
+    if (!fed_eof) {
+        fed_eof = 1; key_to_raw(0x1A, 0x2C);
+        deadline = pc_now_ns() + 2000000000ull; reads_at_eof = pc.kbd_reads;
+        return;
+    }
     if (pc_now_ns() < deadline) return;
+    /* Only a program that is still asking for keys is stuck waiting for
+     * them; one that never polls the BIOS (DOOM) is just running. */
+    if (pc.kbd_reads == reads_at_eof) return;
     fprintf(stderr, "dos-monster: input exhausted, program still running\n");
     pc.exit_requested = 1; pc.exit_code = 1;
     c->halted = 1;

@@ -149,18 +149,13 @@ static int gate_width(const x86_cpu *c) { return X86_AR_DB(c->seg[S_CS].attr) ? 
 
 static int client_is32(void);
 
-/* Whether the code that called this service is 32-bit. A 16-bit gate means
- * a 16-bit client, which settles it; through a 32-bit gate the caller's CS
- * is in the frame and its D bit decides — the same INT 31h entry serves 16-
- * and 32-bit code in one client, and DJGPP's stub declares itself 32-bit
- * while running 16-bit code. */
-static int caller_is32(x86_cpu *c) {
-    if (!c->pmode || gate_width(c) == 2) return 0;
-    uint32_t m = stk_mask(c);
-    uint16_t cs = (uint16_t)x86_rd(c, c->seg[S_SS].base, (c->r[R_SP] + 4) & m, m, 2);
-    uint32_t lo, hi;
-    return x86_read_desc(c, cs, &lo, &hi) ? (int)((hi >> 22) & 1) : client_is32();
-}
+/* ES:(E)DI and friends: DI for a 16-bit client, EDI for a 32-bit one —
+ * the width the client declared at the mode switch, which is the DPMI
+ * rule. Guessing from the calling code segment instead is wrong the moment
+ * a 16-bit handler chains a call on someone else's behalf: DOS/4GW hooks
+ * INT 31h with 16-bit code and passes DOOM's 32-bit requests through, and
+ * the guess sent DOOM's 0500 buffer (EDI 002FBB50) to linear 0000BB50. */
+static int caller_is32(x86_cpu *c) { (void)c; return client_is32(); }
 static uint32_t es_edi(x86_cpu *c) {
     return c->seg[S_ES].base + (caller_is32(c) ? c->r[R_DI] : (c->r[R_DI] & 0xFFFF));
 }

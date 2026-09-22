@@ -142,7 +142,7 @@ typedef struct x86_cpu {
     uint32_t exc_err;
     /* Faults abort the instruction: x86_fault() longjmps here when armed
      * (x86_step, x86_exec_decoded) so no further state is committed. */
-    jmp_buf  fault_jb;
+    jmp_buf  fault_jb;       /* _setjmp/_longjmp: plain setjmp saves the signal mask, a syscall per instruction on macOS */
     int      fault_armed;
 
     /* I/O port hooks (pc/ layer). NULL = open bus. */
