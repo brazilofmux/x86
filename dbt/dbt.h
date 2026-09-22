@@ -169,6 +169,7 @@ typedef struct {
     uint64_t verify_blocks_checked;
     uint64_t links_created, links_patched, links_unpatched;
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
+    uint64_t fallback_by_op[OP__COUNT];  /* which op the interpreter actually ran (dynamic) */
     uint32_t max_block_bytes;
     uint32_t last_block_bytes;
 

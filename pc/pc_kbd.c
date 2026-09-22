@@ -144,6 +144,14 @@ void pc_kbd_int9(x86_cpu *c, int vector) {
     case 0x38: flags = (uint8_t)(down ? flags | 8 : flags & ~8); pc_wr8(c, BDA, 0x17, flags); return;
     }
     if (!down || code == 0xE0) return;
+    if (code >= 0x3B && code <= 0x44) {                               /* F1-F10 with modifiers */
+        int m = (flags & 8) ? 0x2D : (flags & 4) ? 0x23 : (flags & 3) ? 0x19 : 0;
+        pc_kbd_push(c, 0, (uint8_t)(code + m)); return;
+    }
+    if (code == 0x85 || code == 0x86) {                               /* F11/F12 */
+        int m = (flags & 8) ? 6 : (flags & 4) ? 4 : (flags & 3) ? 2 : 0;
+        pc_kbd_push(c, 0, (uint8_t)(code + m)); return;
+    }
     if (flags & 8) { pc_kbd_push(c, 0, code); return; }              /* Alt+key */
     if (!latched_ascii && !(code >= 0x3B && code <= 0x44) && !(code >= 0x47 && code <= 0x53) && code != 0x85 && code != 0x86 && code != 0x01) return;
     pc_kbd_push(c, latched_ascii, code);
@@ -197,29 +205,42 @@ static int next_key(x86_cpu *c, int blocking) {
     uint8_t ascii = b, sc = scancode_for(b);
     if (b == 0x1B && npending >= 3 && (pending[1] == '[' || pending[1] == 'O')) {
         /* CSI / SS3 sequences: arrows, home/end, function keys */
+        /* CSI num [; mod] final — xterm: mod 2 shift, 3 alt, 5 ctrl */
         uint8_t k = pending[2];
-        int num = 0, i = 2;
+        int num = 0, mod = 1, i = 2;
         while (i < npending && pending[i] >= '0' && pending[i] <= '9') num = num * 10 + (pending[i++] - '0');
+        if (i < npending && pending[i] == ';') { i++; mod = 0; while (i < npending && pending[i] >= '0' && pending[i] <= '9') mod = mod * 10 + (pending[i++] - '0'); }
         if (i < npending) { k = pending[i]; used = i + 1; } else { k = 0; used = npending; }
         ascii = 0; sc = 0;
-        if (pending[1] == 'O' || num == 0) {
+        int fkey = 0;                                   /* 1..12 */
+        if (pending[1] == 'O' || (num == 0 || num == 1) ) {
             switch (k) {
             case 'A': sc = 0x48; break; case 'B': sc = 0x50; break;
             case 'C': sc = 0x4D; break; case 'D': sc = 0x4B; break;
             case 'H': sc = 0x47; break; case 'F': sc = 0x4F; break;
-            case 'P': sc = 0x3B; break; case 'Q': sc = 0x3C; break;
-            case 'R': sc = 0x3D; break; case 'S': sc = 0x3E; break;
+            case 'P': fkey = 1; break; case 'Q': fkey = 2; break;
+            case 'R': fkey = 3; break; case 'S': fkey = 4; break;
             }
-        } else if (k == '~') {
+        }
+        if (!sc && !fkey && k == '~') {
             switch (num) {
             case 1: case 7: sc = 0x47; break; case 4: case 8: sc = 0x4F; break;
             case 2: sc = 0x52; break; case 3: sc = 0x53; break;
             case 5: sc = 0x49; break; case 6: sc = 0x51; break;
-            case 11: sc = 0x3B; break; case 12: sc = 0x3C; break; case 13: sc = 0x3D; break;
-            case 14: sc = 0x3E; break; case 15: sc = 0x3F; break; case 17: sc = 0x40; break;
-            case 18: sc = 0x41; break; case 19: sc = 0x42; break; case 20: sc = 0x43; break;
-            case 21: sc = 0x44; break; case 23: sc = 0x85; break; case 24: sc = 0x86; break;
+            case 11: fkey = 1; break; case 12: fkey = 2; break; case 13: fkey = 3; break;
+            case 14: fkey = 4; break; case 15: fkey = 5; break; case 17: fkey = 6; break;
+            case 18: fkey = 7; break; case 19: fkey = 8; break; case 20: fkey = 9; break;
+            case 21: fkey = 10; break; case 23: fkey = 11; break; case 24: fkey = 12; break;
             }
+        }
+        if (fkey) sc = fkey <= 10 ? 0x3B + fkey - 1 : 0x85 + fkey - 11;   /* raw key code; the modifier travels separately */
+        if (sc && mod != 1) {
+            /* Shift/Ctrl/Alt + key as a keyboard sends it: the modifier's
+             * make, the key, the breaks. Whoever owns INT 9 translates. */
+            uint8_t modsc = mod == 2 ? 0x2A : mod == 5 ? 0x1D : 0x38;
+            memmove(pending, pending + used, (size_t)(npending - used)); npending -= used;
+            raw_enqueue(modsc, 0); raw_enqueue(sc, 0); raw_enqueue((uint8_t)(sc | 0x80), 0); raw_enqueue((uint8_t)(modsc | 0x80), 0);
+            return 1;
         }
         if (!sc) { ascii = 0x1B; sc = 0x01; used = 1; }
     } else if (b == 0x1B && npending >= 2 && pending[1] == '+') {

@@ -301,6 +301,13 @@ int dbt_run(x86_dbt *dbt) {
         /* Refused: one interpreter step. Timed (sampled 1 in 16) since on
          * a running system these are the host-service traps. */
         dbt->interp_fallback_insns++;
+        if (cpu->seg[S_CS].sel != cpu->hle_seg) {
+            /* dynamic histogram: what did we hand to the interpreter? */
+            uint8_t fb[16];
+            for (int k = 0; k < 16; k++) fb[k] = x86_phys_rd8(cpu, cpu->seg[S_CS].base + ((cpu->eip + k) & 0xFFFF));
+            x86_dec_ctx dc = { fb, cpu->model, 0 }; x86_insn di;
+            if (x86_decode(&dc, &di)) dbt->fallback_by_op[di.op]++;
+        }
         int timed = (dbt->interp_fallback_insns & 15) == 0;
         struct timespec t0, t1;
         if (timed) clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -339,6 +346,18 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             (unsigned long long)dbt->links_unpatched);
     fprintf(out, "  max block bytes:        %u\n", (unsigned)dbt->max_block_bytes);
     fprintf(out, "  code used:              %u bytes, %u pooled insns\n", dbt->code_used, dbt->insn_used);
+    fprintf(out, "  interp fallbacks by op (dynamic):");
+    for (int n = 0; n < 12; n++) {
+        int best = -1;
+        for (int i = 0; i < OP__COUNT; i++)
+            if (dbt->fallback_by_op[i] && (best < 0 || dbt->fallback_by_op[i] > dbt->fallback_by_op[best])) best = i;
+        if (best < 0) break;
+        x86_insn tmp = { .op = (uint8_t)best };
+        char buf[64];
+        fprintf(out, " %s:%llu", x86_disasm(&tmp, buf, sizeof buf), (unsigned long long)dbt->fallback_by_op[best]);
+        dbt->fallback_by_op[best] = 0;
+    }
+    fprintf(out, "\n");
     /* Which ops the backend refused or ended blocks on — the to-do list. */
     int any = 0;
     for (int i = 0; i < OP__COUNT; i++) if (dbt->refused_by_op[i]) { any = 1; break; }

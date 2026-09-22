@@ -40,6 +40,18 @@ static uint64_t g_last_insns, g_last_ns;
 /* Host events between block runs; also keeps the HUD fresh. */
 static int host_poll(x86_cpu *c) {
     int changed = pc_poll(c);
+    static int rate = -1;
+    if (rate < 0) rate = getenv("X86_RATE") != NULL;
+    if (rate) {
+        static uint64_t li, ln, lf;
+        uint64_t now = pc_now_ns();
+        if (now - ln > 500000000ull) {
+            if (ln) fprintf(stderr, "[rate] %.1f MIPS  fallbacks %llu\n",
+                            (double)(c->insn_count - li) / (double)(now - ln) * 1e3,
+                            (unsigned long long)(g_dbt.interp_fallback_insns - lf));
+            li = c->insn_count; ln = now; lf = g_dbt.interp_fallback_insns;
+        }
+    }
     if (pc.tty_mode) {
         uint64_t now = pc_now_ns();
         if (now - g_last_ns > 1000000000ull) {
