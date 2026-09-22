@@ -39,7 +39,7 @@ static void build_tables(x86_jit_aux *aux) {
 
 int dbt_jit_available(const x86_cpu *cpu) {
 #if defined(__aarch64__)
-    return cpu->mem_mirrored && cpu->model < X86_MODEL_386;
+    return cpu->mem_mirrored;
 #else
     (void)cpu;
     return 0;

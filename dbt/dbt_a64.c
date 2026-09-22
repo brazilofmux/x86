@@ -78,6 +78,15 @@
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
 static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_fault_stub_off, s_fault_exit_off;
 
+/* model >= 386: the pinned registers hold the whole 32-bit guest register,
+ * so a 16-bit write merges into bits 15:0 and anything that consumes a
+ * 16-bit register as an address, a count or a branch target has to mask
+ * it first. Below 386 they are canonical 16-bit and none of that applies. */
+static int s_regs32;
+
+static a64_reg_t emit_reg16(emit_t *e, int reg, a64_reg_t tmp);
+static void emit_set16(emit_t *e, int reg, a64_reg_t src);
+
 /* -V strict mode: every block returns to dbt_run (no links, no probe). */
 static int s_strict_exit = -1;
 
@@ -336,7 +345,7 @@ static void emit_ea(emit_t *e, const x86_insn *in, ea_t *ea) {
         return;
     }
     if (in->base >= 0 && in->index < 0 && disp == 0) {
-        ea->off = R_GPR(in->base);
+        ea->off = emit_reg16(e, in->base, W_OFF);
         return;
     }
     a64_reg_t acc = R_GPR(in->base >= 0 ? in->base : in->index);
@@ -353,6 +362,12 @@ static void emit_ea(emit_t *e, const x86_insn *in, ea_t *ea) {
  * value; returns the register holding it, which is the pinned register
  * itself for 16-bit reads. */
 static a64_reg_t emit_read_reg(emit_t *e, int reg, int size, a64_reg_t tmp) {
+    if (size == 4) return R_GPR(reg);
+    /* NOTE: on 386 this returns the full 32-bit register for a 16-bit
+     * operand. Every consumer either shifts it to the top of the word
+     * (the ALU and shift paths), stores only its low half (STRH, BFI),
+     * or masks explicitly (emit_ea, emit_dynamic_key). A new consumer
+     * that reads it as a bare 16-bit value must mask. */
     if (size == 2) return R_GPR(reg);
     if (reg < 4) (void)emit_and_w32_imm(e, tmp, R_GPR(reg), 0xFF);
     else emit_ubfx_w32(e, tmp, R_GPR(reg & 3), 8, 8);
@@ -361,11 +376,28 @@ static a64_reg_t emit_read_reg(emit_t *e, int reg, int size, a64_reg_t tmp) {
 
 /* Write `src` into guest register (low bits of src are the value). */
 static void emit_write_reg(emit_t *e, int reg, int size, a64_reg_t src) {
-    if (size == 2) {
+    if (size == 4) {
         if (src != R_GPR(reg)) emit_mov_w32_w32(e, R_GPR(reg), src);
         return;
     }
+    if (size == 2) {
+        if (s_regs32) emit_bfi_w32(e, R_GPR(reg), src, 0, 16);
+        else if (src != R_GPR(reg)) emit_mov_w32_w32(e, R_GPR(reg), src);
+        return;
+    }
     emit_bfi_w32(e, R_GPR(reg & 3), src, reg < 4 ? 0 : 8, 8);
+}
+
+/* A pinned register used as a 16-bit address/count/target. */
+static a64_reg_t emit_reg16(emit_t *e, int reg, a64_reg_t tmp) {
+    if (!s_regs32) return R_GPR(reg);
+    emit_uxth_w32(e, tmp, R_GPR(reg));
+    return tmp;
+}
+/* Merge a 16-bit value back into a pinned register. */
+static void emit_set16(emit_t *e, int reg, a64_reg_t src) {
+    if (s_regs32) emit_bfi_w32(e, R_GPR(reg), src, 0, 16);
+    else if (src != R_GPR(reg)) emit_mov_w32_w32(e, R_GPR(reg), src);
 }
 
 /* Where in the block we are, for the thunks' "block invalidated under
@@ -770,21 +802,24 @@ static void emit_shift_imm(emit_t *e, int op, int size, uint32_t cnt, a64_reg_t 
 static void emit_push16(emit_t *e, a64_reg_t val) {
     /* new SP in a temp until the store is known to succeed (fault: SP intact) */
     emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
-    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);   /* also strips ESP[31:16] for the address */
     emit_wrap_check(e, R_SSP, W_T2, val, 1, 1);
     emit_strh_reg_uxtw(e, val, R_SSP, W_T2);
     emit_add_x64_w32_uxtw(e, W_T3, R_SSP, W_T2);
     emit_smc_check_x3(e);
     emit_wrap_back(e);
-    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 2);
-    (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
+    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
+    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+    emit_set16(e, R_SP, W_T2);
 }
 static void emit_pop16(emit_t *e, a64_reg_t dst) {
-    emit_wrap_check(e, R_SSP, R_GPR(R_SP), dst, 0, 0);
-    emit_ldrh_reg_uxtw(e, dst, R_SSP, R_GPR(R_SP));
+    a64_reg_t sp = emit_reg16(e, R_SP, W_T2);
+    emit_wrap_check(e, R_SSP, sp, dst, 0, 0);
+    emit_ldrh_reg_uxtw(e, dst, R_SSP, sp);
     emit_wrap_back(e);
-    emit_add_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 2);
-    (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
+    emit_add_w32_imm(e, W_T2, sp, 2);
+    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+    emit_set16(e, R_SP, W_T2);
 }
 
 /* ----------------------------------------------------------------------
@@ -917,7 +952,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         a64_reg_t b = emit_read_operand(e, in, 1, &ea, W_SRC);
         int wr = (in->op != OP_CMP && in->op != OP_TEST);
         /* Pinned 16-bit register destination: compute in place. */
-        a64_reg_t res = (wr && d->kind == OPK_REG && d->size == 2) ? a : W_VAL;
+        a64_reg_t res = (wr && d->kind == OPK_REG && d->size == 2 && !s_regs32) ? a : W_VAL;
         emit_alu(e, in->op, size, a, b, res, fmask);
         if (wr && res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
         /* ADC/SBB fix OF up after the table, so their NZCV is not the
@@ -932,7 +967,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     }
     case OP_INC: case OP_DEC: {
         a64_reg_t a = emit_read_operand(e, in, 0, &ea, W_VAL);
-        a64_reg_t res = (d->kind == OPK_REG && d->size == 2) ? a : W_VAL;
+        a64_reg_t res = (d->kind == OPK_REG && d->size == 2 && !s_regs32) ? a : W_VAL;
         emit_incdec(e, in->op == OP_INC, size, a, res, fmask);
         if (res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
         if (d->kind != OPK_MEM) {
@@ -961,7 +996,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         uint32_t cnt = in->ops[1].imm & 0xFF;
         if (cnt == 0) break;
         a64_reg_t a = emit_read_operand(e, in, 0, &ea, W_VAL);
-        a64_reg_t res = (d->kind == OPK_REG && d->size == 2) ? a : W_VAL;
+        a64_reg_t res = (d->kind == OPK_REG && d->size == 2 && !s_regs32) ? a : W_VAL;
         emit_shift_imm(e, in->op, size, cnt, a, res, fmask);
         if (res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
         break;
@@ -987,11 +1022,13 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         break;
     case OP_CBW:
         emit_sbfx_w32(e, W_T0, R_GPR(R_AX), 0, 8);
-        emit_uxth_w32(e, R_GPR(R_AX), W_T0);
+        emit_uxth_w32(e, W_T0, W_T0);
+        emit_set16(e, R_AX, W_T0);
         break;
     case OP_CWD:
         emit_sbfx_w32(e, W_T0, R_GPR(R_AX), 15, 1);
-        emit_uxth_w32(e, R_GPR(R_DX), W_T0);
+        emit_uxth_w32(e, W_T0, W_T0);
+        emit_set16(e, R_DX, W_T0);
         break;
     case OP_CLC: (void)emit_and_w32_imm(e, R_F, R_F, ~(uint32_t)X86_CF); break;
     case OP_STC: (void)emit_orr_w32_imm(e, R_F, R_F, X86_CF); break;
@@ -1039,6 +1076,7 @@ static uint64_t target_key(const x86_cpu *cpu, uint32_t ip) {
  * only matters when cs.base + 0xFFFF can pass 1 MB with A20 off. */
 static void emit_dynamic_key(emit_t *e, const x86_cpu *cpu, a64_reg_t ip) {
     uint32_t base = cpu->seg[S_CS].base;
+    if (s_regs32) { emit_uxth_w32(e, W_T0, ip); ip = W_T0; }   /* may be a raw 32-bit register */
     emit_mov_w32_imm32(e, A64_W0, base);
     emit_add_w32(e, A64_W0, A64_W0, ip);
     if (base + 0xFFFF > 0xFFFFF && cpu->a20_mask == 0xFFFFF)
@@ -1063,18 +1101,21 @@ static uint32_t emit_cond_side_branch(emit_t *e, const x86_insn *in) {
         emit_b_cond(e, c, 0);
         break;
     }
-    case OP_JCXZ:
+    case OP_JCXZ: {
+        a64_reg_t cx = emit_reg16(e, R_CX, W_T0);   /* must be emitted before the patch site is taken */
         patch = emit_pos(e);
-        emit_cbz_w32(e, R_GPR(R_CX), 0);
+        emit_cbz_w32(e, cx, 0);
         break;
+    }
     default: {   /* LOOP family: CX = (CX-1) & FFFF, taken when CX != 0 [&& ZF cond] */
-        emit_sub_w32_imm(e, R_GPR(R_CX), R_GPR(R_CX), 1);
-        (void)emit_and_w32_imm(e, R_GPR(R_CX), R_GPR(R_CX), 0xFFFF);
+        emit_sub_w32_imm(e, W_T2, R_GPR(R_CX), 1);
+        (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+        emit_set16(e, R_CX, W_T2);
         if (in->op == OP_LOOP) {
             patch = emit_pos(e);
-            emit_cbnz_w32(e, R_GPR(R_CX), 0);
+            emit_cbnz_w32(e, W_T2, 0);
         } else {
-            emit_cbz_w32(e, R_GPR(R_CX), 12);                 /* skip the flag test + branch */
+            emit_cbz_w32(e, W_T2, 12);                        /* skip the flag test + branch */
             (void)emit_tst_w32_imm(e, R_F, X86_ZF);
             patch = emit_pos(e);
             emit_b_cond(e, in->op == OP_LOOPE ? A64_COND_NE : A64_COND_EQ, 0);
@@ -1107,17 +1148,19 @@ static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t
     if (in->op == OP_RETF) {
         /* Both slots are fetched before SP moves so a 286 limit fault on
          * either leaves SP intact, as the interpreter's frame precheck does. */
-        emit_add_w32_imm(e, W_T0, R_GPR(R_SP), 2);
+        a64_reg_t sp = emit_reg16(e, R_SP, W_T2);
+        emit_add_w32_imm(e, W_T0, sp, 2);
         (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
         emit_wrap_check(e, R_SSP, W_T0, W_SRC, 0, 0);
         emit_ldrh_reg_uxtw(e, W_SRC, R_SSP, W_T0);
         emit_wrap_back(e);
-        emit_wrap_check(e, R_SSP, R_GPR(R_SP), W_VAL, 0, 0);
-        emit_ldrh_reg_uxtw(e, W_VAL, R_SSP, R_GPR(R_SP));
+        emit_wrap_check(e, R_SSP, sp, W_VAL, 0, 0);
+        emit_ldrh_reg_uxtw(e, W_VAL, R_SSP, sp);
         emit_wrap_back(e);
         int32_t adj = 4 + (in->ops[0].kind == OPK_IMM ? (int32_t)(in->ops[0].imm & 0xFFFF) : 0);
-        emit_add_w32_imm_any(e, R_GPR(R_SP), R_GPR(R_SP), adj, W_T1);
-        (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
+        emit_add_w32_imm_any(e, W_T0, sp, adj, W_T1);
+        (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
+        emit_set16(e, R_SP, W_T0);
         emit_load_cs_dynamic(e, cpu);
         emit_dynamic_tail(e, dbt->exit_stub_off);
         return;
@@ -1164,8 +1207,9 @@ static void emit_push16_raw(emit_t *e, a64_reg_t val) {
     emit_add_x64_w32_uxtw(e, W_T3, R_SSP, W_T2);
     emit_smc_check_x3(e);
     if (s_wrap_exact) emit_wrap_back(e);
-    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 2);
-    (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
+    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
+    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+    emit_set16(e, R_SP, W_T2);
 }
 
 /* INT n / INT3. The IVT entry is read before the frame is pushed
@@ -1241,8 +1285,9 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
     case OP_RET:
         emit_pop16(e, W_VAL);
         if (in->ops[0].kind == OPK_IMM) {
-            emit_add_w32_imm_any(e, R_GPR(R_SP), R_GPR(R_SP), (int32_t)(in->ops[0].imm & 0xFFFF), W_T1);
-            (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
+            emit_add_w32_imm_any(e, W_T2, R_GPR(R_SP), (int32_t)(in->ops[0].imm & 0xFFFF), W_T1);
+            (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+            emit_set16(e, R_SP, W_T2);
         }
         emit_dynamic_key(e, cpu, W_VAL);
         emit_dynamic_tail(e, dbt->exit_stub_off);
@@ -1335,6 +1380,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
      * Entry: budget check. Exhausted → out-of-line exit with our own key. */
     s_cur_lin = dbt_key_lin(key);
     s_wrap_exact = cpu->model < X86_MODEL_286;
+    s_regs32 = cpu->model >= X86_MODEL_386;
     s_nwrap = 0;
     s_nzcv.valid = 0;                 /* nothing carries into a block: its first op may be a Jcc */
     s_ea_checked = 0;

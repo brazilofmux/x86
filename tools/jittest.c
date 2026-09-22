@@ -363,7 +363,7 @@ int main(int argc, char **argv) {
     int model = X86_MODEL_8086, prog = -1, fuzz = 0, len = 20, verify = 1, strict = 0, stats = 0, verbose = 0;
     uint64_t seed = 1;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-m") && i + 1 < argc) { int m = atoi(argv[++i]); model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : X86_MODEL_286; }
+        if (!strcmp(argv[i], "-m") && i + 1 < argc) { int m = atoi(argv[++i]); model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 386 ? X86_MODEL_386 : X86_MODEL_286; }
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prog = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) fuzz = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 0);

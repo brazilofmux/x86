@@ -9,7 +9,7 @@ check() { # name expected-output-file command...
     got=$("$@" 2>/dev/null)
     if [ "$got" = "$(cat "$want")" ]; then echo "ok   $name"; else echo "FAIL $name"; echo "$got" | head -5; fail=1; fi
 }
-for mode in -i -j -V "-m 86 -V"; do
+for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "hello.com $mode" tests/dos/hello.out ./dos-monster $mode tests/dos/hello.com
     check "exe1.exe $mode"  tests/dos/exe1.out  ./dos-monster $mode tests/dos/exe1.exe
     check "exec.com $mode"  tests/dos/exec.out  ./dos-monster $mode tests/dos/exec.com
