@@ -56,11 +56,10 @@ void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
  * that: resetting the pool silently abandons all patch sites, sound
  * only because the code containing them is being discarded. */
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
-    for (uint32_t i = 0; i < BLOCK_CACHE_SIZE; i++) {
-        dbt->aux->cache[i].key  = BLOCK_EMPTY_KEY;
-        dbt->aux->cache[i].code = NULL;
-        dbt->link_head[i]       = LINK_NONE;
-    }
+    /* An empty slot is all-ones in both words (its code pointer is never
+     * read while the key says empty), and so is LINK_NONE: two memsets. */
+    memset(dbt->aux->cache, 0xFF, sizeof dbt->aux->cache);
+    memset(dbt->link_head, 0xFF, BLOCK_CACHE_SIZE * sizeof *dbt->link_head);
     dbt->link_used = 0;
     dbt->link_free = LINK_NONE;
     dbt_clear_code_bits(dbt->cpu);
@@ -120,6 +119,8 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     dbt->last_block_bytes = bytes;
     uint8_t *bm = dbt->cpu->code_bitmap;    /* X86_MEM_SLACK past mem_size absorbs a block at the very top */
     for (uint32_t a = start; a < end; a++) bm[a] |= X86_BM_CODE;
+    if (start < dbt->bm_lo) dbt->bm_lo = start;
+    if (end > dbt->bm_hi) dbt->bm_hi = end;
 }
 
 /* A store landed on a byte some cached block covers. Invalidate every
@@ -146,30 +147,61 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
     dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
 }
 
+/* Every translation is stale (A20 flipped, a code descriptor changed).
+ * This runs from inside a helper thunk as often as not, so only the
+ * cache and the link registry are wiped here — the code buffer that is
+ * executing us is rewound by the next translate — and the running block
+ * is told to leave. */
+static void flush_under_running_code(x86_dbt *dbt) {
+    dbt_cache_invalidate_all(dbt);
+    dbt->flush_pending = 1;
+    dbt->cpu->jit_cur_hit = 1;
+}
+
+/* A protected-mode key names CS by selector, and the translation bakes in
+ * what the descriptor said then: base, limit, D bit. Watch the descriptor's
+ * 8 bytes; a store to any of them (a DPMI set-base, a client writing its
+ * LDT) flushes everything. Descriptors change rarely and never in a loop. */
+void dbt_watch_cs_desc(x86_dbt *dbt) {
+    x86_cpu *cpu = dbt->cpu;
+    uint16_t sel = cpu->seg[S_CS].sel;
+    uint32_t at = ((sel & 4) ? cpu->ldtr.base : cpu->gdtr.base) + (sel & 0xFFF8u);
+    if (at >= cpu->mem_size - 8) return;
+    for (uint32_t i = 0; i < 8; i++) cpu->code_bitmap[at + i] |= X86_BM_DESC;
+    if (at < dbt->bm_lo) dbt->bm_lo = at;
+    if (at + 8 > dbt->bm_hi) dbt->bm_hi = at + 8;
+}
+
 /* cpu->smc_hook: reached from x86_phys_wr8 (interpreter, helpers, host
  * services) whenever the bitmap byte is set. */
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
-    invalidate_for_store((x86_dbt *)cpu->dbt, phys);
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    if (cpu->code_bitmap[phys] & X86_BM_DESC) {
+        flush_under_running_code(dbt);     /* clears every CODE and DESC bit */
+        dbt->desc_flushes++;
+        return;
+    }
+    invalidate_for_store(dbt, phys);
 }
 
-/* Forget every translated byte, keeping device marks. */
+/* Forget every translated byte and watched descriptor, keeping device
+ * marks. Only the range ever marked is walked: the bitmap spans all of
+ * memory, and writing it whole would fault in 17 MB per flush. */
 void dbt_clear_code_bits(x86_cpu *cpu) {
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     uint8_t *bm = cpu->code_bitmap;
-    for (uint32_t i = 0; i < cpu->mem_size; i++) bm[i] &= (uint8_t)~X86_BM_CODE;
+    for (uint32_t i = dbt->bm_lo; i < dbt->bm_hi; i++) bm[i] &= (uint8_t)~(X86_BM_CODE | X86_BM_DESC);
+    dbt->bm_lo = cpu->mem_size;
+    dbt->bm_hi = 0;
 }
 
 /* cpu->a20_hook. Every block key and every baked far-transfer mask is
- * stale now. This runs from inside a helper thunk (OUT 92h/60h) as
- * often as not, so only the cache and the link registry are wiped here
- * — the code buffer that is executing us is rewound by the next
- * translate — and the running block is told to leave. */
+ * stale now (OUT 92h/60h, from inside a helper thunk as often as not). */
 void dbt_a20_changed(x86_cpu *cpu, int on) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     (void)on;
     if (!dbt) return;
-    dbt_cache_invalidate_all(dbt);
-    dbt->flush_pending = 1;
-    cpu->jit_cur_hit = 1;
+    flush_under_running_code(dbt);
     dbt->a20_flushes++;
 }
 

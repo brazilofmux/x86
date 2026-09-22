@@ -50,7 +50,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     memset(dbt, 0, sizeof(*dbt));
     dbt->cpu = cpu;
     dbt->quantum = 1u << 20;
-    dbt->verify_mem_every = 1;
+    dbt->verify_mem_every = 256;
     if (getenv("X86_PMPROF")) {
         dbt->pmprof = 1;
         dbt->pmprof_after = strtoull(getenv("X86_PMPROF"), NULL, 0);
@@ -70,6 +70,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->aux->helpers[H_EXEC]       = (void *)dbt_h_exec;
     dbt->aux->helpers[H_POST_STORE] = (void *)x86_store_hook;   /* device memory, then code */
 
+    dbt->bm_lo    = cpu->mem_size;         /* nothing marked yet */
     cpu->dbt      = dbt;
     cpu->jit_aux  = dbt->aux;
     cpu->smc_hook = dbt_smc_store;
@@ -110,15 +111,19 @@ static void dbt_dump_code(x86_dbt *dbt) {
     fclose(f);
 }
 
+static uint8_t dev_record(x86_cpu *c, uint32_t p);
+
 void dbt_cleanup(x86_dbt *dbt) {
     dbt_dump_code(dbt);
     if (dbt->cpu) {
+        dbt_clear_code_bits(dbt->cpu);
         dbt->cpu->dbt = NULL;
         dbt->cpu->smc_hook = NULL;
-        dbt_clear_code_bits(dbt->cpu);
     }
     if (dbt->code_buf && dbt->code_buf != MAP_FAILED) munmap(dbt->code_buf, CODE_BUF_SIZE);
     if (dbt->shadow_live) x86_free(&dbt->shadow);
+    if (dbt->cpu && dbt->cpu->device_read == dev_record) dbt->cpu->device_read = dbt->dev_read_real;
+    free(dbt->devlog);
     free(dbt->aux); free(dbt->span); free(dbt->link_head); free(dbt->link_pool); free(dbt->insn_pool);
     memset(dbt, 0, sizeof(*dbt));
 }
@@ -130,8 +135,9 @@ void dbt_cleanup(x86_dbt *dbt) {
 /* Generic slow path: run the interpreter's execute() on a pooled decoded
  * instruction. The call site has synced every pinned register the
  * interpreter reads (all of them) and reloads them all afterwards; eip
- * already points past the instruction. Nothing that raises or moves CS
- * is ever routed here (can_translate), so exc stays -1. */
+ * already points past the instruction. Nothing that moves CS is routed
+ * here. A fault leaves cpu->exc set and eip at the instruction; the exec
+ * thunk sees it and leaves the block for the run loop to deliver it. */
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     x86_exec_decoded(cpu, &dbt->insn_pool[insn_index]);
@@ -172,9 +178,9 @@ static void verify_first_diff(const x86_cpu *jit, const x86_cpu *interp) {
         fprintf(stderr, "    halted differs: jit=%d interp=%d\n", jit->halted, interp->halted);
 }
 
-static void dump_mem_diff(const uint8_t *a, const uint8_t *b, const char *na, const char *nb) {
+static void dump_mem_diff(const uint8_t *a, const uint8_t *b, uint32_t size, const char *na, const char *nb) {
     int shown = 0;
-    for (uint32_t i = 0; i < X86_LOW_SIZE && shown < 8; i++) {
+    for (uint32_t i = 0; i < size && shown < 8; i++) {
         if (a[i] != b[i]) {
             fprintf(stderr, "    mem[%06X] differs: %s=%02X %s=%02X\n", i, na, a[i], nb, b[i]);
             shown++;
@@ -193,11 +199,58 @@ static void dump_block_bytes(const x86_cpu *c, uint64_t key, const char *tag) {
 }
 
 static void shadow_smc_none(x86_cpu *c, uint32_t p) { (void)c; (void)p; }
+static uint32_t shadow_io_read(x86_cpu *c, uint16_t port, int size) { (void)c; (void)port; (void)size; return 0xFFFFFFFFu; }
+static void shadow_io_write(x86_cpu *c, uint16_t port, uint32_t v, int size) { (void)c; (void)port; (void)v; (void)size; }
 
-/* Copy the real cpu into the shadow: registers, memory, A20. The shadow
- * keeps its own mem/bitmap (never marked, so the hook never fires) and
- * never sees the DBT. */
-static void shadow_resync(x86_dbt *dbt) {
+/* -V: the real cpu's device reads go through dev_record, which logs what
+ * the device answered; the shadow's go through dev_replay, which hands
+ * the same answers back in the same order. A VGA read depends on plane
+ * and latch state the shadow does not have (DOOM's I_ReadScreen copies
+ * the screen out plane by plane), so this is the only way it can agree. */
+static uint8_t dev_record(x86_cpu *c, uint32_t p) {
+    x86_dbt *dbt = (x86_dbt *)c->dbt;
+    uint8_t v = dbt->dev_read_real(c, p);
+    if (dbt->devlog_n == dbt->devlog_cap) {
+        dbt->devlog_cap = dbt->devlog_cap ? dbt->devlog_cap * 2 : 65536;
+        dbt->devlog = realloc(dbt->devlog, dbt->devlog_cap);
+    }
+    dbt->devlog[dbt->devlog_n++] = v;
+    return v;
+}
+static x86_dbt *s_replay_dbt;      /* the shadow has no dbt pointer of its own */
+static uint8_t dev_replay(x86_cpu *c, uint32_t p) {
+    x86_dbt *dbt = s_replay_dbt;
+    if (dbt->devlog_pos < dbt->devlog_n) return dbt->devlog[dbt->devlog_pos++];
+    return c->mem[p];               /* more reads than the real cpu made: a divergence -V will report */
+}
+/* Before the real cpu runs: route its device reads through the recorder
+ * (the device layer installs and removes its hook on mode changes). */
+static void dev_log_arm(x86_dbt *dbt) {
+    x86_cpu *cpu = dbt->cpu;
+    if (cpu->device_read && cpu->device_read != dev_record) {
+        dbt->dev_read_real = cpu->device_read;
+        cpu->device_read = dev_record;
+    }
+    dbt->devlog_n = dbt->devlog_pos = 0;
+}
+
+static int at_hle(const x86_cpu *c) {
+    return c->hle && c->seg[S_CS].base == ((uint32_t)c->hle_seg << 4);
+}
+
+/* How much of memory the shadow tracks. Real mode cannot address past
+ * the HMA — only host services write there — so until translated
+ * protected-mode code has run, low memory is all that needs copying or
+ * comparing; the full 17 MB per resync made -V unusable on real-mode
+ * programs that trap to the host often. */
+static uint32_t shadow_span(const x86_dbt *dbt) {
+    return dbt->shadow_ext ? dbt->cpu->mem_size : X86_LOW_SIZE;
+}
+
+/* Copy the real cpu's registers into the shadow, leaving its memory. The
+ * shadow keeps its own mem/bitmap (never marked, so the hook never fires),
+ * never sees the DBT, and never reaches a device, a port or the host. */
+static void shadow_copy_regs(x86_dbt *dbt) {
     x86_cpu *cpu = dbt->cpu, *sh = &dbt->shadow;
     uint8_t *mem = sh->mem, *bm = sh->code_bitmap;
     int fd = sh->mem_fd; uint8_t mirrored = sh->mem_mirrored;
@@ -209,13 +262,34 @@ static void shadow_resync(x86_dbt *dbt) {
     /* Devices belong to the real machine: the shadow sees their memory as
      * plain bytes and never reaches back into their state. */
     sh->device_store = NULL;
-    sh->device_read = NULL;
+    sh->device_read = cpu->device_read ? dev_replay : NULL;
+    s_replay_dbt = dbt;
     sh->a20_hook = NULL;
-    /* The shadow's HMA window must alias the same way before the copy,
+    sh->io_read = shadow_io_read;
+    sh->io_write = shadow_io_write;
+    sh->hle = NULL;
+    sh->trace_exc = NULL;
+    /* The shadow's HMA window must alias the same way before any copy,
      * or the real HMA bytes land in the shadow's low 64 KB (or vice versa). */
     sh->a20_mask = sh_a20;
     x86_set_a20(sh, cpu->a20_mask != 0xFFFFFu);
-    memcpy(sh->mem, cpu->mem, X86_LOW_SIZE);   /* low memory only: the JIT refuses PM, so nothing above it moves */
+}
+
+/* Device memory — the VGA window, while planar VGA claims it — holds
+ * whatever the device made of a store, which the shadow cannot know, so
+ * it is left out of the comparison and handed over after each check. */
+#define DEV_LO 0xA0000u
+#define DEV_HI 0xB0000u
+static int shadow_mem_equal(const x86_dbt *dbt, uint32_t span) {
+    const uint8_t *a = dbt->cpu->mem, *b = dbt->shadow.mem;
+    if (!dbt->cpu->device_store) return memcmp(a, b, span) == 0;
+    return memcmp(a, b, DEV_LO) == 0 && memcmp(a + DEV_HI, b + DEV_HI, span - DEV_HI) == 0;
+}
+
+/* Registers and memory. */
+static void shadow_resync(x86_dbt *dbt) {
+    shadow_copy_regs(dbt);
+    memcpy(dbt->shadow.mem, dbt->cpu->mem, shadow_span(dbt));
 }
 
 typedef void (*trampoline_fn)(x86_cpu *cpu, uint8_t *mem, void *block, void *aux, uint64_t budget);
@@ -245,29 +319,20 @@ int dbt_run(x86_dbt *dbt) {
         if (cpu->halted) return 0;
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
 
-        /* The block cache is indexed 1:1 on a linear address in low memory,
-         * which is all real mode can reach. Protected mode is both outside
-         * the backend's repertoire and outside that index — a DPMI client
-         * runs from extended memory — so it never reaches a lookup, and
-         * every instruction goes to the interpreter below. */
-        x86_block_entry *be = NULL;
-        uint8_t *code = NULL;
-        uint64_t key = 0;
-        if (!cpu->pmode) {
-            key = dbt_cpu_key(cpu);
-            be = dbt_cache_lookup(dbt, key);
-            code = be ? be->code : NULL;
-            if (!be) {
-                dbt_jit_writable_begin();
-                code = dbt_translate_block(dbt, key);
-                dbt_jit_writable_end();
-                dbt_cache_insert(dbt, key, code);
-                if (code) dbt->blocks_translated++;
-            }
+        uint64_t key = dbt_cpu_key(cpu);
+        x86_block_entry *be = dbt_cache_lookup(dbt, key);
+        uint8_t *code = be ? be->code : NULL;
+        if (!be) {
+            dbt_jit_writable_begin();
+            code = dbt_translate_block(dbt, key);
+            dbt_jit_writable_end();
+            dbt_cache_insert(dbt, key, code);
+            if (code) dbt->blocks_translated++;
         }
 
         if (code) {
             if (dbt->verify) {
+                if (cpu->pmode && !dbt->shadow_ext) { dbt->shadow_ext = 1; dbt->shadow_stale = 1; }
                 if (dbt->shadow_stale) { shadow_resync(dbt); dbt->shadow_stale = 0; }
                 uint64_t insns_before = cpu->insn_count;
                 x86_cpu pre = *cpu;
@@ -283,6 +348,7 @@ int dbt_run(x86_dbt *dbt) {
                 }
 
                 dbt->jit_block_entries++;
+                dev_log_arm(dbt);
                 trampoline(cpu, cpu->mem, code, dbt->aux, dbt->quantum);
                 poll_countdown = 0;
                 if (cpu->exc >= 0) x86_deliver_exception(cpu);
@@ -298,9 +364,13 @@ int dbt_run(x86_dbt *dbt) {
                 runs++;
 
                 int regs_ok = cpu_regs_equal(cpu, &dbt->shadow);
-                int mem_ok = 1;
-                if (dbt->verify_mem_every <= 1 || (runs % (uint64_t)dbt->verify_mem_every) == 0)
-                    mem_ok = memcmp(cpu->mem, dbt->shadow.mem, X86_LOW_SIZE) == 0;
+                /* Low memory after every run; all of it — 17 MB, too much per
+                 * block — every verify_mem_every runs (-M 1 for
+                 * every run, to localise a divergence the sampling found). */
+                int mem_ok = shadow_mem_equal(dbt, X86_LOW_SIZE);
+                if (mem_ok && dbt->shadow_ext && (dbt->verify_mem_every <= 1 || (runs % (uint64_t)dbt->verify_mem_every) == 0))
+                    mem_ok = shadow_mem_equal(dbt, cpu->mem_size);
+                if (cpu->device_store) memcpy(dbt->shadow.mem + DEV_LO, cpu->mem + DEV_LO, DEV_HI - DEV_LO);
                 if (!regs_ok || !mem_ok) {
                     fprintf(stderr, "\n[verify] divergence after JIT run from %04X:%04X (%llu insns)\n",
                             pre.seg[S_CS].sel, pre.eip, (unsigned long long)jit_insns);
@@ -308,7 +378,7 @@ int dbt_run(x86_dbt *dbt) {
                     dump_regs(stderr, "JIT   ", cpu);
                     dump_regs(stderr, "shadow", &dbt->shadow);
                     if (!regs_ok) verify_first_diff(cpu, &dbt->shadow);
-                    if (!mem_ok) dump_mem_diff(cpu->mem, dbt->shadow.mem, "jit", "shadow");
+                    if (!mem_ok) dump_mem_diff(cpu->mem, dbt->shadow.mem, shadow_span(dbt), "jit", "shadow");
                     dump_block_bytes(cpu, key, "entry block, real mem");
                     return -1;
                 }
@@ -338,13 +408,16 @@ int dbt_run(x86_dbt *dbt) {
             }
             if (lin < cpu->mem_size) dbt->pm_hits[lin >> 4]++;
         }
-        if (!cpu->pmode && cpu->seg[S_CS].sel != cpu->hle_seg) {
+        int hle_step = at_hle(cpu);
+        if (!hle_step) {
             /* dynamic histogram: what did we hand to the interpreter? */
             uint8_t fb[16];
-            for (int k = 0; k < 16; k++) fb[k] = x86_phys_rd8(cpu, cpu->seg[S_CS].base + ((cpu->eip + k) & 0xFFFF));
-            x86_dec_ctx dc = { fb, cpu->model, 0 }; x86_insn di;
+            uint32_t m = cpu->pmode ? 0xFFFFFFFFu : 0xFFFFu;
+            for (int k = 0; k < 16; k++) fb[k] = x86_phys_rd8(cpu, cpu->seg[S_CS].base + ((cpu->eip + (uint32_t)k) & m));
+            x86_dec_ctx dc = { fb, cpu->model, cpu->pmode ? cpu->seg[S_CS].big : 0 }; x86_insn di;
             if (x86_decode(&dc, &di)) dbt->fallback_by_op[di.op]++;
         }
+        if (dbt->verify) dev_log_arm(dbt);
         int timed = (dbt->interp_fallback_insns & 15) == 0;
         struct timespec t0, t1;
         if (timed) clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -358,14 +431,20 @@ int dbt_run(x86_dbt *dbt) {
             fprintf(stderr, "dbt_run: interpreter stopped at %04X:%04X\n", cpu->seg[S_CS].sel, cpu->eip);
             return -1;
         }
-        if (dbt->verify) {
+        if (dbt->verify && !dbt->shadow_stale) {
             /* The fallback ran on the reference interpreter — nothing to
-             * verify, and it may have been a host service whose side
-             * effects must not happen twice. The shadow is re-synced, but
-             * only when a translated block next needs it: a run of
-             * fallbacks — all of protected mode, today — would otherwise
-             * copy low memory once per instruction. */
-            dbt->shadow_stale = 1;
+             * verify. An ordinary instruction is replayed on the shadow so
+             * that it stays in step without a copy of memory; its registers
+             * are then taken from the real cpu, which alone saw the ports
+             * and devices. A host service must not run twice: the shadow is
+             * re-synced instead, once a translated block next needs it. */
+            if (hle_step) {
+                dbt->shadow_stale = 1;
+            } else {
+                x86_step(&dbt->shadow);
+                shadow_copy_regs(dbt);
+                if (dbt->shadow.a20_mask != cpu->a20_mask) dbt->shadow_stale = 1;
+            }
         }
         /* Poll after the step as well, not just after a translated block.
          * A fallback is nearly always an HLE service, and the instant it
@@ -451,6 +530,7 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     fprintf(out, "  helper-class ops:       %llu (at translation)\n", (unsigned long long)dbt->helper_insns);
     fprintf(out, "  SMC invalidations:      %llu\n", (unsigned long long)dbt->smc_invalidations);
     if (dbt->a20_flushes) fprintf(out, "  A20 cache flushes:      %llu\n", (unsigned long long)dbt->a20_flushes);
+    if (dbt->desc_flushes) fprintf(out, "  CS descriptor flushes:  %llu\n", (unsigned long long)dbt->desc_flushes);
     fprintf(out, "  links created/patched/unpatched: %llu / %llu / %llu\n",
             (unsigned long long)dbt->links_created, (unsigned long long)dbt->links_patched,
             (unsigned long long)dbt->links_unpatched);

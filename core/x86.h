@@ -186,11 +186,13 @@ static inline void x86_set_reg(x86_cpu *c, int i, int size, uint32_t v) {
  * Physical memory. Everything funnels through these so the A20 gate,
  * the open-bus region and (later) the SMC write hook have one home.
  * ========================================================================= */
-/* The code bitmap carries two things: X86_BM_CODE, a translated block
- * covers the byte (the DBT's), and X86_BM_DEVICE, the byte is device memory
- * whose store has side effects. Either way a store lands, then any nonzero
- * entry sends it to x86_store_hook. */
+/* The code bitmap carries three things: X86_BM_CODE, a translated block
+ * covers the byte; X86_BM_DESC, the byte belongs to a descriptor that a
+ * translated block's key depends on (both the DBT's); and X86_BM_DEVICE,
+ * the byte is device memory whose store has side effects. Either way a
+ * store lands, then any nonzero entry sends it to x86_store_hook. */
 #define X86_BM_CODE   0x01
+#define X86_BM_DESC   0x02
 #define X86_BM_DEVICE 0x80
 void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 

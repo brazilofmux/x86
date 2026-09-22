@@ -68,6 +68,12 @@ test-pm:
 test-pm-compare:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 compare.py
 
+# The oracle image again, through protected-mode JIT blocks under -V lockstep
+test-pm-jit: $(TARGET)
+	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && \
+	! ../../dos-monster -boot pmtest.img -V -m 386 -L 5000000 2>&1 >/dev/null | grep -A12 divergence && \
+	echo "pm oracle image: -V clean"
+
 clean:
 	rm -f $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(DBT_OBJS) $(DBT_OBJS:.o=.d) \
 	      $(PC_OBJS) $(PC_OBJS:.o=.d) $(DOS_OBJS) $(DOS_OBJS:.o=.d) main.o main.d \

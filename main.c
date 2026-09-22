@@ -202,7 +202,7 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
 int main(int argc, char **argv) {
     int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0;
     uint64_t limit = 0;
-    int mem_every = 1;
+    int mem_every = 0;          /* -M N: whole-memory -V compare every N block runs (0: the DBT default) */
     const char *root = NULL, *prog = NULL, *dump = NULL, *gdump = NULL, *drive_a = NULL, *drive_b = NULL;
     int window = -1;                         /* -w / -W; -1: a window if stdout is a terminal */
     const char *boot_img = NULL;
@@ -266,6 +266,7 @@ int main(int argc, char **argv) {
         cpu.eip = 0x7C00;
         cpu.r[R_SP] = 0x7C00;
         cpu.r[R_DX] = 0;                       /* boot drive */
+        x86_set_a20(&cpu, 1);                  /* SeaBIOS (the oracle's QEMU) boots with A20 on */
     } else {
         if (i >= argc) { usage(argv[0]); return 2; }
         prog = argv[i++];
@@ -346,7 +347,7 @@ int main(int argc, char **argv) {
     if (use_jit) {
         if (dbt_init(&g_dbt, &cpu) < 0) return 1;
         g_dbt.verify = verify;
-        g_dbt.verify_mem_every = mem_every;
+        if (mem_every > 0) g_dbt.verify_mem_every = mem_every;
         g_dbt.insn_limit = limit;
         g_dbt.poll = host_poll;
         rc = dbt_run(&g_dbt);

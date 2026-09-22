@@ -76,7 +76,7 @@
 #define ARITH  X86_ARITH_FLAGS   /* 0x8D5 — not a logical immediate, load it */
 
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
-static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_fault_stub_off, s_fault_exit_off;
+static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_fault_stub_off, s_fault_exit_off, s_exit_eip_off;
 
 /* model >= 386: the pinned registers hold the whole 32-bit guest register,
  * so a 16-bit write merges into bits 15:0 and anything that consumes a
@@ -144,12 +144,18 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_load_pinned(&e);
     emit_br(&e, A64_W2);
 
-    /* ---- Exit stub: X0 = next key. ---- */
+    /* ---- Exit stub: X0 = next key. EIP = linear - CS.base, which in
+     * real mode wraps to 16 bits (A20-folded HMA code) and in protected
+     * mode is exact (keys are only made there with A20 on). ---- */
     dbt->exit_stub_off = e.offset;
     emit_ldr_w32_imm(&e, W_T0, R_CPU, OFF_SEG_BASE(S_CS));
     emit_sub_w32(&e, W_T0, A64_W0, W_T0);
+    uint32_t pm_eip = emit_pos(&e);
+    emit_tbnz_x64(&e, A64_W0, 48, 0);                 /* KEY_PMODE */
     (void)emit_and_w32_imm(&e, W_T0, W_T0, 0xFFFF);
+    emit_patch_tb14(&e, pm_eip, emit_pos(&e));
     emit_str_w32_imm(&e, W_T0, R_CPU, OFF_EIP);
+    s_exit_eip_off = e.offset;                        /* enter here with cpu->eip already stored */
     emit_spill_pinned(&e);
     /* insn_count += budget - remaining */
     emit_ldr_x64_imm(&e, A64_W5, R_CPU, OFF_JIT_BUDGET);
@@ -173,11 +179,8 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_str_w32_imm(&e, A64_W5, R_CPU, OFF_EXC);
     s_fault_exit_off = e.offset;
     emit_sub_x64(&e, R_CNT, R_CNT, A64_W4);
-    emit_ldr_w32_imm(&e, W_T1, R_CPU, OFF_SEG_BASE(S_CS));
-    emit_add_w32(&e, A64_W0, W_T1, A64_W3);
-    emit_ldrh_imm(&e, W_T1, R_CPU, OFF_SEG_SEL(S_CS));
-    emit_orr_x64_lsl(&e, A64_W0, A64_W0, W_T1, 32);
-    emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
+    emit_str_w32_imm(&e, A64_W3, R_CPU, OFF_EIP);
+    emit_b(&e, (int32_t)s_exit_eip_off - (int32_t)emit_pos(&e));
 
     /* ---- Thunks. Both are entered by BL from a block with
      *   X0 = cpu, W2 = the block's linear address, W3 = ip after the
@@ -234,15 +237,13 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
         uint32_t cont = emit_pos(&e);
         emit_cbnz_w32(&e, W_T1, 0);
         emit_ret(&e);
-        /* Running block invalidated: X0 = key(CS, cs.base + ip_after),
-         * charge W4 instructions, exit. (HMA-wrapped code is not a case.) */
+        /* Running block invalidated: charge W4 instructions and exit at
+         * ip_after — or, after a helper, wherever the interpreter left
+         * EIP (a protected-mode helper can be a near jump). */
         emit_patch_cond19(&e, cont, emit_pos(&e));
         emit_sub_x64(&e, R_CNT, R_CNT, A64_W4);
-        emit_ldr_w32_imm(&e, W_T1, R_CPU, OFF_SEG_BASE(S_CS));
-        emit_add_w32(&e, A64_W0, W_T1, A64_W3);
-        emit_ldrh_imm(&e, W_T1, R_CPU, OFF_SEG_SEL(S_CS));
-        emit_orr_x64_lsl(&e, A64_W0, A64_W0, W_T1, 32);
-        emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
+        if (!is_exec) emit_str_w32_imm(&e, A64_W3, R_CPU, OFF_EIP);
+        emit_b(&e, (int32_t)s_exit_eip_off - (int32_t)emit_pos(&e));
     }
 
     dbt->code_used = e.offset;
@@ -407,7 +408,7 @@ static int s_wrap_exact;   /* model < 286: word accesses at offset FFFF wrap in-
 
 static void emit_thunk_args(emit_t *e) {
     emit_mov_w32_imm32(e, A64_W2, s_cur_lin);
-    emit_movz_w32(e, A64_W3, (uint16_t)s_cur_ip_after, 0);
+    emit_mov_w32_imm32(e, A64_W3, s_cur_ip_after);
     emit_movz_w32(e, A64_W4, (uint16_t)s_cur_n_done, 0);
 }
 
@@ -834,8 +835,7 @@ static int is_shift_inline(const x86_insn *in) {
     return cnt < (uint32_t)in->ops[0].size * 8;   /* 0 included: static no-op */
 }
 
-static int classify(const x86_insn *in) {
-    if (in->opsize != 2 || in->adsize != 2) return C_REFUSE;   /* 386 forms: Phase B */
+static int classify_op(const x86_insn *in) {
     switch (in->op) {
     case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
     case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
@@ -872,6 +872,32 @@ static int classify(const x86_insn *in) {
     default:
         return C_REFUSE;
     }
+}
+
+static int classify(const x86_insn *in) {
+    if (in->opsize != 2 || in->adsize != 2) return C_REFUSE;   /* 386 forms: Phase B */
+    return classify_op(in);
+}
+
+/* Protected mode, for now: everything the real-mode backend handles
+ * becomes a helper call — the interpreter's own execute() on the
+ * pre-decoded instruction, so exact by construction, faults included —
+ * except what moves CS or goes through a gate, which the interpreter
+ * steps. Near control transfers end the block (see translate). */
+static int classify_pm(const x86_insn *in) {
+    switch (in->op) {
+    case OP_INT: case OP_INT3: case OP_CALLF: case OP_JMPF: case OP_RETF:
+        return C_REFUSE;
+    case OP_DIV: case OP_IDIV:
+        return C_HELPER;          /* #DE is a fault: the thunk's fault exit delivers it */
+    default:
+        return classify_op(in) == C_REFUSE ? C_REFUSE : C_HELPER;
+    }
+}
+
+static int is_near_transfer(int op) {
+    return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JCC || op == OP_JCXZ
+        || op == OP_LOOP || op == OP_LOOPE || op == OP_LOOPNE;
 }
 
 /* Exposed for tools/jittest's fuzzer: 0 refuse, 1 inline, 2 helper. */
@@ -1310,6 +1336,89 @@ static void fetch_at(const x86_cpu *c, uint32_t ip, uint8_t *buf) {
     for (int i = 0; i < 16; i++) buf[i] = x86_phys_rd8((x86_cpu *)c, base + ((ip + i) & 0xFFFF));
 }
 
+/* ----------------------------------------------------------------------
+ * Protected-mode blocks (milestone 1: every instruction a helper).
+ *
+ * Everything the real-mode backend inlines for control transfers — the
+ * interrupt frame, the IVT read, a far target's base from its selector —
+ * is real-mode reasoning, so none of it is used here. A block is a run of
+ * helper calls on pre-decoded instructions; what the translation saves is
+ * the interpreter's fetch and decode. It ends after a near control
+ * transfer (the helper has set EIP; the tail probes for the block there),
+ * before anything classify_pm refuses (the run loop steps it), or at the
+ * end of what the code segment's limit allows.
+ * ---------------------------------------------------------------------- */
+
+/* X0 = key for cpu->eip after a helper moved it. */
+static void emit_pm_dynamic_key(emit_t *e, const x86_cpu *cpu, uint64_t mode_bits) {
+    emit_ldr_w32_imm(e, A64_W0, R_CPU, OFF_EIP);
+    emit_mov_w32_imm32(e, W_T0, cpu->seg[S_CS].base);
+    emit_add_w32(e, A64_W0, A64_W0, W_T0);           /* linear wraps at 4 GB, as the CPU's does */
+    emit_movk_x64(e, A64_W0, cpu->seg[S_CS].sel, 32);
+    emit_movk_x64(e, A64_W0, (uint16_t)(mode_bits >> 48), 48);
+}
+
+static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
+    x86_cpu *cpu = dbt->cpu;
+    const x86_seg *cs = &cpu->seg[S_CS];
+    /* A20 off in protected mode would fold linear addresses under the
+     * block's feet; nothing we run does it, so do not translate it. */
+    if (cpu->a20_mask != 0xFFFFFFFFu) return NULL;
+    uint64_t mode_bits = dbt_cpu_mode_bits(cpu);
+    uint32_t ipmask = cs->big ? 0xFFFFFFFFu : 0xFFFFu;
+
+    x86_insn decs[MAX_BLOCK_INSNS];
+    uint32_t ip_afters[MAX_BLOCK_INSNS];
+    uint32_t ip = cpu->eip, start_ip = ip, n_ops = 0;
+    int ends_dynamic = 0;
+    uint8_t buf[16];
+    x86_dec_ctx ctx = { buf, cpu->model, cs->big };
+    while (n_ops < MAX_BLOCK_INSNS) {
+        x86_insn *in = &decs[n_ops];
+        if (ip > cs->limit) break;
+        uint32_t lin = cs->base + ip;
+        if (lin >= cpu->mem_size || cpu->mem_size - lin < 16) break;   /* the interpreter's open bus */
+        for (int i = 0; i < 16; i++) buf[i] = cpu->mem[lin + (uint32_t)i];
+        if (!x86_decode(&ctx, in)) break;
+        if (ip + in->len - 1 > cs->limit || ip + in->len - 1 < ip) break;   /* straddles the limit: #GP is the interpreter's */
+        if (((ip + in->len) & ipmask) != ip + in->len) break;              /* 16-bit IP wrap */
+        if (classify_pm(in) == C_REFUSE) { dbt->refused_by_op[in->op]++; break; }
+        ip += in->len;
+        ip_afters[n_ops++] = ip;
+        if (is_near_transfer(in->op)) { ends_dynamic = 1; break; }
+    }
+    if (n_ops == 0) return NULL;
+
+    emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
+    uint8_t *entry = dbt->code_buf + e.offset;
+    s_cur_lin = dbt_key_lin(key);
+    uint32_t budget_patch = emit_pos(&e);
+    emit_tbnz_x64(&e, R_CNT, 63, 0);
+    for (uint32_t i = 0; i < n_ops; i++) {
+        s_cur_ip_after = ip_afters[i];
+        s_cur_ip_start = ip_afters[i] - decs[i].len;
+        s_cur_n_done = i + 1;
+        emit_helper_op(dbt, &e, &decs[i]);
+    }
+    emit_tail_prologue(&e, n_ops);
+    if (ends_dynamic) {
+        emit_pm_dynamic_key(&e, cpu, mode_bits);
+        emit_dynamic_tail(&e, dbt->exit_stub_off);
+    } else {
+        emit_edge(dbt, &e, dbt_key(cs->sel, cs->base + ip) | mode_bits);
+    }
+    emit_patch_tb14(&e, budget_patch, emit_pos(&e));
+    emit_mov_x64_imm64(&e, A64_W0, key);
+    emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
+
+    dbt->code_used = e.offset;
+    __builtin___clear_cache((char *)entry, (char *)(dbt->code_buf + e.offset));
+    uint32_t lin = dbt_key_lin(key);
+    dbt_mark_block_bytes(dbt, lin, lin + (ip - start_ip));
+    dbt_watch_cs_desc(dbt);
+    return entry;
+}
+
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     x86_cpu *cpu = dbt->cpu;
     if (s_strict_exit < 0)
@@ -1327,12 +1436,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     /* HLE stub segment: the interpreter step dispatches the host service. */
     if (cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4)) return NULL;
 
-    /* Protected mode is interpreter-only for now. Everything the backend
-     * inlines for control transfers — the interrupt frame, the IVT read, a
-     * far target's base from its selector — is real-mode reasoning, and it
-     * is wrong the moment descriptors exist. Refusing here costs speed and
-     * keeps -V honest; teaching the backend protected mode is its own job. */
-    if (cpu->pmode) return NULL;
+    if (cpu->pmode) return translate_pm(dbt, key);
 
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;

@@ -1490,6 +1490,7 @@ static void fetch_bytes(x86_cpu *c, uint8_t *buf) {
 
 void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
     uint32_t start_ip = c->eip - in->len;
+    c->int_inhibit = 0;          /* the shadow covers one instruction, as in x86_step */
     c->fault_armed = 1;
     if (_setjmp(c->fault_jb) == 0) execute(c, in, start_ip);
     c->fault_armed = 0;

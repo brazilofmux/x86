@@ -7,7 +7,8 @@
  * block and the run loop steps the interpreter for that one instruction.
  * Instructions that are exact but rare go through a generic helper
  * that calls the interpreter's execute() on the pooled decoded form —
- * still inside the block, no exit.
+ * still inside the block, no exit. Protected-mode blocks are, for now,
+ * nothing but such helpers (translate_pm in dbt_a64.c).
  *
  * Block ABI (AArch64, dbt_a64.c). Guest state is PINNED in host
  * registers across blocks and chains:
@@ -184,6 +185,7 @@ typedef struct {
     uint64_t jit_block_entries;
     uint64_t smc_invalidations;
     uint64_t a20_flushes;
+    uint64_t desc_flushes;
     uint64_t verify_blocks_checked;
     uint64_t links_created, links_patched, links_unpatched;
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
@@ -196,12 +198,19 @@ typedef struct {
     uint64_t pm_insns, pm_mem, pm_sib, pm_segovr, pm_rep;
     uint32_t *pm_hits;                  /* per 16-byte line of linear memory */
     uint32_t max_block_bytes;
+    uint32_t bm_lo, bm_hi;         /* bitmap range holding CODE/DESC marks: [lo, hi) */
     uint32_t last_block_bytes;
     int      flush_pending;         /* A20 changed under running code: rewind the code buffer at the next translate */
 
     int trace;
     int verify;                    /* -V: lockstep interp shadow, diff each block run */
     int shadow_stale;              /* the machine moved without the shadow; resync before the next check */
+    int shadow_ext;                /* translated PM code has run: the shadow tracks all of memory, not just low */
+    /* Device reads (planar VGA) seen by the real cpu since the last check,
+     * replayed in order to the shadow, which has no device of its own. */
+    uint8_t (*dev_read_real)(x86_cpu *, uint32_t);
+    uint8_t *devlog;
+    uint32_t devlog_n, devlog_cap, devlog_pos;
     int verify_mem_every;          /* compare guest memory every N block runs (0 = each) */
 
     x86_cpu shadow;                /* verify only; has its own memory */
@@ -222,6 +231,7 @@ void             dbt_cache_invalidate_all(x86_dbt *dbt);
 int  dbt_link_record(x86_dbt *dbt, uint64_t key, uint32_t site_off);
 void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code);
 void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end);
+void dbt_watch_cs_desc(x86_dbt *dbt);                     /* PM: flush if CS's descriptor is rewritten */
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys);          /* cpu->smc_hook */
 void dbt_clear_code_bits(x86_cpu *cpu);                   /* forget translations, keep device marks */
 void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
@@ -237,8 +247,18 @@ int      dbt_classify_op(const x86_insn *in);   /* 0 refuse, 1 inline, 2 helper 
 /* Helpers called from translated code (dbt_common.c) */
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index);
 
-/* Current block key for the cpu's CS:IP. */
+/* Mode bits of a key for the current CS. */
+static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
+    if (!c->pmode) return 0;
+    return KEY_PMODE | (c->seg[S_CS].big ? KEY_BIG : 0);
+}
+
+/* Current block key for the cpu's CS:EIP. Real mode masks for A20 and
+ * the 16-bit IP; protected mode is only translated with A20 on, where
+ * linear = CS.base + EIP exactly and the exit stub can recover EIP as
+ * linear - CS.base. */
 static inline uint64_t dbt_cpu_key(const x86_cpu *c) {
+    if (c->pmode) return dbt_key(c->seg[S_CS].sel, c->seg[S_CS].base + c->eip) | dbt_cpu_mode_bits(c);
     uint32_t lin = (c->seg[S_CS].base + (c->eip & 0xFFFF)) & c->a20_mask;
     return dbt_key(c->seg[S_CS].sel, lin);
 }
