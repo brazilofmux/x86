@@ -56,4 +56,15 @@ if [ -f disks/djgpp/bin/djecho.exe ]; then
     got=$(./dos-monster -i -m 386 -L 20000000000 -C disks/djgpp/bin disks/djgpp/bin/stubedit.exe -v djecho.exe 2>&1)
     case "$got" in *"CWSDPMI.EXE"*"Program to load"*) echo "ok   stubedit -v";; *) echo "FAIL stubedit -v"; echo "$got" | head -5; fail=1;; esac
 fi
+if [ -f disks/doom/inst/DOOMS/DOOM.EXE ]; then
+    # Shareware DOOM 1.9 (tests/dos/fetch-doom.sh): DOS/4GW bound into the
+    # game, a raw-switching DPMI client at ring 3. 60M instructions takes it
+    # through its whole startup — WAD, refresh, DPMI, keyboard, timer, sound
+    # init — to the status bar; the next thing it does is draw.
+    D=disks/doom/inst/DOOMS
+    for mode in -i -j; do
+        got=$(./dos-monster $mode -m 386 -C $D -L 60000000 $D/DOOM.EXE </dev/null 2>&1)
+        case "$got" in *"ST_Init: Init status bar."*) echo "ok   doom startup $mode";; *) echo "FAIL doom startup $mode"; echo "$got" | tail -5; fail=1;; esac
+    done
+fi
 exit $fail

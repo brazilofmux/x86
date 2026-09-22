@@ -18,9 +18,18 @@ uint64_t pc_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* An internal trap: an address in the HLE segment the host hands out
+ * itself (the DPMI entry, its return trampolines). The IVT is not touched. */
+void pc_set_trap(int offset, pc_service_fn fn, int ret_mode) {
+    pc.service[offset & 0xFF] = fn;
+    pc.ret_mode[offset & 0xFF] = (uint8_t)ret_mode;
+}
+
+/* A real interrupt service: the vector gets its own stub, F000:vector. */
 void pc_set_service(int vector, pc_service_fn fn, int ret_mode) {
-    pc.service[vector & 0xFF] = fn;
-    pc.ret_mode[vector & 0xFF] = (uint8_t)ret_mode;
+    pc_set_trap(vector, fn, ret_mode);
+    pc_wr16(pc.cpu, 0, (uint16_t)((vector & 0xFF) * 4), (uint16_t)(vector & 0xFF));
+    pc_wr16(pc.cpu, 0, (uint16_t)((vector & 0xFF) * 4 + 2), PC_HLE_SEG);
 }
 
 /* Pop the INT frame. FLAGS mode is MS-DOS's RETF 2: the caller gets the
@@ -344,6 +353,8 @@ static uint8_t a20_out_port(const x86_cpu *c) { return (uint8_t)(0xCD | (c->a20_
 
 static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     (void)size;
+    uint32_t vv;
+    if (pc_vga_port_read(port, &vv)) return vv;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
         fprintf(stderr, "[port] in %02X → %02X @%llu\n", port, port == 0x60 ? pc.last_scancode : port == 0x61 ? pit_speaker : 0x14, (unsigned long long)c->insn_count);
     switch (port) {
@@ -375,6 +386,7 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
 }
 static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     (void)size;
+    if (pc_vga_port_write(port, val, size)) return;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61 || port == 0x20))
         fprintf(stderr, "[port] out %02X ← %02X @%llu\n", port, val & 0xFF, (unsigned long long)c->insn_count);
     switch (port) {
@@ -443,12 +455,18 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     cpu->io_read = port_read;
     cpu->io_write = port_write;
 
-    /* Stub segment: one IRET per vector, plus the ROM signature bytes. */
+    /* Stub segment: one IRET per vector, plus the ROM signature bytes.
+     * Like a real BIOS, every vector nobody serves points at one shared
+     * dummy IRET — the AT BIOS's own is at F000:FF53, and software knows
+     * it: DOS/4GW finds free vectors by scanning the IVT for two adjacent
+     * identical entries, and with a distinct stub per vector it scanned
+     * forever. pc_set_service gives a served vector its own stub. */
     for (int v = 0; v < 256; v++) {
         pc_wr8(cpu, PC_HLE_SEG, (uint16_t)v, 0xCF);
-        pc_wr16(cpu, 0, (uint16_t)(v * 4), (uint16_t)v);
+        pc_wr16(cpu, 0, (uint16_t)(v * 4), PC_HLE_DUMMY_IRET);
         pc_wr16(cpu, 0, (uint16_t)(v * 4 + 2), PC_HLE_SEG);
     }
+    pc_wr8(cpu, PC_HLE_SEG, PC_HLE_DUMMY_IRET, 0xCF);
     static const char date[] = "01/01/92";
     for (int i = 0; i < 8; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(0xFFF5 + i), (uint8_t)date[i]);
     pc_wr8(cpu, PC_HLE_SEG, 0xFFFE, 0xFC);       /* model: AT */

@@ -14,6 +14,7 @@
  */
 #include "pc.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -133,7 +134,8 @@ void pc_video_teletype(x86_cpu *c, uint8_t ch) {
 }
 
 static void set_mode(x86_cpu *c, int mode) {
-    int nc = (mode == 0 || mode == 1) ? 40 : 80;
+    int m = mode & 0x7F;
+    int nc = (m == 0 || m == 1 || m == 0x13) ? 40 : 80;
     pc_wr8(c, BDA, 0x49, (uint8_t)(mode & 0x7F));
     pc_wr16(c, BDA, 0x4A, (uint16_t)nc);
     pc_wr16(c, BDA, 0x4C, PAGE_BYTES);
@@ -148,7 +150,8 @@ static void set_mode(x86_cpu *c, int mode) {
     pc_wr8(c, BDA, 0x88, 0x09);
     pc_wr8(c, BDA, 0x89, 0x51);
     pc_wr8(c, BDA, 0x8A, 0x08);
-    if (!(mode & 0x80))
+    pc_vga_set_mode(c, mode);                    /* graphics state follows the mode, text or 13h */
+    if (m != 0x13 && !(mode & 0x80))
         for (int i = 0; i < PC_ROWS * PC_COLS; i++)
             pc_wr16(c, PC_VIDEO_SEG, (uint16_t)(i * 2), 0x0720);
     shadow_valid = 0;

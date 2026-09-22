@@ -106,7 +106,7 @@ def records(img=None):
         elif post is None:
             r.update(faulted=None)
         else:
-            reg = {"jmpf": "CS", "callf": "CS", "iret": "CS", "lldt": "LDT", "ltr": "TR"}.get(tgt, tgt.upper())
+            reg = {"jmpf": "CS", "callf": "CS", "iret": "CS", "retf": "CS", "lldt": "LDT", "ltr": "TR"}.get(tgt, tgt.upper())
             d = post["segs"].get(reg, (0, 0, 0, 0))
             r.update(faulted=False, seg=d[0], base=d[1], limit=d[2], ar=d[3] >> 8,
                      esp=post["regs"].get("ESP", 0), ss=post["segs"].get("SS", (0,))[0])

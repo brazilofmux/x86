@@ -35,11 +35,11 @@
 
 #define SEL_HCODE 0x08              /* flat code, base 0 */
 #define SEL_HDATA 0x10              /* flat data, base 0 */
-#define SEL_HLE   0x18              /* code based at the HLE segment */
+#define SEL_HLE   0x1B              /* code based at the HLE segment, DPL 3 (see the ring note) */
 #define SEL_LDT   0x20
 #define SEL_TSS   0x28
-#define SEL_HLE16 0x30              /* the trap segment again, 16-bit: a 16-bit client's gates */
-#define SEL_HSTK  0x38              /* the host's block as a stack, as wide as the client */
+#define SEL_HLE16 0x33              /* the trap segment again, 16-bit: a 16-bit client's gates */
+#define SEL_HSTK  0x3B              /* the host's block as a stack, as wide as the client */
 #define GDT_SLOTS 8
 #define LDT_SLOTS 128
 
@@ -195,11 +195,11 @@ void dpmi_init(x86_cpu *c) {
 
     set_desc(c, gdt_at(1), 0, 0xFFFFFFFFu, 0x9A, 0x40);                 /* flat code */
     set_desc(c, gdt_at(2), 0, 0xFFFFFFFFu, 0x92, 0x40);                 /* flat data */
-    set_desc(c, gdt_at(3), (uint32_t)PC_HLE_SEG << 4, 0xFFFF, 0x9A, 0x40);  /* the trap segment */
+    set_desc(c, gdt_at(3), (uint32_t)PC_HLE_SEG << 4, 0xFFFF, 0xFA, 0x40);  /* the trap segment */
     set_desc(c, gdt_at(4), lin(dpmi.seg, LDT_OFF), LDT_SLOTS * 8 - 1, 0x82, 0x00);
     set_desc(c, gdt_at(5), lin(dpmi.seg, TSS_OFF), 0x67, 0x89, 0x00);
-    set_desc(c, gdt_at(6), (uint32_t)PC_HLE_SEG << 4, 0xFFFF, 0x9A, 0x00);  /* the trap segment, 16-bit */
-    set_desc(c, gdt_at(7), lin(dpmi.seg, 0), HOST_PARAS * 16u - 1, 0x92, 0x00);   /* resized per client */
+    set_desc(c, gdt_at(6), (uint32_t)PC_HLE_SEG << 4, 0xFFFF, 0xFA, 0x00);  /* the trap segment, 16-bit */
+    set_desc(c, gdt_at(7), lin(dpmi.seg, 0), HOST_PARAS * 16u - 1, 0xF2, 0x00);   /* resized per client */
 
     /* Every vector traps to the host, exactly as the real-mode IVT does. */
     for (int v = 0; v < 256; v++) idt_set(c, v, SEL_HLE, (uint32_t)v);
@@ -212,7 +212,7 @@ static uint16_t ldt_alloc(int count) {
         while (k < count && !dpmi.used[i + k]) k++;
         if (k < count) { i += k; continue; }
         for (k = 0; k < count; k++) dpmi.used[i + k] = 1;
-        return (uint16_t)((i << 3) | 4);               /* TI = 1, RPL 0 */
+        return (uint16_t)((i << 3) | 7);               /* TI = 1, RPL 3: the client's privilege */
     }
     return 0;
 }
@@ -237,7 +237,7 @@ static uint16_t sel_for_seg(x86_cpu *c, uint16_t seg) {
     for (int i = 0; i < seg_cached; i++) if (seg_cache[i].seg == seg) return seg_cache[i].sel;
     uint16_t sel = ldt_alloc(1);
     if (!sel) return 0;
-    set_desc(c, ldt_at(ldt_index(sel)), (uint32_t)seg << 4, 0xFFFF, 0x92, 0x00);
+    set_desc(c, ldt_at(ldt_index(sel)), (uint32_t)seg << 4, 0xFFFF, 0xF2, 0x00);
     if (seg_cached < (int)(sizeof seg_cache / sizeof seg_cache[0]))
         seg_cache[seg_cached].seg = seg, seg_cache[seg_cached++].sel = sel;
     return sel;
@@ -285,22 +285,21 @@ void dpmi_mode_switch(x86_cpu *c, int vector) {
      * sizes the frame by the trap segment's D bit. The host stack gets the
      * matching B bit, so a 16-bit handler's SP addresses it correctly. */
     for (int v = 0; v < 256; v++) idt_set(c, v, is32 ? SEL_HLE : SEL_HLE16, (uint32_t)v);
-    set_desc(c, gdt_at(7), lin(dpmi.seg, 0), HOST_PARAS * 16u - 1, 0x92, is32 ? 0x40 : 0x00);
+    set_desc(c, gdt_at(7), lin(dpmi.seg, 0), HOST_PARAS * 16u - 1, 0xF2, is32 ? 0x40 : 0x00);
     x86_set_a20(c, 1);                                 /* a host always enables A20; extended memory needs it */
 
     uint16_t sel_cs = ldt_alloc(1), sel_ds = ldt_alloc(1);
     uint16_t sel_ss = ldt_alloc(1), sel_psp = ldt_alloc(1);
     if (!sel_cs || !sel_ds || !sel_ss || !sel_psp) { c->eflags |= X86_CF; return; }
-    set_desc(c, ldt_at(ldt_index(sel_cs)),  (uint32_t)ccs << 4, 0xFFFF, 0x9A, f);
-    set_desc(c, ldt_at(ldt_index(sel_ds)),  (uint32_t)cds << 4, 0xFFFF, 0x92, f);
-    set_desc(c, ldt_at(ldt_index(sel_ss)),  (uint32_t)css << 4, 0xFFFF, 0x92, f);
-    set_desc(c, ldt_at(ldt_index(sel_psp)), (uint32_t)dos.psp << 4, 0xFF, 0x92, f);
+    set_desc(c, ldt_at(ldt_index(sel_cs)),  (uint32_t)ccs << 4, 0xFFFF, 0xFA, f);
+    set_desc(c, ldt_at(ldt_index(sel_ds)),  (uint32_t)cds << 4, 0xFFFF, 0xF2, f);
+    set_desc(c, ldt_at(ldt_index(sel_ss)),  (uint32_t)css << 4, 0xFFFF, 0xF2, f);
+    set_desc(c, ldt_at(ldt_index(sel_psp)), (uint32_t)dos.psp << 4, 0xFF, 0xF2, f);
 
     c->gdtr.base = lin(dpmi.seg, GDT_OFF);  c->gdtr.limit = GDT_SLOTS * 8 - 1;
     c->idtr.base = lin(dpmi.seg, IDT_OFF);  c->idtr.limit = 256 * 8 - 1;
     c->cr0 |= 1;
     c->pmode = 1;
-    x86_load_seg(c, S_DS, SEL_HDATA);                  /* something valid while we set up */
     c->ldtr.sel = SEL_LDT;
     c->ldtr.base = lin(dpmi.seg, LDT_OFF);
     c->ldtr.limit = LDT_SLOTS * 8 - 1;
@@ -312,10 +311,16 @@ void dpmi_mode_switch(x86_cpu *c, int vector) {
     c->tr.attr = 0x8B;
     c->tr.usable = 1;
 
+    /* The client runs at ring 3, as under every real host: loading CS first
+     * is what makes CPL 3, and SS must then match it. IOPL 3 lets it do its
+     * own port I/O and CLI/STI, which DOS games need and CWSDPMI allows. */
+    x86_load_seg(c, S_CS, sel_cs);
+    c->eip = cip;
     x86_load_seg(c, S_SS, sel_ss);
     c->r[R_SP] = csp;
     x86_load_seg(c, S_DS, sel_ds);
     x86_load_seg(c, S_ES, sel_psp);
+    c->eflags |= X86_IOPL;
     /* DPMI: the environment segment in the PSP becomes a selector, because
      * a client in protected mode has no other way to reach it. DJGPP's crt1
      * reads the word at PSP:2Ch and hands it straight to movedata. The
@@ -326,13 +331,11 @@ void dpmi_mode_switch(x86_cpu *c, int vector) {
         uint16_t envsel = sel_for_seg(c, envseg);
         if (envsel) {
             set_desc(c, ldt_at(ldt_index(envsel)), (uint32_t)envseg << 4,
-                     ((uint32_t)mcb_paras(c, envseg) << 4) - 1, 0x92, 0x00);
+                     ((uint32_t)mcb_paras(c, envseg) << 4) - 1, 0xF2, 0x00);
             pc_wr16(c, dos.psp, 0x2C, envsel);
         }
     }
 
-    x86_load_seg(c, S_CS, sel_cs);
-    c->eip = cip;
     c->eflags &= ~X86_CF;
     dpmi.active = 1;
     pc.returned = 1;                                   /* we placed CS:IP ourselves */
@@ -481,6 +484,51 @@ void dpmi_rm_return(x86_cpu *c, int vector) {
     pc_hle_return(c, HLE_RET_FLAGS);
 }
 
+/* --- Raw mode switches (INT 31h 0305/0306) --------------------------------
+ * DOS/4GW does not go through 0300 for real-mode work: it asks for the raw
+ * switch addresses and jumps between modes itself. One trap serves both
+ * directions, told apart by the mode it was reached in. Either way the new
+ * DS, ES, SS, (E)SP, CS and (E)IP arrive in AX, CX, DX, (E)BX, SI and (E)DI;
+ * FS and GS are zeroed and every other register is left alone. The tables
+ * (GDTR, IDTR, LDTR, TR) never change, so going back to protected mode is
+ * only a matter of CR0.PE and the new segments. */
+void dpmi_raw_switch(x86_cpu *c, int vector) {
+    (void)vector;
+    uint16_t ds = x86_get_r16(c, R_AX), es = x86_get_r16(c, R_CX), ss = x86_get_r16(c, R_DX);
+    uint16_t cs = x86_get_r16(c, R_SI);
+    int to_pm = !c->pmode;
+    int wide = to_pm ? dpmi.is32 : 0;                  /* real mode's SP and IP are 16-bit */
+    uint32_t sp = wide ? c->r[R_BX] : (c->r[R_BX] & 0xFFFF);
+    uint32_t ip = wide ? c->r[R_DI] : (c->r[R_DI] & 0xFFFF);
+    if (to_pm) { c->pmode = 1; c->cr0 |= 1u; c->eflags |= X86_IOPL; }
+    else       { c->pmode = 0; c->cr0 &= ~1u; }
+    x86_load_seg(c, S_CS, cs);                         /* first: in PM it sets CPL */
+    c->eip = ip;
+    x86_load_seg(c, S_DS, ds);
+    x86_load_seg(c, S_ES, es);
+    x86_load_seg(c, S_SS, ss);
+    x86_load_seg(c, S_FS, 0);
+    x86_load_seg(c, S_GS, 0);
+    c->r[R_SP] = sp;
+    pc.returned = 1;
+    if (pc.debug > 1) fprintf(stderr, "[dpmi] raw switch to %s %04X:%08X ss:sp %04X:%08X\n",
+                              to_pm ? "protected" : "real", cs, ip, ss, sp);
+}
+
+/* State save/restore: with nothing to save the routine is a bare far
+ * return, as wide as the far call that reached it. */
+void dpmi_save_state(x86_cpu *c, int vector) {
+    (void)vector;
+    int w = c->pmode && dpmi.is32 ? 4 : 2;
+    uint32_t sp = c->r[R_SP];
+    uint32_t ip = stk_pop(c, &sp, w);
+    uint16_t cs = (uint16_t)stk_pop(c, &sp, w);
+    stk_commit(c, sp);
+    x86_load_seg(c, S_CS, cs);
+    c->eip = ip;
+    pc.returned = 1;
+}
+
 /* --- DOS memory blocks ---------------------------------------------------
  * INT 31h 0100 hands the client both a real-mode segment and a selector for
  * the same memory. A block longer than 64K needs an array of descriptors,
@@ -500,7 +548,7 @@ static void set_dos_descs(x86_cpu *c, uint16_t sel, uint16_t seg, uint16_t paras
         uint32_t left = bytes - (uint32_t)k * 0x10000u;
         uint32_t limit = left >= 0x10000u ? 0xFFFFu : (left ? left - 1 : 0);
         set_desc(c, ldt_at(ldt_index(sel) + k), ((uint32_t)seg << 4) + (uint32_t)k * 0x10000u,
-                 limit, 0x92, 0x00);
+                 limit, 0xF2, 0x00);
     }
 }
 
@@ -637,10 +685,10 @@ void dpmi_exc_return(x86_cpu *c, int vector) {
         nsp = (exc_saved[exc_depth].esp & 0xFFFF0000u) | nsp;
         fl  = (exc_saved[exc_depth].eflags & 0xFFFF0000u) | fl;
     }
-    x86_load_seg(c, S_SS, (uint16_t)nss);
-    c->r[R_SP] = nsp;
     x86_load_seg(c, S_CS, (uint16_t)cs);
     c->eip = eip;
+    x86_load_seg(c, S_SS, (uint16_t)nss);
+    c->r[R_SP] = nsp;
     c->eflags = x86_flags_fixup(c, fl);
     pc.returned = 1;
 }
@@ -656,7 +704,7 @@ static void idt_set(x86_cpu *c, int v, uint16_t sel, uint32_t off) {
      * lead to: our own trap segments say so themselves, and a client's
      * handler is as wide as the client — a 16-bit handler returns with a
      * 16-bit IRET and must be given a 16-bit frame. */
-    int g32 = sel == SEL_HLE ? 1 : sel == SEL_HLE16 ? 0 : dpmi.is32;
+    int g32 = (sel & ~3) == (SEL_HLE & ~3) ? 1 : (sel & ~3) == (SEL_HLE16 & ~3) ? 0 : dpmi.is32;
     uint32_t at = lin(dpmi.seg, IDT_OFF + (uint32_t)v * 8);
     x86_wr(c, at, 0, 0xFFFFFFFFu, 2, off & 0xFFFF);
     x86_wr(c, at, 2, 0xFFFFFFFFu, 2, sel);
@@ -704,6 +752,9 @@ void dpmi_callback(x86_cpu *c, int vector) {
     uint16_t stk_sel = sel_for_seg(c, ss);
     c->pmode = 1;
     c->cr0 |= 1;
+    c->eflags |= X86_IOPL;
+    x86_load_seg(c, S_CS, cb[n].cs);                   /* first: it sets CPL */
+    c->eip = cb[n].eip;
     x86_load_seg(c, S_SS, SEL_HSTK);                   /* the host's own callback stack */
     c->r[R_SP] = 0;
     x86_load_seg(c, S_DS, stk_sel);  c->r[R_SI] = sp;  /* DS:ESI = the real-mode stack */
@@ -717,8 +768,6 @@ void dpmi_callback(x86_cpu *c, int vector) {
     stk_push(c, &hsp, w, w == 4 ? SEL_HLE : SEL_HLE16);
     stk_push(c, &hsp, w, PC_HLE_DPMI_CBRET);
     stk_commit(c, hsp);
-    x86_load_seg(c, S_CS, cb[n].cs);
-    c->eip = cb[n].eip;
     pc.returned = 1;
     if (pc.debug) fprintf(stderr, "[dpmi] callback %d → %04X:%08X\n", n, cb[n].cs, cb[n].eip);
 }
@@ -774,7 +823,7 @@ void dpmi_int31(x86_cpu *c, int vector) {
         if (!sel) { x86_set_r16(c, R_AX, 8); c->eflags |= X86_CF; break; }
         int n = x86_get_r16(c, R_CX);
         for (int k = 0; k < n; k++)
-            set_desc(c, ldt_at(ldt_index(sel) + k), 0, 0, 0x92, 0x40);
+            set_desc(c, ldt_at(ldt_index(sel) + k), 0, 0, 0xF2, 0x40);
         x86_set_r16(c, R_AX, sel);
         break;
     }
@@ -904,6 +953,7 @@ void dpmi_int31(x86_cpu *c, int vector) {
          * the host in the middle. */
         idt_set(c, x86_get_r8(c, R_BL), x86_get_r16(c, R_CX), c->r[R_DX]);
         break;
+    case 0x0702: case 0x0703:                          /* mark pages discardable / pageable */
     case 0x0600: case 0x0601:                          /* lock / unlock linear region */
     case 0x0602: case 0x0603:                          /* mark real-mode region (un)pageable */
         break;                                         /* nothing is ever paged out */
@@ -960,6 +1010,19 @@ void dpmi_int31(x86_cpu *c, int vector) {
         cb[n].used = 0;
         break;
     }
+    case 0x0305:                                       /* state save/restore addresses */
+        x86_set_r16(c, R_AX, 0);                       /* no buffer needed */
+        x86_set_r16(c, R_BX, PC_HLE_SEG);
+        x86_set_r16(c, R_CX, PC_HLE_DPMI_SAVE);
+        x86_set_r16(c, R_SI, dpmi.is32 ? SEL_HLE : SEL_HLE16);
+        if (dpmi.is32) c->r[R_DI] = PC_HLE_DPMI_SAVE; else x86_set_r16(c, R_DI, PC_HLE_DPMI_SAVE);
+        break;
+    case 0x0306:                                       /* raw mode switch addresses */
+        x86_set_r16(c, R_BX, PC_HLE_SEG);              /* real → protected */
+        x86_set_r16(c, R_CX, PC_HLE_DPMI_RAW);
+        x86_set_r16(c, R_SI, dpmi.is32 ? SEL_HLE : SEL_HLE16);   /* protected → real */
+        if (dpmi.is32) c->r[R_DI] = PC_HLE_DPMI_RAW; else x86_set_r16(c, R_DI, PC_HLE_DPMI_RAW);
+        break;
     case 0x0300:                                       /* simulate real-mode interrupt */
         rm_enter(c, RM_INT, x86_get_r8(c, R_BL));
         return;                                        /* rm_enter placed CS:IP */

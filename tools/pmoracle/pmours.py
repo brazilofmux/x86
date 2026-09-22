@@ -35,7 +35,7 @@ def run(img=None, insn_limit=2_000_000):
         elif post is None:
             r.update(faulted=None)
         else:
-            reg = {"jmpf": "CS", "callf": "CS", "iret": "CS",
+            reg = {"jmpf": "CS", "callf": "CS", "iret": "CS", "retf": "CS",
                    "lldt": "LDT", "ltr": "TR"}.get(tgt, tgt.upper())
             d = post["segs"].get(reg, (0, 0, 0, 0))
             r.update(faulted=False, seg=d[0], base=d[1], limit=d[2], ar=d[3] >> 8,

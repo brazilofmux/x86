@@ -27,11 +27,14 @@
 
 /* Return convention of a service after pc_hle_dispatch ran it. */
 enum { HLE_RET_FLAGS, HLE_RET_IRET };
+#define PC_HLE_DUMMY_IRET 0xFF53   /* where every unserved vector points, as on an AT (traps as vector 53h) */
 #define PC_HLE_DPMI_ENTRY 0x00FD   /* offset in the HLE segment; the trap vector is eip & FFh */
 #define PC_HLE_DPMI_RMRET 0x00FC   /* a real-mode excursion (INT 31h 0300-0302) has returned here */
 #define PC_HLE_DPMI_CBRET 0x00FA   /* a real-mode callback's client procedure IRETed to here */
 #define PC_HLE_DPMI_CB    0x00FB   /* real-mode callback n lives at PC_HLE_SEG:(n << 8 | FBh) */
 #define PC_HLE_DPMI_EXCRET 0x00F9  /* a DPMI exception handler far-returned to here */
+#define PC_HLE_DPMI_RAW   0x00F8   /* raw mode switch (INT 31h 0306), both directions */
+#define PC_HLE_DPMI_SAVE  0x00F7   /* state save/restore (INT 31h 0305): nothing to save */
 
 typedef void (*pc_service_fn)(x86_cpu *c, int vector);
 
@@ -86,6 +89,7 @@ extern pc_state pc;
 /* pc_bios.c */
 void pc_init(x86_cpu *cpu, int tty_mode); /* IVT, BDA, stub segment, services */
 void pc_set_service(int vector, pc_service_fn fn, int ret_mode);
+void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);
 void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
 uint64_t pc_now_ns(void);
@@ -105,6 +109,10 @@ void pc_video_flush(int force);                          /* tty mode painter */
 void pc_video_shutdown(void);
 void pc_video_set_hud(const char *text);
 void pc_video_dump(x86_cpu *c, FILE *f);                 /* the text buffer as 25 lines of UTF-8 */
+int  pc_video_png(x86_cpu *c, const char *path);         /* the mode 13h screen; -1 if not in 13h */
+int  pc_vga_port_read(uint16_t port, uint32_t *val);     /* 1 if the port is the VGA's */
+int  pc_vga_port_write(uint16_t port, uint32_t val, int size);
+void pc_vga_set_mode(x86_cpu *c, int mode);             /* INT 10h AH=00, after the BDA */
 
 /* pc_kbd.c */
 void pc_kbd_init(void);

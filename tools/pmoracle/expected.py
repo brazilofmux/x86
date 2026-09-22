@@ -94,4 +94,26 @@ EXPECT = {
     # ---- ES: same rules as DS, spot-checked
     (0, "es", 0x0020, 0): ("#0B", "both",    "not present -> #NP, as for DS"),
     (0, "es", 0x0010, 0): ("ok",  "both",    "plain data"),
+
+    # ---- privilege. Ring 3 runs with IOPL 0 and a TSS with no I/O bitmap.
+    (0, "cli", 0, 0):    ("ok",  "both", "CPL 0 <= IOPL: CLI is allowed"),
+    (0, "in", 0, 0):     ("ok",  "both", "CPL 0 <= IOPL: port I/O needs no bitmap"),
+    (3, "cli", 0, 0):    ("#0D", "both", "CLI with CPL > IOPL -> #GP(0)"),
+    (3, "sti", 0, 0):    ("#0D", "both", "STI with CPL > IOPL -> #GP(0)"),
+    (3, "hlt", 0, 0):    ("#0D", "both", "HLT is a CPL 0 instruction -> #GP(0)"),
+    (3, "in", 0, 0):     ("#0D", "both", "CPL > IOPL consults the TSS I/O bitmap; port DA7Ah's bit lies past the TSS limit -> #GP(0)"),
+    (3, "out", 0, 0):    ("#0D", "both", "likewise for OUT"),
+    (3, "in imm", 0, 0): ("ok",  "both", "measured: the I/O-map base word is 0, so the bitmap starts INSIDE the TSS; port 60h's bit is at offset 0Ch (ESP1, zero) -> allowed. A zeroed TSS is not 'no bitmap'"),
+    (3, "clts", 0, 0):   ("#0D", "both", "CLTS is CPL 0 only"),
+    (3, "lmsw", 0, 0):   ("#0D", "both", "LMSW is CPL 0 only"),
+    (3, "mov cr", 0, 0): ("#0D", "both", "MOV to a control register is CPL 0 only"),
+
+    # ---- RETF: IRET's rules for CS and SS, without EFLAGS
+    (0, "retf", 0x0008, 0):      ("ok",  "both", "same privilege: pops EIP and CS"),
+    (0, "retf", 0x0048, 0):      ("ok",  "both", "conforming code at RPL 0 is a same-privilege return"),
+    (0, "retf", 0x0073, 0x001B): ("ok",  "both", "CS.RPL 3 > CPL: also pops ESP and SS"),
+    (0, "retf", 0x0010, 0):      ("#0D", "both", "a data segment as the return CS -> #GP"),
+    (0, "retf", 0x0050, 0):      ("#0B", "both", "return CS not present -> #NP"),
+    (0, "retf", 0x0073, 0x0010): ("#0D", "both", "SS.RPL must match CS.RPL; error code names the SS"),
+    (3, "retf", 0x0008, 0):      ("#0D", "both", "a return may not go inward: RPL 0 < CPL 3 -> #GP, error code = the CS"),
 }

@@ -98,7 +98,7 @@ inpm:   mov     [psp_sel], es           ; ES is the PSP's selector on entry
         mov     [esp_before], esp
         mov     ebx, [fs:6Ch]
         sti
-tick:   hlt
+tick:                                   ; a client cannot HLT: CPL 3
         cmp     ebx, [fs:6Ch]
         je      tick
         cmp     esp, [esp_before]

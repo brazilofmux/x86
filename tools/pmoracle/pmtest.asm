@@ -146,15 +146,22 @@ next_case:
         ; stack. The case names the CS to return through, and an SS if the
         ; return is meant to change privilege (the processor decides that
         ; from CS.RPL, so a mismatched frame is itself worth testing).
+        ; RETF takes the same frame without the EFLAGS slot.
         cmp byte [slot], 0xCF
+        je  .frame
+        cmp byte [slot], 0xCB
         jne .noframe
+.frame:
         movzx ebp, word [fs:esi + 12]
         test ebp, ebp
         jz  .sameprivilege
         push ebp                               ; SS
         push dword RING3_STACK                 ; ESP
 .sameprivilege:
+        cmp byte [slot], 0xCB
+        je  .noflags
         push dword 2                           ; EFLAGS
+.noflags:
         push eax                               ; CS
         push dword far_target                  ; EIP
 .noframe:
@@ -364,6 +371,33 @@ cases:
         CASE {0xCF}, 0x0050, 0, 0x0000   ; return CS not present
         CASE {0xCF}, 0x0000, 0, 0x0000   ; null return CS
         CASE {0xCF}, 0x0073, 0, 0x0010   ; ring 3 CS with a ring 0 SS in the frame
+        ; ---- RETF, the same questions without EFLAGS. Once had no
+        ; protected-mode path at all in our interpreter: it loaded CS the
+        ; way real mode does, so it never switched stacks going outward
+        ; and never refused to go inward.
+        CASE {0xCB}, 0x0008, 0, 0x0000   ; same privilege
+        CASE {0xCB}, 0x0048, 0, 0x0000   ; conforming code, RPL 0
+        CASE {0xCB}, 0x0073, 0, 0x001B   ; outward to ring 3: pops ESP and SS too
+        CASE {0xCB}, 0x0010, 0, 0x0000   ; data as the return CS
+        CASE {0xCB}, 0x0050, 0, 0x0000   ; return CS not present
+        CASE {0xCB}, 0x0073, 0, 0x0010   ; ring 3 CS, ring 0 SS in the frame
+        CASE {0xCB}, 0x0008, 3, 0x0000   ; inward, ring 3 to ring 0: never
+        ; ---- privilege: what CPL 3 may not do. Ring 3 is entered with EFLAGS
+        ; 2, so IOPL is 0 and port I/O goes to the TSS's I/O bitmap. Its base
+        ; word is 0 here, so the "bitmap" is the TSS itself: ports whose bit
+        ; lands on a zero inside the 67h limit are allowed (60h is), ports past
+        ; it fault (DX = DA7Ah). CPL 0 runs of cli and in are the controls.
+        CASE {0xFA}, 0x0000, 0     ; cli at CPL 0
+        CASE {0xEC}, 0x0000, 0     ; in al, dx at CPL 0
+        CASE {0xFA}, 0x0000, 3     ; cli with CPL > IOPL
+        CASE {0xFB}, 0x0000, 3     ; sti with CPL > IOPL
+        CASE {0xF4}, 0x0000, 3     ; hlt is CPL 0 only
+        CASE {0xEC}, 0x0000, 3     ; in al, dx: CPL > IOPL and no bitmap
+        CASE {0xEE}, 0x0000, 3     ; out dx, al: likewise
+        CASE {0xE4, 0x60}, 0x0000, 3   ; in al, 60h: the immediate form
+        CASE {0x0F, 0x06}, 0x0000, 3   ; clts
+        CASE {0x0F, 0x01, 0xF0}, 0x0000, 3   ; lmsw ax
+        CASE {0x0F, 0x22, 0xC0}, 0x0000, 3   ; mov cr0, eax
 cases_end:
 NCASES  equ (cases_end - cases) / CASE_BYTES
 

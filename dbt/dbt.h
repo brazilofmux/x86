@@ -200,6 +200,7 @@ int  dbt_link_record(x86_dbt *dbt, uint32_t lin, uint32_t site_off);
 void dbt_links_repatch(x86_dbt *dbt, uint32_t lin, uint8_t *code);
 void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end);
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys);          /* cpu->smc_hook */
+void dbt_clear_code_bits(x86_cpu *cpu);                   /* forget translations, keep device marks */
 void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
 void dbt_a20_changed(x86_cpu *cpu, int on);
 

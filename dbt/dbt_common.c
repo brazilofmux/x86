@@ -63,7 +63,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     }
     build_tables(dbt->aux);
     dbt->aux->helpers[H_EXEC]       = (void *)dbt_h_exec;
-    dbt->aux->helpers[H_POST_STORE] = (void *)dbt_smc_store;
+    dbt->aux->helpers[H_POST_STORE] = (void *)x86_store_hook;   /* device memory, then code */
 
     cpu->dbt      = dbt;
     cpu->jit_aux  = dbt->aux;
@@ -110,7 +110,7 @@ void dbt_cleanup(x86_dbt *dbt) {
     if (dbt->cpu) {
         dbt->cpu->dbt = NULL;
         dbt->cpu->smc_hook = NULL;
-        memset(dbt->cpu->code_bitmap, 0, X86_LOW_SIZE);
+        dbt_clear_code_bits(dbt->cpu);
     }
     if (dbt->code_buf && dbt->code_buf != MAP_FAILED) munmap(dbt->code_buf, CODE_BUF_SIZE);
     if (dbt->shadow_live) x86_free(&dbt->shadow);
@@ -201,6 +201,10 @@ static void shadow_resync(x86_dbt *dbt) {
     sh->mem = mem; sh->code_bitmap = bm; sh->mem_fd = fd; sh->mem_mirrored = mirrored;
     sh->dbt = NULL; sh->jit_aux = NULL;
     sh->smc_hook = shadow_smc_none;
+    /* Devices belong to the real machine: the shadow sees their memory as
+     * plain bytes and never reaches back into their state. */
+    sh->device_store = NULL;
+    sh->device_read = NULL;
     sh->a20_hook = NULL;
     /* The shadow's HMA window must alias the same way before the copy,
      * or the real HMA bytes land in the shadow's low 64 KB (or vice versa). */

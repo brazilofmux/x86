@@ -187,6 +187,47 @@ static int vec_has_err(int v) {
     return v == 8 || (v >= 10 && v <= 14) || v == 17;
 }
 
+/* ---- Privilege ---------------------------------------------------------
+ * None of this could be observed while nothing ran above CPL 0; DPMI
+ * clients run at CPL 3. */
+
+/* The system instructions (HLT, LGDT, LIDT, LLDT, LTR, LMSW, MOV CRn, CLTS)
+ * are CPL 0 only: #GP(0) anywhere else in protected mode. */
+static void need_cpl0(x86_cpu *c) {
+    if (c->pmode && x86_cpl(c) != 0) x86_fault(c, X86_EXC_GP, 0);
+}
+
+static int iopl(const x86_cpu *c) { return (int)((c->eflags & X86_IOPL) >> 12); }
+
+/* CLI and STI: #GP(0) when CPL > IOPL. */
+static void need_iopl(x86_cpu *c) {
+    if (c->pmode && x86_cpl(c) > iopl(c)) x86_fault(c, X86_EXC_GP, 0);
+}
+
+/* IN, OUT, INS, OUTS. With CPL > IOPL the 386 asks the TSS's I/O permission
+ * bitmap, whose offset is the word at TSS+66h: every bit covering the access
+ * must be clear, and a bitmap that ends before them — or no room for one at
+ * all — means #GP(0). The 286 has no bitmap. */
+static void io_check(x86_cpu *c, uint32_t port, int size) {
+    if (!c->pmode || x86_cpl(c) <= iopl(c)) return;
+    if (c->model < X86_MODEL_386 || !c->tr.usable || c->tr.limit < 0x67) x86_fault(c, X86_EXC_GP, 0);
+    uint32_t at = x86_rd(c, c->tr.base, 0x66, 0xFFFFFFFFu, 2) + (port >> 3);
+    if (at + 1 > c->tr.limit) x86_fault(c, X86_EXC_GP, 0);
+    uint32_t bits = x86_rd(c, c->tr.base, at, 0xFFFFFFFFu, 2);
+    if (bits & ((((uint32_t)1 << size) - 1) << (port & 7))) x86_fault(c, X86_EXC_GP, 0);
+}
+
+/* POPF and IRET only change what privilege allows: IOPL at CPL 0 alone, IF
+ * only when CPL <= IOPL. The rest of the image lands; these keep their
+ * current value. (Neither faults for trying.) */
+static uint32_t flags_kept(const x86_cpu *c, int cpl) {
+    if (!c->pmode) return 0;
+    uint32_t keep = 0;
+    if (cpl > 0) keep |= X86_IOPL;
+    if (cpl > iopl(c)) keep |= X86_IF;
+    return keep;
+}
+
 /* Load CS for a control transfer. Unlike a data register, the descriptor
  * must be code, and conforming code is reachable from any less privileged
  * level without changing CPL — the RPL written back says which happened. */
@@ -206,6 +247,54 @@ static void load_cs_pm(x86_cpu *c, uint16_t sel, int cpl) {
     if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
     x86_unpack_desc(&c->seg[S_CS], (uint16_t)((sel & 0xFFFC) | cpl), lo, hi);
     x86_set_accessed(c, sel, hi);
+}
+
+/* A far return in protected mode, shared by RETF and IRET. The frame is
+ * EIP and CS, `extra` more slots (IRET's EFLAGS), then — only when CS.RPL
+ * says the return goes outward — ESP and SS. Never inward: that is #GP.
+ * RETF imm16 releases `imm` bytes from the old stack before ESP/SS are read,
+ * and from the new one after. Any data segment the new level cannot reach
+ * is nulled. Returns the new EIP for the caller to install. */
+static uint32_t return_pm(x86_cpu *c, int os, int extra, uint32_t imm) {
+    int cpl = x86_cpl(c);
+    uint32_t nip = peek(c, 0, os);
+    uint16_t ncs = (uint16_t)peek(c, os, os);
+    int rpl = ncs & 3;
+    uint32_t past = (uint32_t)(2 + extra) * (uint32_t)os + imm;   /* bytes up to ESP/SS */
+    if (rpl < cpl) x86_fault(c, X86_EXC_GP, ncs & 0xFFFC);
+    if (rpl > cpl) {
+        uint32_t nsp = peek(c, past, os);
+        uint16_t nss = (uint16_t)peek(c, past + (uint32_t)os, os);
+        if ((nss & 3) != rpl) x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
+        uint32_t slo, shi;
+        if ((nss & 0xFFFC) == 0) x86_fault(c, X86_EXC_GP, 0);
+        if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
+        uint16_t sattr = (uint16_t)(((shi >> 8) & 0xFF) | (((shi >> 20) & 0x0F) << 8));
+        if (!X86_AR_S(sattr) || (X86_AR_TYPE(sattr) & X86_TYPE_CODE)
+            || !(X86_AR_TYPE(sattr) & X86_TYPE_WRITABLE)
+            || X86_AR_DPL(sattr) != rpl)
+            x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
+        if (!X86_AR_P(sattr)) x86_fault(c, X86_EXC_SS, nss & 0xFFFC);
+        load_cs_pm(c, ncs, rpl);
+        x86_unpack_desc(&c->seg[S_SS], nss, slo, shi);
+        c->r[R_SP] = nsp + imm;
+        for (int k = 0; k < 6; k++) {
+            if (k == S_CS || k == S_SS) continue;
+            x86_seg *g = &c->seg[k];
+            if (!g->usable) continue;
+            int t = X86_AR_TYPE(g->attr);
+            int conf = (t & X86_TYPE_CODE) && (t & X86_TYPE_CONFORM);
+            if (!conf && X86_AR_DPL(g->attr) < rpl) {
+                g->sel = 0; g->base = 0; g->limit = 0; g->attr = 0; g->usable = 0;
+            }
+        }
+    } else {
+        load_cs_pm(c, ncs, cpl);
+        uint32_t sm = stkmask(c);
+        uint32_t nsp2 = (c->r[R_SP] + past) & sm;
+        c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | nsp2) : nsp2;
+    }
+    return nip;
 }
 
 /* Push through an explicit stack, so a transfer that switches stacks can
@@ -652,12 +741,14 @@ static void do_string(x86_cpu *c, const x86_insn *in) {
             do_sub(c, x86_get_reg(c, R_AX, size), b, 0, size);
             break;
         case OP_INS:
+            io_check(c, x86_get_r16(c, R_DX), size);
             if (early) set_di(c, am, di + delta);
             limit_check(c, S_ES, di, size);
             a = c->io_read ? c->io_read(c, x86_get_r16(c, R_DX), size) : szmask(size);
             mwr(c, in, S_ES, di, size, a);
             break;
         case OP_OUTS:
+            io_check(c, x86_get_r16(c, R_DX), size);
             if (early) set_si(c, am, si + delta);
             a = mrd(c, in, in->seg, si, size);
             if (c->io_write) c->io_write(c, x86_get_r16(c, R_DX), a, size);
@@ -1003,6 +1094,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_POPF: {
         a = pop(c, in->opsize);
         uint32_t m = in->opsize == 2 ? 0xFFFF : 0xFFFFFFFFu;
+        m &= ~flags_kept(c, x86_cpl(c));
         c->eflags = x86_flags_fixup(c, (c->eflags & ~m) | (a & m));
         break;
     }
@@ -1101,6 +1193,12 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         set_ip(c, a, in->opsize);
         break;
     case OP_RETF: {
+        if (c->pmode) {
+            uint32_t imm = in->ops[0].kind == OPK_IMM ? in->ops[0].imm : 0;
+            uint32_t nip = return_pm(c, in->opsize, 0, imm);
+            c->eip = in->opsize == 2 ? (nip & 0xFFFF) : nip;
+            break;
+        }
         check_target(c, peek(c, 0, in->opsize), in->opsize);
         peek(c, in->opsize, in->opsize);                 /* whole frame checked before SP moves */
         a = pop(c, in->opsize);
@@ -1117,46 +1215,11 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
              * so a frame whose SS does not agree with it is rejected. */
             int cpl = x86_cpl(c);
             int os = in->opsize;
-            uint32_t nip = peek(c, 0, os);
-            uint16_t ncs = (uint16_t)peek(c, os, os);
             uint32_t nfl = peek(c, 2 * os, os);
-            int rpl = ncs & 3;
-            if (rpl < cpl) x86_fault(c, X86_EXC_GP, ncs & 0xFFFC);   /* never inward */
-            if (rpl > cpl) {
-                uint32_t nsp = peek(c, 3 * os, os);
-                uint16_t nss = (uint16_t)peek(c, 4 * os, os);
-                if ((nss & 3) != rpl) x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
-                uint32_t slo, shi;
-                if ((nss & 0xFFFC) == 0) x86_fault(c, X86_EXC_GP, 0);
-                if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
-                uint16_t sattr = (uint16_t)(((shi >> 8) & 0xFF) | (((shi >> 20) & 0x0F) << 8));
-                if (!X86_AR_S(sattr) || (X86_AR_TYPE(sattr) & X86_TYPE_CODE)
-                    || !(X86_AR_TYPE(sattr) & X86_TYPE_WRITABLE)
-                    || X86_AR_DPL(sattr) != rpl)
-                    x86_fault(c, X86_EXC_GP, nss & 0xFFFC);
-                if (!X86_AR_P(sattr)) x86_fault(c, X86_EXC_SS, nss & 0xFFFC);
-                load_cs_pm(c, ncs, rpl);
-                x86_unpack_desc(&c->seg[S_SS], nss, slo, shi);
-                c->r[R_SP] = nsp;
-                /* Any data segment the new level cannot reach becomes null. */
-                for (int k = 0; k < 6; k++) {
-                    if (k == S_CS || k == S_SS) continue;
-                    x86_seg *g = &c->seg[k];
-                    if (!g->usable) continue;
-                    int t = X86_AR_TYPE(g->attr);
-                    int conf = (t & X86_TYPE_CODE) && (t & X86_TYPE_CONFORM);
-                    if (!conf && X86_AR_DPL(g->attr) < rpl) {
-                        g->sel = 0; g->base = 0; g->limit = 0; g->attr = 0; g->usable = 0;
-                    }
-                }
-            } else {
-                load_cs_pm(c, ncs, cpl);
-                uint32_t sm = stkmask(c);
-                uint32_t nsp2 = (c->r[R_SP] + 3u * os) & sm;
-                c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | nsp2) : nsp2;
-            }
+            uint32_t nip = return_pm(c, os, 1, 0);
             c->eip = os == 2 ? (nip & 0xFFFF) : nip;
             uint32_t fm = os == 2 ? 0xFFFFu : 0xFFFFFFFFu;
+            fm &= ~flags_kept(c, cpl);                   /* the CPL the IRET ran at */
             c->eflags = x86_flags_fixup(c, (c->eflags & ~fm) | (nfl & fm));
             break;
         }
@@ -1199,6 +1262,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
     case OP_IN: {
         uint32_t port = rd_op(c, in, 1, ea) & 0xFFFF;
+        io_check(c, port, size);
         a = c->io_read ? c->io_read(c, port, size) : szmask(size);
         wr_op(c, in, 0, ea, a);
         break;
@@ -1206,6 +1270,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_OUT: {
         uint32_t port = rd_op(c, in, 0, ea) & 0xFFFF;
         int sz = in->ops[1].size;
+        io_check(c, port, sz);
         if (c->io_write) c->io_write(c, port, rd_op(c, in, 1, ea), sz);
         break;
     }
@@ -1216,8 +1281,8 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_CMC: c->eflags ^= X86_CF; break;
     case OP_CLD: c->eflags &= ~X86_DF; break;
     case OP_STD: c->eflags |= X86_DF; break;
-    case OP_CLI: c->eflags &= ~X86_IF; break;
-    case OP_STI: c->eflags |= X86_IF; c->int_inhibit = 1; break;
+    case OP_CLI: need_iopl(c); c->eflags &= ~X86_IF; break;
+    case OP_STI: need_iopl(c); c->eflags |= X86_IF; c->int_inhibit = 1; break;
 
     /* ---- bit ops ---------------------------------------------------- */
     case OP_BT: case OP_BTS: case OP_BTR: case OP_BTC: {
@@ -1281,6 +1346,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         if (in->ops[0].kind == OPK_MEM) (void)mrd(c, in, in->seg, ea, c->model >= X86_MODEL_286 ? 2 : 1);
         break;
     case OP_HLT:
+        need_cpl0(c);
         c->halted = 1;
         break;
     case OP_ARPL:
@@ -1292,9 +1358,11 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
 
     /* System instructions: Phase B (DPMI host). */
     case OP_CLTS:
+        need_cpl0(c);
         break;                                  /* CR0.TS: no CR0 yet (Phase B); legal at CPL 0 */
     /* ---- descriptor tables and CR0 -------------------------------- */
     case OP_LGDT: case OP_LIDT: {
+        need_cpl0(c);
         /* m16&32: a limit then a base. A 16-bit operand keeps only 24 bits
          * of base — the 286 form, still reachable on a 386. */
         uint32_t lim = mrd(c, in, in->seg, ea, 2);
@@ -1312,6 +1380,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     }
     case OP_LLDT: case OP_LTR: {
         if (!c->pmode) RAISE(X86_EXC_UD);
+        need_cpl0(c);
         uint16_t lsel = (uint16_t)rd_op(c, in, 0, ea);
         x86_seg *g = in->op == OP_LLDT ? &c->ldtr : &c->tr;
         if ((lsel & 0xFFFC) == 0) {
@@ -1340,10 +1409,12 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         wr_op(c, in, 0, ea, c->cr0 & 0xFFFF);
         break;
     case OP_LMSW:
+        need_cpl0(c);
         c->cr0 = (c->cr0 & ~0xEu) | (rd_op(c, in, 0, ea) & 0xFu) | (c->cr0 & 1u);
         c->pmode = (c->cr0 & 1) != 0;              /* LMSW can set PE but never clear it */
         break;
     case OP_MOVCR: {
+        need_cpl0(c);
         int cr = in->ops[0].kind == OPK_CR ? in->ops[0].reg : in->ops[1].reg;
         if (in->ops[0].kind == OPK_CR) {
             if (cr == 0) { c->cr0 = rd_op(c, in, 1, ea); c->pmode = (c->cr0 & 1) != 0; }

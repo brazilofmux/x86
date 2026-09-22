@@ -124,6 +124,8 @@ void dpmi_callback(x86_cpu *c, int vector);
 void dpmi_cb_return(x86_cpu *c, int vector);
 int  dpmi_pm_exception(x86_cpu *c, int vector);
 void dpmi_exc_return(x86_cpu *c, int vector);
+void dpmi_raw_switch(x86_cpu *c, int vector);
+void dpmi_save_state(x86_cpu *c, int vector);
 void dpmi_int31(x86_cpu *c, int vector);
 
 /* dos_int21.c */

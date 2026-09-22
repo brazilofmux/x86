@@ -18,6 +18,14 @@ void x86_init(x86_cpu *c, int model) {
     x86_reset(c);
 }
 
+/* A store landed on a byte the bitmap marks: device memory first (it may
+ * rewrite the byte), then code the DBT has translated. */
+void x86_store_hook(x86_cpu *c, uint32_t p) {
+    uint8_t b = c->code_bitmap[p];
+    if ((b & X86_BM_DEVICE) && c->device_store) c->device_store(c, p);
+    if ((b & X86_BM_CODE) && c->smc_hook) c->smc_hook(c, p);
+}
+
 void x86_free(x86_cpu *c) {
     x86_mem_free(c);
 }
@@ -97,7 +105,14 @@ static void load_seg_pm(x86_cpu *c, int s, uint16_t sel) {
 
     if (!X86_AR_S(attr)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);   /* a system descriptor */
 
-    if (s == S_SS) {
+    if (s == S_CS) {
+        /* Only the host places CS directly (an HLE service returning, a DPMI
+         * trampoline entering client code); the instructions go through
+         * load_cs_pm with their own rules. What must hold regardless: it is
+         * code, and it is there. CPL becomes the selector's RPL. */
+        if (!(type & X86_TYPE_CODE)) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
+    } else if (s == S_SS) {
         /* The stack is the strict one: writable data, and both RPL and DPL
          * equal to CPL. A read-only segment that any other register accepts
          * is rejected here. */

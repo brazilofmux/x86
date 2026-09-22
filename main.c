@@ -30,6 +30,7 @@ static void usage(const char *prog) {
     printf("  -d          trace DOS and DPMI calls (-d -d: every call, with registers)\n");
     printf("  -L N        stop after N instructions\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
+    printf("  -G FILE     write the mode 13h screen to FILE as a PNG on exit\n");
     printf("  -boot IMG   boot a disk image instead (sector 1 at 7C00; INT 13h serves the rest)\n");
     printf("  -pmtrace LO:HI  -i: dump state before each instruction in [LO,HI], QEMU -d cpu format\n");
     printf("  -pmring     -i: on the first exception, or a fetch outside memory, print the\n");
@@ -201,7 +202,7 @@ int main(int argc, char **argv) {
     int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0;
     uint64_t limit = 0;
     int mem_every = 1;
-    const char *root = NULL, *prog = NULL, *dump = NULL, *drive_a = NULL, *drive_b = NULL;
+    const char *root = NULL, *prog = NULL, *dump = NULL, *gdump = NULL, *drive_a = NULL, *drive_b = NULL;
     const char *boot_img = NULL;
     int i;
     for (i = 1; i < argc; i++) {
@@ -223,6 +224,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) drive_b = argv[++i];
         else if (!strcmp(argv[i], "-L") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) dump = argv[++i];
+        else if (!strcmp(argv[i], "-G") && i + 1 < argc) gdump = argv[++i];
         else if (!strcmp(argv[i], "-M") && i + 1 < argc) mem_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
         else if (!strcmp(argv[i], "-pmring")) g_pmring = 1;
@@ -356,6 +358,8 @@ int main(int argc, char **argv) {
         FILE *f = strcmp(dump, "-") ? fopen(dump, "w") : stdout;
         if (f) { pc_video_dump(&cpu, f); if (f != stdout) fclose(f); }
     }
+    if (gdump && pc_video_png(&cpu, gdump) < 0)
+        fprintf(stderr, "-G %s: the screen is not in mode 13h\n", gdump);
 
     if (rc < 0) {
         fprintf(stderr, "dos-monster: run failed\n");

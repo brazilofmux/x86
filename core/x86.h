@@ -102,6 +102,12 @@ typedef struct x86_cpu {
      * below needs no NULL test. Same mirror layout as mem. */
     uint8_t *code_bitmap;
     void   (*smc_hook)(struct x86_cpu *, uint32_t phys);   /* DBT: a store hit code */
+    /* Device memory (VGA planes). A store to a byte whose bitmap entry has
+     * X86_BM_DEVICE is handed to device_store after it lands, from the
+     * interpreter and from translated code alike; device_read, when set,
+     * takes every interpreter read of the A0000-AFFFF window. */
+    void   (*device_store)(struct x86_cpu *, uint32_t phys);
+    uint8_t (*device_read)(struct x86_cpu *, uint32_t phys);
     void   (*a20_hook)(struct x86_cpu *, int on);          /* DBT: the A20 gate changed */
     void   (*trace_exc)(struct x86_cpu *, int vec, uint32_t err);   /* oracle tracing */
 
@@ -180,15 +186,24 @@ static inline void x86_set_reg(x86_cpu *c, int i, int size, uint32_t v) {
  * Physical memory. Everything funnels through these so the A20 gate,
  * the open-bus region and (later) the SMC write hook have one home.
  * ========================================================================= */
+/* The code bitmap carries two things: X86_BM_CODE, a translated block
+ * covers the byte (the DBT's), and X86_BM_DEVICE, the byte is device memory
+ * whose store has side effects. Either way a store lands, then any nonzero
+ * entry sends it to x86_store_hook. */
+#define X86_BM_CODE   0x01
+#define X86_BM_DEVICE 0x80
+void x86_store_hook(struct x86_cpu *c, uint32_t phys);
+
 static inline uint8_t x86_phys_rd8(x86_cpu *c, uint32_t lin) {
     uint32_t p = lin & c->a20_mask;
+    if (c->device_read && p - 0xA0000u < 0x10000u) return c->device_read(c, p);
     return p < c->mem_size ? c->mem[p] : 0xFF;
 }
 static inline void x86_phys_wr8(x86_cpu *c, uint32_t lin, uint8_t v) {
     uint32_t p = lin & c->a20_mask;
     if (p < c->mem_size) {
         c->mem[p] = v;
-        if (c->code_bitmap[p]) c->smc_hook(c, p);
+        if (c->code_bitmap[p]) x86_store_hook(c, p);
     }
 }
 

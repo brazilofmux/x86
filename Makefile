@@ -9,7 +9,7 @@ CORE_OBJS = $(CORE_SRCS:.c=.o)
 
 DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_a64.c
 DBT_OBJS  = $(DBT_SRCS:.c=.o)
-PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_kbd.c
+PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_kbd.c
 PC_OBJS   = $(PC_SRCS:.c=.o)
 DOS_SRCS  = dos/dos_load.c dos/dos_host.c dos/dos_int21.c dos/dos_dpmi.c
 DOS_OBJS  = $(DOS_SRCS:.c=.o)
@@ -21,7 +21,7 @@ TARGET = dos-monster
 all: $(TARGET) tools/sst tools/jittest
 
 $(TARGET): main.o $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -lz
 
 tools/sst: tools/sst.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lz

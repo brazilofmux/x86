@@ -68,7 +68,7 @@ def run(img, under, fault, ncases, spec=None):
                 aux = spec[i][4] if spec and i < len(spec) else 0
                 if spec and i < len(spec):
                     sel = spec[i][1]          # a far transfer carries it in the instruction
-                reg = {"jmpf": "cs", "callf": "cs", "iret": "cs", "lldt": "ldtr", "ltr": "tr"}.get(tgt, tgt)
+                reg = {"jmpf": "cs", "callf": "cs", "iret": "cs", "retf": "cs", "lldt": "ldtr", "ltr": "tr"}.get(tgt, tgt)
                 v = segs.get(reg, [0, 0, 0, 0])
                 # Landing on stub i *is* the vector: one stub per vector, fixed
                 # stride. Reading it from a register would be a step too early,

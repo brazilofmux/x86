@@ -10,6 +10,9 @@ TARGET = {b"\x8e\xd8": "ds", b"\x8e\xd0": "ss", b"\x8e\xc0": "es",
 FAR = {0xEA: "jmpf", 0x9A: "callf"}
 # 0F 00 /r is a family; the reg field picks which.
 GRP6 = {0: "sldt", 1: "str", 2: "lldt", 3: "ltr", 4: "verr", 5: "verw"}
+# Single instructions whose only observable is whether privilege lets them run.
+PRIV = {b"\xfa": "cli", b"\xfb": "sti", b"\xf4": "hlt", b"\xec": "in", b"\xee": "out",
+        b"\xe4": "in imm", b"\x0f\x06": "clts", b"\x0f\x01": "lmsw", b"\x0f\x22": "mov cr"}
 
 def footer(img):
     d = open(img, "rb").read()
@@ -32,8 +35,13 @@ def cases(img):
         instr = raw.rstrip(b"\x90") or raw[:2]
         if raw[0] == 0xCF:
             out.append(("iret", sel, b"\xcf", ring, aux))
+        elif raw[0] == 0xCB:
+            out.append(("retf", sel, b"\xcb", ring, aux))
         elif raw[0] == 0x0F and raw[1] == 0x00:
             out.append((GRP6.get((raw[2] >> 3) & 7, "grp6"), sel, bytes(raw[:3]), ring, aux))
+        elif bytes(raw[:2]) in PRIV or bytes(raw[:1]) in PRIV:
+            name = PRIV.get(bytes(raw[:2])) or PRIV[bytes(raw[:1])]
+            out.append((name, sel, bytes(instr), ring, aux))
         elif raw[0] in FAR:
             sel = struct.unpack_from("<H", raw, 5)[0]
             out.append((FAR[raw[0]], sel, bytes(raw[:7]), ring, aux))

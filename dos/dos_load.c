@@ -135,12 +135,14 @@ void dos_init(x86_cpu *cpu, const char *root) {
     pc_set_service(0x27, dos_int20, HLE_RET_FLAGS);
     pc_set_service(0x29, dos_int29, HLE_RET_IRET);
     pc_set_service(0x2F, dos_int2f, HLE_RET_FLAGS);
-    pc_set_service(0x31, dpmi_int31, HLE_RET_FLAGS);
-    pc_set_service(PC_HLE_DPMI_ENTRY, dpmi_mode_switch, HLE_RET_FLAGS);
-    pc_set_service(PC_HLE_DPMI_RMRET, dpmi_rm_return, HLE_RET_FLAGS);
-    pc_set_service(PC_HLE_DPMI_CB,    dpmi_callback,  HLE_RET_FLAGS);
-    pc_set_service(PC_HLE_DPMI_CBRET, dpmi_cb_return, HLE_RET_FLAGS);
-    pc_set_service(PC_HLE_DPMI_EXCRET, dpmi_exc_return, HLE_RET_FLAGS);
+    pc_set_trap(0x31, dpmi_int31, HLE_RET_FLAGS);          /* protected mode only: reached through the IDT */
+    pc_set_trap(PC_HLE_DPMI_ENTRY, dpmi_mode_switch, HLE_RET_FLAGS);
+    pc_set_trap(PC_HLE_DPMI_RMRET, dpmi_rm_return, HLE_RET_FLAGS);
+    pc_set_trap(PC_HLE_DPMI_CB,    dpmi_callback,  HLE_RET_FLAGS);
+    pc_set_trap(PC_HLE_DPMI_CBRET, dpmi_cb_return, HLE_RET_FLAGS);
+    pc_set_trap(PC_HLE_DPMI_EXCRET, dpmi_exc_return, HLE_RET_FLAGS);
+    pc_set_trap(PC_HLE_DPMI_RAW,  dpmi_raw_switch, HLE_RET_FLAGS);
+    pc_set_trap(PC_HLE_DPMI_SAVE, dpmi_save_state, HLE_RET_FLAGS);
     pc.pm_exception = dpmi_pm_exception;
     dpmi_init(cpu);
 }

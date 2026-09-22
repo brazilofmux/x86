@@ -60,7 +60,7 @@ void dbt_cache_invalidate_all(x86_dbt *dbt) {
     }
     dbt->link_used = 0;
     dbt->link_free = LINK_NONE;
-    memset(dbt->cpu->code_bitmap, 0, X86_LOW_SIZE);
+    dbt_clear_code_bits(dbt->cpu);
     dbt->max_block_bytes = 0;
     dbt->insn_used = 0;
 }
@@ -113,7 +113,7 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     if (bytes > dbt->max_block_bytes) dbt->max_block_bytes = bytes;
     dbt->last_block_bytes = bytes;
     uint8_t *bm = dbt->cpu->code_bitmap;    /* extended memory past X86_LOW_SIZE absorbs top-of-low-memory blocks */
-    for (uint32_t a = start; a < end; a++) bm[a] = 1;
+    for (uint32_t a = start; a < end; a++) bm[a] |= X86_BM_CODE;
 }
 
 /* A store landed on a byte some cached block covers. Invalidate every
@@ -136,13 +136,19 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
         if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = 1;
     }
     dbt->smc_invalidations++;
-    dbt->cpu->code_bitmap[phys] = 0;
+    dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
 }
 
 /* cpu->smc_hook: reached from x86_phys_wr8 (interpreter, helpers, host
  * services) whenever the bitmap byte is set. */
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
     invalidate_for_store((x86_dbt *)cpu->dbt, phys);
+}
+
+/* Forget every translated byte, keeping device marks. */
+void dbt_clear_code_bits(x86_cpu *cpu) {
+    uint8_t *bm = cpu->code_bitmap;
+    for (uint32_t i = 0; i < X86_LOW_SIZE; i++) bm[i] &= (uint8_t)~X86_BM_CODE;
 }
 
 /* cpu->a20_hook. Every block key and every baked far-transfer mask is
@@ -166,6 +172,6 @@ void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len) {
     if (!cpu->dbt) return;
     for (uint32_t i = 0; i < len; i++) {
         uint32_t p = (phys + i) & cpu->a20_mask;
-        if (p < cpu->mem_size && cpu->code_bitmap[p]) dbt_smc_store(cpu, p);
+        if (p < cpu->mem_size && (cpu->code_bitmap[p] & X86_BM_CODE)) dbt_smc_store(cpu, p);
     }
 }
