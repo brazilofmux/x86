@@ -42,6 +42,22 @@ EXPECT = {
     ("ss", 0x0018): ("#0D", "both",    "SS requires DPL = CPL; DPL 3 at CPL 0 is #GP even though DS takes it"),
     ("ss", 0x001B): ("#0D", "both",    "SS requires RPL = CPL; error code masks the low three bits (0018, not 001B)"),
 
+    # ---- far JMP/CALL at CPL 0. The selector is in the instruction, not AX.
+    ("jmpf",  0x0008): ("ok",  "both", "plain non-conforming code at the same privilege"),
+    ("jmpf",  0x0048): ("ok",  "both", "conforming code is reachable from CPL 0"),
+    ("jmpf",  0x0050): ("#0B", "both", "code segment not present -> #NP"),
+    ("jmpf",  0x0010): ("#0D", "both", "a data segment is not a transfer target -> #GP"),
+    ("jmpf",  0x0000): ("#0D", "both", "null selector as a transfer target -> #GP(0)"),
+    ("jmpf",  0x0080): ("#0D", "both", "index past the GDT limit -> #GP"),
+    ("jmpf",  0x0058): ("ok",  "both", "JMP may go through a call gate; CS becomes the gate's target"),
+    ("jmpf",  0x0060): ("#0B", "both", "gate descriptor not present -> #NP, not #GP"),
+    ("jmpf",  0x0068): ("#0D", "both", "gate whose target selector is data -> #GP"),
+    ("callf", 0x0008): ("ok",  "both", "plain code; pushes a far return address"),
+    ("callf", 0x0058): ("ok",  "both", "through a call gate, CS becomes the gate's target"),
+    ("callf", 0x0050): ("#0B", "both", "code segment not present -> #NP"),
+    ("callf", 0x0010): ("#0D", "both", "data segment as a call target -> #GP"),
+    ("callf", 0x0068): ("#0D", "both", "gate whose target selector is data -> #GP"),
+
     # ---- ES: same rules as DS, spot-checked
     ("es", 0x0020): ("#0B", "both",    "not present -> #NP, as for DS"),
     ("es", 0x0010): ("ok",  "both",    "plain data"),

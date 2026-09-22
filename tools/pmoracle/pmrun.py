@@ -98,7 +98,8 @@ def records(img=None):
         elif post is None:
             r.update(faulted=None)
         else:
-            d = post["segs"].get(tgt.upper(), (0, 0, 0, 0))
+            reg = "CS" if tgt in ("jmpf", "callf") else tgt.upper()
+            d = post["segs"].get(reg, (0, 0, 0, 0))
             r.update(faulted=False, seg=d[0], base=d[1], limit=d[2], ar=d[3] >> 8)
         out.append(r)
     return out

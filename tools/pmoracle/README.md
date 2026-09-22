@@ -56,12 +56,14 @@ display.
 
 ## What it covers so far
 
-Segment-register loads against every descriptor shape, for DS, SS and
-ES: 24 cases, of which 20 match our expectations under both references,
-two differ only in cache encoding, and two are the LDTR case below.
+38 cases: segment-register loads (DS, SS, ES) against every descriptor
+shape, and far JMP/CALL at CPL 0 against code, data, gates and junk.
+33 match our expectations under both references, 2 differ only in cache
+encoding, 2 are the LDTR case below, 1 is an accessed-bit difference,
+and none are unexpected.
 
-The SS rules are the interesting part, because they differ from DS on
-every axis and the oracle shows it plainly:
+The SS rules are worth seeing side by side, because they differ from DS
+on every axis:
 
     case          DS     SS
     0020 absent   #0B    #0C     a not-present stack segment is #SS, not #NP
@@ -69,18 +71,36 @@ every axis and the oracle shows it plainly:
     0018 DPL 3    ok     #0D     SS requires DPL = CPL
     0000 null     ok     #0D     null is legal in DS, not in SS
 
-and one detail worth having measured rather than remembered: loading SS
-with `001B` faults with **error code `0018`**. The low three bits of an
-exception error code are the EXT/IDT/TI flags, so the RPL does not
-appear in it.
+Loading SS with `001B` faults with **error code `0018`**: the low three
+bits of an exception error code are the EXT/IDT/TI flags, so RPL never
+appears there.
+
+Far transfers behave as the manual describes, including the parts that
+are easy to get backwards: a not-present *gate* raises #NP while a gate
+pointing at a data segment raises #GP, and JMP is allowed through a call
+gate, after which CS holds the gate's target rather than the selector
+the instruction named.
+
+### Divergence: the accessed bit
+
+    jmpf <- 0048   ACCESSED BIT: qemu clear, bochs set
+
+Both emulators set the accessed bit when CS is loaded with a
+*non-conforming* code segment; QEMU does not set it for a *conforming*
+one. The bit is architectural — hardware sets it and writes it back to
+the descriptor in memory — so `compare.py` reports it separately from
+cosmetic encoding noise. Bochs looks right here.
 
 ### A limitation of the Bochs side
 
-`pmbochs.py` reports fault-versus-not, not the vector: it infers a fault
-from landing on the handler. QEMU's `-d int` gives the vector and error
-code, so those columns come from QEMU alone and Bochs corroborates only
-the decision. Recording the vector guest-side would need per-vector IDT
-stubs, which is worth doing when the case set grows.
+Both references now report the vector. The IDT has one stub per vector
+(`mov ebp, <vector>; jmp fault`), so landing on stub *i* identifies the
+exception by address alone — which is what lets an emulator with no
+exception log report it. Reading the vector out of EBP instead would be
+a step too early: the post-step dump is taken before the stub runs.
+
+The error code still comes from QEMU's `-d int` only; Bochs corroborates
+the vector but not the code.
 
 ### Where we are deliberately stricter
 

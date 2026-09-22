@@ -5,7 +5,9 @@ import struct
 LOAD_ADDR = 0x7C00
 # The two-byte opcodes the kernel uses, and which register each targets.
 TARGET = {b"\x8e\xd8": "ds", b"\x8e\xd0": "ss", b"\x8e\xc0": "es",
-          b"\x8e\xc8": "cs", b"\x8e\xe0": "fs", b"\x8e\xe8": "gs"}
+          b"\x8e\xe0": "fs", b"\x8e\xe8": "gs"}
+# A far JMP/CALL carries its selector in the instruction, not in AX.
+FAR = {0xEA: "jmpf", 0x9A: "callf"}
 
 def footer(img):
     d = open(img, "rb").read()
@@ -24,5 +26,9 @@ def cases(img):
         raw = d[off:off + 8]
         sel = struct.unpack_from("<H", d, off + 8)[0]
         instr = raw.rstrip(b"\x90") or raw[:2]
-        out.append((TARGET.get(bytes(instr[:2]), instr[:2].hex()), sel, bytes(instr)))
+        if raw[0] in FAR:
+            sel = struct.unpack_from("<H", raw, 5)[0]
+            out.append((FAR[raw[0]], sel, bytes(raw[:7])))
+        else:
+            out.append((TARGET.get(bytes(instr[:2]), instr[:2].hex()), sel, bytes(instr)))
     return out

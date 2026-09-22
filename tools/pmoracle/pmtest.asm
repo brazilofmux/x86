@@ -16,6 +16,8 @@
 STAGE2_LMA  equ 0x7E00
 STAGE2_SECS equ 4
 IDT_BASE    equ 0x6000
+STUB_BASE   equ 0x6400
+STUB_STRIDE equ 16
 STACK_TOP   equ 0x7000
 SEL_CODE    equ 0x08
 SEL_DATA    equ 0x10
@@ -57,18 +59,39 @@ halt1:  hlt
 ; ---------------------------------------------------------------- stage 2
 stage2:
         bits 16
-        mov di, IDT_BASE           ; every vector 0..31 → fault, so a case that
-        mov cx, 32                 ; faults simply resumes the sweep
+        ; One stub per vector: "mov ebp, <vector>; jmp fault". The vector is
+        ; then in EBP in the first dump after any fault, which is what lets
+        ; an emulator without an exception log still report which one it was.
+        mov edi, STUB_BASE
+        xor ecx, ecx
+.stub:  mov byte [edi], 0xBD                   ; mov ebp, imm32
+        mov [edi + 1], ecx
+        mov byte [edi + 5], 0xE9               ; jmp rel32
         mov eax, fault
-.idt:   mov [di], ax
+        sub eax, edi
+        sub eax, 10
+        mov [edi + 6], eax
+        add edi, STUB_STRIDE
+        inc ecx
+        cmp ecx, 32
+        jb  .stub
+
+        mov di, IDT_BASE                       ; gate i -> stub i
+        xor ecx, ecx
+.idt:   mov eax, STUB_BASE
+        push ecx
+        imul ecx, ecx, STUB_STRIDE
+        add eax, ecx
+        pop ecx
+        mov [di], ax
         mov word [di + 2], SEL_CODE
-        mov word [di + 4], 0x8E00  ; present, DPL 0, 32-bit interrupt gate
-        push eax
+        mov word [di + 4], 0x8E00              ; present, DPL 0, 32-bit interrupt gate
         shr eax, 16
         mov [di + 6], ax
-        pop eax
         add di, 8
-        loop .idt
+        inc ecx
+        cmp ecx, 32
+        jb  .idt
 
         lgdt [gdtr]
         lidt [idtr]
@@ -115,6 +138,14 @@ slot_after:
         mov esp, STACK_TOP
         jmp next_case
 
+; A far transfer under test lands here. CS may now be any code selector,
+; so get back to a known one before running the next case.
+far_target:
+        mov esp, STACK_TOP
+        jmp dword SEL_CODE:far_back
+far_back:
+        jmp next_case
+
 done:   mov al, 0
         out 0xF4, al               ; isa-debug-exit, so QEMU stops
 .spin:  hlt
@@ -148,6 +179,19 @@ gdt:
         db 0, 0x92, 0x40, 0                             ; 38 data32 limit 0FFFh, byte granular
         dw 0xFFFF, 0
         db 0, 0x90, 0xCF, 0                             ; 40 data32 READ-ONLY
+        dw 0xFFFF, 0
+        db 0, 0x9E, 0xCF, 0                             ; 48 code32 conforming, readable
+        dw 0xFFFF, 0
+        db 0, 0x1A, 0xCF, 0                             ; 50 code32 NOT PRESENT
+gate58: dw far_target, SEL_CODE                         ; 58 call gate -> 08:far_target
+        db 0, 0x8C
+        dw 0
+gate60: dw far_target, SEL_CODE                         ; 60 call gate, NOT PRESENT
+        db 0, 0x0C
+        dw 0
+gate68: dw far_target, SEL_DATA                         ; 68 call gate whose target is data
+        db 0, 0x8C
+        dw 0
 gdt_end:
 
 gdtr:   dw gdt_end - gdt - 1
@@ -166,6 +210,17 @@ idtr:   dw 32 * 8 - 1
 %define MOV_DS 0x8E, 0xD8           ; mov ds, ax
 %define MOV_SS 0x8E, 0xD0           ; mov ss, ax
 %define MOV_ES 0x8E, 0xC0           ; mov es, ax
+
+; A far JMP/CALL is opcode, offset32, selector16 — seven bytes, so the
+; whole transfer target lives in the case rather than in a register.
+%macro FARCASE 2                   ; %1 = opcode (0xEA jmp / 0x9A call), %2 = selector
+        %%s: db %1
+        dd far_target
+        dw %2
+        times 8 - ($ - %%s) db 0x90
+        dw 0
+        dw 0, 0, 0
+%endmacro
 
         align 16
 cases:
@@ -196,6 +251,22 @@ cases:
         ; ---- ES: same rules as DS, one spot check
         CASE {MOV_ES}, 0x0020      ; not present
         CASE {MOV_ES}, 0x0010      ; plain data
+        ; ---- far JMP: which selectors are a legal transfer target at CPL 0
+        FARCASE 0xEA, 0x0008       ; plain code, same privilege
+        FARCASE 0xEA, 0x0048       ; conforming code
+        FARCASE 0xEA, 0x0050       ; code, not present -> #NP
+        FARCASE 0xEA, 0x0010       ; a data segment is not a transfer target
+        FARCASE 0xEA, 0x0000       ; null selector
+        FARCASE 0xEA, 0x0080       ; index past the GDT limit
+        FARCASE 0xEA, 0x0058       ; through a call gate (JMP may use one)
+        FARCASE 0xEA, 0x0060       ; call gate, not present
+        FARCASE 0xEA, 0x0068       ; call gate whose target selector is data
+        ; ---- far CALL: same table, and it pushes a return address
+        FARCASE 0x9A, 0x0008       ; plain code
+        FARCASE 0x9A, 0x0058       ; through a call gate
+        FARCASE 0x9A, 0x0050       ; not present
+        FARCASE 0x9A, 0x0010       ; data segment
+        FARCASE 0x9A, 0x0068       ; gate whose target is data
 cases_end:
 NCASES  equ (cases_end - cases) / CASE_BYTES
 
