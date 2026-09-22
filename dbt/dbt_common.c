@@ -331,6 +331,13 @@ int dbt_run(x86_dbt *dbt) {
              * effects must not happen twice. Re-sync the shadow. */
             shadow_resync(dbt);
         }
+        /* Poll after the step as well, not just after a translated block.
+         * A fallback is nearly always an HLE service, and the instant it
+         * returns is when IF comes back: with INT inlined, every block in
+         * a poll loop ends with the INT that cleared IF, so a block-only
+         * poll never sees interrupts enabled and pending IRQs would never
+         * be delivered. Affordable since pc_poll became a clock read. */
+        poll_countdown = 0;
     }
 }
 

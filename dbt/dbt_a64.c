@@ -71,6 +71,7 @@
 #define OFF_JIT_CUR_LIN offsetof(x86_cpu, jit_cur_lin)
 #define OFF_JIT_CUR_HIT offsetof(x86_cpu, jit_cur_hit)
 #define OFF_EXC         offsetof(x86_cpu, exc)
+#define OFF_INT_INHIBIT offsetof(x86_cpu, int_inhibit)
 
 #define ARITH  X86_ARITH_FLAGS   /* 0x8D5 — not a logical immediate, load it */
 
@@ -709,12 +710,11 @@ static void emit_shift_imm(emit_t *e, int op, int size, uint32_t cnt, a64_reg_t 
  * ---------------------------------------------------------------------- */
 /* Stack pushes skip the SMC check (the stack essentially never
  * overlaps code) but keep the 8086 wrap check: PUSH at SP=1 exists. */
-/* A push is a store like any other and can land on translated code: a
- * .COM has SS = CS, and an interrupt frame goes wherever SP points. So
- * it carries the same code-bitmap check as any other store. SP is
- * re-derived from the pinned register afterwards rather than carried in
- * a temp, because the SMC helper call clobbers every scratch register
- * and the wrap chunk rejoins here. */
+/* A push is a store like any other: it can land on translated code (a
+ * .COM has SS = CS, and an interrupt frame goes wherever SP points), so
+ * it carries the same code-bitmap check. SP is re-derived from the
+ * pinned register afterwards rather than carried in a temp — the SMC
+ * helper call clobbers every scratch, and the wrap chunk rejoins here. */
 static void emit_push16(emit_t *e, a64_reg_t val) {
     /* new SP in a temp until the store is known to succeed (fault: SP intact) */
     emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
@@ -756,6 +756,7 @@ static int classify(const x86_insn *in) {
     case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD: case OP_CLI: case OP_STI:
     case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
     case OP_RET: case OP_CALLF: case OP_JMPF: case OP_RETF:
+    case OP_INT: case OP_INT3:
         return C_INLINE;
     case OP_PUSH:
         return C_INLINE;
@@ -795,6 +796,8 @@ static int op_may_fault(const x86_insn *in) {
     switch (in->op) {
     case OP_PUSH: case OP_POP: case OP_CALL: case OP_RET: case OP_CALLF: case OP_RETF: case OP_JMPF:
         return 1;
+    case OP_INT: case OP_INT3:
+        return 1;                     /* the frame carries FLAGS: all of them must be materialized */
     default: break;
     }
     for (int i = 0; i < 2; i++)
@@ -803,7 +806,8 @@ static int op_may_fault(const x86_insn *in) {
 }
 
 static int is_uncond_ender(int op) {
-    return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JMPF || op == OP_CALLF || op == OP_RETF;
+    return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JMPF || op == OP_CALLF || op == OP_RETF
+        || op == OP_INT || op == OP_INT3;
 }
 static int is_cond_ender(int op) {
     return op == OP_JCC || op == OP_JCXZ || op == OP_LOOP || op == OP_LOOPE || op == OP_LOOPNE;
@@ -1077,9 +1081,58 @@ static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t
     }
 }
 
+/* Interrupt-frame push: unchecked, like the microcode's (x86_interrupt
+ * uses push_raw, so a 286 takes no #GP here and writes linearly). The
+ * 8086/186 still wrap in-segment, which the wrap chunk handles. */
+static void emit_push16_raw(emit_t *e, a64_reg_t val) {
+    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
+    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+    if (s_wrap_exact) emit_wrap_check(e, R_SSP, W_T2, val, 1, 1);
+    emit_strh_reg_uxtw(e, val, R_SSP, W_T2);
+    emit_add_x64_w32_uxtw(e, W_T3, R_SSP, W_T2);
+    emit_smc_check_x3(e);
+    if (s_wrap_exact) emit_wrap_back(e);
+    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 2);
+    (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
+}
+
+/* INT n / INT3. The IVT entry is read before the frame is pushed
+ * (measured), the pushed FLAGS are the pre-clear value, and IF/TF are
+ * cleared in cpu->eflags — R_F holds only the arithmetic bits, so the
+ * exit stub's spill leaves our store intact. Landing on the HLE stub
+ * segment is a refused key, so the run loop steps the service. */
+static void emit_int_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t ip_after) {
+    x86_cpu *cpu = dbt->cpu;
+    uint32_t vec = in->op == OP_INT3 ? 3 : (in->ops[0].imm & 0xFF);
+    emit_ldrh_imm(e, W_VAL, R_MEM, vec * 4);          /* handler offset */
+    emit_ldrh_imm(e, W_SRC, R_MEM, vec * 4 + 2);      /* handler selector */
+
+    emit_ldr_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+    emit_movz_w32(e, W_T1, ARITH, 0);
+    emit_bic_w32(e, W_T0, W_T0, W_T1);
+    emit_orr_w32(e, W_T0, W_T0, R_F);                 /* FLAGS as the guest sees it */
+    emit_push16_raw(e, W_T0);
+    emit_ldr_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);     /* re-read: a firing SMC check clobbers the scratch */
+    emit_movz_w32(e, W_T1, X86_IF | X86_TF, 0);
+    emit_bic_w32(e, W_T0, W_T0, W_T1);
+    emit_str_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+    emit_strb_imm(e, A64_WZR, R_CPU, OFF_INT_INHIBIT);   /* uint8_t: a word store would reach into cpu->exc */
+
+    emit_movz_w32(e, W_T0, cpu->seg[S_CS].sel, 0);
+    emit_push16_raw(e, W_T0);
+    emit_movz_w32(e, W_T0, (uint16_t)ip_after, 0);
+    emit_push16_raw(e, W_T0);
+
+    emit_load_cs_dynamic(e, cpu);
+    emit_dynamic_tail(e, dbt->exit_stub_off);
+}
+
 static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t ip_after) {
     x86_cpu *cpu = dbt->cpu;
     switch (in->op) {
+    case OP_INT: case OP_INT3:
+        emit_int_ender(dbt, e, in, ip_after);
+        return;
     case OP_CALLF: case OP_JMPF: case OP_RETF:
         emit_far_ender(dbt, e, in, ip_after);
         return;

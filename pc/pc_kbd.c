@@ -298,6 +298,15 @@ void pc_kbd_idle_poll(x86_cpu *c) {
  * which we cannot do from here — it gets the keys when it returns.) */
 static void drain_raw_here(x86_cpu *c) {
     if (pc_rd16(c, 0, 9 * 4 + 2) != PC_HLE_SEG) return;
+    /* pc.last_scancode is a one-code latch shared with the IRQ path. A
+     * code already latched for an INT 9 that has not run yet has to be
+     * translated before we overwrite it, or it is simply lost — which
+     * shows up as a dropped keystroke, and only ever a visible one when
+     * the same key is pressed twice in a row ("hello" -> "helo"). */
+    if (pc.irq_pending & (1 << 9)) {
+        pc.irq_pending &= ~(1 << 9);
+        pc_kbd_int9(c, 9);
+    }
     uint8_t code;
     while (pc_kbd_raw_next(&code)) { pc.last_scancode = code; pc_kbd_int9(c, 9); }
 }
