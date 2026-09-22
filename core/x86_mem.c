@@ -104,9 +104,9 @@ void x86_mem_free(x86_cpu *c) {
     c->mem_mirrored = 0;
 }
 
-/* Gate A20. Remaps the HMA window; the caller owns any translated-code
- * consequences (block keys are A20-masked linear addresses, so the DBT
- * must flush its cache when this changes). */
+/* Gate A20. Remaps the HMA window, then tells the DBT (block keys are
+ * A20-masked linear addresses and translated far transfers bake the
+ * mask in, so its cache must go). */
 int x86_set_a20(x86_cpu *c, int on) {
     uint32_t mask = on ? 0xFFFFFFFFu : 0xFFFFFu;
     if (mask == c->a20_mask) return 0;
@@ -116,5 +116,6 @@ int x86_set_a20(x86_cpu *c, int on) {
                       X86_MEM_SIZE + (on ? HMA_OFF : 0)) < 0) return -1;
     }
     c->a20_mask = mask;
+    if (c->a20_hook) c->a20_hook(c, on);
     return 0;
 }

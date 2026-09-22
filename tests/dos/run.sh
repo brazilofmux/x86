@@ -13,6 +13,7 @@ for mode in -i -j -V "-m 86 -V"; do
     check "hello.com $mode" tests/dos/hello.out ./dos-monster $mode tests/dos/hello.com
     check "exe1.exe $mode"  tests/dos/exe1.out  ./dos-monster $mode tests/dos/exe1.exe
     check "exec.com $mode"  tests/dos/exec.out  ./dos-monster $mode tests/dos/exec.com
+    check "a20.com $mode"   tests/dos/a20.out   ./dos-monster $mode tests/dos/a20.com
 done
 if [ -f disks/tp55/TPC.EXE ]; then
     rm -f disks/tp55/HELLO.EXE

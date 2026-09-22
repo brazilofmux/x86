@@ -108,6 +108,8 @@ static void bios_int12(x86_cpu *c, int vector) {
     x86_set_r16(c, R_AX, pc_rd16(c, PC_BDA_SEG, 0x13));
 }
 
+static void a20_set(x86_cpu *c, int on);
+
 static void bios_int15(x86_cpu *c, int vector) {
     (void)vector;
     switch (x86_get_r8(c, R_AH)) {
@@ -121,6 +123,15 @@ static void bios_int15(x86_cpu *c, int vector) {
     case 0xC0:                                   /* system configuration: none */
         x86_set_r8(c, R_AH, 0x80);
         c->eflags |= X86_CF;
+        break;
+    case 0x24:                                   /* A20 gate */
+        switch (x86_get_r8(c, R_AL)) {
+        case 0x00: a20_set(c, 0); x86_set_r8(c, R_AH, 0); c->eflags &= ~X86_CF; break;
+        case 0x01: a20_set(c, 1); x86_set_r8(c, R_AH, 0); c->eflags &= ~X86_CF; break;
+        case 0x02: x86_set_r16(c, R_AX, (uint16_t)(c->a20_mask != 0xFFFFFu ? 1 : 0)); c->eflags &= ~X86_CF; break;
+        case 0x03: x86_set_r16(c, R_AX, 0); x86_set_r16(c, R_BX, 3); c->eflags &= ~X86_CF; break;   /* keyboard controller and port 92h */
+        default: x86_set_r8(c, R_AH, 0x86); c->eflags |= X86_CF; break;
+        }
         break;
     case 0x86: {                                 /* wait CX:DX microseconds */
         uint32_t us = ((uint32_t)x86_get_r16(c, R_CX) << 16) | x86_get_r16(c, R_DX);
@@ -215,6 +226,18 @@ static uint16_t pit_now(int ch) {
     return (uint16_t)(reload - (ticks % reload));
 }
 
+/* ---- A20 --------------------------------------------------------------
+ * Three ways to reach the gate, all landing in x86_set_a20 (which
+ * remaps the HMA window and tells the DBT to drop its cache): the 8042
+ * output port (64h D1 / 60h data, or the DD/DF shortcuts), the PS/2
+ * system control port 92h, and INT 15h AH=24h. */
+static void a20_set(x86_cpu *c, int on) {
+    int was = c->a20_mask != 0xFFFFFu;
+    if (pc.debug && was != on) fprintf(stderr, "[pc] A20 %s @%llu\n", on ? "on" : "off", (unsigned long long)c->insn_count);
+    x86_set_a20(c, on);
+}
+static uint8_t a20_out_port(const x86_cpu *c) { return (uint8_t)(0xCD | (c->a20_mask != 0xFFFFFu ? 2 : 0)); }   /* 8042 output port: A20 in bit 1, bit 0 = no reset */
+
 static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     (void)size;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
@@ -234,9 +257,12 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     case 0x43: return 0xFF;
     case 0x20: return 0;
     case 0x21: return pic_mask;
-    case 0x60: pc.irq9_busy = 0; return pc.last_scancode;
+    case 0x60:
+        if (pc.kbc_out_full) { pc.kbc_out_full = 0; return pc.kbc_out; }
+        pc.irq9_busy = 0; return pc.last_scancode;
     case 0x61: return pit_speaker;
-    case 0x64: return 0x14;                      /* 8042 status: not busy, no output */
+    case 0x64: return (uint32_t)(0x14 | (pc.kbc_out_full ? 1 : 0));   /* 8042 status: not busy; bit 0 = response ready */
+    case 0x92: return (uint32_t)(c->a20_mask != 0xFFFFFu ? 2 : 0);
     case 0x3DA: {                                /* CGA status: toggle retrace bits */
         static uint8_t t; t ^= 0x09; return t;
     }
@@ -271,6 +297,28 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         else if (val == 0x20) for (int i = 0; i < 8; i++) if (pc.irq_in_service & (1 << i)) { pc.irq_in_service &= ~(1 << i); break; }
         break;
     case 0x61: pit_speaker = (uint8_t)(val & 0x0F); break;
+    case 0x64:
+        switch (val & 0xFF) {
+        case 0xD0: pc.kbc_out = a20_out_port(c); pc.kbc_out_full = 1; break;   /* read output port */
+        case 0xD1: pc.kbc_cmd = 0xD1; break;                                   /* write output port: data follows */
+        case 0xDD: a20_set(c, 0); break;
+        case 0xDF: a20_set(c, 1); break;
+        case 0xAD: case 0xAE: break;                                           /* keyboard disable/enable: no-op */
+        case 0xFE: fprintf(stderr, "pc: 8042 CPU reset requested; ignored\n"); break;
+        default: pc.kbc_cmd = (uint8_t)val; break;                             /* others: swallow any data byte */
+        }
+        break;
+    case 0x60:
+        if (pc.kbc_cmd == 0xD1) {
+            if (!(val & 1)) fprintf(stderr, "pc: 8042 output port reset bit cleared; ignored\n");
+            a20_set(c, (val >> 1) & 1);
+        }
+        pc.kbc_cmd = 0;                          /* keyboard commands (LEDs, typematic): swallowed */
+        break;
+    case 0x92:
+        a20_set(c, (val >> 1) & 1);
+        if (val & 1) fprintf(stderr, "pc: port 92h fast reset requested; ignored\n");
+        break;
     default: break;
     }
 }

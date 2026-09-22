@@ -83,6 +83,7 @@ typedef struct x86_cpu {
      * below needs no NULL test. Same mirror layout as mem. */
     uint8_t *code_bitmap;
     void   (*smc_hook)(struct x86_cpu *, uint32_t phys);   /* DBT: a store hit code */
+    void   (*a20_hook)(struct x86_cpu *, int on);          /* DBT: the A20 gate changed */
     void    *dbt;           /* owning translator, NULL when interpreting only */
     void    *jit_aux;       /* DBT aux block base, reloaded by helper-call sequences */
     uint64_t jit_budget;    /* insn budget handed to the trampoline (exit stub math) */

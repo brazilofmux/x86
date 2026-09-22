@@ -41,6 +41,9 @@ typedef struct pc_state {
      * ring buffer at 40:1E; the last scancode is readable at port 60h. */
     uint8_t  last_scancode;
     uint8_t  irq9_busy;              /* reserved: INT 9 in progress */
+    uint8_t  kbc_cmd;                /* 8042: command awaiting its data byte on port 60h (0 = none) */
+    uint8_t  kbc_out;                /* 8042: pending response for port 60h (with kbc_out_full) */
+    uint8_t  kbc_out_full;
     int      kbd_raw;                /* host terminal is in raw mode */
     uint64_t kbd_reads;              /* guest keyboard reads/polls; paces scripted input */
     int      eof_seen;

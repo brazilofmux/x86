@@ -68,6 +68,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     cpu->dbt      = dbt;
     cpu->jit_aux  = dbt->aux;
     cpu->smc_hook = dbt_smc_store;
+    cpu->a20_hook = dbt_a20_changed;
     dbt_cache_invalidate_all(dbt);
 
     dbt->code_buf = mmap(NULL, CODE_BUF_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -195,13 +196,16 @@ static void shadow_resync(x86_dbt *dbt) {
     x86_cpu *cpu = dbt->cpu, *sh = &dbt->shadow;
     uint8_t *mem = sh->mem, *bm = sh->code_bitmap;
     int fd = sh->mem_fd; uint8_t mirrored = sh->mem_mirrored;
+    uint32_t sh_a20 = sh->a20_mask;
     *sh = *cpu;
     sh->mem = mem; sh->code_bitmap = bm; sh->mem_fd = fd; sh->mem_mirrored = mirrored;
     sh->dbt = NULL; sh->jit_aux = NULL;
     sh->smc_hook = shadow_smc_none;
-    if ((sh->a20_mask != 0xFFFFFu) != (cpu->a20_mask != 0xFFFFFu))
-        x86_set_a20(sh, cpu->a20_mask != 0xFFFFFu);
-    sh->a20_mask = cpu->a20_mask;
+    sh->a20_hook = NULL;
+    /* The shadow's HMA window must alias the same way before the copy,
+     * or the real HMA bytes land in the shadow's low 64 KB (or vice versa). */
+    sh->a20_mask = sh_a20;
+    x86_set_a20(sh, cpu->a20_mask != 0xFFFFFu);
     memcpy(sh->mem, cpu->mem, X86_MEM_SIZE);
 }
 
@@ -341,6 +345,7 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             dbt->interp_fallback_insns ? (double)dbt->interp_fallback_ns * 16.0 / (double)dbt->interp_fallback_insns : 0.0);
     fprintf(out, "  helper-class ops:       %llu (at translation)\n", (unsigned long long)dbt->helper_insns);
     fprintf(out, "  SMC invalidations:      %llu\n", (unsigned long long)dbt->smc_invalidations);
+    if (dbt->a20_flushes) fprintf(out, "  A20 cache flushes:      %llu\n", (unsigned long long)dbt->a20_flushes);
     fprintf(out, "  links created/patched/unpatched: %llu / %llu / %llu\n",
             (unsigned long long)dbt->links_created, (unsigned long long)dbt->links_patched,
             (unsigned long long)dbt->links_unpatched);

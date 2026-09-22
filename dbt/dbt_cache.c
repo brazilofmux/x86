@@ -144,6 +144,21 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
     invalidate_for_store((x86_dbt *)cpu->dbt, phys);
 }
 
+/* cpu->a20_hook. Every block key and every baked far-transfer mask is
+ * stale now. This runs from inside a helper thunk (OUT 92h/60h) as
+ * often as not, so only the cache and the link registry are wiped here
+ * — the code buffer that is executing us is rewound by the next
+ * translate — and the running block is told to leave. */
+void dbt_a20_changed(x86_cpu *cpu, int on) {
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    (void)on;
+    if (!dbt) return;
+    dbt_cache_invalidate_all(dbt);
+    dbt->flush_pending = 1;
+    cpu->jit_cur_hit = 1;
+    dbt->a20_flushes++;
+}
+
 /* The host wrote guest memory directly (loader, DOS file reads): run
  * the same invalidation a guest store would have. */
 void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len) {
