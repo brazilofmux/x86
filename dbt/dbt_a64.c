@@ -746,7 +746,7 @@ static int classify(const x86_insn *in) {
     case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
     case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD: case OP_CLI: case OP_STI:
     case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
-    case OP_RET:
+    case OP_RET: case OP_CALLF: case OP_JMPF: case OP_RETF:
         return C_INLINE;
     case OP_PUSH:
         return C_INLINE;
@@ -780,8 +780,21 @@ static int classify(const x86_insn *in) {
 /* Exposed for tools/jittest's fuzzer: 0 refuse, 1 inline, 2 helper. */
 int dbt_classify_op(const x86_insn *in) { return classify(in); }
 
+/* Inline ops with a word-sized memory or stack access: the 286+ limit
+ * check in front of it can raise #GP. Byte accesses cannot straddle. */
+static int op_may_fault(const x86_insn *in) {
+    switch (in->op) {
+    case OP_PUSH: case OP_POP: case OP_CALL: case OP_RET: case OP_CALLF: case OP_RETF: case OP_JMPF:
+        return 1;
+    default: break;
+    }
+    for (int i = 0; i < 2; i++)
+        if (in->ops[i].kind == OPK_MEM && in->ops[i].size >= 2) return 1;
+    return 0;
+}
+
 static int is_uncond_ender(int op) {
-    return op == OP_JMP || op == OP_CALL || op == OP_RET;
+    return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JMPF || op == OP_CALLF || op == OP_RETF;
 }
 static int is_cond_ender(int op) {
     return op == OP_JCC || op == OP_JCXZ || op == OP_LOOP || op == OP_LOOPE || op == OP_LOOPNE;
@@ -991,9 +1004,76 @@ static void emit_cond_taken_tail(x86_dbt *dbt, emit_t *e, const x86_insn *in, ui
     emit_edge(dbt, e, target_key(dbt->cpu, ip_after + in->ops[0].imm));
 }
 
+/* Far transfers (real mode: base = sel << 4). CS is stored to the cpu
+ * before the tail — the exit stub derives EIP from it and the key
+ * carries the selector. A static target (ptr16:16 immediate) is an
+ * ordinary linkable edge; the others build the key from W_SRC (sel)
+ * and W_VAL (offset) at run time, masking for A20 when it is off. */
+static void emit_load_cs_dynamic(emit_t *e, const x86_cpu *cpu) {
+    emit_strh_imm(e, W_SRC, R_CPU, OFF_SEG_SEL(S_CS));
+    emit_lsl_w32_imm(e, W_T0, W_SRC, 4);
+    emit_str_w32_imm(e, W_T0, R_CPU, OFF_SEG_BASE(S_CS));
+    emit_add_w32(e, A64_W0, W_T0, W_VAL);
+    if (cpu->a20_mask == 0xFFFFF) (void)emit_and_w32_imm(e, A64_W0, A64_W0, 0xFFFFF);
+    emit_orr_x64_lsl(e, A64_W0, A64_W0, W_SRC, 32);
+}
+static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t ip_after) {
+    x86_cpu *cpu = dbt->cpu;
+    if (in->op == OP_RETF) {
+        /* Both slots are fetched before SP moves so a 286 limit fault on
+         * either leaves SP intact, as the interpreter's frame precheck does. */
+        emit_add_w32_imm(e, W_T0, R_GPR(R_SP), 2);
+        (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
+        emit_wrap_check(e, R_SSP, W_T0, W_SRC, 0, 0);
+        emit_ldrh_reg_uxtw(e, W_SRC, R_SSP, W_T0);
+        emit_wrap_back(e);
+        emit_wrap_check(e, R_SSP, R_GPR(R_SP), W_VAL, 0, 0);
+        emit_ldrh_reg_uxtw(e, W_VAL, R_SSP, R_GPR(R_SP));
+        emit_wrap_back(e);
+        int32_t adj = 4 + (in->ops[0].kind == OPK_IMM ? (int32_t)(in->ops[0].imm & 0xFFFF) : 0);
+        emit_add_w32_imm_any(e, R_GPR(R_SP), R_GPR(R_SP), adj, W_T1);
+        (void)emit_and_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 0xFFFF);
+        emit_load_cs_dynamic(e, cpu);
+        emit_dynamic_tail(e, dbt->exit_stub_off);
+        return;
+    }
+    int is_imm = in->ops[0].kind == OPK_IMM;
+    if (!is_imm) {
+        /* ptr16:16 in memory: offset then selector, each wrap-checked on its own */
+        ea_t ea = { 0, 0 };
+        emit_ea(e, in, &ea);
+        emit_read_mem(e, &ea, 2, W_VAL);
+        emit_add_w32_imm(e, W_T0, ea.off, 2);
+        (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
+        ea_t ea2 = { ea.segp, W_T0 };
+        emit_read_mem(e, &ea2, 2, W_SRC);
+    }
+    if (in->op == OP_CALLF) {
+        emit_movz_w32(e, W_T0, cpu->seg[S_CS].sel, 0);
+        emit_push16(e, W_T0);
+        emit_movz_w32(e, W_T0, (uint16_t)ip_after, 0);
+        emit_push16(e, W_T0);
+    }
+    if (is_imm) {
+        uint16_t sel = (uint16_t)in->imm2, off = (uint16_t)in->ops[0].imm;
+        emit_movz_w32(e, W_T0, sel, 0);
+        emit_strh_imm(e, W_T0, R_CPU, OFF_SEG_SEL(S_CS));
+        emit_mov_w32_imm32(e, W_T0, (uint32_t)sel << 4);
+        emit_str_w32_imm(e, W_T0, R_CPU, OFF_SEG_BASE(S_CS));
+        uint32_t lin = (((uint32_t)sel << 4) + off) & cpu->a20_mask;
+        emit_edge(dbt, e, dbt_key(sel, lin));
+    } else {
+        emit_load_cs_dynamic(e, cpu);
+        emit_dynamic_tail(e, dbt->exit_stub_off);
+    }
+}
+
 static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t ip_after) {
     x86_cpu *cpu = dbt->cpu;
     switch (in->op) {
+    case OP_CALLF: case OP_JMPF: case OP_RETF:
+        emit_far_ender(dbt, e, in, ip_after);
+        return;
     case OP_JMP:
         if (in->ops[0].kind == OPK_IMM) {
             emit_edge(dbt, e, target_key(cpu, ip_after + in->ops[0].imm));
@@ -1109,6 +1189,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         for (int i = (int)n_ops - 1; i >= 0; i--) {
             uint32_t rd, wr;
             op_flag_effects(&decs[i], cls[i], &rd, &wr);
+            /* 286+: a limit fault is an unplanned exit whose frame holds
+             * the flags, so an op that can fault observes all of them. */
+            if (cpu->model >= X86_MODEL_286 && op_may_fault(&decs[i])) rd |= ARITH;
             fmask[i] = live;
             live = (live & ~wr) | rd;
         }

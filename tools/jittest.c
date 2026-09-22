@@ -258,6 +258,7 @@ static int fuzz_accept(const x86_insn *in) {
     if (in->seg_override == S_CS) return 0;
     switch (in->op) {
     case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
+    case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INT: case OP_INT3: case OP_INTO:
     case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_POPF: case OP_HLT:
         return 0;
     case OP_POP: case OP_PUSH:
