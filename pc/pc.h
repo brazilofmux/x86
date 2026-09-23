@@ -27,6 +27,8 @@
 
 /* Return convention of a service after pc_hle_dispatch ran it. */
 enum { HLE_RET_FLAGS, HLE_RET_IRET };
+#define PC_STUB_SEG     0xF100     /* native BIOS stubs: in the ROM area, but not the trap segment's base */
+#define PC_STUB_INT1C   0x0000     /* INT 1Ch; IRET — INT 8's tail */
 #define PC_HLE_DUMMY_IRET 0xFF53   /* where every unserved vector points, as on an AT (traps as vector 53h) */
 #define PC_HLE_DPMI_ENTRY 0x00FD   /* offset in the HLE segment; the trap vector is eip & FFh */
 #define PC_HLE_DPMI_RMRET 0x00FC   /* a real-mode excursion (INT 31h 0300-0302) has returned here */
@@ -94,6 +96,7 @@ void pc_init(x86_cpu *cpu, int tty_mode); /* IVT, BDA, stub segment, services */
 void pc_set_service(int vector, pc_service_fn fn, int ret_mode);
 void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted machine reboots */
 void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
+void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads as an empty bus */
 void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);
 void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
@@ -110,7 +113,8 @@ static inline void     pc_wr16(x86_cpu *c, uint16_t seg, uint16_t off, uint16_t 
 void pc_video_init(x86_cpu *c);
 void pc_video_teletype(x86_cpu *c, uint8_t ch);          /* INT 10h/0E semantics, page 0 */
 void pc_video_int10(x86_cpu *c, int vector);
-void pc_kbd_busy(void);                                  /* the guest did work: not idle-polling */
+void pc_kbd_busy(void);
+void pc_kbd_raw_reply(uint8_t code);                     /* the keyboard answers a command byte */                                  /* the guest did work: not idle-polling */
 void pc_video_flush(int force);                          /* tty mode painter */
 void pc_video_shutdown(void);
 void pc_video_set_hud(const char *text);
@@ -128,7 +132,7 @@ void pc_kbd_poll(x86_cpu *c);                            /* host keys → BIOS b
 int  pc_kbd_buffer_empty(x86_cpu *c);
 int  pc_kbd_peek(x86_cpu *c, uint16_t *key);             /* ascii | scancode<<8 */
 int  pc_kbd_get(x86_cpu *c, uint16_t *key);
-void pc_kbd_wait(x86_cpu *c);                            /* block until a key is in the buffer */
+int  pc_kbd_wait(x86_cpu *c, int can_return);            /* a key in the buffer (1), or return to the guest first (0; can_return) */
 void pc_kbd_idle_poll(x86_cpu *c);                       /* DOS-level "is a key ready" polls */
 void pc_kbd_int16(x86_cpu *c, int vector);
 void pc_kbd_int9(x86_cpu *c, int vector);                /* default INT 9: latched code → BIOS buffer */

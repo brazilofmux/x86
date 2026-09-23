@@ -216,7 +216,15 @@ static void int13(x86_cpu *c, int vector) {
         return;
     }
     case 0x08: {                                             /* drive parameters */
-        if (!d) { status(c, dl, dl & 0x80 ? 0x07 : 0x01); return; }   /* (DOS probes 81h this way) */
+        if (!d) {
+            /* No such drive — but DL still says how many there are: IO.SYS
+             * takes it as the count of fixed disks whatever CF says, and
+             * with 80h left in DL built 128 of them (MS-DOS 6.22 then
+             * walked its drive chain off into garbage). */
+            x86_set_r8(c, R_DL, (uint8_t)(dl & 0x80 ? nhd : nfd));
+            status(c, dl, dl & 0x80 ? 0x07 : 0x01);
+            return;
+        }
         int mc = d->cyls - 1;
         x86_set_r8(c, R_CH, (uint8_t)mc);
         x86_set_r8(c, R_CL, (uint8_t)(d->spt | ((mc >> 2) & 0xC0)));

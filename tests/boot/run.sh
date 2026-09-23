@@ -45,4 +45,26 @@ if [ -f disks/freedos/c286.img ]; then
     then echo "ok   freedos 286 hard disk boot"; else echo "FAIL freedos 286 hard disk boot"; fail=1; fi
     rm -f tmp/boot-c.img tmp/boot-c.exp
 fi
+if [ -f disks/msdos622/c.img ]; then
+    # MS-DOS 6.22 as its Setup left it (tests/boot/msinstall.sh): HIMEM, DOS=HIGH
+    cp disks/msdos622/c.img tmp/boot-c.img
+    printf 'C:.>$\tver\\r\nMS-DOS Version 6.22\t\n' > tmp/boot-c.exp
+    if python3 tools/expect.py -t 90 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+    then echo "ok   ms-dos 6.22 hard disk boot"; else echo "FAIL ms-dos 6.22 hard disk boot"; fail=1; fi
+    # EMM386 (V86 mode, paging, UMBs, EMS), SMARTDRV loaded high, then WP
+    printf 'DEVICE=C:\\DOS\\SETVER.EXE\r\nDEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\EMM386.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=30\r\n' > tmp/boot-cfg.sys
+    printf 'LH C:\\DOS\\SMARTDRV.EXE /X\r\n@ECHO OFF\r\nPROMPT $p$g\r\nPATH C:\\DOS\r\nSET TEMP=C:\\DOS\r\n' > tmp/boot-auto.bat
+    mcopy -o -i tmp/boot-c.img@@32256 tmp/boot-cfg.sys ::/CONFIG.SYS
+    mcopy -o -i tmp/boot-c.img@@32256 tmp/boot-auto.bat ::/AUTOEXEC.BAT
+    printf 'C:.>$\tmem /c\\r\n*Free Expanded \\(EMS\\)\t\n' > tmp/boot-c.exp
+    if python3 tools/expect.py -t 90 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+    then echo "ok   ms-dos under emm386 (v86)"; else echo "FAIL ms-dos under emm386 (v86)"; fail=1; fi
+    if [ -d disks/WP51 ]; then
+        mcopy -s -i tmp/boot-c.img@@32256 disks/WP51 ::/
+        printf 'C:.>$\tcd \\\\wp51\\rwp\\r\nDoc 1 Pg 1\tHello from MS-DOS.\nMS-DOS\\.\t\n' > tmp/boot-c.exp
+        if python3 tools/expect.py -t 120 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 110 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+        then echo "ok   wp51 under ms-dos + emm386"; else echo "FAIL wp51 under ms-dos + emm386"; fail=1; fi
+    fi
+    rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-cfg.sys tmp/boot-auto.bat
+fi
 exit $fail

@@ -52,3 +52,32 @@ WordPerfect was added with mtools:
 
 (the partition starts at sector 63). run.sh boots scratch copies, so the
 image never changes under a test.
+
+MS-DOS 6.22 (disks/msdos622/, git-ignored: the user's own diskettes,
+msdos622-1..3.img, and c.img installed from them by msinstall.sh)
+-----------------------------------------------------------------
+
+  tests/boot/msinstall.sh            # ~25 s, blank disk to C:\> with C:\DOS
+
+Setup (the upgrade edition) won't touch a blank disk, so the script exits
+it, partitions with FDISK (it reboots through the reset vector), formats
+with FORMAT C: /S, and lets Setup finish over the fresh system ("Continue
+Setup and replace"). Diskette changes are expect.py's ESC + key. run.sh
+boots it as Setup left it (HIMEM, DOS=HIGH), then with EMM386.EXE RAM,
+DOS=HIGH,UMB and LH SMARTDRV (V86 mode, paging: 16M EMS, UMBs), then
+WordPerfect under that.
+
+What it took, beyond FreeDOS:
+- IO.SYS times the keyboard controller's ACK by counting port 61h's
+  refresh toggle (bit 4, every 15 us), and wants the FAh ACK itself.
+- INT 16h AH=00h can't wait in the host once INT 9 is hooked (IO.SYS,
+  KEYB): it returns unfinished with IF set and the INT reruns.
+- IO.SYS runs a stack on its own code: a CALL FAR's push into the running
+  block must not leave the block mid-instruction (the SMC check of a block
+  ender names no running block).
+- EMM386 looks for its page frame in open bus: C0000-EFFFF read FFh and
+  ignore writes (X86_BM_EMPTY), and a not-present gate that also has a
+  bad type is #GP, not #NP (QEMU as the oracle: -d int).
+- The BIOS's INT 8 chains INT 1Ch through a real stub (INT 1Ch; IRET at
+  F100:0000), so a V86 monitor reflects it like any other interrupt.
+- POST sets the tick count from the RTC, so TIME is right at boot.

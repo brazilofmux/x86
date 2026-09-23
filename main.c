@@ -114,7 +114,8 @@ static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
     for (int k = -12; k < 8; k++) fprintf(stderr, "%s%02X", k == 0 ? " | " : " ", x86_phys_rd8(c, lin + (uint32_t)k));
     fprintf(stderr, "\n");
     const char *dump = getenv("X86_EXC_MEMDUMP");       /* memory and registers at the first one */
-    if (c->pmode && n <= 3) {
+    if (c->pmode && (n <= 3 || vec == 11)) {
+        fprintf(stderr, "      IDTR %08X/%04X  CR0=%08X CR3=%08X EFL=%08X\n", c->idtr.base, c->idtr.limit, c->cr0, c->cr3, c->eflags);
         fprintf(stderr, "      GDTR %08X/%04X:", c->gdtr.base, c->gdtr.limit);
         for (uint32_t k = 0; k < 32 && k <= c->gdtr.limit; k++) fprintf(stderr, "%s%02X", k % 8 ? "" : " ", x86_phys_rd8(c, c->gdtr.base + k));
         fprintf(stderr, "\n");
@@ -160,6 +161,7 @@ static void pm_trace(x86_cpu *c) {
  * of where it left its own code. */
 #define PMRING 400
 static int g_pmring;
+static int g_pmstop_set;
 static uint32_t g_pmstop;
 static struct { uint16_t cs, ss; uint32_t eip, lin, esp; } pmring[PMRING];
 static uint64_t pmring_n;
@@ -180,7 +182,7 @@ static void pmring_dump(x86_cpu *c) {
 /* With -pmring, the first protected-mode exception is the interesting one:
  * a client that installs its own handler turns every later one into noise. */
 static void pmring_exc(x86_cpu *c, int vec, uint32_t err) {
-    if (g_pmstop) return;                  /* -pmstop wants the run-up to its address, not this */
+    if (g_pmstop_set) return;              /* -pmstop wants the run-up to its address, not this */
     fprintf(stderr, "pmring: exception %02X err %04X at %04X:%08X\n",
             vec, err, c->seg[S_CS].sel, c->eip);
     fprintf(stderr, "  EAX=%08X ECX=%08X EDX=%08X EBX=%08X ESP=%08X EBP=%08X ESI=%08X EDI=%08X\n",
@@ -207,7 +209,7 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
             pmring[k].ss = c->seg[S_SS].sel; pmring[k].esp = c->r[R_SP];
             /* Fetching from open bus means the guest already lost control;
              * the interesting part is the run-up, not the wreck. */
-            if (g_pmstop && pmring[k].lin == g_pmstop) {
+            if (g_pmstop_set && pmring[k].lin == g_pmstop) {
                 fprintf(stderr, "pmring: reached %08X\n", g_pmstop);
                 pmring_dump(c);
                 return 0;
@@ -281,7 +283,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-hdb") && i + 1 < argc) img_hd[1] = argv[++i];
         else if (!strcmp(argv[i], "-ro")) img_ro = 1;
         else if (!strcmp(argv[i], "-pmring")) g_pmring = 1;
-        else if (!strcmp(argv[i], "-pmstop") && i + 1 < argc) { g_pmring = 1; g_pmstop = (uint32_t)strtoul(argv[++i], NULL, 0); }
+        else if (!strcmp(argv[i], "-pmstop") && i + 1 < argc) { g_pmring = 1; g_pmstop_set = 1; g_pmstop = (uint32_t)strtoul(argv[++i], NULL, 0); }
         else if (!strcmp(argv[i], "-pmtrace") && i + 1 < argc) {
             const char *a = argv[++i];
             g_pmtrace_lo = (uint32_t)strtoul(a, NULL, 0);
@@ -312,6 +314,7 @@ int main(int argc, char **argv) {
         x86_init(&cpu, model);
         pc_init(&cpu, tty);
         pc.booted = 1;
+        pc_empty_upper_memory(&cpu);
         pc_disk_install(&cpu);
         pc_cmos_init(&cpu);
         pc.debug = debug;
@@ -438,11 +441,11 @@ int main(int argc, char **argv) {
         FILE *f = strcmp(dump, "-") ? fopen(dump, "w") : stdout;
         if (f) { pc_video_dump(&cpu, f); if (f != stdout) fclose(f); }
     }
-    /* X86_MEMDUMP=FILE: guest memory (the first 1 MB + 64K) at exit, for
+    /* X86_MEMDUMP=FILE: all of guest memory at exit, for
      * disassembling where a run ended (ndisasm -o, -e) */
     if (getenv("X86_MEMDUMP")) {
         FILE *f = fopen(getenv("X86_MEMDUMP"), "wb");
-        if (f) { fwrite(cpu.mem, 1, cpu.mem_size < 0x110000 ? cpu.mem_size : 0x110000, f); fclose(f); }
+        if (f) { fwrite(cpu.mem, 1, cpu.mem_size, f); fclose(f); }
     }
     if (gdump && pc_video_png(&cpu, gdump) < 0)
         fprintf(stderr, "-G %s: the screen is in neither a text mode nor mode 13h\n", gdump);

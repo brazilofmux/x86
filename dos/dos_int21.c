@@ -66,7 +66,7 @@ static uint8_t con_in(x86_cpu *c, int echo) {
     static uint8_t pending_ext;                 /* second byte of an extended key */
     if (pending_ext) { uint8_t v = pending_ext; pending_ext = 0; return v; }
     uint16_t key;
-    pc_kbd_wait(c);
+    pc_kbd_wait(c, 0);                        /* the shim's console waits in the host, as it always has */
     if (!pc_kbd_get(c, &key)) return 0x1A;
     uint8_t a = key & 0xFF;
     if (a == 0 || a == 0xE0) { pending_ext = (uint8_t)(key >> 8); a = 0; }

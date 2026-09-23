@@ -96,6 +96,14 @@ static void raw_enqueue(uint8_t code, uint8_t ascii) {
 }
 int pc_kbd_raw_pending(void) { return rawq_head != rawq_tail; }
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii) { raw_enqueue(code, ascii); }
+/* The keyboard's answer to a command byte (FAh, ACK): ahead of any keys
+ * still waiting, as the keyboard sends it straight back. */
+void pc_kbd_raw_reply(uint8_t code) {
+    int prev = (rawq_head - 1) & 255;
+    if (prev == rawq_tail) return;
+    rawq_head = prev;
+    rawq[rawq_head] = (rawkey){ code, 0 };
+}
 int pc_kbd_raw_next(uint8_t *code) {
     if (rawq_head == rawq_tail) return 0;
     *code = rawq[rawq_head].code; latched_ascii = rawq[rawq_head].ascii;
@@ -147,6 +155,13 @@ void pc_kbd_int9(x86_cpu *c, int vector) {
     pc.irq9_busy = 0;
     pc.irq_in_service &= ~2;                     /* the BIOS handler's EOI */
     uint8_t code = pc.last_scancode;
+    /* a command's acknowledgement or resend request, not a key: the AT
+     * BIOS notes it in 40:97 (bit 4 ACK, bit 5 RESEND), where whoever sent
+     * the command waits for it (MS-DOS's IO.SYS setting the LEDs) */
+    if (code == 0xFA || code == 0xFE) {
+        pc_wr8(c, BDA, 0x97, (uint8_t)(pc_rd8(c, BDA, 0x97) | (code == 0xFA ? 0x10 : 0x20)));
+        return;
+    }
     /* shift state → BDA 40:17 (bit 0 rshift, 1 lshift, 2 ctrl, 3 alt) */
     uint8_t flags = pc_rd8(c, BDA, 0x17);
     int down = !(code & 0x80);
@@ -388,30 +403,41 @@ static void drain_raw_here(x86_cpu *c) {
     while (pc_kbd_raw_next(&code)) { pc.last_scancode = code; pc_kbd_int9(c, 9); }
 }
 
-void pc_kbd_wait(x86_cpu *c) {
+/* Wait for a key in the BIOS buffer. Returns 1 when there is one, 0 when
+ * the caller must return to the guest unfinished: with INT 9 hooked by
+ * the guest (MS-DOS's IO.SYS does) only the guest's own handler can move
+ * a scancode into the buffer, and it can only run between instructions —
+ * so the service leaves CS:IP on its stub with interrupts on, IRQ 1 is
+ * delivered there, and the service runs again after the handler's IRET,
+ * as a real BIOS waits with STI in a loop. */
+int pc_kbd_wait(x86_cpu *c, int can_return) {
     while (pc_kbd_buffer_empty(c)) {
         pc_video_flush(1);
         drain_raw_here(c);
         if (!pc_kbd_buffer_empty(c)) break;
+        int hooked = can_return && pc_rd16(c, 0, 9 * 4 + 2) != PC_HLE_SEG;
         if (pc.eof_seen) {
             /* Scripted input ran out: hand the program a Ctrl-Z once,
              * then treat further waits as "nothing more will happen". */
             static int fed_eof;
-            if (!fed_eof) { fed_eof = 1; key_to_raw(0x1A, 0x2C); return; }
+            if (!fed_eof) { fed_eof = 1; key_to_raw(0x1A, 0x2C); if (hooked) return 0; continue; }
             fprintf(stderr, "dos-monster: input exhausted while waiting for a key\n");
             pc.exit_requested = 1; pc.exit_code = 1;
             c->halted = 1;
-            return;
+            return 1;
         }
+        if (hooked && (pc_kbd_raw_pending() || (pc.irq_pending & (1 << 9)))) return 0;   /* the guest's INT 9 has work */
         pc.kbd_reads++;
         /* Waiting on the host, not emulating: charged separately so it
           * is not mistaken for the cost of running the service. */
         uint64_t w0 = pc_now_ns();
-        int ready = host_readable(50);
+        int ready = host_readable(hooked ? 10 : 50);
         pc.blocked_ns += pc_now_ns() - w0;
         pc.blocked_calls++;
         if (ready) pc_kbd_poll(c);
+        if (hooked) return 0;                      /* let the timer and anything else run too */
     }
+    return 1;
 }
 
 /* ---- Idle polling ------------------------------------------------------------
@@ -467,7 +493,13 @@ void pc_kbd_int16(x86_cpu *c, int vector) {
     switch (x86_get_r8(c, R_AH)) {
     case 0x00: case 0x10:
         if (pc.debug > 2) pc_video_dump(c, stderr);
-        pc_kbd_wait(c);
+        if (!pc_kbd_wait(c, 1)) {
+            /* back to the guest unfinished: CS:IP stays on our stub, where
+             * the next step calls us again (see pc_kbd_wait) */
+            c->eflags |= X86_IF;
+            pc.returned = 1;
+            break;
+        }
         if (pc_kbd_get(c, &key)) x86_set_r16(c, R_AX, key);
         if (pc.debug > 1) fprintf(stderr, "[bios] INT 16h read → %04X (IVT 9 = %04X:%04X, IVT 16 = %04X:%04X, shift %02X)\n", key,
                                   pc_rd16(c, 0, 9 * 4 + 2), pc_rd16(c, 0, 9 * 4), pc_rd16(c, 0, 0x16 * 4 + 2), pc_rd16(c, 0, 0x16 * 4), pc_rd8(c, BDA, 0x17));

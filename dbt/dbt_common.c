@@ -379,6 +379,10 @@ int dbt_run(x86_dbt *dbt) {
         x86_init(&dbt->shadow, cpu->model);
         dbt->shadow_live = 1;
         shadow_resync(dbt);
+        /* empty-bus bytes behave the same in the shadow (its bitmap is
+         * otherwise never marked) */
+        for (uint32_t p = 0; p < X86_LOW_SIZE; p++)
+            if (cpu->code_bitmap[p] & X86_BM_EMPTY) dbt->shadow.code_bitmap[p] |= X86_BM_EMPTY;
     }
 
     uint64_t runs = 0;

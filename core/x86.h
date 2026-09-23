@@ -230,6 +230,7 @@ static inline void x86_set_reg(x86_cpu *c, int i, int size, uint32_t v) {
 #define X86_BM_CODE   0x01
 #define X86_BM_DESC   0x02
 #define X86_BM_DEVICE 0x80
+#define X86_BM_EMPTY  0x40                  /* no memory here: reads FFh, a store vanishes (an empty bus) */
 void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 
 /* ---- Paging --------------------------------------------------------------

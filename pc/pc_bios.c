@@ -155,9 +155,21 @@ static void bios_int8(x86_cpu *c, int vector) {
     if (t >= 0x1800B0) { t = 0; pc_wr8(c, PC_BDA_SEG, 0x70, 1); }
     pc_wr16(c, PC_BDA_SEG, 0x6C, (uint16_t)t);
     pc_wr16(c, PC_BDA_SEG, 0x6E, (uint16_t)(t >> 16));
-    /* Return from INT 8, then invoke the user tick hook INT 1Ch. */
-    pc_hle_return(c, HLE_RET_IRET);
-    x86_interrupt(c, 0x1C, 0);
+    /* Then the user tick hook, INT 1Ch, the way a BIOS calls it: by
+     * executing INT 1Ch, from the native stub at PC_STUB_SEG:0 (INT 1Ch;
+     * IRET) with our frame still on the stack. From V86 mode that INT is a
+     * real instruction for the monitor to fault on, decode and reflect —
+     * EMM386 reads the CD 1C at CS:IP; a delivery made by the host instead
+     * went through its IDT and ended at 0000:0000. The HLE DPMI host's
+     * protected mode keeps the direct call. */
+    if (c->pmode && !(c->eflags & X86_VM)) {
+        pc_hle_return(c, HLE_RET_IRET);
+        x86_interrupt(c, 0x1C, 0);
+        return;
+    }
+    x86_load_seg(c, S_CS, PC_STUB_SEG);
+    c->eip = PC_STUB_INT1C;
+    pc.returned = 1;
 }
 
 static void bios_int1a(x86_cpu *c, int vector) {
@@ -412,7 +424,11 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     case 0x60:
         if (pc.kbc_out_full) { pc.kbc_out_full = 0; return pc.kbc_out; }
         pc.irq9_busy = 0; return pc.last_scancode;
-    case 0x61: return pit_speaker;
+    case 0x61:
+        /* bit 4 toggles with the DRAM refresh, every 15.085 us — the
+         * AT's own timing reference (IO.SYS counts its toggles while it
+         * waits for the keyboard; a bit that never moved hung it) */
+        return (uint32_t)((pit_speaker & 0x0F) | ((pc_now_ns() / 15085u) & 1u) << 4);
     case 0x64: return (uint32_t)(0x14 | (pc.kbc_out_full ? 1 : 0));   /* 8042 status: not busy; bit 0 = response ready */
     case 0x92: return (uint32_t)(c->a20_mask != 0xFFFFFu ? 2 : 0);
     case 0x3DA: {                                /* CGA status: toggle retrace bits */
@@ -469,7 +485,8 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
             if (!(val & 1)) pc_request_reset(c, "8042 output port reset bit");
             a20_set(c, (val >> 1) & 1);
         }
-        pc.kbc_cmd = 0;                          /* keyboard commands (LEDs, typematic): swallowed */
+        else if (!pc.kbc_cmd) pc_kbd_raw_reply(0xFA);   /* a byte for the keyboard itself (LEDs, typematic): ACK */
+        pc.kbc_cmd = 0;
         break;
     case 0xE9:                                   /* the Bochs/QEMU debug console: a boot
                                                   * image's transcript (tools/pmoracle) */
@@ -506,6 +523,10 @@ static void post(x86_cpu *cpu) {
         pc_wr16(cpu, 0, (uint16_t)(v * 4 + 2), PC_HLE_SEG);
     }
     pc_wr8(cpu, PC_HLE_SEG, PC_HLE_DUMMY_IRET, 0xCF);
+    /* Native BIOS code (outside the trap segment's base, so it runs):
+     * INT 8's tail, INT 1Ch then IRET. */
+    static const uint8_t int1c_tail[3] = { 0xCD, 0x1C, 0xCF };
+    for (int i = 0; i < 3; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT1C + i), int1c_tail[i]);
     /* FFFF:0000, the reset vector: JMP F000:FFF0, which traps (TRAP_RESET) */
     static const uint8_t jmp[5] = { 0xEA, 0xF0, 0xFF, 0x00, 0xF0 };
     for (int i = 0; i < 5; i++) pc_wr8(cpu, 0xFFFF, (uint16_t)i, jmp[i]);
@@ -523,6 +544,17 @@ static void post(x86_cpu *cpu) {
     pc_wr16(cpu, PC_BDA_SEG, 0x80, 0x1E);        /* buffer start */
     pc_wr16(cpu, PC_BDA_SEG, 0x82, 0x3E);        /* buffer end */
     pc_wr8 (cpu, PC_BDA_SEG, 0x96, 0x10);        /* enhanced keyboard */
+}
+
+/* The upper memory area where adapters would sit (C0000-EFFFF): no option
+ * ROM and no adapter RAM here, so it behaves as an empty bus does: reads
+ * FFh, and a store does not stick. EMM386's scan takes that for free
+ * space; writable zeros looked like adapter RAM, and it found no room for
+ * its page frame. A booted machine
+ * only: under the HLE DOS nothing scans for it. */
+void pc_empty_upper_memory(x86_cpu *c) {
+    memset(c->mem + 0xC0000, 0xFF, 0x30000);
+    for (uint32_t p = 0xC0000; p < 0xF0000; p++) c->code_bitmap[p] |= X86_BM_EMPTY;   /* stores put the FFh back */
 }
 
 /* A CPU reset — the 8042's pulse, port 92h, a jump to FFFF:0000. A booted
@@ -555,6 +587,7 @@ void pc_reboot(x86_cpu *c) {
     memset(pit, 0, sizeof pit);
     pic_mask = 0xB8;
     post(c);
+    pc_empty_upper_memory(c);
     pc_disk_install(c);
     pc_cmos_init(c);
     pc_mouse_reboot(c);

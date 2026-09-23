@@ -668,6 +668,13 @@ static void emit_smc_check_x3(emit_t *e, int size) {
     emit_sub_x64(e, A64_W1, W_T3, R_MEM);
     if (size > 1) (void)emit_orr_w32_imm(e, A64_W1, A64_W1, (uint32_t)size << 28);
     emit_thunk_args(e);
+    /* A block ender's stores (CALL's return address, a far CALL's or an
+     * inlined INT's frame) may land on the running block itself — IO.SYS
+     * points SS at its own code while relocating — and the thunk would
+     * then leave the block with the instruction half done (CS pushed, IP
+     * not, no transfer). The ender leaves the block anyway: invalidate,
+     * but name no running block, and let the ender finish. */
+    if (s_cur_ender) emit_mov_w32_imm32(e, A64_W2, 0xFFFFFFFFu);
     emit_bl(e, (int32_t)s_smc_thunk_off - (int32_t)emit_pos(e));
     emit_patch_cond19(e, skip, emit_pos(e));
     if (dev_done) emit_patch_b26(e, dev_done, emit_pos(e));

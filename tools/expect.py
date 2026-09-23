@@ -7,7 +7,8 @@ The emulator runs with X86_SCREEN pointing at a scratch file, which it
 rewrites with the text screen four times a second. SCRIPT holds one step
 per line: a regular expression, a TAB, and the keys to send once the
 expression matches the last three non-blank lines of the screen (where a
-prompt and the cursor are). Keys use Python escapes: \\r is Enter, \\x1b+
+prompt and the cursor are; a pattern starting with * is searched in the
+whole screen, for dialogs drawn mid-screen). Keys use Python escapes: \\r is Enter, \\x1b+
 puts the next diskette of an -fda sequence in. "delay SECONDS" pauses.
 Blank lines and # comments are ignored. After each send the next step
 waits for the screen to change, so a prompt still showing is not taken
@@ -44,21 +45,23 @@ def main():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         if line.startswith("delay "):
-            steps.append(("delay", float(line.split()[1])))
+            steps.append(("delay", float(line.split()[1]), False))
             continue
         pat, _, keys = line.partition("\t")
-        steps.append((re.compile(pat), keys.encode().decode("unicode_escape").encode("latin-1")))
+        whole = pat.startswith("*")                 # *PATTERN: anywhere on the screen
+        if whole: pat = pat[1:]
+        steps.append((re.compile(pat), keys.encode().decode("unicode_escape").encode("latin-1"), whole))
     scr = os.path.join(tempfile.mkdtemp(), "screen.txt")
     env = dict(os.environ, X86_SCREEN=scr)
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
     deadline = time.time() + timeout
     last_sent = None                            # the screen as it was when keys last went in
-    for pat, keys in steps:
+    for pat, keys, whole in steps:
         if pat == "delay":
             time.sleep(keys); continue
         while True:
             s = screen(scr)
-            if s and s != last_sent and pat.search(tail(s)):
+            if s and s != last_sent and pat.search(s if whole else tail(s)):
                 break
             if time.time() > deadline or p.poll() is not None:
                 sys.stderr.write("expect: no %r; the screen:\n%s\n" % (pat.pattern, s))

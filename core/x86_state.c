@@ -22,6 +22,7 @@ void x86_init(x86_cpu *c, int model) {
  * rewrite the byte), then code the DBT has translated. */
 void x86_store_hook(x86_cpu *c, uint32_t p) {
     uint8_t b = c->code_bitmap[p];
+    if (b & X86_BM_EMPTY) { c->mem[p] = 0xFF; return; }
     if ((b & X86_BM_DEVICE) && c->device_store) c->device_store(c, p);
     if ((b & (X86_BM_CODE | X86_BM_DESC)) && c->smc_hook) c->smc_hook(c, p);
 }

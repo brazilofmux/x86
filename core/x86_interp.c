@@ -355,11 +355,15 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     uint16_t gattr = (uint16_t)((hi >> 8) & 0xFF);
     int type = gattr & 0x1F;
     int gate32 = (type & 0x08) != 0;
-    if (!(gattr & 0x80)) x86_fault(c, X86_EXC_NP, (off | 2));
+    /* The 386's order: the gate's type, then a software INT's privilege,
+     * and only then the present bit. An all-zero gate is #GP, not #NP —
+     * EMM386 leaves some vectors so and reflects the #GP an INT n from V86
+     * raises; the #NP it treats as fatal ("error #11"). QEMU agrees. */
     if ((type & 0x17) != 0x06) x86_fault(c, X86_EXC_GP, (off | 2));     /* not an interrupt/trap gate */
     /* A software INT may only use a gate at or below its own privilege. */
     int cpl = x86_cpl(c);
     if (is_sw && ((gattr >> 5) & 3) < cpl) x86_fault(c, X86_EXC_GP, (off | 2));
+    if (!(gattr & 0x80)) x86_fault(c, X86_EXC_NP, (off | 2));
 
     uint16_t gsel = (uint16_t)(lo >> 16);
     uint32_t gip = (lo & 0xFFFF) | (gate32 ? (hi & 0xFFFF0000u) : 0);
@@ -523,7 +527,31 @@ static void far_transfer_pm(x86_cpu *c, uint16_t sel, uint32_t off, int is_call,
 }
 
 void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
-    if (c->pmode) { deliver_pm(c, vector, is_sw, c->exc_err); return; }
+    if (c->pmode) {
+        if (c->fault_armed) { deliver_pm(c, vector, is_sw, c->exc_err); return; }
+        /* Outside an instruction — an IRQ the host delivers, a BIOS
+         * service chaining — nothing catches a fault in the delivery, and
+         * x86_fault would return into a half-built frame. Arm here: a
+         * fault delivers that exception instead, a fault in that is #DF,
+         * and a third shuts the processor down. */
+        uint32_t err = c->exc_err;
+        for (int depth = 0; ; depth++) {
+            c->fault_armed = 1;
+            if (_setjmp(c->fault_jb) == 0) {
+                deliver_pm(c, vector, is_sw, err);
+                c->fault_armed = 0;
+                return;
+            }
+            c->fault_armed = 0;
+            c->pg_super = 0;
+            if (depth == 2) { c->exc = -1; c->halted = 1; return; }   /* triple fault */
+            vector = depth == 1 ? X86_EXC_DF : c->exc;
+            err = depth == 1 ? 0 : c->exc_err;
+            c->exc = -1;
+            is_sw = 0;
+            c->exc_delivered = 1;
+        }
+    }
     (void)is_sw;
     /* The vector is read before the frame is pushed (measured on the
      * 386: a frame landing on the IVT entry does not redirect). */

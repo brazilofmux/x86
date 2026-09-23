@@ -57,6 +57,17 @@ void pc_cmos_init(x86_cpu *c) {
     uint16_t sum = 0;
     for (int i = 0x10; i <= 0x2D; i++) sum += nvram[i];
     nvram[0x2E] = (uint8_t)(sum >> 8); nvram[0x2F] = (uint8_t)sum;
+    /* POST sets the BIOS tick count from the clock, which is where DOS
+     * takes the time of day from (it was 00:00 at every boot) */
+    if (pc.booted) {
+        time_t t = time(NULL);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        uint32_t secs = (uint32_t)(tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+        uint32_t ticks = (uint32_t)((uint64_t)secs * 1193182u / 65536u);
+        pc_wr16(c, PC_BDA_SEG, 0x6C, (uint16_t)ticks);
+        pc_wr16(c, PC_BDA_SEG, 0x6E, (uint16_t)(ticks >> 16));
+    }
 }
 
 static uint8_t cmos_read(uint8_t idx) {
