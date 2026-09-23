@@ -375,6 +375,36 @@ void pc_kbd_wait(x86_cpu *c) {
     }
 }
 
+/* ---- Idle polling ------------------------------------------------------------
+ * A program waiting for a key by asking "is one there?" in a loop —
+ * WordPerfect: twelve million INT 16h AH=11h a second, a host core at
+ * 100% — gets the same treatment as one blocked in AH=00h: once the "no"
+ * answers come back to back (within IDLE_GAP guest instructions of each
+ * other, IDLE_RUN of them in a row), each further one waits up to a
+ * millisecond for the host to have input, then answers. Real work
+ * between the polls (a background reformat, a spell check) spreads them
+ * out and breaks the run; any key resets it. The wait is charged to
+ * pc.blocked_ns, the time the statistics report as idle. Timer ticks
+ * keep coming on the wall clock; a key typed into the window is picked
+ * up by the next poll, a millisecond later at most. */
+#define IDLE_GAP 20000ull
+#define IDLE_RUN 200
+static unsigned idle_run;
+static uint64_t idle_last_insn;
+
+static void idle_check(x86_cpu *c) {
+    if (c->insn_count - idle_last_insn > IDLE_GAP) idle_run = 0;
+    idle_last_insn = c->insn_count;
+    if (++idle_run < IDLE_RUN) return;
+    uint64_t w0 = pc_now_ns();
+    /* a terminal (or a pipe with more to come) can end the wait early;
+     * at end of input, or on /dev/null, just sleep */
+    if (!pc.eof_seen && isatty(STDIN_FILENO)) (void)host_readable(1);
+    else usleep(1000);
+    pc.blocked_ns += pc_now_ns() - w0;
+    pc.blocked_calls++;
+}
+
 /* ---- INT 16h --------------------------------------------------------------- */
 void pc_kbd_int16(x86_cpu *c, int vector) {
     (void)vector;
@@ -394,8 +424,8 @@ void pc_kbd_int16(x86_cpu *c, int vector) {
         break;
     case 0x01: case 0x11:
         pc_kbd_poll(c);
-        if (pc_kbd_peek(c, &key)) { x86_set_r16(c, R_AX, key); c->eflags &= ~X86_ZF; }
-        else c->eflags |= X86_ZF;
+        if (pc_kbd_peek(c, &key)) { x86_set_r16(c, R_AX, key); c->eflags &= ~X86_ZF; idle_run = 0; }
+        else { c->eflags |= X86_ZF; idle_check(c); }
         break;
     case 0x02: case 0x12:
         x86_set_r8(c, R_AL, pc_rd8(c, BDA, 0x17));
