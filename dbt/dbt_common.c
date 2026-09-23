@@ -584,6 +584,12 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             (unsigned long long)dbt->links_unpatched);
     fprintf(out, "  max block bytes:        %u\n", (unsigned)dbt->max_block_bytes);
     fprintf(out, "  code used:              %u bytes, %u pooled insns\n", dbt->code_used, dbt->insn_used);
+    {
+        uint64_t by_tag[3] = { 0, 0, 0 };
+        for (uint32_t i = 0; i < dbt->insn_used; i++) by_tag[dbt->insn_tag[i]] += dbt->insn_hits[i];
+        fprintf(out, "  helper calls from:      all-helper PM blocks %llu, flat blocks %llu, flat slow paths %llu\n",
+                (unsigned long long)by_tag[0], (unsigned long long)by_tag[1], (unsigned long long)by_tag[2]);
+    }
     fprintf(out, "  helper calls by op (dynamic):");
     for (int n = 0; n < 14; n++) {
         int best = -1;
