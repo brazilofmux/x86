@@ -250,6 +250,11 @@ int  dbt_run(x86_dbt *dbt);
 void dbt_cleanup(x86_dbt *dbt);
 int  dbt_jit_available(const x86_cpu *cpu);
 void dbt_print_stats(x86_dbt *dbt, FILE *out);
+/* X86_SAMPLE=N: sample the host PC every N microseconds (SIGPROF) and,
+ * at exit, report where the time went: translated blocks by guest
+ * address, the run-time's own functions by name. */
+void dbt_sample_start(void);
+void dbt_sample_report(x86_dbt *dbt, FILE *out);
 
 /* Cache management (dbt_cache.c) */
 x86_block_entry *dbt_cache_lookup(x86_dbt *dbt, uint64_t key);

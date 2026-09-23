@@ -359,6 +359,7 @@ int main(int argc, char **argv) {
         if (mem_every > 0) g_dbt.verify_mem_every = mem_every;
         g_dbt.insn_limit = limit;
         g_dbt.poll = host_poll;
+        dbt_sample_start();
         rc = dbt_run(&g_dbt);
     } else {
         rc = run_interp(&cpu, limit);
@@ -400,6 +401,7 @@ int main(int argc, char **argv) {
         pc_svcprof_dump(stderr);
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);
     }
+    if (use_jit) dbt_sample_report(&g_dbt, stderr);
     if (use_jit) dbt_cleanup(&g_dbt);
     /* X86_MEM_DUMP=<path>: the whole guest memory at exit, for locating
      * hot blocks from a profile (ndisasm -b 32 -o ADDR -e ADDR). */

@@ -350,6 +350,17 @@ static void do_read(x86_cpu *c, int h, uint32_t lin, uint16_t len) {
         return;
     }
     if (dh->dev) { SET_AX(0); ok(c); return; }
+    /* Straight into guest memory when the range is plain memory (no A20
+     * fold, inside the buffer), then the store hook for any byte the
+     * code bitmap marks, as x86_phys_wr8 would per byte. */
+    uint32_t p = lin & c->a20_mask;
+    if (len && (lin & c->a20_mask) + len - 1 == ((lin + len - 1) & c->a20_mask) && p + len <= c->mem_size) {
+        ssize_t n = file_read(dh, c->mem + p, len);
+        if (n < 0) { err(c, dos_errno()); return; }
+        for (ssize_t i = 0; i < n; i++) if (c->code_bitmap[p + (uint32_t)i]) x86_store_hook(c, p + (uint32_t)i);
+        SET_AX(n); ok(c);
+        return;
+    }
     uint8_t buf[65536];
     ssize_t n = file_read(dh, buf, len);
     if (n < 0) { err(c, dos_errno()); return; }
@@ -371,9 +382,19 @@ static void do_write(x86_cpu *c, int h, uint32_t lin, uint16_t len) {
         if (ftruncate(dh->fd, dh->pos) < 0) { err(c, dos_errno()); return; }
         SET_AX(0); ok(c); return;
     }
-    uint8_t buf[65536];
-    for (uint16_t i = 0; i < len; i++) buf[i] = x86_phys_rd8(c, lin + i);
-    ssize_t n = file_write(dh, buf, len);
+    /* Straight from guest memory unless the range folds at A20, leaves
+     * the buffer, or reaches the device window (whose reads the device
+     * answers). */
+    uint32_t p = lin & c->a20_mask;
+    ssize_t n;
+    if ((lin & c->a20_mask) + len - 1 == ((lin + len - 1) & c->a20_mask) && p + len <= c->mem_size
+        && (!c->device_read || p + len <= 0xA0000u || p >= 0xB0000u)) {
+        n = file_write(dh, c->mem + p, len);
+    } else {
+        uint8_t buf[65536];
+        for (uint16_t i = 0; i < len; i++) buf[i] = x86_phys_rd8(c, lin + i);
+        n = file_write(dh, buf, len);
+    }
     if (n < 0) { err(c, dos_errno()); return; }
     SET_AX(n); ok(c);
 }

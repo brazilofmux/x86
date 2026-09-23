@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <dlfcn.h>
+#include <sys/ucontext.h>
 
 /* NZCV nibble (N=8 Z=4 C=2 V=1) → x86 SF/ZF/CF/OF. The SUB variants
  * invert C (ARM carry = no borrow); INC/DEC drop CF so the emitter can
@@ -662,4 +666,92 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
         }
         fprintf(out, "\n");
     }
+}
+
+/* ----------------------------------------------------------------------
+ * X86_SAMPLE: a PC sampler for runs too short for an outside profiler
+ * ---------------------------------------------------------------------- */
+#define SAMPLE_MAX (1u << 20)
+static uintptr_t *s_samples;
+static volatile uint32_t s_nsamples;
+
+static void on_sample(int sig, siginfo_t *si, void *ctx) {
+    (void)sig; (void)si;
+    ucontext_t *uc = (ucontext_t *)ctx;
+    uint32_t n = s_nsamples;
+    if (n < SAMPLE_MAX) { s_samples[n] = (uintptr_t)uc->uc_mcontext->__ss.__pc; s_nsamples = n + 1; }
+}
+
+void dbt_sample_start(void) {
+    const char *e = getenv("X86_SAMPLE");
+    if (!e) return;
+    long us = strtol(e, NULL, 0);
+    if (us <= 0) us = 100;
+    s_samples = calloc(SAMPLE_MAX, sizeof(uintptr_t));
+    if (!s_samples) return;
+    struct sigaction sa = { 0 };
+    sa.sa_sigaction = on_sample;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    /* The wall-clock timer: macOS delivers ITIMER_PROF's SIGPROF on the
+     * way out of the kernel, which piles the samples onto system calls. */
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = { { 0, (int)us }, { 0, (int)us } };
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+
+typedef struct { uint32_t off; uint64_t key; } blk_ent_t;
+static int cmp_blk(const void *a, const void *b) {
+    uint32_t x = ((const blk_ent_t *)a)->off, y = ((const blk_ent_t *)b)->off;
+    return x < y ? -1 : x > y;
+}
+typedef struct { const char *name; uint64_t key; uint32_t n; } hot_t;
+static int cmp_hot(const void *a, const void *b) {
+    uint32_t x = ((const hot_t *)a)->n, y = ((const hot_t *)b)->n;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+void dbt_sample_report(x86_dbt *dbt, FILE *out) {
+    if (!s_samples || !s_nsamples) return;
+    struct itimerval off = { { 0, 0 }, { 0, 0 } };
+    setitimer(ITIMER_REAL, &off, NULL);
+    uint32_t n = s_nsamples;
+    /* the translated blocks still in the cache, by code offset */
+    blk_ent_t *b = malloc(sizeof(blk_ent_t) * BLOCK_CACHE_SIZE);
+    uint32_t nb = 0;
+    for (uint32_t i = 0; i < BLOCK_CACHE_SIZE; i++) {
+        const x86_block_entry *be = &dbt->aux->cache[i];
+        if (be->key == BLOCK_EMPTY_KEY || !be->code) continue;
+        b[nb].off = (uint32_t)(be->code - dbt->code_buf); b[nb].key = be->key; nb++;
+    }
+    qsort(b, nb, sizeof *b, cmp_blk);
+    hot_t *h = calloc(n + 1, sizeof(hot_t));
+    uint32_t nh = 0, jit = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        uintptr_t pc = s_samples[k];
+        const char *name = NULL; uint64_t key = 0;
+        if (pc >= (uintptr_t)dbt->code_buf && pc < (uintptr_t)dbt->code_buf + dbt->code_used) {
+            uint32_t o = (uint32_t)(pc - (uintptr_t)dbt->code_buf);
+            jit++;
+            uint32_t lo = 0, hi = nb;
+            while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (b[mid].off <= o) lo = mid + 1; else hi = mid; }
+            if (!nb || lo == 0 || (b[0].off > o)) name = "(trampoline, exit stub, thunks)";
+            else key = b[lo - 1].key, name = "block";
+        } else {
+            Dl_info di;
+            name = (dladdr((void *)pc, &di) && di.dli_sname) ? di.dli_sname : "(unknown)";
+        }
+        uint32_t j;
+        for (j = 0; j < nh; j++) if (h[j].name == name && h[j].key == key) break;
+        if (j == nh) { if (nh >= n) continue; h[nh].name = name; h[nh].key = key; nh++; }
+        h[j].n++;
+    }
+    qsort(h, nh, sizeof *h, cmp_hot);
+    fprintf(out, "  host PC samples: %u, %u in translated code (%.0f%%)\n", n, jit, 100.0 * jit / n);
+    for (uint32_t j = 0; j < nh && j < 30; j++) {
+        if (h[j].key) fprintf(out, "    %6u %5.1f%%  block %04X:%05X%s\n", h[j].n, 100.0 * h[j].n / n,
+                              (unsigned)(h[j].key >> 32) & 0xFFFF, (unsigned)h[j].key,
+                              (h[j].key & KEY_PMODE) ? " (pm)" : "");
+        else fprintf(out, "    %6u %5.1f%%  %s\n", h[j].n, 100.0 * h[j].n / n, h[j].name);
+    }
+    free(h); free(b);
 }

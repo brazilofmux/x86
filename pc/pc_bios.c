@@ -11,11 +11,30 @@
 pc_state pc;
 
 
+/* Monotonic nanoseconds. Every caller takes differences only. The run
+ * loop asks after every interpreter step (a DOS call, most of the time),
+ * which through clock_gettime was 6% of a COBOL program's run; on
+ * AArch64 the virtual counter is a register read, scaled here by a
+ * 32.32 fixed-point factor (24 MHz on Apple Silicon: 41.7 ns ticks). */
+#if defined(__aarch64__)
+uint64_t pc_now_ns(void) {
+    static uint64_t mult;
+    uint64_t v;
+    if (!mult) {
+        uint64_t f;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        mult = f ? (1000000000ull << 32) / f : 1ull << 32;
+    }
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return (uint64_t)(((unsigned __int128)v * mult) >> 32);
+}
+#else
 uint64_t pc_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+#endif
 
 /* An internal trap: an address in the HLE segment the host hands out
  * itself (the DPMI entry, its return trampolines). The IVT is not touched. */
