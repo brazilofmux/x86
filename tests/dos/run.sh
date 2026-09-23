@@ -15,6 +15,7 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "exec.com $mode"  tests/dos/exec.out  ./dos-monster $mode tests/dos/exec.com
     check "a20.com $mode"   tests/dos/a20.out   ./dos-monster $mode tests/dos/a20.com
     check "smcpush $mode"   tests/dos/smcpush.out ./dos-monster $mode tests/dos/smcpush.com
+    check "smcfar $mode"    tests/dos/smcfar.out  ./dos-monster $mode tests/dos/smcfar.com
     check "fileio $mode"    tests/dos/fileio.out  ./dos-monster $mode -L 50000000 tests/dos/fileio.com
 done
 # The VGA text renderer (-G on a text screen: attributes, blink off, line

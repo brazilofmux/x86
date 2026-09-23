@@ -5,7 +5,8 @@ The images live in disks/freedos/ (git-ignored; FreeDOS 1.3 is GPL):
   disks/freedos/floppy/144m/   FD13-FloppyEdition.zip, 1.44M disks:
                                x86BOOT.img, x86DSK01..05.img
   disks/freedos/lite/          FD13-LiteUSB.zip (not used yet)
-  disks/freedos/c.img          128 MB hard disk, FreeDOS installed, WP51\
+  disks/freedos/c.img          128 MB hard disk, FreeDOS installed (386), WP51
+  disks/freedos/c286.img       the same installed on a 286
 
 from https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/official/
 
@@ -18,10 +19,18 @@ c.img was made by the installer itself, on a blank image:
       -hda disks/freedos/c.img -boot a
 
 It partitions (FDISK through INT 13h), reboots (the reset vector), formats,
-writes the system and extracts all five diskettes (1544 files). Then its
-last step — "duplicate required installer file to C:\FREEDOS" — spins
-forever on a 386 (on a 286 it stops with "Invalid Opcode"); stop it
-there, the system is complete. WordPerfect was added with mtools:
+writes the system, extracts all five diskettes (1544 files) and finishes;
+fdinstall.exp answers N to the closing reboot. c286.img is the same with
+-m 286 (the 8086 kernel), booted on a 286 by run.sh.
+
+The first installs died after the extraction — a jump into data inside
+XCOPY on a 286, a runaway on a 386. That was the JIT: INT n and CALL FAR
+[mem] held the target CS:IP in scratch registers across the frame's
+pushes, and a push onto memory that had held translated code (SLICEREX's,
+freed, reused as the next program's stack) fired the SMC check, whose
+thunk did not save them. tests/dos/smcfar.com is the reduction.
+
+WordPerfect was added with mtools:
 
   mcopy -s -i disks/freedos/c.img@@32256 disks/WP51 ::/
 

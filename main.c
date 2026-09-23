@@ -102,6 +102,25 @@ static void pm_trace_exc(x86_cpu *c, int vec, uint32_t err) {
             c->seg[S_CS].base + c->eip, c->seg[S_SS].sel, c->r[R_SP]);
 }
 
+/* X86_EXC_TRACE=1: every exception the CPU raises, with the code around
+ * it (EIP is past the faulting instruction here; faults restart at its
+ * start after this hook). The first 50, then quiet. */
+static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
+    static int n;
+    if (n++ >= 50) return;
+    uint32_t lin = c->seg[S_CS].base + c->eip;
+    fprintf(stderr, "[exc] v=%02X err=%04X at %04X:%04X (%s) bytes before/after:", vec, err,
+            c->seg[S_CS].sel, c->eip, c->pmode ? "pm" : "rm");
+    for (int k = -12; k < 8; k++) fprintf(stderr, "%s%02X", k == 0 ? " | " : " ", x86_phys_rd8(c, lin + (uint32_t)k));
+    fprintf(stderr, "\n");
+    const char *dump = getenv("X86_EXC_MEMDUMP");       /* memory and registers at the first one */
+    if (n == 1 && dump) {
+        x86_dump(c, stderr);
+        FILE *f = fopen(dump, "wb");
+        if (f) { fwrite(c->mem, 1, c->mem_size < 0x110000 ? c->mem_size : 0x110000, f); fclose(f); }
+    }
+}
+
 /* Bounded: a kernel that faults in a loop would otherwise write gigabytes
  * before anyone notices it is stuck. */
 static void pm_trace(x86_cpu *c) {
@@ -382,6 +401,7 @@ int main(int argc, char **argv) {
     }
     if (g_pmtrace_hi) cpu.trace_exc = pm_trace_exc;
     else if (g_pmring) cpu.trace_exc = pmring_exc;
+    else if (getenv("X86_EXC_TRACE")) cpu.trace_exc = exc_trace;
 
     uint64_t t0 = pc_now_ns();
     g_last_ns = t0;

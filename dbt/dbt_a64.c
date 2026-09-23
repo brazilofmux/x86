@@ -223,7 +223,7 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
         int is_exec = which == 0;
         if (is_exec) s_exec_thunk_off = e.offset; else s_smc_thunk_off = e.offset;
 
-        emit_stp_pre_sp(&e, A64_W29, A64_W30, -96);
+        emit_stp_pre_sp(&e, A64_W29, A64_W30, -144);
         emit_stp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
         emit_str_w32_imm(&e, A64_W2, R_CPU, OFF_JIT_CUR_LIN);
         emit_str_w32_imm(&e, A64_WZR, R_CPU, OFF_JIT_CUR_HIT);
@@ -240,15 +240,28 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
             emit_stp_x64_off(&e, A64_W13, A64_W14, A64_SP, 48);
             emit_stp_x64_off(&e, A64_W15, A64_W16, A64_SP, 64);
             emit_str_x64_imm(&e, A64_W17, A64_SP, 80);
+            /* The scratch too (W_T1, W_T0, W_SRC, W_VAL, W_OFF, X_SEGP):
+             * a checked store is not always a block's last use of them.
+             * INT n and CALL FAR [mem] hold the target CS:IP in W_SRC/W_VAL
+             * across the frame's pushes, and a push onto memory that once
+             * held translated code — a DOS stack reusing a freed program's
+             * space — fired this thunk and sent the far jump into garbage
+             * (FreeDOS's installer, XCOPY after SLICEREX). */
+            emit_stp_x64_off(&e, A64_W5, A64_W6, A64_SP, 96);
+            emit_stp_x64_off(&e, A64_W7, A64_W8, A64_SP, 112);
+            emit_stp_x64_off(&e, A64_W9, A64_W10, A64_SP, 128);
             emit_ldr_x64_imm(&e, A64_W9, R_AUX, AUX_HELPERS + 8 * H_POST_STORE);
             emit_blr(&e, A64_W9);
+            emit_ldp_x64_off(&e, A64_W9, A64_W10, A64_SP, 128);
+            emit_ldp_x64_off(&e, A64_W7, A64_W8, A64_SP, 112);
+            emit_ldp_x64_off(&e, A64_W5, A64_W6, A64_SP, 96);
             emit_ldr_x64_imm(&e, A64_W17, A64_SP, 80);
             emit_ldp_x64_off(&e, A64_W15, A64_W16, A64_SP, 64);
             emit_ldp_x64_off(&e, A64_W13, A64_W14, A64_SP, 48);
             emit_ldp_x64_off(&e, A64_W11, A64_W12, A64_SP, 32);
         }
         emit_ldp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
-        emit_ldp_post_sp(&e, A64_W29, A64_W30, 96);
+        emit_ldp_post_sp(&e, A64_W29, A64_W30, 144);
         if (is_exec) {
             /* The interpreter faulted inside the helper op: cpu->exc is
              * set and eip points at the instruction. Charge it, leave. */

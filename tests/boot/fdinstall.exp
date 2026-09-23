@@ -12,4 +12,5 @@ Insert diskette containing file A:.FREEDOS.024	\x1b+\r
 Insert diskette containing file A:.FREEDOS.048	\x1b+\r
 Insert diskette containing file A:.FREEDOS.072	\x1b+\r
 Insert diskette containing file A:.FREEDOS.096	\x1b+\r
-NEVER-MATCHES-show-me-the-end	
+# done: answer N (no reboot); the disk is complete
+has completed[\s\S]*reboot now \[Y,N\]\?	n\r

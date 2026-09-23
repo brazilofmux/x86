@@ -28,4 +28,12 @@ if [ -f disks/freedos/c.img ]; then
     fi
     rm -f tmp/boot-c.img tmp/boot-c.exp
 fi
+if [ -f disks/freedos/c286.img ]; then
+    # the same install made on a 286 (8086 kernel), booted on one
+    cp disks/freedos/c286.img tmp/boot-c.img
+    printf 'C:.>$\tver\\r\nFreeCom version\t\n' > tmp/boot-c.exp
+    if python3 tools/expect.py -t 90 tmp/boot-c.exp -- ./dos-monster -m 286 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+    then echo "ok   freedos 286 hard disk boot"; else echo "FAIL freedos 286 hard disk boot"; fail=1; fi
+    rm -f tmp/boot-c.img tmp/boot-c.exp
+fi
 exit $fail
