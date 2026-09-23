@@ -63,6 +63,9 @@
 #define OFF_EFLAGS      offsetof(x86_cpu, eflags)
 #define OFF_SEG_SEL(i)  (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, sel))
 #define OFF_SEG_BASE(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, base))
+#define OFF_SEG_LIMIT(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, limit))
+#define OFF_SEG_USABLE(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, usable))
+#define OFF_EXC_ERR     offsetof(x86_cpu, exc_err)
 #define OFF_INSN_COUNT  offsetof(x86_cpu, insn_count)
 #define OFF_CODE_BITMAP offsetof(x86_cpu, code_bitmap)
 #define OFF_JIT_AUX     offsetof(x86_cpu, jit_aux)
@@ -100,6 +103,9 @@ static inline uint32_t topshift(int size) { return size == 1 ? 24 : size == 2 ? 
  * effective addresses straight off R_MEM, keys built with s_mode_bits. */
 static int s_flat;
 static uint64_t s_mode_bits;
+/* Segmented 16-bit protected mode (a KEY_SEG16 block, see dbt_seg16_ok):
+ * the real-mode shape with a limit check on every access. */
+static int s_seg16;
 
 /* -V strict mode: every block returns to dbt_run (no links, no probe). */
 static int s_strict_exit = -1;
@@ -191,6 +197,7 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
      * the exception for the run loop and exits at that instruction. ---- */
     s_fault_stub_off = e.offset;
     emit_str_w32_imm(&e, A64_W5, R_CPU, OFF_EXC);
+    emit_str_w32_imm(&e, A64_WZR, R_CPU, OFF_EXC_ERR);   /* #GP/#SS(0) in protected mode */
     s_fault_exit_off = e.offset;
     emit_sub_x64(&e, R_CNT, R_CNT, A64_W4);
     emit_str_w32_imm(&e, A64_W3, R_CPU, OFF_EIP);
@@ -308,7 +315,9 @@ static void emit_dynamic_tail(emit_t *e, uint32_t exit_stub_off) {
         emit_b(e, (int32_t)exit_stub_off - (int32_t)emit_pos(e));
         return;
     }
-    (void)emit_and_w32_imm(e, W_T2, A64_W0, BLOCK_CACHE_MASK);
+    emit_lsr_x64_imm(e, W_T2, A64_W0, KEY_MODE_SHIFT);          /* slot = (lin ^ mode << 16) & mask, as dbt_slot */
+    emit_eor_w32_lsl(e, W_T2, A64_W0, W_T2, 16);
+    (void)emit_and_w32_imm(e, W_T2, W_T2, BLOCK_CACHE_MASK);
     emit_add_x64_imm_lsl12(e, W_T3, R_AUX, AUX_CACHE >> 12);
     emit_add_x64_w32_uxtw_lsl(e, W_T3, W_T3, W_T2, 4);
     emit_ldp_x64_off(e, W_T1, W_T2, W_T3, 0);
@@ -334,7 +343,7 @@ static void emit_edge(x86_dbt *dbt, emit_t *e, uint64_t key) {
     uint32_t site = e->offset;
     int linked = 0;
     if (dbt_link_record(dbt, key, site)) {
-        x86_block_entry *be = &dbt->aux->cache[dbt_slot(dbt_key_lin(key))];
+        x86_block_entry *be = &dbt->aux->cache[dbt_slot(key)];
         if (be->key == key && be->code) {
             emit_b(e, (int32_t)(be->code - (e->buf + site)));
             linked = 1;
@@ -357,6 +366,7 @@ static void emit_tail_prologue(emit_t *e, uint32_t n) {
 typedef struct {
     a64_reg_t segp;   /* host pointer register for the segment */
     a64_reg_t off;    /* W register with the 16-bit offset */
+    int       seg;    /* segment index, for the limit check of a KEY_SEG16 block */
 } ea_t;
 
 static a64_reg_t seg_ptr_reg(int s) {
@@ -400,6 +410,7 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
 /* Compute the effective address. Uses W_OFF (and X_SEGP for CS/FS/GS);
  * a bare [reg] form returns the pinned register itself. */
 static void emit_ea(emit_t *e, const x86_insn *in, ea_t *ea) {
+    ea->seg = in->seg;
     if (s_flat) { emit_ea_flat(e, in, ea); return; }
     ea->segp = seg_ptr_reg(in->seg);
     if (ea->segp == X_SEGP) emit_load_seg_ptr(e, X_SEGP, in->seg);
@@ -550,6 +561,24 @@ static void fault_site(emit_t *e, uint8_t vector) {
     if (s_nfault >= 64) { fprintf(stderr, "dbt: fault site table overflow\n"); abort(); }
     s_fault[s_nfault++] = (fault_site_t){ emit_pos(e), s_cur_ip_start, s_cur_n_done, vector };
 }
+/* KEY_SEG16 access check: off + size - 1 <= limit, and the segment
+ * usable (a null DS or ES has limit 0, which alone would let offset 0
+ * through). Both come from the cpu at run time — the same block runs
+ * under whatever DS and ES the code has loaded since. A 16-bit offset
+ * plus 3 cannot overflow the compare. Out of range or unusable: #GP,
+ * or #SS through SS on the 386 (CONTRACT, limit_check in the interp),
+ * error code 0, at the instruction, nothing committed. Clobbers W_T1, W_T3. */
+static void emit_limit_check(emit_t *e, int seg, a64_reg_t off, int size) {
+    a64_reg_t hi = off;
+    if (size > 1) { emit_add_w32_imm(e, W_T3, off, (uint32_t)size - 1); hi = W_T3; }
+    emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_LIMIT(seg));
+    emit_cmp_w32_w32(e, hi, W_T1);
+    emit_ldrb_imm(e, W_T1, R_CPU, OFF_SEG_USABLE(seg));
+    emit_ccmp_w32_imm(e, W_T1, 0, 0x4, A64_COND_LS);   /* in range: Z = !usable; past it: Z = 1 */
+    fault_site(e, (uint8_t)(seg == S_SS && s_regs32 ? X86_EXC_SS : X86_EXC_GP));
+    emit_b_cond(e, A64_COND_EQ, 0);
+}
+
 static void emit_fault_chunks(emit_t *e) {
     for (uint32_t k = 0; k < s_nfault; k++) {
         fault_site_t *f = &s_fault[k];
@@ -669,8 +698,12 @@ static void emit_wrap_slow_chunks(emit_t *e) {
 static int s_ea_checked;
 
 static void emit_read_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t dst) {
+    if (s_seg16) {
+        emit_limit_check(e, ea->seg, ea->off, size);
+        s_ea_checked = 1;                       /* 286+: a straddling store after this is unreachable */
+    }
     if (size == 1) { emit_ldrb_reg_uxtw(e, dst, ea->segp, ea->off); return; }
-    if (s_flat) {
+    if (s_flat || s_seg16) {
         if (size == 2) emit_ldrh_reg_uxtw(e, dst, ea->segp, ea->off);
         else emit_ldr_w32_reg_uxtw(e, dst, ea->segp, ea->off);
         return;
@@ -683,7 +716,8 @@ static void emit_read_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t dst) {
 
 /* Store + inline SMC check. Clobbers W_T2, W_T3, X0..X4 on the slow path. */
 static void emit_write_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t src) {
-    int check = size == 2 && !s_ea_checked && !s_flat;
+    int check = size == 2 && !s_ea_checked && !s_flat && !s_seg16;
+    if (s_seg16 && !s_ea_checked) emit_limit_check(e, ea->seg, ea->off, size);
     if (size == 4) emit_str_w32_reg_uxtw(e, src, ea->segp, ea->off);
     else if (size == 1) emit_strb_reg_uxtw(e, src, ea->segp, ea->off);
     else {
@@ -978,7 +1012,7 @@ static void emit_shift_imm(emit_t *e, int op, int size, uint32_t cnt, a64_reg_t 
     if (!fmask) {
         switch (op) {
         case OP_SHL: case OP_SAL: emit_lsl_w32_imm(e, res, a, cnt); (void)emit_and_w32_imm(e, res, res, m); break;
-        case OP_SHR: emit_lsr_w32_imm(e, res, a, cnt); break;
+        case OP_SHR: emit_ubfx_w32(e, res, a, cnt, bits - cnt); break;   /* not LSR: a may be a whole 32-bit register */
         default:     emit_sbfx_w32(e, res, a, cnt, bits - cnt); (void)emit_and_w32_imm(e, res, res, m); break;
         }
         return;
@@ -1145,30 +1179,38 @@ static void emit_popa_flat(emit_t *e) {
 
 /* emit_push16/emit_pop16 are the stack operations of whatever block is
  * being emitted: 16-bit real mode, or (s_flat) the 32-bit flat stack. */
-static void emit_push16(emit_t *e, a64_reg_t val) {
+/* A 16-bit stack (real mode, or a KEY_SEG16 block) takes a word or, on
+ * the 386 in a segmented block, a dword. */
+static void emit_push_stk(emit_t *e, a64_reg_t val, int size) {
     if (s_flat) { emit_push32_flat(e, val); return; }
     /* new SP in a temp until the store is known to succeed (fault: SP intact) */
-    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
+    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), (uint32_t)size);
     (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);   /* also strips ESP[31:16] for the address */
-    emit_wrap_check(e, R_SSP, W_T2, val, 1, 1);
-    emit_strh_reg_uxtw(e, val, R_SSP, W_T2);
+    if (s_seg16) emit_limit_check(e, S_SS, W_T2, size);
+    else emit_wrap_check(e, R_SSP, W_T2, val, 1, 1);
+    if (size == 4) emit_str_w32_reg_uxtw(e, val, R_SSP, W_T2);
+    else emit_strh_reg_uxtw(e, val, R_SSP, W_T2);
     emit_add_x64_w32_uxtw(e, W_T3, R_SSP, W_T2);
-    emit_smc_check_x3(e, 2);
-    emit_wrap_back(e);
-    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 2);
+    emit_smc_check_x3(e, size);
+    if (!s_seg16) emit_wrap_back(e);
+    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), (uint32_t)size);
     (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
     emit_set16(e, R_SP, W_T2);
 }
-static void emit_pop16(emit_t *e, a64_reg_t dst) {
+static void emit_pop_stk(emit_t *e, a64_reg_t dst, int size) {
     if (s_flat) { emit_pop32_flat(e, dst); return; }
     a64_reg_t sp = emit_reg16(e, R_SP, W_T2);
-    emit_wrap_check(e, R_SSP, sp, dst, 0, 0);
-    emit_ldrh_reg_uxtw(e, dst, R_SSP, sp);
-    emit_wrap_back(e);
-    emit_add_w32_imm(e, W_T2, sp, 2);
+    if (s_seg16) emit_limit_check(e, S_SS, sp, size);
+    else emit_wrap_check(e, R_SSP, sp, dst, 0, 0);
+    if (size == 4) emit_ldr_w32_reg_uxtw(e, dst, R_SSP, sp);
+    else emit_ldrh_reg_uxtw(e, dst, R_SSP, sp);
+    if (!s_seg16) emit_wrap_back(e);
+    emit_add_w32_imm(e, W_T2, sp, (uint32_t)size);
     (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
     emit_set16(e, R_SP, W_T2);
 }
+static void emit_push16(emit_t *e, a64_reg_t val) { emit_push_stk(e, val, 2); }
+static void emit_pop16(emit_t *e, a64_reg_t dst) { emit_pop_stk(e, dst, 2); }
 
 /* ----------------------------------------------------------------------
  * Classification
@@ -1192,6 +1234,7 @@ static int classify_op(const x86_insn *in) {
     case OP_RET: case OP_CALLF: case OP_JMPF: case OP_RETF:
     case OP_INT: case OP_INT3:
     case OP_OUT:
+    case OP_MOVZX: case OP_MOVSX: case OP_SETCC:
         return C_INLINE;
     case OP_PUSH:
         return C_INLINE;
@@ -1207,7 +1250,6 @@ static int classify_op(const x86_insn *in) {
     case OP_PUSHA: case OP_POPA: case OP_PUSHF: case OP_POPF: case OP_ENTER: case OP_LEAVE:
     case OP_MOVS: case OP_CMPS: case OP_STOS: case OP_LODS: case OP_SCAS:
     case OP_LES: case OP_LDS:
-    case OP_MOVZX: case OP_MOVSX: case OP_SETCC:
     case OP_BT: case OP_BTS: case OP_BTR: case OP_BTC: case OP_BSF: case OP_BSR:
     case OP_SHLD: case OP_SHRD: case OP_CMPXCHG: case OP_XADD: case OP_BSWAP:
         return C_HELPER;
@@ -1307,9 +1349,49 @@ static int classify_flat(const x86_insn *in) {
     }
 }
 
+/* Segmented 16-bit protected mode: the real-mode set with 16-bit
+ * addressing through DS, ES or SS (limit-checked at run time), plus the
+ * 32-bit-operand forms of the straight-line ops the emitters handle at
+ * any width (DOS/4GW's dispatcher moves dwords through 16-bit
+ * segments). What touches IOPL (CLI/STI), a segment register, a far
+ * target or an interrupt frame stays with the interpreter — a helper,
+ * ending the block when it loads a segment (loads_segment), or refused. */
+static int classify_seg16(const x86_insn *in) {
+    if (classify_pm(in) == C_REFUSE) return C_REFUSE;
+    if (in->adsize != 2) return C_HELPER;
+    if (in->ea_valid && in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return C_HELPER;
+    switch (in->op) {
+    case OP_CLI: case OP_STI:
+        return C_HELPER;              /* #GP above IOPL */
+    case OP_OUT:
+        return C_INLINE;
+    default: break;
+    }
+    if (in->opsize == 4) {
+        switch (in->op) {
+        case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
+        case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
+        case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
+            return C_INLINE;
+        case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
+            /* by CL only at 32 bits (emit_shift_cl); a byte op under a 66 prefix is not */
+            if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
+            return is_shift_inline(in) ? C_INLINE : C_HELPER;
+        case OP_PUSH:
+            return in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
+        case OP_POP:
+            return in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
+        default:
+            return C_HELPER;          /* 32-bit near transfers included: EIP would need to stay whole */
+        }
+    }
+    return classify_op(in);
+}
+
 /* Exposed for tools/jittest's fuzzer: 0 refuse, 1 inline, 2 helper. */
 int dbt_classify_op(const x86_insn *in) { return classify(in); }
 int dbt_classify_op_pm(const x86_insn *in) { return classify_pm(in); }
+int dbt_classify_op_seg16(const x86_insn *in) { return classify_seg16(in); }
 
 /* Inline ops with a word-sized memory or stack access: the 286+ limit
  * check in front of it can raise #GP. Byte accesses cannot straddle. */
@@ -1322,7 +1404,7 @@ static int op_may_fault(const x86_insn *in) {
     default: break;
     }
     for (int i = 0; i < 2; i++)
-        if (in->ops[i].kind == OPK_MEM && in->ops[i].size >= 2) return 1;
+        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || s_seg16)) return 1;   /* seg16: a limit is any size's problem */
     return 0;
 }
 
@@ -1436,7 +1518,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     s_nzcv.valid = 0;                   /* only the op just emitted can leave NZCV usable */
     if (cls == C_HELPER) { emit_helper_op(dbt, e, in); return; }
 
-    ea_t ea = { 0, 0 };
+    ea_t ea = { 0, 0, 0 };
     if (in->ea_valid) emit_ea(e, in, &ea);
     int size = in->ops[0].size;
     const x86_operand *d = &in->ops[0];
@@ -1654,11 +1736,19 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
             (void)emit_and_w32_imm(e, W_VAL, W_VAL, 0xFFFF);
             v = W_VAL;
         }
-        emit_push16(e, v);
+        emit_push_stk(e, v, in->opsize);
         break;
     }
     case OP_POP:
-        emit_pop16(e, W_VAL);
+        /* POP [mem] on the 386 leaves SP where it was if the destination
+         * faults (CONTRACT, measured): check it before the pop. The EA
+         * never involves SP with 16-bit addressing. */
+        if (d->kind == OPK_MEM && s_regs32 && !s_flat) {
+            if (s_seg16) emit_limit_check(e, ea.seg, ea.off, d->size);
+            else if (d->size == 2) emit_wrap_check(e, ea.segp, ea.off, W_VAL, 1, 1);   /* 286+: the chunk is a #GP, never returns */
+            s_ea_checked = 1;
+        }
+        emit_pop_stk(e, W_VAL, in->opsize);
         emit_write_operand(e, in, 0, &ea, W_VAL);
         break;
     default:
@@ -1677,7 +1767,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
 static uint64_t target_key(const x86_cpu *cpu, uint32_t ip) {
     if (s_flat) return dbt_key(cpu->seg[S_CS].sel, cpu->seg[S_CS].base + ip) | s_mode_bits;
     uint32_t lin = (cpu->seg[S_CS].base + (ip & 0xFFFF)) & cpu->a20_mask;
-    return dbt_key(cpu->seg[S_CS].sel, lin);
+    return dbt_key(cpu->seg[S_CS].sel, lin) | (s_seg16 ? s_mode_bits : 0);
 }
 
 /* X0 = key for a run-time ip in W register `ip` (16-bit canonical):
@@ -1698,6 +1788,7 @@ static void emit_dynamic_key(emit_t *e, const x86_cpu *cpu, a64_reg_t ip) {
     if (base + 0xFFFF > 0xFFFFF && cpu->a20_mask == 0xFFFFF)
         (void)emit_and_w32_imm(e, A64_W0, A64_W0, 0xFFFFF);
     emit_movk_x64(e, A64_W0, cpu->seg[S_CS].sel, 32);
+    if (s_seg16) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
 }
 
 /* Inline part of a conditional: guts + test + B.cond toward the taken
@@ -1791,12 +1882,12 @@ static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t
     int is_imm = in->ops[0].kind == OPK_IMM;
     if (!is_imm) {
         /* ptr16:16 in memory: offset then selector, each wrap-checked on its own */
-        ea_t ea = { 0, 0 };
+        ea_t ea = { 0, 0, 0 };
         emit_ea(e, in, &ea);
         emit_read_mem(e, &ea, 2, W_VAL);
         emit_add_w32_imm(e, W_T0, ea.off, 2);
         (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
-        ea_t ea2 = { ea.segp, W_T0 };
+        ea_t ea2 = { ea.segp, W_T0, ea.seg };
         emit_read_mem(e, &ea2, 2, W_SRC);
     }
     if (in->op == OP_CALLF) {
@@ -1879,7 +1970,7 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
         if (in->ops[0].kind == OPK_IMM) {
             emit_edge(dbt, e, target_key(cpu, ip_after + in->ops[0].imm));
         } else {
-            ea_t ea = { 0, 0 };
+            ea_t ea = { 0, 0, 0 };
             if (in->ea_valid) emit_ea(e, in, &ea);
             a64_reg_t t = emit_read_operand(e, in, 0, &ea, W_VAL);
             emit_dynamic_key(e, cpu, t);
@@ -1887,7 +1978,7 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
         }
         return;
     case OP_CALL: {
-        ea_t ea = { 0, 0 };
+        ea_t ea = { 0, 0, 0 };
         a64_reg_t t = 0;
         int dyn = in->ops[0].kind != OPK_IMM;
         if (dyn) {
@@ -1960,6 +2051,7 @@ static void emit_pm_dynamic_key(emit_t *e, const x86_cpu *cpu, uint64_t mode_bit
 static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
     x86_cpu *cpu = dbt->cpu;
     s_flat = 0;
+    s_seg16 = 0;
     const x86_seg *cs = &cpu->seg[S_CS];
     /* A20 off in protected mode would fold linear addresses under the
      * block's feet; nothing we run does it, so do not translate it. */
@@ -2080,8 +2172,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     /* HLE stub segment: the interpreter step dispatches the host service. */
     if (cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4)) return NULL;
 
-    if (cpu->pmode && (!(key & KEY_FLAT) || cpu->a20_mask != 0xFFFFFFFFu)) return translate_pm(dbt, key);
-    s_flat = cpu->pmode;              /* from here on: real mode, or a flat block */
+    if (cpu->pmode && (!(key & (KEY_FLAT | KEY_SEG16)) || cpu->a20_mask != 0xFFFFFFFFu)) return translate_pm(dbt, key);
+    s_flat = cpu->pmode && (key & KEY_FLAT) != 0;    /* from here on: real mode, a flat block, or a segmented 16-bit one */
+    s_seg16 = cpu->pmode && !s_flat;
     s_mode_bits = key & 0x7FFF000000000000ull;
 
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
@@ -2112,7 +2205,8 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         }
         if (!x86_decode(&ctx, in)) break;
         if (!s_flat && ip + in->len > 0x10000) break;  /* IP wrap: leave it to the interp */
-        int c = s_flat ? classify_flat(in) : classify(in);
+        if (s_seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
+        int c = s_flat ? classify_flat(in) : s_seg16 ? classify_seg16(in) : classify(in);
         if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
         if (c == C_REFUSE) {
             dbt->refused_by_op[in->op]++;
@@ -2121,7 +2215,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         int r = R_PLAIN;
         if (c == C_INLINE && is_uncond_ender(in->op)) r = R_UNCOND;
         else if (c == C_INLINE && is_cond_ender(in->op)) r = R_COND;
-        else if (s_flat && c == C_HELPER && (is_near_transfer(in->op) || loads_segment(in))) r = R_HELPER_END;
+        else if ((s_flat || s_seg16) && c == C_HELPER && (is_near_transfer(in->op) || loads_segment(in))) r = R_HELPER_END;
         cls[n_ops] = (uint8_t)c;
         role[n_ops] = (uint8_t)r;
         dyn_lin[n_ops] = s_flat && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip) : 0;
@@ -2247,6 +2341,6 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             nskip++;
         }
     dbt_mark_block_bytes_except(dbt, lin, lin + (ip - start_ip), skip, nskip);
-    if (s_flat) dbt_watch_cs_desc(dbt);
+    if (s_flat || s_seg16) dbt_watch_cs_desc(dbt);
     return entry;
 }

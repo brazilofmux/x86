@@ -15,7 +15,7 @@
 #include <string.h>
 
 x86_block_entry *dbt_cache_lookup(x86_dbt *dbt, uint64_t key) {
-    x86_block_entry *e = &dbt->aux->cache[dbt_slot(dbt_key_lin(key))];
+    x86_block_entry *e = &dbt->aux->cache[dbt_slot(key)];
     if (e->key == key || e->key == (key | BLOCK_REFUSED_BIT)) {
         dbt->cache_hits++;
         return e;
@@ -36,7 +36,7 @@ static void evict_slot(x86_dbt *dbt, uint32_t slot) {
 }
 
 void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
-    uint32_t slot = dbt_slot(dbt_key_lin(key));
+    uint32_t slot = dbt_slot(key);
     x86_block_entry *e = &dbt->aux->cache[slot];
     /* Another key in this slot: the old block's direct links would
      * otherwise keep running it after the probe stopped finding it. */
@@ -68,7 +68,7 @@ void dbt_cache_invalidate_all(x86_dbt *dbt) {
 }
 
 int dbt_link_record(x86_dbt *dbt, uint64_t key, uint32_t site_off) {
-    uint32_t i, slot = dbt_slot(dbt_key_lin(key));
+    uint32_t i, slot = dbt_slot(key);
     if (dbt->link_free != LINK_NONE) {
         i = dbt->link_free;
         dbt->link_free = dbt->link_pool[i].next;
@@ -89,7 +89,7 @@ int dbt_link_record(x86_dbt *dbt, uint64_t key, uint32_t site_off) {
  * (the block is gone), unlink those sites and free their records. Sites
  * naming other keys that share the slot are left alone either way. */
 void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code) {
-    uint32_t *pi = &dbt->link_head[dbt_slot(dbt_key_lin(key))];
+    uint32_t *pi = &dbt->link_head[dbt_slot(key)];
     if (*pi == LINK_NONE) return;
     dbt_jit_writable_begin();
     while (*pi != LINK_NONE) {
@@ -150,17 +150,20 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
     uint32_t window = dbt->max_block_bytes;
     if (dbt->smc_heat[phys] < 255) dbt->smc_heat[phys]++;
     for (uint32_t k = 0; k < window && k <= phys; k++) {
-        uint32_t p = phys - k, slot = dbt_slot(p);
-        x86_block_entry *e = &dbt->aux->cache[slot];
-        if (e->key == BLOCK_EMPTY_KEY || dbt_key_lin(e->key) != p || k >= dbt->span[slot]) continue;
-        uint64_t old = e->key & ~BLOCK_REFUSED_BIT;
-        e->key  = BLOCK_EMPTY_KEY;
-        e->code = NULL;
-        dbt_links_repatch(dbt, old, NULL);
-        /* The block that is executing right now (a JIT store or a helper
-         * op inside it): the thunk sees this flag and leaves the block
-         * before its next, now stale, instruction. */
-        if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = 1;
+        uint32_t p = phys - k;
+        for (int m = 0; m < KEY_MODE_VARIANTS; m++) {
+            uint32_t slot = dbt_slot_mode(p, dbt_key_modes[m]);
+            x86_block_entry *e = &dbt->aux->cache[slot];
+            if (e->key == BLOCK_EMPTY_KEY || dbt_key_lin(e->key) != p || k >= dbt->span[slot]) continue;
+            uint64_t old = e->key & ~BLOCK_REFUSED_BIT;
+            e->key  = BLOCK_EMPTY_KEY;
+            e->code = NULL;
+            dbt_links_repatch(dbt, old, NULL);
+            /* The block that is executing right now (a JIT store or a helper
+             * op inside it): the thunk sees this flag and leaves the block
+             * before its next, now stale, instruction. */
+            if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = 1;
+        }
     }
     dbt->smc_invalidations++;
     dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */

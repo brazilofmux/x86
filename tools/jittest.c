@@ -470,6 +470,138 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     return rc != 0;
 }
 
+/* ---- Segmented 16-bit protected mode (-G) ----
+ * A 386 with a 16-bit code segment and 16-bit data segments of random
+ * limits: what a DOS extender's own code looks like, and the shape of a
+ * KEY_SEG16 block. Faults (#GP/#SS past a limit, #DE) reach a 16-bit
+ * gate onto a HLT, ending the run on both machines. */
+#define CODE16 0x120000u
+#define HLT16  0x1000u                     /* offset of the fault landing in CS */
+extern int dbt_classify_op_seg16(const x86_insn *in);
+
+static int fuzz_accept_seg16(const x86_insn *in) {
+    if (in->seg_override == S_CS || in->seg_override == S_FS || in->seg_override == S_GS) return 0;
+    if (in->lock) return 0;
+    switch (in->op) {
+    case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
+    case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INTO: case OP_INT: case OP_INT3:
+    case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_HLT:
+    case OP_IN: case OP_INS: case OP_OUTS: case OP_AAM: case OP_BOUND: case OP_ENTER: case OP_UD:
+        return 0;
+    case OP_POP: case OP_PUSH:
+        return in->ops[0].kind != OPK_SREG;
+    case OP_OUT:
+        return 1;
+    default:
+        return dbt_classify_op_seg16(in) != 0;
+    }
+}
+
+/* base/limit into a descriptor pair; attr is the access byte, 16-bit (no G, no D) */
+static void put_desc(x86_cpu *cpu, uint32_t at, uint32_t base, uint32_t limit, uint32_t attr) {
+    uint32_t lo = (limit & 0xFFFF) | ((base & 0xFFFF) << 16);
+    uint32_t hi = ((base >> 16) & 0xFF) | (attr << 8) | (((limit >> 16) & 0xF) << 16) | (base & 0xFF000000u);
+    memcpy(cpu->mem + at, &lo, 4); memcpy(cpu->mem + at + 4, &hi, 4);
+}
+static void set_seg16(x86_cpu *cpu, int s, uint16_t sel, uint32_t base, uint32_t limit, uint32_t attr) {
+    x86_seg *g = &cpu->seg[s];
+    memset(g, 0, sizeof *g);
+    g->sel = sel; g->usable = sel != 0; g->base = base; g->limit = limit; g->big = 0; g->attr = (uint16_t)attr;
+}
+
+static int fuzz_one_seg16(int len, uint64_t seed, int verbose) {
+    rng_state = seed ? seed : 0x9E3779B97F4A7C15ull;
+    uint8_t prog[2048]; int plen = 0;
+    for (int i = 0; i < len; ) {
+        uint8_t tmp[16];
+        x86_insn in;
+        for (int k = 0; k < 16; k++) tmp[k] = (uint8_t)rnd();
+        x86_dec_ctx c2 = { tmp, X86_MODEL_386, 0 };
+        if (!x86_decode(&c2, &in) || in.len > 10 || !fuzz_accept_seg16(&in)) continue;
+        if ((rnd() % 6) == 0) {
+            static const uint8_t cc[] = { 0xE0, 0xE1, 0xE2, 0xE3 };
+            int dbl = (rnd() % 3) == 0;
+            if (dbl) {
+                uint32_t r = rnd();
+                prog[plen++] = (r & 3) ? (uint8_t)(0x70 + ((r >> 4) & 15)) : cc[(r >> 4) & 3];
+                prog[plen++] = (uint8_t)(2 + in.len);
+                i++;
+            }
+            uint32_t r2 = rnd();
+            prog[plen++] = (r2 & 3) ? (uint8_t)(0x70 + ((r2 >> 4) & 15)) : cc[(r2 >> 4) & 3];
+            prog[plen++] = (uint8_t)in.len;
+            i++;
+        }
+        memcpy(prog + plen, tmp, in.len); plen += in.len; i++;
+    }
+    prog[plen++] = 0xF4;
+
+    x86_cpu cpu;
+    x86_init(&cpu, X86_MODEL_386);
+    x86_set_a20(&cpu, 1);
+    cpu.pmode = 1;
+    cpu.cr0 |= 1;
+    /* limits: mostly full 64K, sometimes small so accesses and pushes fault */
+    uint32_t lim_ds = (rnd() & 1) ? 0xFFFF : 0x100 + (rnd() & 0x7FFF);
+    uint32_t lim_es = (rnd() & 1) ? 0xFFFF : 0x100 + (rnd() & 0x7FFF);
+    uint32_t lim_ss = (rnd() & 3) ? 0xFFFF : 0x100 + (rnd() & 0x7FFF);
+    cpu.gdtr.base = 0x110000; cpu.gdtr.limit = 0x27;
+    put_desc(&cpu, 0x110008, CODE16, 0xFFFF, 0x9B);
+    put_desc(&cpu, 0x110010, 0x30000, lim_ds, 0x93);
+    put_desc(&cpu, 0x110018, 0x50000, lim_es, 0x93);
+    put_desc(&cpu, 0x110020, 0x70000, lim_ss, 0x93);
+    set_seg16(&cpu, S_CS, 0x08, CODE16, 0xFFFF, 0x9B);
+    set_seg16(&cpu, S_DS, (rnd() % 8) ? 0x10 : 0, 0x30000, lim_ds, 0x93);   /* sometimes null: #GP on use */
+    set_seg16(&cpu, S_ES, (rnd() % 8) ? 0x18 : 0, 0x50000, lim_es, 0x93);
+    set_seg16(&cpu, S_SS, 0x20, 0x70000, lim_ss, 0x93);
+    if (!cpu.seg[S_DS].sel) { cpu.seg[S_DS].base = 0; cpu.seg[S_DS].limit = 0; cpu.seg[S_DS].attr = 0; }
+    if (!cpu.seg[S_ES].sel) { cpu.seg[S_ES].base = 0; cpu.seg[S_ES].limit = 0; cpu.seg[S_ES].attr = 0; }
+    /* IDT: 32 16-bit interrupt gates onto the HLT */
+    cpu.idtr.base = 0x110100; cpu.idtr.limit = 32 * 8 - 1;
+    for (int v = 0; v < 32; v++) {
+        uint32_t lo = HLT16 | (0x08u << 16), hi = 0x8600u;
+        memcpy(cpu.mem + 0x110100 + v * 8, &lo, 4); memcpy(cpu.mem + 0x110104 + v * 8, &hi, 4);
+    }
+    cpu.mem[CODE16 + HLT16] = 0xF4;
+    for (int i = 0; i < 8; i++) cpu.r[i] = rnd();
+    cpu.r[R_SP] = (cpu.r[R_SP] & 0xFFFF0000u) | (0x1000 + (rnd() & 0xEFFE));
+    cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
+    cpu.eip = 0x100;
+    memcpy(cpu.mem + CODE16 + 0x100, prog, plen);
+    for (int i = 0; i < 0x30000; i++) cpu.mem[0x30000 + i] = (uint8_t)rnd();
+    for (int i = 0; i < 0x10000; i++) cpu.mem[0x70000 + i] = (uint8_t)rnd();
+
+    if (verbose) {
+        fprintf(stderr, "seed=%llu:", (unsigned long long)seed);
+        for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
+        fprintf(stderr, "\n");
+    }
+    x86_dbt dbt;
+    if (dbt_init(&dbt, &cpu) < 0) return 1;
+    dbt.verify = 1;
+    dbt.verify_mem_every = 1;
+    dbt.insn_limit = 1000000;
+    int rc = dbt_run(&dbt);
+    if (verbose) dbt_print_stats(&dbt, stderr);
+    if (rc != 0 || verbose) {
+        fprintf(stderr, "%s seed=%llu seg16 len=%d lim ds=%X es=%X ss=%X ds_sel=%X es_sel=%X:", rc ? "FAIL" : "ok", (unsigned long long)seed, len,
+                lim_ds, lim_es, lim_ss, cpu.seg[S_DS].sel, cpu.seg[S_ES].sel);
+        for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
+        fprintf(stderr, "\n");
+        uint32_t ip = 0x100; uint8_t buf[16]; x86_insn in; char d[128];
+        while (ip < 0x100u + (uint32_t)plen) {
+            memcpy(buf, prog + (ip - 0x100), 16);
+            x86_dec_ctx c3 = { buf, X86_MODEL_386, 0 };
+            if (!x86_decode(&c3, &in)) break;
+            fprintf(stderr, "    %04X: %s\n", ip, x86_disasm(&in, d, sizeof d));
+            ip += in.len;
+        }
+    }
+    dbt_cleanup(&dbt);
+    x86_free(&cpu);
+    return rc != 0;
+}
+
 static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
     rng_state = seed ? seed : 0x9E3779B97F4A7C15ull;
     uint8_t prog[2048]; int plen = 0;
@@ -574,6 +706,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-s")) stats = 1;
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-P")) pm = 1;
+        else if (!strcmp(argv[i], "-G")) pm = 2;
         else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] [-P] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
     }
     if (prog >= 0 && pm) return run_pm_prog(prog, stats);
@@ -581,9 +714,10 @@ int main(int argc, char **argv) {
     if (fuzz) {
         int fails = 0;
         for (int i = 0; i < fuzz; i++)
-            fails += pm ? fuzz_one_pm(len, seed + (uint64_t)i, verbose) : fuzz_one(model, len, seed + (uint64_t)i, verbose);
+            fails += pm == 2 ? fuzz_one_seg16(len, seed + (uint64_t)i, verbose)
+                   : pm ? fuzz_one_pm(len, seed + (uint64_t)i, verbose) : fuzz_one(model, len, seed + (uint64_t)i, verbose);
         printf("fuzz: %d/%d failed (seeds %llu..%llu, %s, len %d)\n", fails, fuzz,
-               (unsigned long long)seed, (unsigned long long)(seed + fuzz - 1), pm ? "flat PM" : "real mode", len);
+               (unsigned long long)seed, (unsigned long long)(seed + fuzz - 1), pm == 2 ? "segmented 16-bit PM" : pm ? "flat PM" : "real mode", len);
         return fails != 0;
     }
     return 2;

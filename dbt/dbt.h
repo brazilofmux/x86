@@ -89,10 +89,24 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_PMODE          (1ull << 48)
 #define KEY_BIG            (1ull << 49)   /* CS D bit: 32-bit default operand/address size */
 #define KEY_FLAT           (1ull << 50)   /* CS, DS, ES, SS all base 0, limit 4G, 32-bit (dbt_seg_flat) */
+#define KEY_SEG16          (1ull << 51)   /* 16-bit CS and SS, expand-up data segments: real-mode-shaped code with limits (dbt_seg16_ok) */
 
 static inline uint64_t dbt_key(uint32_t cs_sel, uint32_t lin) { return ((uint64_t)cs_sel << 32) | lin; }
 static inline uint32_t dbt_key_lin(uint64_t key) { return (uint32_t)key; }
-static inline uint32_t dbt_slot(uint32_t lin) { return lin & BLOCK_CACHE_MASK; }
+/* Cache slot: the linear address, with the key's mode bits (48..52:
+ * PMODE, BIG, FLAT, SEG16) folded into bits 16..20 so the same code
+ * seen under two segment shapes — DOS/4GW's dispatcher enters on the
+ * client's 32-bit stack and switches to its own 16-bit one — holds
+ * both translations instead of evicting one with the other. Real-mode
+ * keys (no mode bits) stay 1:1 over low memory. */
+#define KEY_MODE_SHIFT 48
+#define KEY_MODE_MASK  0x1Fu
+static inline uint32_t dbt_slot_mode(uint32_t lin, uint32_t mode) { return (lin ^ (mode << 16)) & BLOCK_CACHE_MASK; }
+static inline uint32_t dbt_slot(uint64_t key) { return dbt_slot_mode((uint32_t)key, (uint32_t)(key >> KEY_MODE_SHIFT) & KEY_MODE_MASK); }
+/* Every mode-bit combination a key can carry: real; PM 16-bit; PM 32-bit;
+ * flat; segmented 16-bit. The SMC sweep probes each. */
+#define KEY_MODE_VARIANTS 5
+static const uint32_t dbt_key_modes[KEY_MODE_VARIANTS] = { 0, 1, 3, 7, 9 };
 
 #ifndef MAX_BLOCK_INSNS
 #define MAX_BLOCK_INSNS    64
@@ -278,6 +292,29 @@ static inline int dbt_seg_flat(const x86_seg *g, int code) {
     return !(g->attr & X86_TYPE_CODE) && (g->attr & X86_TYPE_WRITABLE) && !(g->attr & X86_TYPE_EXPDOWN);
 }
 
+/* Segmented 16-bit protected mode (a KEY_SEG16 block): the real-mode
+ * translator's shape — 16-bit IP and SP, offsets through pinned segment
+ * bases — with each access checked against the segment's limit, read
+ * from the cpu at run time (DOS/4GW's data segments change under the
+ * same block). Needs a 16-bit code segment and a 16-bit expand-up stack;
+ * DS and ES may be null (an access through one is #GP: the check sees
+ * `usable`) but not expand-down, whose limit reads the other way. */
+static inline int dbt_seg16_data_ok(const x86_seg *g) {
+    if (!g->usable) return 1;
+    if (!X86_AR_S(g->attr)) return 0;
+    if (g->attr & X86_TYPE_CODE) return (g->attr & X86_TYPE_READABLE) != 0;
+    return !(g->attr & X86_TYPE_EXPDOWN);
+}
+static inline int dbt_seg16_ok(const x86_cpu *c) {
+    const x86_seg *cs = &c->seg[S_CS], *ss = &c->seg[S_SS];
+    if (!cs->usable || cs->big || !X86_AR_S(cs->attr) || !(cs->attr & X86_TYPE_CODE)) return 0;
+    if (!ss->usable || ss->big || !X86_AR_S(ss->attr) || (ss->attr & X86_TYPE_CODE)
+        || !(ss->attr & X86_TYPE_WRITABLE) || (ss->attr & X86_TYPE_EXPDOWN)) return 0;
+    return dbt_seg16_data_ok(&c->seg[S_DS]) && dbt_seg16_data_ok(&c->seg[S_ES]);
+}
+
+extern int dbt_seg16_enabled;   /* X86_NO_SEG16 clears it: segmented 16-bit PM blocks stay all-helper (A/B) */
+
 /* Mode bits of a key for the current segments. */
 static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
     if (!c->pmode) return 0;
@@ -285,6 +322,8 @@ static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
     if (dbt_seg_flat(&c->seg[S_CS], 1) && dbt_seg_flat(&c->seg[S_DS], 0)
         && dbt_seg_flat(&c->seg[S_ES], 0) && dbt_seg_flat(&c->seg[S_SS], 0))
         b |= KEY_FLAT;
+    else if (dbt_seg16_enabled && dbt_seg16_ok(c))
+        b |= KEY_SEG16;
     return b;
 }
 

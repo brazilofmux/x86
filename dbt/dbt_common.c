@@ -46,6 +46,8 @@ int dbt_jit_available(const x86_cpu *cpu) {
 #endif
 }
 
+int dbt_seg16_enabled = 1;
+
 int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     memset(dbt, 0, sizeof(*dbt));
     dbt->cpu = cpu;
@@ -57,6 +59,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
         dbt->pm_hits = calloc(X86_MEM_SIZE >> 4, sizeof(uint32_t));
     }
 
+    if (getenv("X86_NO_SEG16")) dbt_seg16_enabled = 0;
     dbt->aux       = calloc(1, sizeof(x86_jit_aux));
     dbt->span      = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));
     dbt->link_head = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));
@@ -359,9 +362,15 @@ int dbt_run(x86_dbt *dbt) {
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
 
         uint64_t key = dbt_cpu_key(cpu);
-        x86_block_entry *be = dbt_cache_lookup(dbt, key);
+        /* A MOV SS / POP SS / STI helper left interrupts inhibited for
+         * one instruction and its block ended (or ran on inline, which
+         * never clears the inhibit). The interpreter runs that one
+         * instruction: it clears the inhibit, or renews it, exactly; the
+         * poll above saw it and delivered nothing. */
+        int inhibited = cpu->int_inhibit != 0;
+        x86_block_entry *be = inhibited ? NULL : dbt_cache_lookup(dbt, key);
         uint8_t *code = be ? be->code : NULL;
-        if (!be) {
+        if (!be && !inhibited) {
             dbt_jit_writable_begin();
             code = dbt_translate_block(dbt, key);
             dbt_jit_writable_end();
