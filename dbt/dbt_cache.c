@@ -56,7 +56,7 @@ void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
  * that: resetting the pool silently abandons all patch sites, sound
  * only because the code containing them is being discarded. */
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
-    memset(dbt->v86_code_page, 0, sizeof dbt->v86_code_page);
+    dbt->n_pcode = 0;
     memset(dbt->phys_alias, 0, sizeof dbt->phys_alias);
     /* An empty slot is all-ones in both words (its code pointer is never
      * read while the key says empty), and so is LINK_NONE: two memsets. */
@@ -249,26 +249,49 @@ void dbt_tlb_flushed(x86_cpu *cpu) {
     /* A CR3 reload is how a memory manager flushes after any remap (JEMM
      * with NOINVLPG does it for every A20 emulation), so dropping all
      * translations each time thrashes. Only the code pages paged blocks
-     * stand on matter: re-peek each, and drop the V86 blocks of any that
-     * no longer maps where it did when they were translated. A V86 key's slot is its linear
-     * address XOR (16 << 16) — KEY_V86 folded — so a page's blocks sit in
-     * 4096 consecutive slots. */
-    for (uint32_t p = 0; p < X86_PGD_PAGES; p++) {
-        if (!dbt->v86_code_page[p]) continue;
-        uint32_t lin = p << 12;
-        uint32_t was = (uint32_t)dbt->v86_code_phys[p] << 12;
-        if ((cpu->cr0 & X86_CR0_PG) && x86_page_peek(cpu, lin) == was) continue;
-        if (dbt->phys_alias[was >> 12] == p + 1) dbt->phys_alias[was >> 12] = 0;
-        for (uint32_t k = 0; k < 4096; k++) {
-            uint32_t slot = dbt_slot_mode(lin + k, (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT));
-            x86_block_entry *e = &dbt->aux->cache[slot];
-            if (e->key == BLOCK_EMPTY_KEY || !(e->key & KEY_V86) || dbt_key_lin(e->key) != lin + k) continue;
-            evict_slot(dbt, slot);
+     * stand on matter: re-peek each, and drop the paged blocks of any that
+     * no longer maps where it did when they were translated. A page's
+     * blocks sit in 4096 consecutive slots per key mode (its linear
+     * address XOR the folded mode bits): V86, and flat 32-bit PM. */
+    static const uint32_t modes[2] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
+                                       (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT) };
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < dbt->n_pcode; i++) {
+        uint32_t lin = dbt->pcode[i].lin_page << 12, was = dbt->pcode[i].phys_page << 12;
+        if ((cpu->cr0 & X86_CR0_PG) && x86_page_peek(cpu, lin, dbt->pcode[i].user) == was) {
+            dbt->pcode[kept++] = dbt->pcode[i];
+            continue;
         }
-        if (cpu->jit_cur_lin >> 12 == p) cpu->jit_cur_hit = 1;
-        dbt->v86_code_page[p] = 0;
+        if (dbt->phys_alias[was >> 12] == dbt->pcode[i].lin_page + 1) dbt->phys_alias[was >> 12] = 0;
+        for (int m = 0; m < 2; m++)
+            for (uint32_t k = 0; k < 4096; k++) {
+                uint32_t slot = dbt_slot_mode(lin + k, modes[m]);
+                x86_block_entry *e = &dbt->aux->cache[slot];
+                if (e->key == BLOCK_EMPTY_KEY || !(e->key & KEY_PAGED) || dbt_key_lin(e->key) != lin + k) continue;
+                evict_slot(dbt, slot);
+            }
+        if ((cpu->jit_cur_lin & 0xFFFFF000u) == lin) cpu->jit_cur_hit = 1;
         dbt->tlb_page_drops++;
     }
+    dbt->n_pcode = kept;
+}
+
+/* A paged block is being translated on LIN_PAGE, which maps to PHYS_PAGE
+ * (both page numbers): note it for dbt_tlb_flushed. 0 if the list is
+ * full — the caller then does not translate. */
+int dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user) {
+    for (uint32_t i = 0; i < dbt->n_pcode; i++)
+        if (dbt->pcode[i].lin_page == lin_page) {
+            dbt->pcode[i].phys_page = phys_page;
+            dbt->pcode[i].user = (uint8_t)user;
+            return 1;
+        }
+    if (dbt->n_pcode == DBT_PCODE_MAX) return 0;
+    dbt->pcode[dbt->n_pcode].lin_page = lin_page;
+    dbt->pcode[dbt->n_pcode].phys_page = phys_page;
+    dbt->pcode[dbt->n_pcode].user = (uint8_t)user;
+    dbt->n_pcode++;
+    return 1;
 }
 
 /* The host wrote guest memory directly (loader, DOS file reads): run

@@ -281,8 +281,14 @@ int pc_poll(x86_cpu *c) {
     /* A keyboard delivers a scancode every couple of milliseconds at
      * best; handlers (WP's) rely on having finished with one before the
      * next arrives, beyond what the PIC's in-service gating guarantees. */
+    /* And not while IRQ 1 is still in service: a V86 monitor (JEMM) reads
+     * port 60h itself before it reflects the interrupt to DOS, which let
+     * the next code overwrite the latch before the BIOS's INT 9 had taken
+     * the first — one key lost, the next one twice ("HHlo"). The EOI, or
+     * our INT 9, says the code has been used. */
     static uint64_t last_code_ns;
-    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
+    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !(pc.irq_in_service & 2)
+        && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
         uint8_t code;
         pc_kbd_raw_next(&code);
         pc.last_scancode = code;

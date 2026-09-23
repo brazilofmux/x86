@@ -46,12 +46,33 @@ static void phys_or8(x86_cpu *c, uint32_t p, uint8_t bits) {
  * physical page address with A20 applied, or X86_PG_BAD when a user
  * could not read it. For the translator, deciding whether a code page is
  * mapped one-to-one. */
-uint32_t x86_page_peek(x86_cpu *c, uint32_t lin) {
+uint32_t x86_page_peek(x86_cpu *c, uint32_t lin, int user) {
+    uint32_t need = user ? 5u : 1u;
     uint32_t pde = phys_rd32(c, (c->cr3 & 0xFFFFF000u) | ((lin >> 20) & 0xFFCu));
-    if (!(pde & 1) || !(pde & 4)) return X86_PG_BAD;
+    if ((pde & need) != need) return X86_PG_BAD;
     uint32_t pte = phys_rd32(c, (pde & 0xFFFFF000u) | ((lin >> 10) & 0xFFCu));
-    if (!(pte & 1) || !(pte & 4)) return X86_PG_BAD;
+    if ((pte & need) != need) return X86_PG_BAD;
     return (pte & 0xFFFFF000u) & c->a20_mask;
+}
+
+/* Is a physical page one translated code may address straight? */
+static int plain_ram(const x86_cpu *c, uint32_t phys) {
+    phys &= c->a20_mask;
+    return phys + 0xFFFu < c->mem_size && (phys & 0xFFFF0000u) != 0xA0000u;
+}
+
+/* A low page answered from the translator's delta tables (x86_lin) goes
+ * into the TLB as well, which is where translated protected-mode code
+ * looks: the same translation, the permissions the tables imply. */
+uint32_t x86_tlb_from_pgd(x86_cpu *c, uint32_t lin) {
+    uint32_t page = lin >> 12;
+    uint32_t phys = (uint32_t)((int64_t)(lin & 0xFFFFF000u) + c->pgd_r[page]);
+    struct x86_tlbe *t = &c->tlb[page & 255];
+    t->tag = (lin & 0xFFFFF000u) | X86_TLB_V | X86_TLB_U
+           | (!(c->pgd_w[page] & 1) ? X86_TLB_UW | X86_TLB_D : 0)
+           | (plain_ram(c, phys) ? X86_TLB_MEM : 0);
+    t->phys = phys;
+    return phys | (lin & 0xFFF);
 }
 
 void x86_tlb_flush(x86_cpu *c) {
@@ -94,7 +115,8 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
     t->tag = (lin & 0xFFFFF000u) | X86_TLB_V
            | ((both & 4) ? X86_TLB_U : 0)
            | ((both & 4) && (both & 2) ? X86_TLB_UW : 0)
-           | ((pte & 0x40) ? X86_TLB_D : 0);
+           | ((pte & 0x40) ? X86_TLB_D : 0)
+           | (plain_ram(c, pte & 0xFFFFF000u) ? X86_TLB_MEM : 0);
     t->phys = pte & 0xFFFFF000u;
     /* the translator's tables, low linear pages only, user permissions */
     uint32_t page = lin >> 12;

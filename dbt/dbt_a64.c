@@ -114,6 +114,9 @@ static uint64_t s_mode_bits;
  * paging (KEY_PAGED) every memory access goes through cpu->pgd_r/pgd_w
  * (emit_paged). s_iopl3: CLI/STI/PUSHF behave as in real mode. */
 static int s_v86, s_paged, s_iopl3;
+static int s_pg_user;       /* a paged flat block at CPL 3: user permissions in the TLB check */
+static int s_esnull;        /* KEY_ESNULL: ES is null, its accesses are the interpreter's */
+static int s_dsnull;        /* KEY_DSNULL: the same for DS */
 /* Segmented 16-bit protected mode (a KEY_SEG16 block, see dbt_seg16_ok):
  * the real-mode shape with a limit check on every access. */
 static int s_seg16;
@@ -405,6 +408,9 @@ static a64_reg_t seg_ptr_reg(int s) {
 static void emit_flat_check(emit_t *e, a64_reg_t off);
 static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only);
 static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea);
+static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write);
+static int writes_mem_operand(const x86_insn *in);
+static int flat_access_size(const x86_insn *in);
 
 /* Flat EA: base + index << scale + disp, wrapping at 4 GB like the
  * CPU's 32-bit address arithmetic, then the range check (not for LEA,
@@ -429,7 +435,13 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
         if (disp) { emit_add_w32_imm_any(e, W_OFF, acc, disp, W_T1); acc = W_OFF; }
         ea->off = acc;
     }
-    if (in->op != OP_LEA) emit_flat_check_as(e, ea->off, in->op == OP_MOV && in->ops[0].kind == OPK_MEM);
+    if (in->op == OP_LEA) return;
+    if (s_paged) {
+        emit_pgflat(e, ea->off, flat_access_size(in), writes_mem_operand(in));
+        ea->segp = X_SEGP;
+        return;
+    }
+    emit_flat_check_as(e, ea->off, in->op == OP_MOV && in->ops[0].kind == OPK_MEM);
 }
 
 /* Compute the effective address. Uses W_OFF (and X_SEGP for CS/FS/GS);
@@ -733,6 +745,42 @@ static void emit_add_x64_big(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_t imm
     if ((imm & 0xFFF) || rd != rn) emit_add_x64_imm(e, rd, rn, imm & 0xFFF);
 }
 
+/* A flat block under paging: the access at linear OFF (size bytes)
+ * through the interpreter's own TLB. The entry for its page must match
+ * and allow it — valid, plain RAM (X86_TLB_MEM), dirty for a store, and
+ * the user bits at CPL 3 — and the access must stay on the page; then
+ * X_SEGP = R_MEM + physical page - linear page, so the flat emitters'
+ * [base + off] addressing (off+2, off+4 included) lands in the right
+ * page. Anything else is the flat slow path: the interpreter walks,
+ * faults, sets accessed/dirty and fills the entry for next time.
+ * Clobbers X0-X2, W_T1; leaves OFF and W_T2/W_T3 alone. */
+static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write) {
+    emit_ubfx_w32(e, A64_W0, off, 12, 8);                       /* TLB index */
+    emit_add_x64_big(e, A64_W2, R_CPU, (uint32_t)offsetof(x86_cpu, tlb));
+    emit_lsl_x64_imm(e, A64_W0, A64_W0, 3);
+    emit_add_x64(e, A64_W2, A64_W2, A64_W0);
+    emit_ldp_w32_off(e, A64_W0, A64_W1, A64_W2, 0);             /* w0 = tag, w1 = physical page */
+    emit_eor_w32(e, W_T1, A64_W0, off);
+    (void)emit_tst_w32_imm(e, W_T1, 0xFFFFF000u);               /* the entry is for this page */
+    flat_slow_site(e);
+    emit_b_cond(e, A64_COND_NE, 0);
+    uint32_t need = X86_TLB_V | X86_TLB_MEM | (write ? X86_TLB_D : 0)
+                  | (s_pg_user ? (write ? X86_TLB_UW : X86_TLB_U) : 0);
+    emit_movz_w32(e, W_T1, (uint16_t)need, 0);
+    emit_bic_w32(e, W_T1, W_T1, A64_W0);                         /* a needed bit missing? */
+    flat_slow_site(e);
+    emit_cbnz_w32(e, W_T1, 0);
+    if (size > 1) {
+        (void)emit_and_w32_imm(e, W_T1, off, 0xFFF);
+        emit_cmp_w32_imm(e, W_T1, (uint32_t)(0x1000 - size));
+        flat_slow_site(e);
+        emit_b_cond(e, A64_COND_HI, 0);
+    }
+    (void)emit_and_w32_imm(e, W_T1, off, 0xFFFFF000u);
+    emit_sub_x64(e, A64_W1, A64_W1, W_T1);                       /* physical - linear page, signed */
+    emit_add_x64(e, X_SEGP, R_MEM, A64_W1);
+}
+
 /* V86 under paging: the identity host address segp + off becomes the
  * physical one through the page's delta in cpu->pgd_r (pgd_w for a
  * store, which also needs the page dirty already), left in X_SEGP.
@@ -780,6 +828,19 @@ static int writes_mem_operand(const x86_insn *in) {
     default:
         return 1;
     }
+}
+
+/* Bytes an instruction's memory operand covers (a far pointer's four or
+ * six for LES/LDS and indirect far transfers). */
+static int flat_access_size(const x86_insn *in) {
+    int size = in->opsize;
+    for (int i = 0; i < 3; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
+    switch (in->op) {
+    case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_JMPF: case OP_CALLF:
+        size = in->opsize + 2; break;
+    default: break;
+    }
+    return size;
 }
 
 /* The EA of a paged V86 block, translated for the instruction's one
@@ -1573,15 +1634,19 @@ static void emit_load_seg_real(emit_t *e, int s, a64_reg_t sel) {
  * the scratch registers when it fires. */
 static void emit_push32_flat(emit_t *e, a64_reg_t val) {
     emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 4);
-    emit_flat_check_as(e, W_T2, 1);
-    emit_str_w32_reg_uxtw(e, val, R_MEM, W_T2);
-    emit_add_x64_w32_uxtw(e, W_T3, R_MEM, W_T2);
+    a64_reg_t base = R_MEM;
+    if (s_paged) { emit_pgflat(e, W_T2, 4, 1); base = X_SEGP; }
+    else emit_flat_check_as(e, W_T2, 1);
+    emit_str_w32_reg_uxtw(e, val, base, W_T2);
+    emit_add_x64_w32_uxtw(e, W_T3, base, W_T2);
     emit_smc_check_x3(e, 4);
     emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
 }
 static void emit_pop32_flat(emit_t *e, a64_reg_t dst) {
-    emit_flat_check(e, R_GPR(R_SP));
-    emit_ldr_w32_reg_uxtw(e, dst, R_MEM, R_GPR(R_SP));
+    a64_reg_t base = R_MEM;
+    if (s_paged) { emit_pgflat(e, R_GPR(R_SP), 4, 0); base = X_SEGP; }
+    else emit_flat_check(e, R_GPR(R_SP));
+    emit_ldr_w32_reg_uxtw(e, dst, base, R_GPR(R_SP));
     emit_add_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
 }
 
@@ -2764,27 +2829,28 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     s_flat = cpu->pmode && !s_v86 && (key & KEY_FLAT) != 0;    /* from here on: real mode or V86, a flat block, or a segmented 16-bit one */
     s_seg16 = cpu->pmode && !s_v86 && !s_flat;
     s_mode_bits = key & 0x7FFF000000000000ull;
-    /* A paged V86 block lives on one code page mapped one-to-one, so its
-     * key (linear) and the code bitmap (physical) agree about it; the
-     * bytes are read straight from memory, without a walk's side effects. */
+    s_esnull = (key & KEY_ESNULL) != 0;
+    s_dsnull = (key & KEY_DSNULL) != 0;
+    s_pg_user = s_flat && s_paged && (cpu->seg[S_CS].sel & 3) == 3;
     uint32_t code_page = 0, code_delta = 0;
     if (s_paged) {
-        /* The block stays on one code page. Its key is linear; its bytes,
-         * and their code-bitmap marks, are wherever the page maps — one-
-         * to-one, or remapped (UMB code), which phys_alias lets the SMC
-         * sweep find. */
-        code_page = (cpu->seg[S_CS].base + (cpu->eip & 0xFFFF)) & 0xFFFFF000u;
-        uint32_t phys = x86_page_peek(cpu, code_page);
+        /* A paged block (V86, or flat protected mode) stays on one code
+         * page. Its key is linear; its bytes, and their code-bitmap
+         * marks, are wherever the page maps — one-to-one, or remapped
+         * (UMB code, a memory manager mapped high), which phys_alias lets
+         * the SMC sweep find. dbt_tlb_flushed re-peeks it. */
+        int user = s_v86 || s_pg_user;
+        code_page = (cpu->seg[S_CS].base + (s_flat ? cpu->eip : (cpu->eip & 0xFFFF))) & 0xFFFFF000u;
+        uint32_t phys = x86_page_peek(cpu, code_page, user);
         if (phys == X86_PG_BAD || phys + 0xFFFu >= cpu->mem_size) return NULL;
+        if (!dbt_note_code_page(dbt, code_page >> 12, phys >> 12, user)) return NULL;
         if (phys != (code_page & cpu->a20_mask)) {
-            uint16_t *alias = &dbt->phys_alias[phys >> 12];
+            uint32_t *alias = &dbt->phys_alias[phys >> 12];
             if (*alias && *alias != (code_page >> 12) + 1) return NULL;   /* one alias per physical page */
-            *alias = (uint16_t)((code_page >> 12) + 1);
+            *alias = (code_page >> 12) + 1;
             code_delta = phys - code_page;
         }
-        (void)x86_phys_rd8(cpu, cpu->seg[S_CS].base + (cpu->eip & 0xFFFF));   /* the fetch's walk: accessed bits */
-        dbt->v86_code_page[code_page >> 12] = 1;
-        dbt->v86_code_phys[code_page >> 12] = (uint16_t)(phys >> 12);
+        (void)x86_phys_rd8(cpu, code_page | ((cpu->seg[S_CS].base + cpu->eip) & 0xFFF));   /* the fetch's walk: accessed bits */
     }
 
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
@@ -2806,7 +2872,11 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
 
     while (n_ops < MAX_BLOCK_INSNS) {
         x86_insn *in = &decs[n_ops];
-        if (s_flat) {
+        if (s_flat && s_paged) {
+            uint32_t lin = cpu->seg[S_CS].base + ip;
+            if ((lin & 0xFFFFF000u) != code_page) break;
+            memcpy(buf, cpu->mem + lin + code_delta, 16);
+        } else if (s_flat) {
             /* flat CS: no limit to hit short of 4 GB; stay inside memory */
             uint32_t lin = cpu->seg[S_CS].base + ip;
             if (lin >= cpu->mem_size || cpu->mem_size - lin < 16) break;
@@ -2837,6 +2907,11 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         if (s_seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
         int c = s_flat ? classify_flat(in) : s_seg16 ? classify_seg16(in) : classify(in);
         if (s_v86) c = classify_v86(in, c);
+        if (s_flat && c == C_INLINE) {
+            if (s_esnull && in->ea_valid && in->seg == S_ES) c = C_HELPER;          /* #GP: the interpreter's */
+            if (s_dsnull && in->ea_valid && in->seg == S_DS) c = C_HELPER;
+            if (s_paged && (in->op == OP_PUSHA || in->op == OP_POPA)) c = C_HELPER;  /* two accesses */
+        }
         if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
         if (c == C_REFUSE) {
             dbt->refused_by_op[in->op]++;
@@ -2850,7 +2925,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             r = R_HELPER_END;                          /* paged V86: a transfer run by the interpreter */
         cls[n_ops] = (uint8_t)c;
         role[n_ops] = (uint8_t)r;
-        dyn_lin[n_ops] = s_flat && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip) : 0;
+        dyn_lin[n_ops] = s_flat && !s_paged && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip) : 0;
         ip_afters[n_ops] = ip + in->len;
         n_ops++;
         ip += in->len;

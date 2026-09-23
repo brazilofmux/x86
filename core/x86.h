@@ -246,10 +246,12 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 #define X86_TLB_U   0x002u
 #define X86_TLB_UW  0x004u
 #define X86_TLB_D   0x008u
+#define X86_TLB_MEM 0x010u                   /* the physical page is plain RAM (not past memory, not the VGA read window): translated code may use it */
 #define X86_PG_BAD  0xFFFFFFFFu              /* a probe's miss: reads as open bus */
 uint32_t x86_page_walk(struct x86_cpu *c, uint32_t lin, int write);
 void     x86_tlb_flush(struct x86_cpu *c);
-uint32_t x86_page_peek(struct x86_cpu *c, uint32_t lin);   /* user mapping of LIN's page, no side effects */
+uint32_t x86_page_peek(struct x86_cpu *c, uint32_t lin, int user);   /* LIN's physical page, no side effects */
+uint32_t x86_tlb_from_pgd(struct x86_cpu *c, uint32_t lin);          /* a low page's delta, into the TLB too */
 int      x86_cpl(const struct x86_cpu *c);
 
 static inline uint32_t x86_lin(x86_cpu *c, uint32_t lin, int write) {
@@ -259,15 +261,15 @@ static inline uint32_t x86_lin(x86_cpu *c, uint32_t lin, int write) {
      * -V shadow walking a page the JIT still holds would set an accessed
      * bit the JIT run never set). An entry there allows any access of its
      * kind: present and user-readable, or user-writable and dirty. */
-    if ((lin >> 12) < X86_PGD_PAGES) {
-        int64_t d = write ? c->pgd_w[lin >> 12] : c->pgd_r[lin >> 12];
-        if (!(d & 1)) return (uint32_t)((int64_t)lin + d);
-    }
     struct x86_tlbe *t = &c->tlb[(lin >> 12) & 255];
     if ((t->tag & 0xFFFFF000u) == (lin & 0xFFFFF000u) && (t->tag & X86_TLB_V)) {
         uint32_t need = write ? X86_TLB_D : 0;
         if (!c->pg_super && x86_cpl(c) == 3) need |= write ? X86_TLB_UW : X86_TLB_U;
         if ((t->tag & need) == need) return t->phys | (lin & 0xFFF);
+    }
+    if ((lin >> 12) < X86_PGD_PAGES) {
+        int64_t d = write ? c->pgd_w[lin >> 12] : c->pgd_r[lin >> 12];
+        if (!(d & 1)) return x86_tlb_from_pgd(c, lin);
     }
     return x86_page_walk(c, lin, write);
 }

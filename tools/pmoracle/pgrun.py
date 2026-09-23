@@ -32,10 +32,18 @@ def qemu(img):
         return open(out, encoding="latin-1").read()
 
 def ours(img, extra):
-    r = subprocess.run([os.path.join(ROOT, "dos-monster"), "-W", "-m", "386", "-T", "20",
-                        *extra, "-boot", img],
-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-    return r.stdout.decode("latin-1")
+    # stdin stays an open, empty pipe: end of input would feed the guest a
+    # Ctrl-Z, and its keyboard interrupt would land in a slow -V run
+    p = subprocess.Popen([os.path.join(ROOT, "dos-monster"), "-W", "-m", "386", "-T", "60",
+                          *extra, "-boot", img],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        out = p.stdout.read()
+        p.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        p.kill(); out = b""
+    p.stdin.close()
+    return out.decode("latin-1")
 
 def main():
     args = sys.argv[1:]

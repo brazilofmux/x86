@@ -92,7 +92,9 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_SEG16          (1ull << 51)
 #define KEY_V86            (1ull << 52)   /* virtual-8086 mode: real-mode-shaped code at CPL 3 */
 #define KEY_IOPL3          (1ull << 53)   /* V86 at IOPL 3: CLI/STI/PUSHF behave as in real mode */
-#define KEY_PAGED          (1ull << 54)   /* V86 under paging: memory through cpu->pgd_r/pgd_w */   /* 16-bit CS and SS, expand-up data segments: real-mode-shaped code with limits (dbt_seg16_ok) */
+#define KEY_PAGED          (1ull << 54)   /* under paging: V86 through cpu->pgd_r/pgd_w, flat PM through cpu->tlb */
+#define KEY_ESNULL         (1ull << 55)   /* flat, but ES is null (a monitor entered from V86): ES accesses are the interpreter's */
+#define KEY_DSNULL         (1ull << 56)   /* ...and the same for DS */   /* 16-bit CS and SS, expand-up data segments: real-mode-shaped code with limits (dbt_seg16_ok) */
 
 static inline uint64_t dbt_key(uint32_t cs_sel, uint32_t lin) { return ((uint64_t)cs_sel << 32) | lin; }
 static inline uint32_t dbt_key_lin(uint64_t key) { return (uint32_t)key; }
@@ -207,14 +209,18 @@ typedef struct {
     uint64_t jit_block_entries;
     uint64_t smc_invalidations;
     uint64_t a20_flushes;
-    uint8_t  v86_code_page[X86_PGD_PAGES];   /* paged V86 blocks were translated on this linear page... */
-    uint16_t v86_code_phys[X86_PGD_PAGES];   /* ...which was then mapped to this physical page */
-    /* A remapped code page (UMB code): the block keys are linear, the code
-     * bitmap and every SMC report physical. phys_alias[physical page] is
-     * the linear page + 1 whose blocks a store there must also sweep. One
-     * alias per physical page; a second linear page onto the same one is
-     * not translated. */
-    uint16_t phys_alias[X86_MEM_SIZE >> 12];
+    /* Code pages paged blocks were translated on (V86 or flat protected
+     * mode), with the physical page each mapped to then: a TLB flush
+     * re-peeks them and drops the blocks of any that moved. */
+#define DBT_PCODE_MAX 512
+    struct { uint32_t lin_page, phys_page; uint8_t user; } pcode[DBT_PCODE_MAX];
+    uint32_t n_pcode;
+    /* A remapped code page (UMB code, a memory manager mapped high): the
+     * block keys are linear, the code bitmap and every SMC report
+     * physical. phys_alias[physical page] is the linear page + 1 whose
+     * blocks a store there must also sweep. One alias per physical page;
+     * a second linear page onto the same one is not translated. */
+    uint32_t phys_alias[X86_MEM_SIZE >> 12];
     uint64_t smc_hot_refusals;      /* blocks ended before a patched instruction */
     uint64_t tlb_flushes;           /* TLB flushes seen (CR3, PG, A20)... */
     uint64_t tlb_page_drops;        /* ...and code pages whose blocks went because the page moved */
@@ -300,6 +306,7 @@ void dbt_clear_code_bits(x86_cpu *cpu);                   /* forget translations
 void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
 void dbt_a20_changed(x86_cpu *cpu, int on);
 void             dbt_tlb_flushed(x86_cpu *cpu);
+int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user);
 
 /* Backend hooks (dbt_a64.c) */
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key);
@@ -354,9 +361,16 @@ extern int dbt_seg16_enabled;   /* X86_NO_SEG16 clears it: segmented 16-bit PM b
 static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
     if (!c->pmode) return 0;
     uint64_t b = KEY_PMODE | (c->seg[S_CS].big ? KEY_BIG : 0);
-    if (dbt_seg_flat(&c->seg[S_CS], 1) && dbt_seg_flat(&c->seg[S_DS], 0)
-        && dbt_seg_flat(&c->seg[S_ES], 0) && dbt_seg_flat(&c->seg[S_SS], 0))
-        b |= KEY_FLAT;
+    /* Flat: CS and SS flat, DS and ES flat or null — entering a monitor
+     * from V86 mode nulls DS/ES/FS/GS, and its handler addresses through
+     * SS until it loads its own (KEY_DSNULL/KEY_ESNULL: accesses through
+     * a null one are the interpreter's #GP). */
+    if (dbt_seg_flat(&c->seg[S_CS], 1) && dbt_seg_flat(&c->seg[S_SS], 0)
+        && (dbt_seg_flat(&c->seg[S_DS], 0) || !c->seg[S_DS].usable)
+        && (dbt_seg_flat(&c->seg[S_ES], 0) || !c->seg[S_ES].usable)) {
+        b |= KEY_FLAT | (c->seg[S_ES].usable ? 0 : KEY_ESNULL) | (c->seg[S_DS].usable ? 0 : KEY_DSNULL);
+        if (c->cr0 & X86_CR0_PG) b |= KEY_PAGED;
+    }
     else if (dbt_seg16_enabled && dbt_seg16_ok(c))
         b |= KEY_SEG16;
     return b;

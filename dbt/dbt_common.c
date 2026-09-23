@@ -402,12 +402,14 @@ int dbt_run(x86_dbt *dbt) {
          * never clears the inhibit). The interpreter runs that one
          * instruction: it clears the inhibit, or renews it, exactly; the
          * poll above saw it and delivered nothing. */
-        /* Paged protected-mode code (the memory manager's own) is the
+        /* Paged protected-mode code is translated when it is flat (a
+         * memory manager's ring 0: KEY_FLAT | KEY_PAGED), else the
          * interpreter's; V86 code, paged or not, is translated as
          * real-mode-shaped blocks (KEY_V86). RF lasts one instruction,
          * which the interpreter runs and clears. */
         int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF)
-                     || ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM));   /* paged PM: the interpreter's */
+                     || ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM)
+                         && !(dbt_cpu_mode_bits(cpu) & KEY_FLAT));        /* paged PM that is not flat: the interpreter's */
         x86_block_entry *be = inhibited ? NULL : dbt_cache_lookup(dbt, key);
         uint8_t *code = be ? be->code : NULL;
         if (!be && !inhibited) {
