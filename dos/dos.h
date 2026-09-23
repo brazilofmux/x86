@@ -49,6 +49,7 @@ typedef struct {
     uint8_t  mode;           /* open mode byte */
     uint8_t  drive;
     uint16_t owner_psp;
+    int      refs;           /* job-file-table slots (any PSP) that name this entry */
     char     path[DOS_MAX_PATH];
 } dos_handle;
 
@@ -97,6 +98,8 @@ int  dos_load_program(x86_cpu *cpu, const char *host_path, const char *dos_name,
  * error code. */
 int  dos_exec(x86_cpu *cpu, const char *dos_path, int mode, uint16_t pblk_seg, uint16_t pblk_off);
 uint16_t dos_mem_alloc(uint16_t paras, uint16_t owner, uint16_t *largest);
+void dos_jft_inherit(x86_cpu *c, uint16_t psp);   /* a new PSP copied its parent's JFT: count the references */
+void dos_jft_release(x86_cpu *c, uint16_t psp);   /* a PSP is going away: drop every slot it holds */
 int  dos_mem_free(uint16_t seg);
 int  dos_mem_resize(uint16_t seg, uint16_t paras, uint16_t *largest);
 void dos_mem_free_owner(uint16_t owner);

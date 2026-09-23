@@ -98,15 +98,71 @@ static void buffered_input(x86_cpu *c) {
 }
 
 /* ---- Handles ------------------------------------------------------------- */
+/* Handles are what DOS makes them: an index into the current PSP's job
+ * file table (20 bytes at PSP:18h by default; count at :32h, far pointer
+ * at :34h, both a program may change — INT 21h 67h, or by hand), each
+ * byte naming a system file table entry (dos.handles[]) or FFh. Programs
+ * do rearrange the table themselves: Micro Focus's run-time moves the
+ * file it just opened up to slot 19 to keep the low handles free, and
+ * reads through 19 from then on. Children inherit a copy, so an entry
+ * counts its references and closes on the last. */
+static uint16_t jft_base(x86_cpu *c, uint16_t psp, uint16_t *seg, uint16_t *off) {
+    *off = pc_rd16(c, psp, 0x34); *seg = pc_rd16(c, psp, 0x36);
+    return pc_rd16(c, psp, 0x32);
+}
+static int jft_get(x86_cpu *c, uint16_t psp, int h) {
+    uint16_t seg, off, n = jft_base(c, psp, &seg, &off);
+    if (h < 0 || h >= (int)n) return -1;
+    return pc_rd8(c, seg, (uint16_t)(off + h));
+}
+static void jft_set(x86_cpu *c, uint16_t psp, int h, int sft) {
+    uint16_t seg, off; jft_base(c, psp, &seg, &off);
+    pc_wr8(c, seg, (uint16_t)(off + h), (uint8_t)sft);
+}
+static int sft_of(x86_cpu *c, int h) {
+    int s = jft_get(c, dos.psp, h);
+    if (s < 0 || s == 0xFF || s >= DOS_MAX_HANDLES || dos.handles[s].fd == -1) return -1;
+    return s;
+}
 static dos_handle *handle(x86_cpu *c, int h) {
-    (void)c;
-    if (h < 0 || h >= DOS_MAX_HANDLES || dos.handles[h].fd == -1) return NULL;
-    return &dos.handles[h];
+    int s = sft_of(c, h);
+    return s < 0 ? NULL : &dos.handles[s];
 }
 
-static int new_handle(void) {
-    for (int i = 5; i < DOS_MAX_HANDLES; i++) if (dos.handles[i].fd == -1) return i;
-    return -1;
+/* A free JFT slot of the current PSP paired with a free SFT entry; the
+ * slot points at the entry, whose refs start at 1. Returns the handle. */
+static int new_handle(x86_cpu *c) {
+    uint16_t seg, off, n = jft_base(c, dos.psp, &seg, &off);
+    int h = -1, s = -1;
+    for (int i = 0; i < (int)n; i++) if (pc_rd8(c, seg, (uint16_t)(off + i)) == 0xFF) { h = i; break; }
+    for (int i = 5; i < DOS_MAX_HANDLES; i++) if (dos.handles[i].fd == -1) { s = i; break; }
+    if (h < 0 || s < 0) return -1;
+    pc_wr8(c, seg, (uint16_t)(off + h), (uint8_t)s);
+    dos.handles[s].refs = 1;
+    return h;
+}
+
+/* Drop one JFT reference; the entry closes when nothing names it. */
+static void sft_release(int s) {
+    if (s < 5 || s >= DOS_MAX_HANDLES || dos.handles[s].fd == -1) return;
+    if (--dos.handles[s].refs > 0) return;
+    if (dos.handles[s].fd >= 0 && !dos.handles[s].dev) close(dos.handles[s].fd);
+    dos.handles[s].fd = -1;
+}
+
+void dos_jft_inherit(x86_cpu *c, uint16_t psp) {
+    uint16_t seg, off, n = jft_base(c, psp, &seg, &off);
+    for (int i = 0; i < (int)n; i++) {
+        int s = pc_rd8(c, seg, (uint16_t)(off + i));
+        if (s >= 5 && s < DOS_MAX_HANDLES && dos.handles[s].fd != -1) dos.handles[s].refs++;
+    }
+}
+void dos_jft_release(x86_cpu *c, uint16_t psp) {
+    uint16_t seg, off, n = jft_base(c, psp, &seg, &off);
+    for (int i = 0; i < (int)n; i++) {
+        int s = pc_rd8(c, seg, (uint16_t)(off + i));
+        if (s != 0xFF) { sft_release(s); pc_wr8(c, seg, (uint16_t)(off + i), 0xFF); }
+    }
 }
 
 static int is_device_name(const char *dos_path, uint8_t *dev) {
@@ -127,9 +183,10 @@ static int is_device_name(const char *dos_path, uint8_t *dev) {
 static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int attr) {
     (void)attr;
     trace(c, "open \"%s\" mode %d%s", dos_path, mode, create ? " create" : "");
-    int h = new_handle();
+    int h = new_handle(c);
     if (h < 0) { err(c, DE_TOO_MANY_OPEN); return; }
-    dos_handle *dh = &dos.handles[h];
+    dos_handle *dh = &dos.handles[jft_get(c, dos.psp, h)];
+#define OPEN_FAIL(e) do { jft_set(c, dos.psp, h, 0xFF); err(c, (e)); return; } while (0)
     uint8_t dev;
     if (is_device_name(dos_path, &dev)) {
         dh->fd = -2;                                  /* devices own no host fd (never close(0)!) */
@@ -141,8 +198,8 @@ static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int 
     }
     char host[DOS_MAX_PATH]; int exists, is_dir;
     int e = dos_resolve(dos_path, host, sizeof host, &exists, &is_dir);
-    if (e) { err(c, e); return; }
-    if (is_dir && exists) { err(c, DE_ACCESS_DENIED); return; }
+    if (e) OPEN_FAIL(e);
+    if (is_dir && exists) OPEN_FAIL(DE_ACCESS_DENIED);
     int flags;
     switch (mode & 7) {
     case 0: flags = O_RDONLY; break;
@@ -150,17 +207,18 @@ static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int 
     default: flags = O_RDWR; break;
     }
     if (create == 1) flags = O_RDWR | O_CREAT | O_TRUNC;
-    else if (create == 2) { if (exists) { err(c, DE_FILE_EXISTS); return; } flags = O_RDWR | O_CREAT | O_EXCL; }
-    else if (!exists) { err(c, DE_FILE_NOT_FOUND); return; }
+    else if (create == 2) { if (exists) OPEN_FAIL(DE_FILE_EXISTS); flags = O_RDWR | O_CREAT | O_EXCL; }
+    else if (!exists) OPEN_FAIL(DE_FILE_NOT_FOUND);
     int fd = open(host, flags, 0644);
     if (fd < 0 && (flags & O_ACCMODE) != O_RDONLY && errno == EACCES) fd = open(host, O_RDONLY);
-    if (fd < 0) { err(c, dos_errno()); return; }
+    if (fd < 0) OPEN_FAIL(dos_errno());
     dh->fd = fd; dh->dev = 0; dh->binary = 1; dh->mode = (uint8_t)mode; dh->owner_psp = dos.psp;
     dh->drive = (uint8_t)dos_path_drive(dos_path);
     snprintf(dh->path, sizeof dh->path, "%s", host);
     if (pc.debug) trace(c, "open %s (%s) mode %02X create %d → %d", dos_path, host, mode, create, h);
     SET_AX(h); ok(c);
 }
+#undef OPEN_FAIL
 
 static void do_read(x86_cpu *c, int h, uint32_t lin, uint16_t len) {
     dos_handle *dh = handle(c, h);
@@ -406,9 +464,10 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x3C: get_path(c, P_DS(DX), path, sizeof path); do_open(c, path, 2, 1, CX); break;
     case 0x3D: get_path(c, P_DS(DX), path, sizeof path); do_open(c, path, AL, 0, 0); break;
     case 0x3E: {
-        dos_handle *dh = handle(c, BX);
-        if (!dh) { err(c, DE_INVALID_HANDLE); break; }
-        if (BX >= 5) { if (dh->fd >= 0 && !dh->dev) close(dh->fd); dh->fd = -1; }
+        int s = sft_of(c, BX);
+        if (s < 0) { err(c, DE_INVALID_HANDLE); break; }
+        jft_set(c, dos.psp, BX, 0xFF);
+        sft_release(s);
         ok(c);
         break;
     }
@@ -485,24 +544,26 @@ void dos_int21(x86_cpu *c, int vector) {
         }
         break;
     }
-    case 0x45: {
-        dos_handle *dh = handle(c, BX);
-        if (!dh) { err(c, DE_INVALID_HANDLE); break; }
-        int h = new_handle();   /* 45h dup */
+    case 0x45: {                                     /* dup: a new slot naming the same entry (shared position) */
+        int s = sft_of(c, BX);
+        if (s < 0) { err(c, DE_INVALID_HANDLE); break; }
+        uint16_t seg, off, n = jft_base(c, dos.psp, &seg, &off);
+        int h = -1;
+        for (int i = 0; i < (int)n; i++) if (pc_rd8(c, seg, (uint16_t)(off + i)) == 0xFF) { h = i; break; }
         if (h < 0) { err(c, DE_TOO_MANY_OPEN); break; }
-        dos.handles[h] = *dh;
-        if (!dh->dev) { dos.handles[h].fd = dup(dh->fd); }
+        jft_set(c, dos.psp, h, s);
+        if (s >= 5) dos.handles[s].refs++;
         SET_AX(h); ok(c);
         break;
     }
-    case 0x46: {
-        dos_handle *dh = handle(c, BX);
-        int t = CX;
-        if (!dh || t < 0 || t >= DOS_MAX_HANDLES) { err(c, DE_INVALID_HANDLE); break; }
+    case 0x46: {                                     /* force dup: CX names the entry BX does */
+        int s = sft_of(c, BX), t = CX;
+        if (s < 0 || jft_get(c, dos.psp, t) < 0) { err(c, DE_INVALID_HANDLE); break; }
         if (t != (int)BX) {
-            if (dos.handles[t].fd >= 0 && t >= 5 && !dos.handles[t].dev) close(dos.handles[t].fd);
-            dos.handles[t] = *dh;
-            if (!dh->dev) dos.handles[t].fd = dup(dh->fd);
+            int old = jft_get(c, dos.psp, t);
+            if (old != 0xFF) sft_release(old);
+            jft_set(c, dos.psp, t, s);
+            if (s >= 5) dos.handles[s].refs++;
         }
         ok(c);
         break;
@@ -633,7 +694,17 @@ void dos_int21(x86_cpu *c, int vector) {
         } else err(c, DE_INVALID_FN);
         break;
     case 0x66: if (AL == 1) { SET_BX(437); SET_DX(437); ok(c); } else ok(c); break;
-    case 0x67: ok(c); break;
+    case 0x67: {                                     /* set handle count: a larger JFT in a block of its own */
+        uint16_t seg, off, n = jft_base(c, dos.psp, &seg, &off);
+        if (BX <= n) { ok(c); break; }
+        uint16_t blk = dos_mem_alloc((uint16_t)((BX + 15) / 16), dos.psp, NULL);
+        if (!blk) { err(c, DE_NO_MEMORY); break; }
+        for (int i = 0; i < (int)BX; i++) pc_wr8(c, blk, (uint16_t)i, i < (int)n ? pc_rd8(c, seg, (uint16_t)(off + i)) : 0xFF);
+        pc_wr16(c, dos.psp, 0x32, BX);
+        pc_wr16(c, dos.psp, 0x34, 0); pc_wr16(c, dos.psp, 0x36, blk);
+        ok(c);
+        break;
+    }
     case 0x68: ok(c); break;
     case 0x6C: {
         get_path(c, P_DS(SI), path, sizeof path);

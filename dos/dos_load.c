@@ -121,6 +121,7 @@ void dos_init(x86_cpu *cpu, const char *root) {
     for (int i = 0; i < DOS_MAX_HANDLES; i++) dos.handles[i].fd = -1;
     for (int i = 0; i < 5; i++) {
         dos.handles[i].fd = -2;
+        dos.handles[i].refs = 1 << 20;                /* the standard devices never close */
         dos.handles[i].dev = i < 3 ? 1 : (i == 3 ? 2 : 3);
         strcpy(dos.handles[i].path, i < 3 ? "CON" : i == 3 ? "AUX" : "PRN");
     }
@@ -202,6 +203,7 @@ static void build_psp(x86_cpu *c, uint16_t psp, uint16_t parent, uint16_t env, u
     pc_wr16(c, psp, 0x2C, env);
     pc_wr16(c, psp, 0x32, 20);
     pc_wr16(c, psp, 0x34, 0x18); pc_wr16(c, psp, 0x36, psp);
+    if (parent != psp) dos_jft_inherit(c, psp);
     pc_wr16(c, psp, 0x38, 0xFFFF); pc_wr16(c, psp, 0x3A, 0xFFFF);
     pc_wr8(c, psp, 0x50, 0xCD); pc_wr8(c, psp, 0x51, 0x21); pc_wr8(c, psp, 0x52, 0xCB);
     /* FCBs from the first two args */
@@ -475,9 +477,7 @@ int dos_exec(x86_cpu *c, const char *dos_path, int mode, uint16_t pb_seg, uint16
 void dos_terminate(x86_cpu *c, int code, int keep_paras) {
     uint16_t psp = dos.psp;
     if (pc.debug) fprintf(stderr, "[dos] terminate code %d, PSP %04X (root %04X)\n", code, psp, dos.root_psp);
-    for (int i = 5; i < DOS_MAX_HANDLES; i++)
-        if (dos.handles[i].fd >= 0 && !dos.handles[i].dev && dos.handles[i].owner_psp == psp) { close(dos.handles[i].fd); dos.handles[i].fd = -1; }
-        else if (dos.handles[i].fd == -2 && dos.handles[i].owner_psp == psp) dos.handles[i].fd = -1;
+    dos_jft_release(c, psp);
     if (!keep_paras) dos_mem_free_owner(psp);
     else dos_mem_resize(psp, keep_paras, NULL);   /* TSR: keep this much of the program block */
     dos.return_code = code | (keep_paras ? 0x300 : 0);   /* 4Dh: AH = termination type */
