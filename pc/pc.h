@@ -58,8 +58,9 @@ typedef struct pc_state {
     uint64_t now_ns;                 /* clock read by the last pc_poll, for reuse */
     uint64_t blocked_ns;             /* host time spent deliberately idle (waiting on stdin, honouring a guest delay) */
     uint64_t blocked_calls;
-    const uint8_t *boot_img;         /* -boot: the raw image, served by INT 13h */
-    size_t   boot_len;
+    int booted;                      /* started from a disk image, not the HLE DOS */
+    int boot_drive;                  /* ... this one (00h, 80h) */
+    int reboot;                      /* a booted machine reset itself: POST and boot again */
     int      eof_seen;
 
     /* Timer */
@@ -77,6 +78,7 @@ typedef struct pc_state {
      * Returns nonzero if it took the exception. */
     int (*pm_exception)(x86_cpu *c, int vector);
     uint8_t       ret_mode[256];
+    uint8_t       ivt_service[256];  /* the vector points at its own stub (pc_set_service) */
 
     int returned;                    /* the running service popped its own frame */
     int (*swap_disk)(void);          /* ESC-+ : next diskette (dos layer) */
@@ -90,6 +92,8 @@ extern pc_state pc;
 /* pc_bios.c */
 void pc_init(x86_cpu *cpu, int tty_mode); /* IVT, BDA, stub segment, services */
 void pc_set_service(int vector, pc_service_fn fn, int ret_mode);
+void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted machine reboots */
+void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
 void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);
 void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
@@ -147,6 +151,12 @@ void pc_sdl_text(int on);                                 /* -w: the window show
 int  pc_sdl_window_allowed(void);                         /* a window may open (so there is a mouse to have) */
 /* pc_mouse.c: the INT 33h driver, present when a window is */
 void pc_mouse_install(x86_cpu *c);
+int  pc_disk_attach(int drive, const char *path, int readonly);   /* 00h/01h diskettes, 80h/81h fixed */
+int  pc_disk_present(int drive);
+int  pc_disk_swap(void);                                          /* ESC-+: next image of a diskette sequence */
+int  pc_disk_boot(x86_cpu *c, int drive);                          /* sector 0 to 0000:7C00 */
+void pc_disk_install(x86_cpu *c);
+void pc_mouse_reboot(x86_cpu *c);
 void pc_kbd_mouse_reporting(void);                        /* -t: the terminal reports mouse events */
 void pc_mouse_motion(int fx, int fy);                     /* pointer in a 640x480 frame */
 void pc_mouse_button(int button, int down);               /* 0 left, 1 right, 2 middle */

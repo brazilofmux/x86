@@ -384,7 +384,28 @@ void pc_video_shutdown(void) {
     active = 0;
 }
 
+/* X86_SCREEN=FILE: the text screen rewritten into FILE four times a
+ * second (whole, through a rename), for scripts that drive a program by
+ * what it shows — tools/expect.py. A test aid; unset, it costs a getenv
+ * once. */
+static void live_screen(void) {
+    static const char *path; static int checked; static uint64_t next;
+    if (!checked) { checked = 1; path = getenv("X86_SCREEN"); }
+    if (!path) return;
+    uint64_t now = pc_now_ns();
+    if (now < next) return;
+    next = now + 250000000ull;
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    pc_video_dump(pc.cpu, f);
+    fclose(f);
+    rename(tmp, path);
+}
+
 void pc_video_flush(int force) {
+    live_screen();
     if (!pc.tty_mode) { if (!force) fflush(stdout); return; }
     if (!active) tty_init();
     x86_cpu *c = pc.cpu;

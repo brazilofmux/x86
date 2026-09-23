@@ -46,6 +46,7 @@ void pc_set_trap(int offset, pc_service_fn fn, int ret_mode) {
 /* A real interrupt service: the vector gets its own stub, F000:vector. */
 void pc_set_service(int vector, pc_service_fn fn, int ret_mode) {
     pc_set_trap(vector, fn, ret_mode);
+    pc.ivt_service[vector & 0xFF] = 1;
     pc_wr16(pc.cpu, 0, (uint16_t)((vector & 0xFF) * 4), (uint16_t)(vector & 0xFF));
     pc_wr16(pc.cpu, 0, (uint16_t)((vector & 0xFF) * 4 + 2), PC_HLE_SEG);
 }
@@ -201,28 +202,6 @@ static void bios_int12(x86_cpu *c, int vector) {
 }
 
 static void a20_set(x86_cpu *c, int on);
-
-/* INT 13h AH=02, enough of it to let a boot sector load the rest of itself.
- * The image is addressed as a 1.44M floppy: 18 sectors per track, 2 heads. */
-static void bios_int13(x86_cpu *c, int vector) {
-    (void)vector;
-    if (x86_get_r8(c, R_AH) != 0x02 || !pc.boot_img) {
-        x86_set_r8(c, R_AH, 0x01);
-        c->eflags |= X86_CF;
-        return;
-    }
-    int count = x86_get_r8(c, R_AL);
-    int sector = x86_get_r8(c, R_CL) & 0x3F;                 /* 1-based */
-    long lba = ((long)x86_get_r8(c, R_CH) * 2 + x86_get_r8(c, R_DH)) * 18 + (sector - 1);
-    uint32_t dst = ((uint32_t)c->seg[S_ES].sel << 4) + x86_get_r16(c, R_BX);
-    for (long b = 0; b < (long)count * 512; b++) {
-        long off = lba * 512 + b;
-        x86_phys_wr8(c, dst + (uint32_t)b, off < (long)pc.boot_len ? pc.boot_img[off] : 0);
-    }
-    x86_set_r8(c, R_AH, 0);
-    x86_set_r8(c, R_AL, (uint8_t)count);
-    c->eflags &= ~X86_CF;
-}
 
 static void bios_int15(x86_cpu *c, int vector) {
     (void)vector;
@@ -473,30 +452,109 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         case 0xDD: a20_set(c, 0); break;
         case 0xDF: a20_set(c, 1); break;
         case 0xAD: case 0xAE: break;                                           /* keyboard disable/enable: no-op */
-        case 0xFE: fprintf(stderr, "pc: 8042 CPU reset requested; ignored\n"); break;
+        case 0xFE: pc_request_reset(c, "8042 CPU reset"); break;
         default: pc.kbc_cmd = (uint8_t)val; break;                             /* others: swallow any data byte */
         }
         break;
     case 0x60:
         if (pc.kbc_cmd == 0xD1) {
-            if (!(val & 1)) fprintf(stderr, "pc: 8042 output port reset bit cleared; ignored\n");
+            if (!(val & 1)) pc_request_reset(c, "8042 output port reset bit");
             a20_set(c, (val >> 1) & 1);
         }
         pc.kbc_cmd = 0;                          /* keyboard commands (LEDs, typematic): swallowed */
         break;
     case 0xF4:                                   /* isa-debug-exit, as QEMU offers it:
                                                   * a boot image can say it is done */
-        if (pc.boot_img) { pc.exit_requested = 1; pc.exit_code = (int)((val << 1) | 1); c->halted = 1; }
+        if (pc.booted) { pc.exit_requested = 1; pc.exit_code = (int)((val << 1) | 1); c->halted = 1; }
         break;
     case 0x92:
         a20_set(c, (val >> 1) & 1);
-        if (val & 1) fprintf(stderr, "pc: port 92h fast reset requested; ignored\n");
+        if (val & 1) pc_request_reset(c, "port 92h fast reset");
         break;
     default: break;
     }
 }
 
 /* ---- Boot -------------------------------------------------------------- */
+
+/* What POST leaves behind: the ROM's stubs and signature, an IVT with the
+ * served vectors on their own stubs and the rest on the shared dummy
+ * IRET, the reset vector, the BIOS data area. Run at power-on and again
+ * at every reboot, so it only writes. */
+static void post(x86_cpu *cpu) {
+    /* Stub segment: one IRET per vector, plus the ROM signature bytes.
+     * Like a real BIOS, every vector nobody serves points at one shared
+     * dummy IRET — the AT BIOS's own is at F000:FF53, and software knows
+     * it: DOS/4GW finds free vectors by scanning the IVT for two adjacent
+     * identical entries, and with a distinct stub per vector it scanned
+     * forever. pc_set_service gives a served vector its own stub. */
+    for (int v = 0; v < 256; v++) {
+        pc_wr8(cpu, PC_HLE_SEG, (uint16_t)v, 0xCF);
+        pc_wr16(cpu, 0, (uint16_t)(v * 4), pc.ivt_service[v] ? (uint16_t)v : PC_HLE_DUMMY_IRET);
+        pc_wr16(cpu, 0, (uint16_t)(v * 4 + 2), PC_HLE_SEG);
+    }
+    pc_wr8(cpu, PC_HLE_SEG, PC_HLE_DUMMY_IRET, 0xCF);
+    /* FFFF:0000, the reset vector: JMP F000:FFF0, which traps (TRAP_RESET) */
+    static const uint8_t jmp[5] = { 0xEA, 0xF0, 0xFF, 0x00, 0xF0 };
+    for (int i = 0; i < 5; i++) pc_wr8(cpu, 0xFFFF, (uint16_t)i, jmp[i]);
+    static const char date[] = "01/01/92";
+    for (int i = 0; i < 8; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(0xFFF5 + i), (uint8_t)date[i]);
+    pc_wr8(cpu, PC_HLE_SEG, 0xFFFE, 0xFC);       /* model: AT */
+
+    /* BIOS data area */
+    for (int i = 0; i < 0x100; i++) pc_wr8(cpu, PC_BDA_SEG, (uint16_t)i, 0);
+    pc_wr16(cpu, PC_BDA_SEG, 0x10, 0x0021);      /* equipment: 80x25 colour, 1 floppy */
+    pc_wr16(cpu, PC_BDA_SEG, 0x13, PC_CONV_KB);
+    pc_wr8 (cpu, PC_BDA_SEG, 0x17, 0x00);        /* shift flags */
+    pc_wr16(cpu, PC_BDA_SEG, 0x1A, 0x1E);        /* kbd buffer head */
+    pc_wr16(cpu, PC_BDA_SEG, 0x1C, 0x1E);        /* tail */
+    pc_wr16(cpu, PC_BDA_SEG, 0x80, 0x1E);        /* buffer start */
+    pc_wr16(cpu, PC_BDA_SEG, 0x82, 0x3E);        /* buffer end */
+    pc_wr8 (cpu, PC_BDA_SEG, 0x96, 0x10);        /* enhanced keyboard */
+}
+
+/* A CPU reset — the 8042's pulse, port 92h, a jump to FFFF:0000. A booted
+ * machine stops the run and main() reboots it (pc_reboot); under the HLE
+ * DOS there is nothing to boot, so it is reported and ignored as always. */
+void pc_request_reset(x86_cpu *c, const char *how) {
+    if (!pc.booted) { fprintf(stderr, "pc: %s requested; ignored\n", how); return; }
+    if (pc.debug) fprintf(stderr, "pc: %s: rebooting\n", how);
+    pc.reboot = 1;
+    pc.exit_requested = 1;
+    c->halted = 1;
+}
+
+#define TRAP_RESET 0xF0                  /* F000:FFF0 */
+static void reset_trap(x86_cpu *c, int vector) {
+    (void)vector;
+    pc_request_reset(c, "jump to the reset vector");
+    pc.returned = 1;
+}
+
+/* Warm boot, as the ROM does it after a reset: memory cleared, POST, the
+ * drives' tables, mode 3, the boot drive's sector one at 0000:7C00. The
+ * caller has stopped the run and flushes the translator's cache. */
+void pc_reboot(x86_cpu *c) {
+    memset(c->mem, 0, c->mem_size);
+    x86_reset(c);
+    pc.reboot = 0; pc.exit_requested = 0; pc.exit_code = 0;
+    pc.irq_pending = 0; pc.irq_in_service = 0; pc.irq9_busy = 0;
+    pc.kbc_cmd = 0; pc.kbc_out_full = 0;
+    memset(pit, 0, sizeof pit);
+    pic_mask = 0xB8;
+    post(c);
+    pc_disk_install(c);
+    pc_mouse_reboot(c);
+    pc_video_init(c);
+    pc_disk_boot(c, pc.boot_drive);
+    for (int i = 0; i < 6; i++) x86_load_seg(c, i, 0);
+    c->eip = 0x7C00;
+    c->r[R_SP] = 0x7C00;
+    c->r[R_DX] = (uint32_t)pc.boot_drive;
+    x86_set_a20(c, 1);
+    c->eflags |= X86_IF;
+}
+
 void pc_init(x86_cpu *cpu, int tty_mode) {
     memset(&pc, 0, sizeof pc);
     pc.cpu = cpu;
@@ -507,39 +565,12 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     cpu->hle = hle_dispatch;
     cpu->io_read = port_read;
     cpu->io_write = port_write;
-
-    /* Stub segment: one IRET per vector, plus the ROM signature bytes.
-     * Like a real BIOS, every vector nobody serves points at one shared
-     * dummy IRET — the AT BIOS's own is at F000:FF53, and software knows
-     * it: DOS/4GW finds free vectors by scanning the IVT for two adjacent
-     * identical entries, and with a distinct stub per vector it scanned
-     * forever. pc_set_service gives a served vector its own stub. */
-    for (int v = 0; v < 256; v++) {
-        pc_wr8(cpu, PC_HLE_SEG, (uint16_t)v, 0xCF);
-        pc_wr16(cpu, 0, (uint16_t)(v * 4), PC_HLE_DUMMY_IRET);
-        pc_wr16(cpu, 0, (uint16_t)(v * 4 + 2), PC_HLE_SEG);
-    }
-    pc_wr8(cpu, PC_HLE_SEG, PC_HLE_DUMMY_IRET, 0xCF);
-    static const char date[] = "01/01/92";
-    for (int i = 0; i < 8; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(0xFFF5 + i), (uint8_t)date[i]);
-    pc_wr8(cpu, PC_HLE_SEG, 0xFFFE, 0xFC);       /* model: AT */
-
-    /* BIOS data area */
-    pc_wr16(cpu, PC_BDA_SEG, 0x10, 0x0021);      /* equipment: 80x25 colour, 1 floppy */
-    pc_wr16(cpu, PC_BDA_SEG, 0x13, PC_CONV_KB);
-    pc_wr8 (cpu, PC_BDA_SEG, 0x17, 0x00);        /* shift flags */
-    pc_wr16(cpu, PC_BDA_SEG, 0x1A, 0x1E);        /* kbd buffer head */
-    pc_wr16(cpu, PC_BDA_SEG, 0x1C, 0x1E);        /* tail */
-    pc_wr16(cpu, PC_BDA_SEG, 0x80, 0x1E);        /* buffer start */
-    pc_wr16(cpu, PC_BDA_SEG, 0x82, 0x3E);        /* buffer end */
-    pc_wr8 (cpu, PC_BDA_SEG, 0x96, 0x10);        /* enhanced keyboard */
-    pc_wr16(cpu, PC_BDA_SEG, 0x6C, 0);
-    pc_wr16(cpu, PC_BDA_SEG, 0x6E, 0);
+    post(cpu);
+    pc_set_trap(TRAP_RESET, reset_trap, HLE_RET_IRET);
 
     pc_set_service(0x08, bios_int8, HLE_RET_IRET);
     pc_set_service(0x11, bios_int11, HLE_RET_FLAGS);
     pc_set_service(0x12, bios_int12, HLE_RET_FLAGS);
-    pc_set_service(0x13, bios_int13, HLE_RET_FLAGS);
     pc_set_service(0x15, bios_int15, HLE_RET_FLAGS);
     pc_set_service(0x1A, bios_int1a, HLE_RET_FLAGS);
     pc_set_service(0x10, pc_video_int10, HLE_RET_FLAGS);

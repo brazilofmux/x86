@@ -305,6 +305,9 @@ static void int33(x86_cpu *c, int vector) {
     }
 }
 
+/* A reboot forgets the program's handler and whatever it set. */
+void pc_mouse_reboot(x86_cpu *c) { if (m.installed) reset(c); }
+
 /* With a mouse: the driver answers INT 33h. Without one (main.c decides)
  * the vector keeps pointing at the BIOS's dummy IRET. */
 void pc_mouse_install(x86_cpu *c) {

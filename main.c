@@ -25,6 +25,9 @@ static void usage(const char *prog) {
     printf("  -m MODEL    cpu model: 86, 186, 286, 386 (default 286; DPMI clients need 386)\n");
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
+    printf("  -fda IMG    diskette image as drive 00h (also -fdb); -hda IMG fixed disk 80h (also -hdb)\n");
+    printf("  -ro         the images are read-only: the guest may write, the files never change\n");
+    printf("  -boot a|c|IMG  boot the machine from A: or C: (IMG: -fda IMG -boot a), no HLE DOS\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
     printf("  -s          print statistics on exit\n");
     printf("  -d          trace DOS and DPMI calls (-d -d: every call, with registers)\n");
@@ -220,7 +223,8 @@ int main(int argc, char **argv) {
     int mem_every = 0;          /* -M N: whole-memory -V compare every N block runs (0: the DBT default) */
     const char *root = NULL, *prog = NULL, *dump = NULL, *gdump = NULL, *drive_a = NULL, *drive_b = NULL;
     int window = -1;                         /* -w / -W; -1: a window if stdout is a terminal */
-    const char *boot_img = NULL;
+    const char *boot_img = NULL, *img_fd[2] = { 0 }, *img_hd[2] = { 0 };
+    int img_ro = 0;
     int i;
     for (i = 1; i < argc; i++) {
         if (argv[i][0] != '-' || !strcmp(argv[i], "-")) break;
@@ -247,6 +251,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-W")) window = 0;
         else if (!strcmp(argv[i], "-M") && i + 1 < argc) mem_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
+        else if (!strcmp(argv[i], "-fda") && i + 1 < argc) img_fd[0] = argv[++i];
+        else if (!strcmp(argv[i], "-fdb") && i + 1 < argc) img_fd[1] = argv[++i];
+        else if (!strcmp(argv[i], "-hda") && i + 1 < argc) img_hd[0] = argv[++i];
+        else if (!strcmp(argv[i], "-hdb") && i + 1 < argc) img_hd[1] = argv[++i];
+        else if (!strcmp(argv[i], "-ro")) img_ro = 1;
         else if (!strcmp(argv[i], "-pmring")) g_pmring = 1;
         else if (!strcmp(argv[i], "-pmstop") && i + 1 < argc) { g_pmring = 1; g_pmstop = (uint32_t)strtoul(argv[++i], NULL, 0); }
         else if (!strcmp(argv[i], "-pmtrace") && i + 1 < argc) {
@@ -259,29 +268,38 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "unknown option %s\n", argv[i]); usage(argv[0]); return 2; }
     }
     x86_cpu cpu;
+    int boot_drive = -1;
     if (boot_img) {
-        /* Boot a raw image instead of loading a DOS program: sector one at
-         * 7C00 in real mode, exactly as a BIOS would leave it. The rest of
-         * the image is served to the boot sector through INT 13h. */
-        FILE *bf = fopen(boot_img, "rb");
-        if (!bf) { perror(boot_img); return 1; }
-        static uint8_t img[1 << 20];
-        size_t n = fread(img, 1, sizeof img, bf);
-        fclose(bf);
-        if (n < 512) { fprintf(stderr, "%s: not a boot image\n", boot_img); return 1; }
+        if (!strcmp(boot_img, "a") || !strcmp(boot_img, "A")) boot_drive = 0x00;
+        else if (!strcmp(boot_img, "c") || !strcmp(boot_img, "C")) boot_drive = 0x80;
+        else { img_fd[0] = boot_img; boot_drive = 0x00; }
+    } else if (i >= argc && (img_fd[0] || img_hd[0])) {
+        boot_drive = img_fd[0] ? 0x00 : 0x80;        /* images and no program: boot them */
+    }
+    for (int k = 0; k < 2; k++) {
+        if (img_fd[k] && pc_disk_attach(k, img_fd[k], img_ro) < 0) return 1;
+        if (img_hd[k] && pc_disk_attach(0x80 | k, img_hd[k], img_ro) < 0) return 1;
+    }
+    if (boot_drive >= 0) {
+        /* Boot the machine as a BIOS would: sector one of the boot drive
+         * at 0000:7C00 in real mode, DL the drive, and everything after
+         * it through INT 13h. */
+        if (!pc_disk_present(boot_drive)) { fprintf(stderr, "-boot: no image for drive %02Xh\n", boot_drive); return 1; }
         x86_init(&cpu, model);
         pc_init(&cpu, tty);
+        pc_disk_install(&cpu);
         pc.debug = debug;
-        pc.boot_img = img;
-        pc.boot_len = n;
-        for (size_t k = 0; k < 512; k++) x86_phys_wr8(&cpu, 0x7C00 + (uint32_t)k, img[k]);
+        pc.booted = 1;
+        pc.boot_drive = boot_drive;
+        pc.swap_disk = pc_disk_swap;
+        pc_disk_boot(&cpu, boot_drive);
         x86_load_seg(&cpu, S_CS, 0);
         x86_load_seg(&cpu, S_DS, 0);
         x86_load_seg(&cpu, S_ES, 0);
         x86_load_seg(&cpu, S_SS, 0);
         cpu.eip = 0x7C00;
         cpu.r[R_SP] = 0x7C00;
-        cpu.r[R_DX] = 0;                       /* boot drive */
+        cpu.r[R_DX] = (uint32_t)boot_drive;
         x86_set_a20(&cpu, 1);                  /* SeaBIOS (the oracle's QEMU) boots with A20 on */
     } else {
         if (i >= argc) { usage(argv[0]); return 2; }
@@ -318,6 +336,7 @@ int main(int argc, char **argv) {
 
         x86_init(&cpu, model);
         pc_init(&cpu, tty);
+        pc_disk_install(&cpu);
         pc.debug = debug;
         dos_init(&cpu, root_abs);
         if (drive_a && dos_mount(0, drive_a) < 0) return 1;
@@ -353,7 +372,7 @@ int main(int argc, char **argv) {
     }
     if (strict) setenv("X86_VERIFY_STRICT", "1", 1);
 
-    pc_sdl_allow(window >= 0 ? window : isatty(1), prog ? prog : boot_img);
+    pc_sdl_allow(window >= 0 ? window : isatty(1), prog ? prog : boot_img ? boot_img : img_hd[0] ? img_hd[0] : img_fd[0]);
     pc_sdl_text(window == 1);
     /* A mouse to take input from: the window, the -t terminal's mouse
      * reports, or a script's (X86_MOUSE=1: SGR reports on stdin). */
@@ -374,9 +393,12 @@ int main(int argc, char **argv) {
         g_dbt.insn_limit = limit;
         g_dbt.poll = host_poll;
         dbt_sample_start();
-        rc = dbt_run(&g_dbt);
-    } else {
-        rc = run_interp(&cpu, limit);
+    }
+    for (;;) {
+        rc = use_jit ? dbt_run(&g_dbt) : run_interp(&cpu, limit);
+        if (rc < 0 || !pc.reboot) break;
+        pc_reboot(&cpu);                       /* the booted machine reset itself */
+        if (use_jit) { dbt_cache_invalidate_all(&g_dbt); g_dbt.shadow_stale = 1; }
     }
     uint64_t t1 = pc_now_ns();
 
@@ -388,6 +410,12 @@ int main(int argc, char **argv) {
     if (dump) {
         FILE *f = strcmp(dump, "-") ? fopen(dump, "w") : stdout;
         if (f) { pc_video_dump(&cpu, f); if (f != stdout) fclose(f); }
+    }
+    /* X86_MEMDUMP=FILE: guest memory (the first 1 MB + 64K) at exit, for
+     * disassembling where a run ended (ndisasm -o, -e) */
+    if (getenv("X86_MEMDUMP")) {
+        FILE *f = fopen(getenv("X86_MEMDUMP"), "wb");
+        if (f) { fwrite(cpu.mem, 1, cpu.mem_size < 0x110000 ? cpu.mem_size : 0x110000, f); fclose(f); }
     }
     if (gdump && pc_video_png(&cpu, gdump) < 0)
         fprintf(stderr, "-G %s: the screen is in neither a text mode nor mode 13h\n", gdump);

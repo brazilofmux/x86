@@ -1,0 +1,15 @@
+# FreeDOS 1.3 floppy-edition install onto a blank -hda image (tools/expect.py)
+# boot menu: take the default
+Select from Menu	\r
+proceed \[Y,N\]\?	y\r
+reboot now \[Y,N\]\?	y\r
+Select from Menu	\r
+proceed \[Y,N\]\?	y\r
+format your drive \[Y,N\]\?	y\r
+ready to install|proceed \[Y,N\]\?	y\r
+Insert diskette #2	\x1b+\r
+Insert diskette containing file A:.FREEDOS.024	\x1b+\r
+Insert diskette containing file A:.FREEDOS.048	\x1b+\r
+Insert diskette containing file A:.FREEDOS.072	\x1b+\r
+Insert diskette containing file A:.FREEDOS.096	\x1b+\r
+NEVER-MATCHES-show-me-the-end	
