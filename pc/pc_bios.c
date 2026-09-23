@@ -429,7 +429,9 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     case 0x64: return (uint32_t)(0x14 | (pc.kbc_out_full ? 1 : 0));   /* 8042 status: not busy; bit 0 = response ready */
     case 0x92: return (uint32_t)(c->a20_mask != 0xFFFFFu ? 2 : 0);
     case 0x3DA: {                                /* CGA status: toggle retrace bits */
-        static uint8_t t; t ^= 0x09; return t;
+        static uint8_t t; t ^= 0x09;
+        pc_vga_status_read();
+        return t;
     }
     default: return 0xFF;
     }

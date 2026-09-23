@@ -68,6 +68,24 @@ static void get_cursor(x86_cpu *c, int pg, int *row, int *col) {
 }
 static void set_cursor(x86_cpu *c, int pg, int row, int col) {
     pc_wr16(c, BDA, (uint16_t)(0x50 + pg * 2), (uint16_t)((row << 8) | col));
+    /* the displayed page's cursor is also the CRTC's, in words from the
+     * start of video memory, as a real BIOS programs it */
+    if (pg == (pc_rd8(c, BDA, 0x62) & 7))
+        pc_vga_set_cursor_pos((uint16_t)(page_off(pg) / 2 + row * cols(c) + col));
+}
+
+/* INT 10h AH=01: the cursor's start/end scan lines in CH/CL, bit 5 of CH
+ * to hide it. Like a VGA BIOS, a shape given in the CGA's 8-line terms
+ * (both lines under 8) is scaled to the loaded font's height, so the
+ * usual 0607h becomes 13-14 of 16 and 0007h a block. */
+static void cursor_shape(x86_cpu *c, uint16_t cx) {
+    int s = (cx >> 8) & 0x1F, e = cx & 0x1F, hide = (cx >> 8) & 0x20;
+    int h = pc_rd8(c, BDA, 0x85); if (!h) h = 16;
+    if (h > 8 && s < 8 && e < 8) {
+        if (e == 7) { e = h - 2; s = s >= 6 ? h - 3 : s * h / 8; }
+        else { s = s * h / 8; e = e * h / 8; }
+    }
+    pc_vga_set_cursor_shape((uint8_t)(s | hide), (uint8_t)e);
 }
 
 static uint16_t cell_off(x86_cpu *c, int pg, int row, int col) {
@@ -151,6 +169,7 @@ static void set_mode(x86_cpu *c, int mode) {
     pc_wr8(c, BDA, 0x89, 0x51);
     pc_wr8(c, BDA, 0x8A, 0x08);
     pc_vga_set_mode(c, mode);                    /* graphics state follows the mode, text or 13h */
+    pc_vga_set_cursor_pos(0);
     if (m != 0x13 && !(mode & 0x80))
         for (int i = 0; i < PC_ROWS * PC_COLS; i++)
             pc_wr16(c, PC_VIDEO_SEG, (uint16_t)(i * 2), 0x0720);
@@ -177,6 +196,7 @@ void pc_video_int10(x86_cpu *c, int vector) {
         break;
     case 0x01:
         pc_wr16(c, BDA, 0x60, x86_get_r16(c, R_CX));
+        cursor_shape(c, x86_get_r16(c, R_CX));
         break;
     case 0x02:
         set_cursor(c, bh & 7, x86_get_r8(c, R_DH), x86_get_r8(c, R_DL));
@@ -187,10 +207,14 @@ void pc_video_int10(x86_cpu *c, int vector) {
         x86_set_r16(c, R_CX, pc_rd16(c, BDA, 0x60));
         break;
     }
-    case 0x05:
+    case 0x05: {
         pc_wr8(c, BDA, 0x62, (uint8_t)(al & 7));
         pc_wr16(c, BDA, 0x4E, page_off(al & 7));
+        pc_vga_set_start((uint16_t)(page_off(al & 7) / 2));
+        int row, col; get_cursor(c, al & 7, &row, &col);
+        set_cursor(c, al & 7, row, col);              /* the new page's cursor into the CRTC */
         break;
+    }
     case 0x06: case 0x07:
         scroll(c, pg, ah == 0x06, al, x86_get_r8(c, R_CH), x86_get_r8(c, R_CL),
                x86_get_r8(c, R_DH), x86_get_r8(c, R_DL), (uint8_t)bh);
@@ -219,12 +243,75 @@ void pc_video_int10(x86_cpu *c, int vector) {
         x86_set_r8(c, R_AH, (uint8_t)cols(c));
         x86_set_r8(c, R_BH, (uint8_t)pg);
         break;
-    case 0x10:
-        if (al == 0x10 || al == 0x12 || al == 0x00 || al == 0x03) { /* palette/blink: accepted */ }
+    case 0x10: {                                   /* palette: the attribute controller and the DAC */
+        uint16_t es = c->seg[S_ES].sel, dx = x86_get_r16(c, R_DX), bx = x86_get_r16(c, R_BX);
+        uint8_t rgb[3];
+        switch (al) {
+        case 0x00: if (bl < 16) pc_vga_set_ac(bl, (uint8_t)bh); break;
+        case 0x01: pc_vga_set_ac(0x11, (uint8_t)bh); break;
+        case 0x02:
+            for (int i = 0; i < 16; i++) pc_vga_set_ac(i, pc_rd8(c, es, (uint16_t)(dx + i)));
+            pc_vga_set_ac(0x11, pc_rd8(c, es, (uint16_t)(dx + 16)));
+            break;
+        case 0x03: {                                  /* BL 0: bright backgrounds, 1: blink */
+            uint8_t m = pc_vga_get_ac(0x10);
+            pc_vga_set_ac(0x10, (uint8_t)(bl ? m | 0x08 : m & ~0x08));
+            break;
+        }
+        case 0x07: x86_set_r8(c, R_BH, pc_vga_get_ac(bl & 0x1F)); break;
+        case 0x08: x86_set_r8(c, R_BH, pc_vga_get_ac(0x11)); break;
+        case 0x09:
+            for (int i = 0; i < 16; i++) pc_wr8(c, es, (uint16_t)(dx + i), pc_vga_get_ac(i));
+            pc_wr8(c, es, (uint16_t)(dx + 16), pc_vga_get_ac(0x11));
+            break;
+        case 0x10:
+            rgb[0] = x86_get_r8(c, R_DH); rgb[1] = x86_get_r8(c, R_CH); rgb[2] = x86_get_r8(c, R_CL);
+            pc_vga_set_dac(bx, rgb);
+            break;
+        case 0x12:
+            for (int i = 0; i < (int)x86_get_r16(c, R_CX); i++) {
+                for (int k = 0; k < 3; k++) rgb[k] = pc_rd8(c, es, (uint16_t)(dx + i * 3 + k));
+                pc_vga_set_dac(bx + i, rgb);
+            }
+            break;
+        case 0x15:
+            pc_vga_get_dac(bx, rgb);
+            x86_set_r8(c, R_DH, rgb[0]); x86_set_r8(c, R_CH, rgb[1]); x86_set_r8(c, R_CL, rgb[2]);
+            break;
+        case 0x17:
+            for (int i = 0; i < (int)x86_get_r16(c, R_CX); i++) {
+                pc_vga_get_dac(bx + i, rgb);
+                for (int k = 0; k < 3; k++) pc_wr8(c, es, (uint16_t)(dx + i * 3 + k), rgb[k]);
+            }
+            break;
+        case 0x1A:
+            x86_set_r8(c, R_BL, (uint8_t)(pc_vga_get_ac(0x10) >> 7));
+            x86_set_r8(c, R_BH, pc_vga_get_ac(0x14));
+            break;
+        }
         break;
-    case 0x11:
-        if (al == 0x30) { x86_set_r16(c, R_CX, 16); x86_set_r8(c, R_DL, PC_ROWS - 1); }
+    }
+    case 0x11: {                                   /* character generator */
+        int h = 0;
+        switch (al) {
+        case 0x01: case 0x11: h = 14; break;       /* the ROM 8x14 set: 28 rows */
+        case 0x02: case 0x12: h = 8; break;        /* 8x8: 50 rows */
+        case 0x04: case 0x14: h = 16; break;       /* 8x16: 25 rows */
+        case 0x30: {
+            int ch = pc_rd8(c, BDA, 0x85);
+            x86_set_r16(c, R_CX, (uint16_t)(ch ? ch : 16));
+            x86_set_r8(c, R_DL, (uint8_t)(rows(c) - 1));
+            break;
+        }
+        }
+        if (h) {
+            pc_wr8(c, BDA, 0x85, (uint8_t)h);
+            pc_wr8(c, BDA, 0x84, (uint8_t)(400 / h - 1));
+            pc_vga_set_char_height(h);
+            cursor_shape(c, 0x0607);
+        }
         break;
+    }
     case 0x12:
         if (bl == 0x10) { x86_set_r8(c, R_BH, 0); x86_set_r8(c, R_BL, 3); x86_set_r16(c, R_CX, 0); }
         else if (bl == 0x30) x86_set_r8(c, R_AL, 0x12);

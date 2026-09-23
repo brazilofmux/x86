@@ -132,7 +132,18 @@ int  pc_kbd_raw_pending(void);
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */
 int  pc_vga_frame(x86_cpu *c, uint8_t *rgb);              /* 320x200 RGB24; -1 if not in mode 13h */
+int  pc_vga_text_frame(x86_cpu *c, uint8_t *rgb, int maxw, int maxh, int *w, int *h, unsigned frame);   /* -1 if not text */
+void pc_vga_set_cursor_pos(uint16_t words);               /* CRTC 0E/0F, as the BIOS keeps them */
+void pc_vga_set_start(uint16_t words);                    /* CRTC 0C/0D: the displayed page */
+void pc_vga_set_cursor_shape(uint8_t start, uint8_t end); /* CRTC 0A/0B */
+void pc_vga_set_char_height(int h);                       /* CRTC 09 */
+uint8_t pc_vga_get_ac(int i);
+void pc_vga_set_ac(int i, uint8_t v);
+void pc_vga_get_dac(int i, uint8_t rgb[3]);
+void pc_vga_set_dac(int i, const uint8_t rgb[3]);
+void pc_vga_status_read(void);                            /* port 3DAh read: resets the 3C0h flip-flop */
 void pc_sdl_allow(int on, const char *prog);              /* may a window open for graphics modes */
+void pc_sdl_text(int on);                                 /* -w: the window shows text modes too */
 void pc_sdl_poll(x86_cpu *c, uint64_t now_ns);            /* frames at 70 Hz, window events */
 void pc_sdl_shutdown(void);
 

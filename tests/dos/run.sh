@@ -17,6 +17,18 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "smcpush $mode"   tests/dos/smcpush.out ./dos-monster $mode tests/dos/smcpush.com
     check "fileio $mode"    tests/dos/fileio.out  ./dos-monster $mode -L 50000000 tests/dos/fileio.com
 done
+# The VGA text renderer (-G on a text screen: attributes, blink off, line
+# drawing, a block cursor), compared as decoded pixels; and the BIOS's
+# INT 9 translation of modified keys fed as xterm sequences.
+mkdir -p tmp
+for mode in -j -V; do
+    rm -f tmp/text.png
+    ./dos-monster -W $mode -G tmp/text.png tests/dos/text.com </dev/null >/dev/null 2>&1
+    if [ "$(python3 tests/dos/pnghash.py tmp/text.png 2>/dev/null)" = "$(cat tests/dos/text.out)" ]; then echo "ok   text render $mode"; else echo "FAIL text render $mode"; fail=1; fi
+    got=$( (printf '\033[1;5D\033[1;5C\033[1;5H\033[1;5F\033[5;5~\033[6;5~\033[1;2P\033[1;3R\033[12;5~\033[23~\033[24;2~a'; sleep 2; printf '\033') | ./dos-monster -W $mode -L 200000000 tests/dos/kbd.com 2>/dev/null | tr -d '\r')
+    if [ "$got" = "$(cat tests/dos/kbd.out)" ]; then echo "ok   kbd codes $mode"; else echo "FAIL kbd codes $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
+done
+rm -f tmp/text.png
 # The DPMI clients only make sense on a 386: one source, assembled as a
 # 16-bit client (dpmi.com) and a 32-bit one (dpmi32.com), since the host
 # shapes every gate and frame by the client's width. Each prints a line per

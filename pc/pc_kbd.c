@@ -21,7 +21,7 @@
 
 static struct termios saved_tio;
 static int raw_active;
-static uint8_t pending[64];
+static uint8_t pending[1024];                    /* big enough that a scripted burst of escape sequences is not split mid-sequence */
 static int npending;
 
 /* Scancodes for ASCII 0x20..0x7E (US layout, unshifted key). */
@@ -145,15 +145,31 @@ void pc_kbd_int9(x86_cpu *c, int vector) {
     case 0x38: flags = (uint8_t)(down ? flags | 8 : flags & ~8); pc_wr8(c, BDA, 0x17, flags); return;
     }
     if (!down || code == 0xE0) return;
+    int alt = (flags & 8) != 0, ctrl = (flags & 4) != 0, shift = (flags & 3) != 0;
     if (code >= 0x3B && code <= 0x44) {                               /* F1-F10 with modifiers */
-        int m = (flags & 8) ? 0x2D : (flags & 4) ? 0x23 : (flags & 3) ? 0x19 : 0;
+        int m = alt ? 0x2D : ctrl ? 0x23 : shift ? 0x19 : 0;
         pc_kbd_push(c, 0, (uint8_t)(code + m)); return;
     }
+    if (code == 0x57 || code == 0x58) code = (uint8_t)(0x85 + (code - 0x57));   /* F11/F12's make codes */
     if (code == 0x85 || code == 0x86) {                               /* F11/F12 */
-        int m = (flags & 8) ? 6 : (flags & 4) ? 4 : (flags & 3) ? 2 : 0;
+        int m = alt ? 6 : ctrl ? 4 : shift ? 2 : 0;
         pc_kbd_push(c, 0, (uint8_t)(code + m)); return;
     }
-    if (flags & 8) { pc_kbd_push(c, 0, code); return; }              /* Alt+key */
+    /* The enhanced keyboard's extended codes (what an AT BIOS's INT 9
+     * stores; INT 16h hands them to the program as they are): Ctrl and
+     * Alt on the navigation keys, Tab/Backspace/Enter with modifiers,
+     * Alt on the number row. Word processors live on these. */
+    if (code >= 0x47 && code <= 0x53 && code != 0x4A && code != 0x4C && code != 0x4E && (ctrl || alt)) {
+        static const uint8_t ctl[13] = { 0x77, 0x8D, 0x84, 0, 0x73, 0x8F, 0x74, 0, 0x75, 0x91, 0x76, 0x92, 0x93 };
+        static const uint8_t alc[13] = { 0x97, 0x98, 0x99, 0, 0x9B, 0,    0x9D, 0, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3 };
+        uint8_t x = alt ? alc[code - 0x47] : ctl[code - 0x47];
+        if (x) { pc_kbd_push(c, 0, x); return; }
+    }
+    if (code == 0x0F && (shift || ctrl || alt)) { pc_kbd_push(c, 0, alt ? 0xA5 : ctrl ? 0x94 : 0x0F); return; }   /* Tab */
+    if (code == 0x0E && (ctrl || alt)) { pc_kbd_push(c, alt ? 0 : 0x7F, 0x0E); return; }                      /* Backspace */
+    if (code == 0x1C && (ctrl || alt)) { pc_kbd_push(c, alt ? 0 : 0x0A, alt ? 0xA6 : 0x1C); return; }        /* Enter */
+    if (alt && code >= 0x02 && code <= 0x0D) { pc_kbd_push(c, 0, (uint8_t)(0x78 + (code - 0x02))); return; } /* Alt+1..= */
+    if (alt) { pc_kbd_push(c, 0, code); return; }                     /* Alt+key */
     if (!latched_ascii && !(code >= 0x3B && code <= 0x44) && !(code >= 0x47 && code <= 0x53) && code != 0x85 && code != 0x86 && code != 0x01) return;
     pc_kbd_push(c, latched_ascii, code);
 }
@@ -234,7 +250,7 @@ static int next_key(x86_cpu *c, int blocking) {
             case 21: fkey = 10; break; case 23: fkey = 11; break; case 24: fkey = 12; break;
             }
         }
-        if (fkey) sc = fkey <= 10 ? 0x3B + fkey - 1 : 0x85 + fkey - 11;   /* raw key code; the modifier travels separately */
+        if (fkey) sc = fkey <= 10 ? 0x3B + fkey - 1 : 0x57 + fkey - 11;   /* make codes (F11/F12: 57h/58h); the modifier travels separately */
         if (sc && mod != 1) {
             /* Shift/Ctrl/Alt + key as a keyboard sends it: the modifier's
              * make, the key, the breaks. Whoever owns INT 9 translates. */

@@ -31,8 +31,9 @@ static void usage(const char *prog) {
     printf("  -L N        stop after N instructions\n");
     printf("  -T SECS     stop after SECS seconds of wall-clock time\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
-    printf("  -G FILE     write the mode 13h screen to FILE as a PNG on exit\n");
-    printf("  -w / -W     do / do not open a window for graphics modes (default: if stdout is a terminal)\n");
+    printf("  -G FILE     write the screen (text mode, or mode 13h) to FILE as a PNG on exit\n");
+    printf("  -w          the window is the display: text modes and graphics, from the start\n");
+    printf("  -W          no window at all (default: one opens for graphics modes if stdout is a terminal)\n");
     printf("  -boot IMG   boot a disk image instead (sector 1 at 7C00; INT 13h serves the rest)\n");
     printf("  -pmtrace LO:HI  -i: dump state before each instruction in [LO,HI], QEMU -d cpu format\n");
     printf("  -pmring     -i: on the first exception, or a fetch outside memory, print the\n");
@@ -347,6 +348,7 @@ int main(int argc, char **argv) {
     if (strict) setenv("X86_VERIFY_STRICT", "1", 1);
 
     pc_sdl_allow(window >= 0 ? window : isatty(1), prog ? prog : boot_img);
+    pc_sdl_text(window == 1);
     if (g_pmtrace_hi) cpu.trace_exc = pm_trace_exc;
     else if (g_pmring) cpu.trace_exc = pmring_exc;
 
@@ -376,7 +378,7 @@ int main(int argc, char **argv) {
         if (f) { pc_video_dump(&cpu, f); if (f != stdout) fclose(f); }
     }
     if (gdump && pc_video_png(&cpu, gdump) < 0)
-        fprintf(stderr, "-G %s: the screen is not in mode 13h\n", gdump);
+        fprintf(stderr, "-G %s: the screen is in neither a text mode nor mode 13h\n", gdump);
 
     if (rc < 0) {
         fprintf(stderr, "dos-monster: run failed\n");

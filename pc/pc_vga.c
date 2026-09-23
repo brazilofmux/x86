@@ -20,8 +20,17 @@
  * not load latches — the one thing that differs, and -V would say so.
  *
  * The DAC (256 six-bit RGB entries, loaded through 3C8h/3C9h) and the CRTC
- * start address and pitch are kept for whoever draws the screen: today the
- * -G PNG writer. */
+ * start address and pitch are kept for whoever draws the screen: the
+ * window and the -G PNG writer.
+ *
+ * Text modes (pc_vga_text_frame): the cell buffer at B800 (B000 for mode
+ * 7) from the CRTC's start address, drawn as the VGA does — 9-dot cells,
+ * the ninth column repeating the eighth for the line-drawing characters
+ * C0-DF, the 8x16/8x14/8x8 font the BIOS data area says is loaded — with
+ * colours through the attribute controller's palette into the DAC,
+ * attribute bit 7 as blink or bright background per the AC mode control
+ * register, and the CRTC's cursor (location, start/end scan lines,
+ * disable bit). The BIOS keeps those registers as a real one does. */
 #include "pc.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +49,10 @@ static struct {
     int     planar;                  /* mode 13h with chain-4 off */
     uint8_t dac[256][3];
     uint8_t dac_widx, dac_wcomp, dac_ridx, dac_rcomp;
+    uint8_t ac[0x15], ac_idx, ac_flip;   /* attribute controller: 3C0h index/data flip-flop */
 } vga;
+
+extern const uint8_t pc_font8[256 * 8], pc_font14[256 * 14], pc_font16[256 * 16];
 
 static int mode13(x86_cpu *c) { return (pc_rd8(c, PC_BDA_SEG, 0x49) & 0x7F) == 0x13; }
 static int read_plane(void) { return vga.gc[4] & 3; }
@@ -158,6 +170,40 @@ static void dac_default(void) {
     memcpy(vga.dac, ega, sizeof ega);
 }
 
+/* The text modes' power-on state: the EGA 64-colour set in DAC 0-63 (bit
+ * 0/1/2 = blue/green/red at 2/3, bit 3/4/5 at 1/3 intensity), the
+ * attribute palette that picks the CGA sixteen out of it (6 is brown,
+ * 0x14; the bright eight are 0x38-0x3F), blink and line graphics on, the
+ * cursor on scan lines 13-14 of 16. */
+static void text_default(x86_cpu *c) {
+    for (int i = 0; i < 64; i++) {
+        vga.dac[i][0] = (uint8_t)((i & 4 ? 42 : 0) + (i & 32 ? 21 : 0));
+        vga.dac[i][1] = (uint8_t)((i & 2 ? 42 : 0) + (i & 16 ? 21 : 0));
+        vga.dac[i][2] = (uint8_t)((i & 1 ? 42 : 0) + (i & 8 ? 21 : 0));
+    }
+    static const uint8_t pal[16] = { 0, 1, 2, 3, 4, 5, 0x14, 7, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F };
+    memset(vga.ac, 0, sizeof vga.ac);
+    memcpy(vga.ac, pal, 16);
+    vga.ac[0x10] = 0x0C;                                  /* mode control: blink, line graphics */
+    vga.ac[0x12] = 0x0F;                                  /* colour plane enable */
+    int h = pc_rd8(c, PC_BDA_SEG, 0x85); if (!h) h = 16;
+    vga.crtc[0x09] = (uint8_t)(h - 1);                   /* maximum scan line */
+    vga.crtc[0x0A] = (uint8_t)(h - 3);                   /* cursor start */
+    vga.crtc[0x0B] = (uint8_t)(h - 2);                   /* cursor end */
+}
+
+/* ---- what the BIOS sets as it goes (INT 10h) ------------------------------ */
+void pc_vga_set_cursor_pos(uint16_t words) { vga.crtc[0x0E] = (uint8_t)(words >> 8); vga.crtc[0x0F] = (uint8_t)words; }
+void pc_vga_set_start(uint16_t words)      { vga.crtc[0x0C] = (uint8_t)(words >> 8); vga.crtc[0x0D] = (uint8_t)words; }
+void pc_vga_set_cursor_shape(uint8_t start, uint8_t end) { vga.crtc[0x0A] = start; vga.crtc[0x0B] = end; }
+void pc_vga_set_char_height(int h) { vga.crtc[0x09] = (uint8_t)((vga.crtc[0x09] & 0xE0) | ((h - 1) & 0x1F)); }
+uint8_t pc_vga_get_ac(int i) { return i < 0x15 ? vga.ac[i] : 0; }
+void pc_vga_set_ac(int i, uint8_t v) { if (i < 0x15) vga.ac[i] = v; }
+void pc_vga_get_dac(int i, uint8_t rgb[3]) { memcpy(rgb, vga.dac[i & 0xFF], 3); }
+void pc_vga_set_dac(int i, const uint8_t rgb[3]) { for (int k = 0; k < 3; k++) vga.dac[i & 0xFF][k] = rgb[k] & 0x3F; }
+/* Port 3DAh (input status 1) read: resets the 3C0h flip-flop to "index". */
+void pc_vga_status_read(void) { vga.ac_flip = 0; }
+
 /* INT 10h AH=00 lands here after the BIOS data area is set up. */
 void pc_vga_set_mode(x86_cpu *c, int mode) {
     set_planar(c, 0);
@@ -178,6 +224,8 @@ void pc_vga_set_mode(x86_cpu *c, int mode) {
             memset(c->mem + WIN, 0, 320 * 200);
             memset(vga.plane, 0, sizeof vga.plane);
         }
+    } else {
+        text_default(c);
     }
 }
 
@@ -189,6 +237,8 @@ int pc_vga_port_read(uint16_t port, uint32_t *val) {
     case 0x3CF: *val = vga.gc_idx < 9 ? vga.gc[vga.gc_idx] : 0xFF; return 1;
     case 0x3D4: *val = vga.crtc_idx; return 1;
     case 0x3D5: *val = vga.crtc_idx < sizeof vga.crtc ? vga.crtc[vga.crtc_idx] : 0xFF; return 1;
+    case 0x3C0: *val = vga.ac_idx; return 1;
+    case 0x3C1: *val = (vga.ac_idx & 0x1F) < 0x15 ? vga.ac[vga.ac_idx & 0x1F] : 0; return 1;
     case 0x3C7: *val = 0; return 1;                      /* DAC state: nobody looks */
     case 0x3C8: *val = vga.dac_widx; return 1;
     case 0x3C9:
@@ -208,6 +258,11 @@ int pc_vga_port_write(uint16_t port, uint32_t val, int size) {
     }
     uint8_t v = (uint8_t)val;
     switch (port) {
+    case 0x3C0:                                          /* index, then data, alternately */
+        if (!vga.ac_flip) vga.ac_idx = v;
+        else if ((vga.ac_idx & 0x1F) < 0x15) vga.ac[vga.ac_idx & 0x1F] = v;
+        vga.ac_flip ^= 1;
+        return 1;
     case 0x3C4: vga.seq_idx = v; return 1;
     case 0x3C5:
         vga.seq[vga.seq_idx & 7] = v;
@@ -276,26 +331,96 @@ int pc_vga_frame(x86_cpu *c, uint8_t *rgb) {
     return 0;
 }
 
+/* The screen as an 8-bit RGB PNG: mode 13h at 320x200, a text mode as
+ * the VGA draws it (720x400 for 80x25), blink and cursor in their "on"
+ * phase. 0, or -1 if neither or the file cannot be written. */
 int pc_video_png(x86_cpu *c, const char *path) {
-    enum { W = 320, H = 200 };
-    static uint8_t rgb[W * H * 3], raw[H * (1 + W * 3)];
-    if (pc_vga_frame(c, rgb) < 0) return -1;
+    enum { MW = 1188, MH = 480 };
+    static uint8_t rgb[MW * MH * 3], raw[MH * (1 + MW * 3)];
+    int W = 320, H = 200;
+    if (pc_vga_frame(c, rgb) < 0 && pc_vga_text_frame(c, rgb, MW, MH, &W, &H, 0) < 0) return -1;
     for (int y = 0; y < H; y++) {
         raw[y * (1 + W * 3)] = 0;                        /* filter: none */
-        memcpy(raw + y * (1 + W * 3) + 1, rgb + y * W * 3, W * 3);
+        memcpy(raw + y * (1 + W * 3) + 1, rgb + y * W * 3, (size_t)W * 3);
     }
-    uLongf zlen = compressBound(sizeof raw);
+    uLong rawlen = (uLong)H * (uLong)(1 + W * 3);
+    uLongf zlen = compressBound(rawlen);
     uint8_t *z = malloc(zlen);
-    if (!z || compress2(z, &zlen, raw, sizeof raw, 6) != Z_OK) { free(z); return -1; }
+    if (!z || compress2(z, &zlen, raw, rawlen, 6) != Z_OK) { free(z); return -1; }
     FILE *f = fopen(path, "wb");
     if (!f) { free(z); return -1; }
     static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
-    uint8_t ihdr[13] = { 0, 0, 1, 0x40, 0, 0, 0, 200, 8, 2, 0, 0, 0 };   /* 320x200, 8-bit RGB */
+    uint8_t ihdr[13] = { 0, 0, (uint8_t)(W >> 8), (uint8_t)W, 0, 0, (uint8_t)(H >> 8), (uint8_t)H, 8, 2, 0, 0, 0 };   /* W x H, 8-bit RGB */
     fwrite(sig, 1, 8, f);
     png_chunk(f, "IHDR", ihdr, 13);
     png_chunk(f, "IDAT", z, (uint32_t)zlen);
     png_chunk(f, "IEND", NULL, 0);
     fclose(f);
     free(z);
+    return 0;
+}
+
+/* ---- text modes ------------------------------------------------------------ */
+
+static int text_mode(x86_cpu *c) {
+    int m = pc_rd8(c, PC_BDA_SEG, 0x49) & 0x7F;
+    return m <= 3 || m == 7;
+}
+
+/* Draw the text screen into rgb (RGB24, width *w, height *h, at most
+ * maxw x maxh): 0, or -1 when the display is not in a text mode. frame
+ * counts the VGA's 70 Hz frames: the cursor blinks every 8, blinking
+ * characters every 16, as the hardware's counters do. */
+int pc_vga_text_frame(x86_cpu *c, uint8_t *rgb, int maxw, int maxh, int *w, int *h, unsigned frame) {
+    if (!text_mode(c)) return -1;
+    int mono = (pc_rd8(c, PC_BDA_SEG, 0x49) & 0x7F) == 7;
+    int cols = pc_rd16(c, PC_BDA_SEG, 0x4A); if (cols <= 0 || cols > 132) cols = 80;
+    int rows = pc_rd8(c, PC_BDA_SEG, 0x84) + 1; if (rows < 1 || rows > 60) rows = 25;
+    int ch = (vga.crtc[0x09] & 0x1F) + 1;
+    const uint8_t *font = ch <= 8 ? pc_font8 : ch <= 14 ? pc_font14 : pc_font16;
+    int fh = ch <= 8 ? 8 : ch <= 14 ? 14 : 16;
+    if (cols * 9 > maxw) cols = maxw / 9;
+    if (rows * fh > maxh) rows = maxh / fh;
+    *w = cols * 9; *h = rows * fh;
+    uint8_t lut[16][3];
+    for (int i = 0; i < 16; i++) {
+        int d = (vga.ac[i] & 0x3F) | ((vga.ac[0x14] & 0x0C) << 4);
+        for (int k = 0; k < 3; k++) { uint8_t v = vga.dac[d][k]; lut[i][k] = (uint8_t)((v << 2) | (v >> 4)); }
+    }
+    int blink_attr = (vga.ac[0x10] & 0x08) != 0, line_gfx = (vga.ac[0x10] & 0x04) != 0;
+    int blink_off = (frame >> 4) & 1, cursor_off = (frame >> 3) & 1;
+    uint32_t base = mono ? 0xB0000u : 0xB8000u;
+    uint32_t start = ((uint32_t)vga.crtc[0x0C] << 8) | vga.crtc[0x0D];
+    uint32_t cur = ((uint32_t)vga.crtc[0x0E] << 8) | vga.crtc[0x0F];
+    int cs = vga.crtc[0x0A] & 0x1F, ce = vga.crtc[0x0B] & 0x1F;
+    int cursor_on = !(vga.crtc[0x0A] & 0x20) && cs <= ce && !cursor_off;
+    int stride = *w * 3;
+    for (int r = 0; r < rows; r++)
+        for (int col = 0; col < cols; col++) {
+            uint32_t cell = start + (uint32_t)(r * cols + col);
+            uint32_t a = base + ((cell * 2) & 0x7FFF);
+            uint8_t chr = c->mem[a], at = c->mem[a + 1];
+            int fg = at & 0x0F, bg = at >> 4, hide = 0;
+            if (blink_attr) { if ((bg & 8) && blink_off) hide = 1; bg &= 7; }
+            if (mono) {                                   /* MDA attributes: 07 normal, 0F bright, 70 reverse */
+                int rev = (at & 0x77) == 0x70;
+                fg = rev ? 0 : ((at & 0x07) ? ((at & 0x08) ? 15 : 7) : 0);
+                bg = rev ? 7 : 0;
+            }
+            const uint8_t *glyph = font + chr * fh;
+            int in_cur = cursor_on && cell == cur;
+            for (int y = 0; y < fh; y++) {
+                uint8_t bits = hide ? 0 : glyph[y];
+                int cur_line = in_cur && y >= cs && y <= ce;      /* the cursor is drawn in the cell's foreground */
+                int ninth = line_gfx && chr >= 0xC0 && chr <= 0xDF ? (bits & 1) : 0;
+                if (cur_line) { bits = 0xFF; ninth = 1; }
+                uint8_t *px = rgb + (r * fh + y) * stride + col * 27;
+                for (int x = 0; x < 9; x++) {
+                    int on = x < 8 ? (bits >> (7 - x)) & 1 : ninth;
+                    const uint8_t *p = lut[on ? fg : bg];
+                    px[x * 3] = p[0]; px[x * 3 + 1] = p[1]; px[x * 3 + 2] = p[2];
+                }
+            }
+        }
     return 0;
 }

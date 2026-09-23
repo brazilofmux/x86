@@ -1,9 +1,12 @@
-/* pc_sdl.c — a window for the graphics modes, and a keyboard with key-up
+/* pc_sdl.c — a window for the display, and a keyboard with key-up
  *
- * Text mode keeps its terminal (stdio echo, or the -t painter). The first
- * time the machine enters mode 13h a window opens, 4:3 like the monitor a
- * 320x200 picture was drawn for, and from then on pc_poll hands it a frame
- * at the VGA's 70 Hz. Leaving the graphics mode hides it again.
+ * By default text mode keeps its terminal (stdio echo, or the -t painter):
+ * the first time the machine enters mode 13h a window opens, 4:3 like the
+ * monitor a 320x200 picture was drawn for, and from then on pc_poll hands
+ * it a frame at the VGA's 70 Hz; leaving the graphics mode hides it again.
+ * With -w (pc_sdl_text) the window is the display from the start: text
+ * modes too, drawn as the VGA draws them (pc_vga_text_frame: 720x400 for
+ * 80x25, blinking cursor and attributes), letterboxed to the same 4:3.
  *
  * The keyboard is the reason a terminal cannot do this job: it reports
  * keys pressed, never keys released, and a game that polls the keyboard
@@ -26,9 +29,13 @@
 #include <SDL.h>
 
 static int allowed;                          /* -w, or stdout is a terminal; -W never */
+static int text_window;                      /* -w: text modes in the window too */
 static SDL_Window *win;
 static SDL_Renderer *ren;
 static SDL_Texture *tex;
+static SDL_Texture *ttex;                    /* the text screen, tw x th */
+static int tw, th;
+static unsigned frames;                      /* 70 Hz frames: the blink counters */
 static int shown;
 static uint64_t next_frame_ns, next_title_ns, title_insns;
 static const char *title_prog = "dos-monster";
@@ -36,6 +43,7 @@ static const char *title_prog = "dos-monster";
 #define FRAME_NS (1000000000ull / 70)
 
 void pc_sdl_allow(int on, const char *prog) { allowed = on; if (prog) title_prog = prog; }
+void pc_sdl_text(int on) { text_window = on; }
 
 static int open_window(void) {
     SDL_SetMainReady();
@@ -142,7 +150,16 @@ static uint8_t ascii_for(SDL_Keycode k, uint16_t mod) {
     case SDLK_BACKSPACE: return 8;
     case SDLK_TAB: return 9;
     case SDLK_SPACE: return ' ';
+    case SDLK_KP_PLUS: return '+';
+    case SDLK_KP_MINUS: return '-';
+    case SDLK_KP_MULTIPLY: return '*';
+    case SDLK_KP_DIVIDE: return '/';
     }
+    /* the keypad's digits and point: characters with NumLock on, cursor
+     * keys (no character) with it off, as the BIOS decides */
+    if (k >= SDLK_KP_1 && k <= SDLK_KP_9) return (mod & KMOD_NUM) ? (uint8_t)('1' + (k - SDLK_KP_1)) : 0;
+    if (k == SDLK_KP_0) return (mod & KMOD_NUM) ? '0' : 0;
+    if (k == SDLK_KP_PERIOD) return (mod & KMOD_NUM) ? '.' : 0;
     if (k >= 32 && k < 127) {
         static const char plain[]   = "1234567890-=[]\\;',./`";
         static const char shifted[] = "!@#$%^&*()_+{}|:\"<>?~";
@@ -158,26 +175,49 @@ static void key(const SDL_KeyboardEvent *e, int down) {
     if (!code) return;
     uint8_t c8 = (uint8_t)(code & 0x7F);
     if (code & 0x100) pc_kbd_raw_key(0xE0, 0);
-    pc_kbd_raw_key(down ? c8 : (uint8_t)(c8 | 0x80),
-                   down && !(code & 0x100) ? ascii_for(e->keysym.sym, e->keysym.mod) : 0);
+    /* E0-prefixed keys carry a character only where the key makes one:
+     * keypad Enter and slash; the gray cursor keys make none */
+    pc_kbd_raw_key(down ? c8 : (uint8_t)(c8 | 0x80), down ? ascii_for(e->keysym.sym, e->keysym.mod) : 0);
 }
 
 /* ---- frames ---------------------------------------------------------------- */
+
+/* The text screen into ttex, (re)made at the screen's size: smooth
+ * scaling, since 720x400 into a 4:3 frame is no whole multiple and nearest
+ * would draw the strokes of a letter unevenly wide. */
+static int draw_text(x86_cpu *c) {
+    enum { MW = 1188, MH = 480 };
+    static uint8_t trgb[MW * MH * 3];
+    int w, h;
+    if (pc_vga_text_frame(c, trgb, MW, MH, &w, &h, frames) < 0) return -1;
+    if (!ttex || w != tw || h != th) {
+        if (ttex) SDL_DestroyTexture(ttex);
+        ttex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (!ttex) return -1;
+        SDL_SetTextureScaleMode(ttex, SDL_ScaleModeLinear);
+        tw = w; th = h;
+    }
+    SDL_UpdateTexture(ttex, NULL, trgb, w * 3);
+    return 0;
+}
 
 void pc_sdl_poll(x86_cpu *c, uint64_t now) {
     if (!allowed) return;
     static uint8_t rgb[320 * 200 * 3];
     if (now >= next_frame_ns) {
         next_frame_ns = now + FRAME_NS;
+        frames++;
         int graphics = pc_vga_frame(c, rgb) == 0;
-        if (graphics && !win && open_window() < 0) return;
+        int text = !graphics && text_window;
+        if ((graphics || text) && !win && open_window() < 0) return;
         if (win) {
-            if (graphics && !shown) { SDL_ShowWindow(win); shown = 1; }
-            if (!graphics && shown) { SDL_HideWindow(win); shown = 0; }
-            if (graphics) {
-                SDL_UpdateTexture(tex, NULL, rgb, 320 * 3);
+            if (text && draw_text(c) < 0) text = 0;
+            if ((graphics || text) && !shown) { SDL_ShowWindow(win); shown = 1; }
+            if (!graphics && !text && shown) { SDL_HideWindow(win); shown = 0; }
+            if (graphics) SDL_UpdateTexture(tex, NULL, rgb, 320 * 3);
+            if (graphics || text) {
                 SDL_RenderClear(ren);
-                SDL_RenderCopy(ren, tex, NULL, NULL);
+                SDL_RenderCopy(ren, graphics ? tex : ttex, NULL, NULL);
                 SDL_RenderPresent(ren);
             }
         }
@@ -212,6 +252,7 @@ void pc_sdl_shutdown(void) {
 
 #else  /* no SDL: headless */
 void pc_sdl_allow(int on, const char *prog) { (void)on; (void)prog; }
+void pc_sdl_text(int on) { (void)on; }
 void pc_sdl_poll(x86_cpu *c, uint64_t now) { (void)c; (void)now; }
 void pc_sdl_shutdown(void) {}
 #endif
