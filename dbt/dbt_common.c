@@ -62,7 +62,8 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->link_head = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));
     dbt->link_pool = calloc(LINK_POOL_SIZE, sizeof(x86_link));
     dbt->insn_pool = calloc(INSN_POOL_SIZE, sizeof(x86_insn));
-    if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool) {
+    dbt->smc_heat  = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);     /* touched only where SMC happens */
+    if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool || !dbt->smc_heat) {
         fprintf(stderr, "dbt_init: out of memory\n");
         return -1;
     }
@@ -124,6 +125,7 @@ void dbt_cleanup(x86_dbt *dbt) {
     if (dbt->shadow_live) x86_free(&dbt->shadow);
     if (dbt->cpu && dbt->cpu->device_read == dev_record) dbt->cpu->device_read = dbt->dev_read_real;
     free(dbt->devlog);
+    free(dbt->smc_heat);
     free(dbt->aux); free(dbt->span); free(dbt->link_head); free(dbt->link_pool); free(dbt->insn_pool);
     memset(dbt, 0, sizeof(*dbt));
 }
@@ -140,7 +142,9 @@ void dbt_cleanup(x86_dbt *dbt) {
  * thunk sees it and leaves the block for the run loop to deliver it. */
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
-    x86_exec_decoded(cpu, &dbt->insn_pool[insn_index]);
+    const x86_insn *in = &dbt->insn_pool[insn_index];
+    dbt->helper_by_op[in->op]++;
+    x86_exec_decoded(cpu, in);
 }
 
 /* A translated store of 1, 2 or 4 bytes (count in bits 31:28, 0 meaning
@@ -375,6 +379,10 @@ int dbt_run(x86_dbt *dbt) {
                 runs++;
 
                 int regs_ok = cpu_regs_equal(cpu, &dbt->shadow);
+                /* An OUT inside the run flipped A20: the shadow's ports are
+                 * stubs, so it did not follow. Registers are compared as is;
+                 * memory resyncs before the next check. */
+                int a20_moved = dbt->shadow.a20_mask != cpu->a20_mask;
                 /* Low memory after every run; all of it — 17 MB, too much per
                  * block — every verify_mem_every runs (-M 1 for
                  * every run, to localise a divergence the sampling found). */
@@ -382,6 +390,7 @@ int dbt_run(x86_dbt *dbt) {
                 if (mem_ok && dbt->shadow_ext && (dbt->verify_mem_every <= 1 || (runs % (uint64_t)dbt->verify_mem_every) == 0))
                     mem_ok = shadow_mem_equal(dbt, cpu->mem_size);
                 if (cpu->device_store) memcpy(dbt->shadow.mem + DEV_LO, cpu->mem + DEV_LO, DEV_HI - DEV_LO);
+                if (a20_moved) { mem_ok = 1; dbt->shadow_stale = 1; }
                 if (!regs_ok || !mem_ok) {
                     fprintf(stderr, "\n[verify] divergence after JIT run from %04X:%04X (%llu insns)\n",
                             pre.seg[S_CS].sel, pre.eip, (unsigned long long)jit_insns);
@@ -547,6 +556,18 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             (unsigned long long)dbt->links_unpatched);
     fprintf(out, "  max block bytes:        %u\n", (unsigned)dbt->max_block_bytes);
     fprintf(out, "  code used:              %u bytes, %u pooled insns\n", dbt->code_used, dbt->insn_used);
+    fprintf(out, "  helper calls by op (dynamic):");
+    for (int n = 0; n < 14; n++) {
+        int best = -1;
+        for (int i = 0; i < OP__COUNT; i++)
+            if (dbt->helper_by_op[i] && (best < 0 || dbt->helper_by_op[i] > dbt->helper_by_op[best])) best = i;
+        if (best < 0) break;
+        x86_insn tmp = { .op = (uint8_t)best };
+        char buf[64];
+        fprintf(out, " %s:%llu", x86_disasm(&tmp, buf, sizeof buf), (unsigned long long)dbt->helper_by_op[best]);
+        dbt->helper_by_op[best] = 0;
+    }
+    fprintf(out, "\n");
     fprintf(out, "  interp fallbacks by op (dynamic):");
     for (int n = 0; n < 12; n++) {
         int best = -1;

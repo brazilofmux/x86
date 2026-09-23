@@ -30,11 +30,14 @@ static void addfix(int size, int base) { A.fix[A.nfix++] = (fixup_t){ A.len, 0, 
 static void REL8(int l)  { addfix(1, A.len + 1); A.fix[A.nfix - 1].label = l; A.buf[A.len++] = 0; }
 static void REL16(int l) { addfix(2, A.len + 2); A.fix[A.nfix - 1].label = l; A.buf[A.len++] = 0; A.buf[A.len++] = 0; }
 static void ABS16(int l) { addfix(3, 0); A.fix[A.nfix - 1].label = l; A.buf[A.len++] = 0; A.buf[A.len++] = 0; }
+/* 32-bit absolute address of label + addend (flat protected mode) */
+static void ABS32(int l, int add) { addfix(4, add); A.fix[A.nfix - 1].label = l; for (int k = 0; k < 4; k++) A.buf[A.len++] = 0; }
 static void asm_finish(int org) {
     for (int i = 0; i < A.nfix; i++) {
-        int v = A.labels[A.fix[i].label] - (A.fix[i].size == 3 ? -org : A.fix[i].base);
-        if (A.fix[i].size == 1) A.buf[A.fix[i].at] = (uint8_t)v;
-        else { A.buf[A.fix[i].at] = (uint8_t)v; A.buf[A.fix[i].at + 1] = (uint8_t)(v >> 8); }
+        int sz = A.fix[i].size;
+        int v = A.labels[A.fix[i].label] - (sz == 3 ? -org : sz == 4 ? -(org + A.fix[i].base) : A.fix[i].base);
+        int n = sz == 1 ? 1 : sz == 4 ? 4 : 2;
+        for (int k = 0; k < n; k++) A.buf[A.fix[i].at + k] = (uint8_t)(v >> (8 * k));
     }
 }
 enum { L_LOOP1, L_SUB1, L_PATCH, L_LOOP2, L_SKIP, L_SUB2, L_DONE, L_L3, L_TAB, L_L4, L_L5, L_STR, L_L6 };
@@ -305,6 +308,83 @@ static int fuzz_accept_pm(const x86_insn *in) {
  * sometimes — disp32, ECX as a base — its out-of-range slow path. */
 #define CODE_PM 0x120000u
 #define DATA_PM 0x400000u
+
+/* A flat 32-bit protected-mode machine: CS/DS/ES/SS base 0, limit 4G. */
+static void pm_flat_setup(x86_cpu *cpu) {
+    x86_init(cpu, X86_MODEL_386);
+    x86_set_a20(cpu, 1);
+    cpu->pmode = 1;
+    cpu->cr0 |= 1;
+    static const uint16_t sels[6] = { 0x10, 0x08, 0x10, 0x10, 0, 0 };
+    for (int s = 0; s < 6; s++) {
+        x86_seg *g = &cpu->seg[s];
+        memset(g, 0, sizeof *g);
+        g->sel = sels[s];
+        if (!sels[s]) continue;
+        g->usable = 1;
+        g->base = 0;
+        g->limit = 0xFFFFFFFFu;
+        g->big = 1;
+        g->attr = (uint16_t)((s == S_CS ? 0x9B : 0x93) | 0xC00);
+    }
+    cpu->gdtr.base = 0x110000; cpu->gdtr.limit = 0x17;
+    cpu->eip = CODE_PM;
+}
+
+enum { P_OUTER, P_INNER, P_PATCH1, P_PATCH2 };
+/* PM program 0: R_DrawColumn's shape. Per outer pass, store a new step
+ * into the imm32 of two `add ebp, imm32` inside the inner loop, then run
+ * it. Without run-time immediates every pass invalidates and retranslates
+ * the loop. */
+static void pmprog0(void) {
+    B(0xB9, 0x2C, 0x01, 0x00, 0x00);          /* mov ecx, 300 */
+    B(0x31, 0xED);                            /* xor ebp, ebp */
+    B(0xBE, 0x00, 0x00, 0x40, 0x00);          /* mov esi, 400000h */
+    L(P_OUTER);
+    B(0x89, 0xCB);                            /* mov ebx, ecx */
+    B(0xC1, 0xE3, 0x17);                      /* shl ebx, 23 */
+    B(0xB8); ABS32(P_PATCH1, 2);              /* mov eax, patch1+2 */
+    B(0x89, 0x18);                            /* mov [eax], ebx */
+    B(0xB8); ABS32(P_PATCH2, 2);              /* mov eax, patch2+2 */
+    B(0x89, 0x18);                            /* mov [eax], ebx */
+    B(0xBA, 0x14, 0x00, 0x00, 0x00);          /* mov edx, 20 */
+    L(P_INNER);
+    B(0x89, 0xEF);                            /* mov edi, ebp */
+    L(P_PATCH1);
+    B(0x81, 0xC5, 0x11, 0x11, 0x11, 0x11);    /* add ebp, 11111111h (patched) */
+    B(0xC1, 0xEF, 0x19);                      /* shr edi, 25 */
+    B(0x01, 0x3C, 0xBE);                      /* add [esi+edi*4], edi */
+    L(P_PATCH2);
+    B(0x81, 0xC5, 0x22, 0x22, 0x22, 0x22);    /* add ebp, 22222222h (patched) */
+    B(0x4A);                                  /* dec edx */
+    B(0x75); REL8(P_INNER);                   /* jnz inner */
+    B(0xE2); REL8(P_OUTER);                   /* loop outer */
+    B(0xF4);                                  /* hlt */
+}
+
+static int run_pm_prog(int n, int stats) {
+    (void)n;
+    memset(&A, 0, sizeof A);
+    pmprog0();
+    asm_finish(CODE_PM);
+    x86_cpu cpu;
+    pm_flat_setup(&cpu);
+    cpu.r[R_SP] = DATA_PM + 0x80000;
+    memcpy(cpu.mem + CODE_PM, A.buf, A.len);
+    x86_dbt dbt;
+    if (dbt_init(&dbt, &cpu) < 0) return 1;
+    dbt.verify = 1;
+    dbt.insn_limit = 10000000;
+    int rc = dbt_run(&dbt);
+    if (stats) dbt_print_stats(&dbt, stderr);
+    printf("pm prog %d (self-patching step): %s — %llu insns, %llu SMC invalidations, %llu blocks translated\n",
+           n, rc == 0 && cpu.halted ? "OK" : "FAIL", (unsigned long long)cpu.insn_count,
+           (unsigned long long)dbt.smc_invalidations, (unsigned long long)dbt.blocks_translated);
+    int bad = rc != 0 || !cpu.halted;
+    dbt_cleanup(&dbt);
+    x86_free(&cpu);
+    return bad;
+}
 static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     rng_state = seed ? seed : 0x9E3779B97F4A7C15ull;
     uint8_t prog[2048]; int plen = 0;
@@ -333,30 +413,19 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     prog[plen++] = 0xF4;
 
     x86_cpu cpu;
-    x86_init(&cpu, X86_MODEL_386);
-    x86_set_a20(&cpu, 1);
-    cpu.pmode = 1;
-    cpu.cr0 |= 1;
-    static const uint16_t sels[6] = { 0x10, 0x08, 0x10, 0x10, 0, 0 };
-    for (int s = 0; s < 6; s++) {
-        x86_seg *g = &cpu.seg[s];
-        memset(g, 0, sizeof *g);
-        g->sel = sels[s];
-        if (!sels[s]) continue;
-        g->usable = 1;
-        g->base = 0;
-        g->limit = 0xFFFFFFFFu;
-        g->big = 1;
-        g->attr = (uint16_t)((s == S_CS ? 0x9B : 0x93) | 0xC00);
-    }
-    cpu.gdtr.base = 0x110000; cpu.gdtr.limit = 0x17;
+    pm_flat_setup(&cpu);
     for (int i = 0; i < 8; i++) cpu.r[i] = DATA_PM + (rnd() & 0xFFFFF);
+    /* Two registers into conventional memory (and sometimes the VGA
+     * window, plain memory here): the low half of the fast path. */
+    cpu.r[R_BX] = 0x20000 + (rnd() % 0x90000);
+    cpu.r[R_DI] = 0x20000 + (rnd() % 0x90000);
     cpu.r[R_CX] = rnd() & 0xFF;
     cpu.r[R_SP] = DATA_PM + 0x80000 + (rnd() & 0xFFFC);
     cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
     cpu.eip = CODE_PM;
     memcpy(cpu.mem + CODE_PM, prog, plen);
     for (uint32_t i = 0; i < 0x110000; i++) cpu.mem[DATA_PM + i] = (uint8_t)rnd();
+    for (uint32_t i = 0x20000; i < 0xC0000; i++) cpu.mem[i] = (uint8_t)rnd();
 
     if (verbose) {
         fprintf(stderr, "seed=%llu:", (unsigned long long)seed);
@@ -494,6 +563,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-P")) pm = 1;
         else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] [-P] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
     }
+    if (prog >= 0 && pm) return run_pm_prog(prog, stats);
     if (prog >= 0) return run_prog(prog, model, verify, strict, stats);
     if (fuzz) {
         int fails = 0;

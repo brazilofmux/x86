@@ -191,6 +191,7 @@ typedef struct {
     uint64_t links_created, links_patched, links_unpatched;
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
     uint64_t fallback_by_op[OP__COUNT];  /* which op the interpreter actually ran (dynamic) */
+    uint64_t helper_by_op[OP__COUNT];    /* which op helper calls ran (dynamic) — the promotion list */
     /* X86_PMPROF=1: what protected-mode code actually executes, to decide
      * what the backend learns first. Indexed [op][opsize==4][adsize==4]. */
     int      pmprof;
@@ -200,6 +201,13 @@ typedef struct {
     uint32_t *pm_hits;                  /* per 16-byte line of linear memory */
     uint32_t max_block_bytes;
     uint32_t bm_lo, bm_hi;         /* bitmap range holding CODE/DESC marks: [lo, hi) */
+    /* SMC heat: how often a store to each guest byte has invalidated
+     * translated code (saturating). A byte at SMC_VOLATILE or above is
+     * patched data living in an instruction — an immediate that code
+     * rewrites before running it (DOOM's column drawers) — and a flat
+     * block reads such an immediate from memory at run time instead of
+     * baking it in, leaving the bytes unmarked. */
+    uint8_t *smc_heat;
     uint32_t last_block_bytes;
     int      flush_pending;         /* A20 changed under running code: rewind the code buffer at the next translate */
 
@@ -231,7 +239,9 @@ void             dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code);
 void             dbt_cache_invalidate_all(x86_dbt *dbt);
 int  dbt_link_record(x86_dbt *dbt, uint64_t key, uint32_t site_off);
 void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code);
+#define SMC_VOLATILE 4
 void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end);
+void dbt_mark_block_bytes_except(x86_dbt *dbt, uint32_t start, uint32_t end, const uint32_t *skip, uint32_t nskip);
 void dbt_watch_cs_desc(x86_dbt *dbt);                     /* PM: flush if CS's descriptor is rewritten */
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys);          /* cpu->smc_hook */
 void dbt_clear_code_bits(x86_cpu *cpu);                   /* forget translations, keep device marks */

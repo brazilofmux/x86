@@ -63,9 +63,16 @@ typedef struct x86_operand {
     uint8_t  kind;
     uint8_t  reg;
     uint8_t  size;   /* bytes: 1, 2, 4; 6 for far pointer memory operands (16:32) */
-    uint8_t  pad;
+    uint8_t  imm_enc;   /* OPK_IMM read from the byte stream: X86_IMM_AT/LEN/SX; 0 if implicit */
     uint32_t imm;
 } x86_operand;
+
+/* Where an immediate came from in the instruction bytes — so the DBT can
+ * read a value that self-modifying code keeps patching from memory at run
+ * time rather than baking it into the translation. */
+#define X86_IMM_AT(e)   ((e) & 0x0F)          /* byte offset within the instruction */
+#define X86_IMM_LEN(e)  (((e) >> 4) & 0x07)   /* encoded bytes: 1, 2 or 4 */
+#define X86_IMM_SX(e)   (((e) >> 7) & 1)      /* sign-extended to the operand size */
 
 typedef struct x86_insn {
     uint8_t  len;        /* total bytes including prefixes */

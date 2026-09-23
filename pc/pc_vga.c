@@ -58,6 +58,16 @@ static void vga_store(x86_cpu *c, uint32_t p) {
     uint32_t off = p - WIN;
     pc_vga_stores++;
     uint8_t v = c->mem[p];
+    /* The common case, and DOOM's every store: write mode 0 with no
+     * rotate, logical function, set/reset or bit mask — the byte goes to
+     * each plane the map mask enables, and the window keeps showing it
+     * unless the read plane was not among them. */
+    if ((vga.gc[5] & 3) == 0 && vga.gc[3] == 0 && vga.gc[1] == 0 && vga.gc[8] == 0xFF) {
+        uint8_t mm = vga.seq[2];
+        for (int i = 0; i < 4; i++) if (mm & (1 << i)) vga.plane[i][off] = v;
+        if (!(mm & (1 << read_plane()))) c->mem[p] = vga.plane[read_plane()][off];
+        return;
+    }
     uint8_t mode = vga.gc[5] & 3, mask = vga.gc[8], func = (vga.gc[3] >> 3) & 3;
     uint8_t rot = vga.gc[3] & 7;
     uint8_t rv = (uint8_t)((v >> rot) | (v << ((8 - rot) & 7)));

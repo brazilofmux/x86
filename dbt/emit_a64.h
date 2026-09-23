@@ -1374,6 +1374,23 @@ static inline void emit_bfxil_w32(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_
     uint32_t immr = lsb & 31u, imms = (lsb + width - 1u) & 31u;
     emit_inst(e, 0x33000000u | (immr << 16) | (imms << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));
 }
+/* CMP Xn, Wm, SXTW */
+static inline void emit_cmp_x64_w32_sxtw(emit_t *e, a64_reg_t xn, a64_reg_t wm) {
+    emit_inst(e, 0xEB20C01Fu | ((uint32_t)(wm & 0x1F) << 16) | ((uint32_t)(xn & 0x1F) << 5));
+}
+
+/* CCMP Wn, #imm5, #nzcv, cond — flags = cond ? (Wn - imm5) : nzcv */
+static inline void emit_ccmp_w32_imm(emit_t *e, a64_reg_t rn, uint32_t imm5, uint32_t nzcv, a64_cond_t cond) {
+    emit_inst(e, 0x7A400800u | ((imm5 & 31u) << 16) | (((uint32_t)cond & 15u) << 12)
+                 | ((uint32_t)(rn & 0x1F) << 5) | (nzcv & 15u));
+}
+
+/* EXTR Wd, Wn, Wm, #lsb — bits lsb+31..lsb of the 64-bit Wn:Wm */
+static inline void emit_extr_w32(emit_t *e, a64_reg_t rd, a64_reg_t rn, a64_reg_t rm, uint32_t lsb) {
+    emit_inst(e, 0x13800000u | ((uint32_t)(rm & 0x1F) << 16) | ((lsb & 31u) << 10)
+                 | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));
+}
+
 /* SBFX Wd, Wn, #lsb, #width (sign-extending extract) */
 static inline void emit_sbfx_w32(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_t lsb, uint32_t width) {
     uint32_t immr = lsb & 31u, imms = (lsb + width - 1u) & 31u;

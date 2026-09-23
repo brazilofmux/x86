@@ -113,6 +113,24 @@ void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code) {
     dbt_jit_writable_end();
 }
 
+/* As dbt_mark_block_bytes, leaving out the [lo, hi) pairs in skip —
+ * immediates the block reads from memory at run time. Nothing is ever
+ * cleared here: a byte another translation baked in keeps its mark. */
+void dbt_mark_block_bytes_except(x86_dbt *dbt, uint32_t start, uint32_t end, const uint32_t *skip, uint32_t nskip) {
+    uint32_t bytes = end - start;
+    if (bytes > dbt->max_block_bytes) dbt->max_block_bytes = bytes;
+    dbt->last_block_bytes = bytes;
+    uint8_t *bm = dbt->cpu->code_bitmap;
+    for (uint32_t a = start; a < end; a++) {
+        int skipped = 0;
+        for (uint32_t k = 0; k < nskip; k++)
+            if (a >= skip[2 * k] && a < skip[2 * k + 1]) { skipped = 1; break; }
+        if (!skipped) bm[a] |= X86_BM_CODE;
+    }
+    if (start < dbt->bm_lo) dbt->bm_lo = start;
+    if (end > dbt->bm_hi) dbt->bm_hi = end;
+}
+
 void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     uint32_t bytes = end - start;
     if (bytes > dbt->max_block_bytes) dbt->max_block_bytes = bytes;
@@ -130,6 +148,7 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
  * after its covering blocks are gone, never clear it before the sweep). */
 static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
     uint32_t window = dbt->max_block_bytes;
+    if (dbt->smc_heat[phys] < 255) dbt->smc_heat[phys]++;
     for (uint32_t k = 0; k < window && k <= phys; k++) {
         uint32_t p = phys - k, slot = dbt_slot(p);
         x86_block_entry *e = &dbt->aux->cache[slot];

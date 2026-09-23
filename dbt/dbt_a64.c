@@ -346,6 +346,7 @@ static a64_reg_t seg_ptr_reg(int s) {
 }
 
 static void emit_flat_check(emit_t *e, a64_reg_t off);
+static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only);
 
 /* Flat EA: base + index << scale + disp, wrapping at 4 GB like the
  * CPU's 32-bit address arithmetic, then the range check (not for LEA,
@@ -370,7 +371,7 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
         if (disp) { emit_add_w32_imm_any(e, W_OFF, acc, disp, W_T1); acc = W_OFF; }
         ea->off = acc;
     }
-    if (in->op != OP_LEA) emit_flat_check(e, ea->off);
+    if (in->op != OP_LEA) emit_flat_check_as(e, ea->off, in->op == OP_MOV && in->ops[0].kind == OPK_MEM);
 }
 
 /* Compute the effective address. Uses W_OFF (and X_SEGP for CS/FS/GS);
@@ -454,17 +455,18 @@ static void emit_thunk_args(emit_t *e) {
 }
 
 /* ---- Flat-mode memory ----
- * A flat block addresses guest memory as R_MEM + offset. The fast path
- * covers [FLAT_LO, FLAT_LO + 16 MB) — extended memory, less its top page
- * so a dword cannot run past mem_size — with one SUBS and one TST.
- * Anything else (low memory with the VGA window and its device reads,
- * open bus) branches to an out-of-line chunk that runs the whole
- * instruction through the exec thunk and rejoins after it. Every check
- * precedes the instruction's first state change, so the helper starts
- * clean; and no access through a flat segment can fault, so neither
- * path raises. */
-#define FLAT_LO 0x10F000u
-_Static_assert(FLAT_LO + 0x1000000u + 4 <= X86_MEM_SIZE, "flat fast path must stay inside guest memory");
+ * A flat block addresses guest memory as R_MEM + offset. The fast path is
+ * everything below 16 MB — low memory, the HMA, all but the top megabyte
+ * of extended memory — less, for reads, the VGA window A0000-AFFFF, whose
+ * reads the device answers (device_read, the interpreter's). A store there
+ * is fine: it lands and the bitmap check hands the byte to the device, as
+ * the interpreter's store does. Anything else branches to an out-of-line
+ * chunk that runs the whole instruction through the exec thunk and rejoins
+ * after it. Every check precedes the instruction's first state change, so
+ * the helper starts clean; and no access through a flat segment can
+ * fault, so neither path raises. */
+#define FLAT_TOP 0x1000000u
+_Static_assert(FLAT_TOP + 4 <= X86_MEM_SIZE, "flat fast path must stay inside guest memory");
 typedef struct {
     uint32_t patch_off, back_off;
     uint32_t ip_after, n_done;
@@ -475,12 +477,25 @@ typedef struct {
 static flat_slow_t s_fslow[FLAT_SLOW_MAX];
 static uint32_t s_nfslow;
 static const x86_insn *s_cur_insn;   /* the instruction being emitted, for its slow path */
+static uint32_t s_dyn_imm_lin;       /* nonzero: read the current instruction's immediate from this linear address */
 static int s_cur_ender;
 
-static void emit_flat_check(emit_t *e, a64_reg_t off) {
+/* store_only: the instruction writes this address and never reads it,
+ * so the VGA window need not be avoided. */
+static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only) {
     if (s_nfslow >= FLAT_SLOW_MAX) { fprintf(stderr, "dbt: flat slow-path table overflow\n"); abort(); }
-    (void)emit_addsubs_w32_imm_any(e, 1, W_T3, off, FLAT_LO);
-    (void)emit_tst_w32_imm(e, W_T3, 0xFF000000u);
+    a64_cond_t slow = A64_COND_NE;
+    if (store_only) {
+        (void)emit_tst_w32_imm(e, off, ~(FLAT_TOP - 1));              /* off >= 16 MB */
+    } else {
+        /* slow if off >= 16 MB, or bits 23:16 are 0xA (the VGA window):
+         * below 16 MB the CCMP compares those bits with 0xA, above it
+         * forces Z — either hazard reads as EQ. */
+        emit_ubfx_w32(e, W_T3, off, 16, 8);
+        (void)emit_tst_w32_imm(e, off, ~(FLAT_TOP - 1));
+        emit_ccmp_w32_imm(e, W_T3, 0xA, 0x4, A64_COND_EQ);
+        slow = A64_COND_EQ;
+    }
     flat_slow_t *f = &s_fslow[s_nfslow++];
     f->patch_off = emit_pos(e);
     f->back_off = 0;
@@ -488,8 +503,9 @@ static void emit_flat_check(emit_t *e, a64_reg_t off) {
     f->n_done = s_cur_n_done;
     f->ender = s_cur_ender;
     f->in = *s_cur_insn;
-    emit_b_cond(e, A64_COND_NE, 0);
+    emit_b_cond(e, slow, 0);
 }
+static void emit_flat_check(emit_t *e, a64_reg_t off) { emit_flat_check_as(e, off, 0); }
 
 /* Post-store SMC check for the `size` bytes at host address X3: one
  * load of their bitmap entries (LDRB/LDRH/LDR — a word store that starts
@@ -605,7 +621,28 @@ static a64_reg_t emit_read_operand(emit_t *e, const x86_insn *in, int i, const e
     const x86_operand *o = &in->ops[i];
     switch (o->kind) {
     case OPK_REG:  return emit_read_reg(e, o->reg, o->size, tmp);
-    case OPK_IMM:  emit_mov_w32_imm32(e, tmp, o->imm & szmask(o->size)); return tmp;
+    case OPK_IMM:
+        if (s_dyn_imm_lin && i == 1) {
+            /* Patched immediate (see dbt->smc_heat): load it as the code
+             * is now, sign-extending an imm8 the way the decoder did. */
+            uint8_t enc = o->imm_enc;
+            emit_mov_w32_imm32(e, tmp, s_dyn_imm_lin);
+            switch (X86_IMM_LEN(enc)) {
+            case 1:
+                if (X86_IMM_SX(enc)) {
+                    emit_ldrsb_w32_reg_uxtw(e, tmp, R_MEM, tmp);
+                    (void)emit_and_w32_imm(e, tmp, tmp, szmask(o->size));
+                } else {
+                    emit_ldrb_reg_uxtw(e, tmp, R_MEM, tmp);
+                }
+                break;
+            case 2: emit_ldrh_reg_uxtw(e, tmp, R_MEM, tmp); break;
+            default: emit_ldr_w32_reg_uxtw(e, tmp, R_MEM, tmp); break;
+            }
+            return tmp;
+        }
+        emit_mov_w32_imm32(e, tmp, o->imm & szmask(o->size));
+        return tmp;
     case OPK_SREG: emit_ldrh_imm(e, tmp, R_CPU, OFF_SEG_SEL(o->reg)); return tmp;
     case OPK_MEM:  emit_read_mem(e, ea, o->size, tmp); return tmp;
     }
@@ -899,7 +936,7 @@ static void emit_shift_imm(emit_t *e, int op, int size, uint32_t cnt, a64_reg_t 
  * the scratch registers when it fires. */
 static void emit_push32_flat(emit_t *e, a64_reg_t val) {
     emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 4);
-    emit_flat_check(e, W_T2);
+    emit_flat_check_as(e, W_T2, 1);
     emit_str_w32_reg_uxtw(e, val, R_MEM, W_T2);
     emit_add_x64_w32_uxtw(e, W_T3, R_MEM, W_T2);
     emit_smc_check_x3(e, 4);
@@ -1005,6 +1042,10 @@ static int classify_pm(const x86_insn *in) {
         return C_REFUSE;
     case OP_DIV: case OP_IDIV:
         return C_HELPER;          /* #DE is a fault: the thunk's fault exit delivers it */
+    /* OUT stays a fallback: a port can halt the machine (the oracle's exit
+     * port) or reach any other host state, which the instructions after it
+     * in a block must see, and under -V the shadow's stubbed ports could not
+     * follow. As a helper it was worth ~5% of DOOM. */
     default:
         return classify_op(in) == C_REFUSE ? C_REFUSE : C_HELPER;
     }
@@ -1042,6 +1083,14 @@ static int classify_flat(const x86_insn *in) {
         return in->ops[0].size < 4 ? C_INLINE : C_HELPER;   /* the carry fold needs bit 32 */
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
         return is_shift_inline(in) ? C_INLINE : C_HELPER;
+    case OP_SHLD: case OP_SHRD:
+        /* 32-bit, immediate count 1..31: one EXTR. CL counts, zero counts
+         * and 16-bit forms (the 386's count > 16 quirk) stay helpers. */
+        return in->ops[0].size == 4 && in->imm2 != 0xFFFFFFFFu && (in->imm2 & 31) ? C_INLINE : C_HELPER;
+    case OP_IMUL:
+        return in->opcode2 == 0xAF && in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* IMUL r32, r/m32 */
+    case OP_IMUL3:
+        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
     case OP_PUSH:
         return in->opsize == 4 && in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
     case OP_POP:
@@ -1074,6 +1123,19 @@ static int op_may_fault(const x86_insn *in) {
     return 0;
 }
 
+/* Inline ops that store to guest memory. The store's SMC check can find
+ * that it patched the running block and leave it right there — an
+ * unplanned exit after the op, whose flags the next block (or the run
+ * loop) sees in full. */
+static int op_stores(const x86_insn *in) {
+    switch (in->op) {
+    case OP_PUSH: case OP_CALL: case OP_CALLF: case OP_INT: case OP_INT3: return 1;
+    case OP_CMP: case OP_TEST: case OP_LEA: return 0;
+    case OP_XCHG: return in->ea_valid;
+    default: return in->ops[0].kind == OPK_MEM;
+    }
+}
+
 static int is_uncond_ender(int op) {
     return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JMPF || op == OP_CALLF || op == OP_RETF
         || op == OP_INT || op == OP_INT3;
@@ -1097,6 +1159,10 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
         if (in->ops[1].imm & 0xFF) *wr = ARITH;
         break;
+    case OP_SHLD: case OP_SHRD:
+        *wr = ARITH; break;          /* inline only with a nonzero immediate count */
+    case OP_IMUL: case OP_IMUL3:
+        *wr = ARITH; break;
     case OP_CLC: case OP_STC: *wr = X86_CF; break;
     case OP_CMC: *wr = X86_CF; *rd = X86_CF; break;
     case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
@@ -1200,6 +1266,55 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     case OP_LEA:
         emit_write_reg(e, d->reg, d->size, ea.off);
         break;
+    case OP_SHLD: case OP_SHRD: {
+        /* CONTRACT (interp): CF = last bit out of the destination, OF =
+         * sign change of the destination, AF cleared, SZP from the result. */
+        uint32_t cnt = in->imm2 & 31;
+        int shld = in->op == OP_SHLD;
+        a64_reg_t a = emit_read_operand(e, in, 0, &ea, W_VAL);
+        a64_reg_t b = emit_read_operand(e, in, 1, &ea, W_SRC);
+        if (shld) emit_extr_w32(e, W_T0, a, b, 32 - cnt);    /* (a:b) >> (32-cnt) */
+        else      emit_extr_w32(e, W_T0, b, a, cnt);         /* (b:a) >> cnt */
+        if (fmask) {
+            emit_tst_w32(e, W_T0, W_T0);                        /* N, Z; C = V = 0 */
+            emit_flags_from_nzcv(e, T_ADD);
+            emit_ubfx_w32(e, W_T1, a, shld ? 32 - cnt : cnt - 1, 1);
+            emit_orr_w32(e, R_F, R_F, W_T1);
+            emit_eor_w32(e, W_T1, a, W_T0);
+            emit_lsr_w32_imm(e, W_T1, W_T1, 31);
+            emit_orr_w32_lsl(e, R_F, R_F, W_T1, 11);
+            if (fmask & X86_PF) emit_flag_pf(e, W_T0);
+        }
+        emit_write_operand(e, in, 0, &ea, W_T0);
+        break;
+    }
+    case OP_IMUL: case OP_IMUL3: {
+        /* 32-bit two- and three-operand IMUL. CONTRACT (interp, 386):
+         * SZP from the HIGH half of the product, AF clear, CF = OF = the
+         * product does not fit in 32 bits. */
+        a64_reg_t a, b;
+        if (in->op == OP_IMUL) {
+            a = emit_read_operand(e, in, 0, &ea, W_VAL);
+            b = emit_read_operand(e, in, 1, &ea, W_SRC);
+        } else {
+            a = emit_read_operand(e, in, 1, &ea, W_VAL);
+            emit_mov_w32_imm32(e, W_SRC, in->imm2);
+            b = W_SRC;
+        }
+        emit_smull(e, W_T0, a, b);                               /* X6 = full product */
+        if (fmask) {
+            emit_asr_x64_imm(e, W_T2, W_T0, 32);                 /* W4 = high half */
+            emit_tst_w32(e, W_T2, W_T2);
+            emit_flags_from_nzcv(e, T_ADD);                      /* SF, ZF */
+            if (fmask & X86_PF) emit_flag_pf(e, W_T2);
+            emit_cmp_x64_w32_sxtw(e, W_T0, W_T0);
+            emit_cset_w32(e, W_T2, A64_COND_NE);
+            emit_orr_w32(e, R_F, R_F, W_T2);                     /* CF */
+            emit_orr_w32_lsl(e, R_F, R_F, W_T2, 11);             /* OF */
+        }
+        emit_write_reg(e, d->reg, 4, W_T0);
+        break;
+    }
     case OP_MOVZX: case OP_MOVSX: {
         const x86_operand *s = &in->ops[1];
         a64_reg_t v;
@@ -1613,6 +1728,27 @@ static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
     return entry;
 }
 
+/* An inline op whose immediate keeps being patched (every byte of it at
+ * SMC_VOLATILE heat) reads it from memory at run time: returns the
+ * immediate's linear address, or 0 to bake it in as usual. Only ops that
+ * read the immediate as a value through emit_read_operand, and only with
+ * no memory operand — a flat memory operand has a slow path that replays
+ * the pooled decode, immediate and all. */
+static uint32_t dyn_imm_at(const x86_dbt *dbt, const x86_insn *in, uint32_t insn_lin) {
+    switch (in->op) {
+    case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
+    case OP_TEST: case OP_MOV:
+        break;
+    default:
+        return 0;
+    }
+    if (in->ea_valid || in->ops[1].kind != OPK_IMM || !in->ops[1].imm_enc) return 0;
+    uint32_t at = insn_lin + X86_IMM_AT(in->ops[1].imm_enc), n = X86_IMM_LEN(in->ops[1].imm_enc);
+    for (uint32_t k = 0; k < n; k++)
+        if (dbt->smc_heat[at + k] < SMC_VOLATILE) return 0;
+    return at;
+}
+
 /* Out-of-range paths of a flat block: the whole instruction through the
  * exec thunk, then back after its inline code — or, for a block ender
  * (already charged), on to wherever the helper left EIP. */
@@ -1662,6 +1798,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     uint32_t ip_afters[MAX_BLOCK_INSNS];
     uint8_t  cls[MAX_BLOCK_INSNS];
     uint8_t  role[MAX_BLOCK_INSNS];
+    uint32_t dyn_lin[MAX_BLOCK_INSNS];
     enum { R_PLAIN, R_UNCOND, R_COND, R_HELPER_END };
     uint32_t ip = s_flat ? cpu->eip : cpu->eip & 0xFFFF;
     uint32_t start_ip = ip;
@@ -1693,6 +1830,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         else if (s_flat && c == C_HELPER && (is_near_transfer(in->op) || loads_segment(in))) r = R_HELPER_END;
         cls[n_ops] = (uint8_t)c;
         role[n_ops] = (uint8_t)r;
+        dyn_lin[n_ops] = s_flat && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip) : 0;
         ip_afters[n_ops] = ip + in->len;
         n_ops++;
         ip += in->len;
@@ -1712,8 +1850,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             /* 286+: a limit fault is an unplanned exit whose frame holds
              * the flags, so an op that can fault observes all of them. */
             if (cpu->model >= X86_MODEL_286 && !s_flat && op_may_fault(&decs[i])) rd |= ARITH;
-            fmask[i] = live;
-            live = (live & ~wr) | rd;
+            /* A store can leave the block after the op (SMC): all live out. */
+            fmask[i] = live | (cls[i] == C_INLINE && op_stores(&decs[i]) ? ARITH : 0);
+            live = (fmask[i] & ~wr) | rd;
         }
     }
 
@@ -1771,7 +1910,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             break;
         }
         uint32_t first_slow = s_nfslow;
+        s_dyn_imm_lin = dyn_lin[i];
         emit_op(dbt, &e, in, cls[i], fmask[i]);
+        s_dyn_imm_lin = 0;
         for (uint32_t k = first_slow; k < s_nfslow; k++) s_fslow[k].back_off = emit_pos(&e);
     }
 
@@ -1802,7 +1943,14 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     __builtin___clear_cache((char *)entry, (char *)(dbt->code_buf + e.offset));
 
     uint32_t lin = dbt_key_lin(key);
-    dbt_mark_block_bytes(dbt, lin, lin + (ip - start_ip));
+    uint32_t skip[2 * MAX_BLOCK_INSNS], nskip = 0;
+    for (uint32_t i = 0; i < n_ops; i++)
+        if (dyn_lin[i]) {
+            skip[2 * nskip] = dyn_lin[i];
+            skip[2 * nskip + 1] = dyn_lin[i] + X86_IMM_LEN(decs[i].ops[1].imm_enc);
+            nskip++;
+        }
+    dbt_mark_block_bytes_except(dbt, lin, lin + (ip - start_ip), skip, nskip);
     if (s_flat) dbt_watch_cs_desc(dbt);
     return entry;
 }

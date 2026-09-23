@@ -292,10 +292,10 @@ static int fill_operand(cursor *c, x86_insn *in, x86_operand *o, int form) {
         if (c->model == X86_MODEL_286 && in->reg >= 4) return 0;
         if (o->reg >= 6) return 0;                                    /* 386: no segment register 6/7 */
         break;
-    case F_Ib:  o->kind = OPK_IMM; o->size = 1; o->imm = fetch8(c); break;
-    case F_Iw:  o->kind = OPK_IMM; o->size = 2; o->imm = fetch16(c); break;
-    case F_Iv:  o->kind = OPK_IMM; o->imm = in->opsize == 2 ? fetch16(c) : fetch32(c); break;
-    case F_Ibs: o->kind = OPK_IMM; o->imm = (int8_t)fetch8(c); if (in->opsize == 2) o->imm &= 0xFFFF; break;
+    case F_Ib:  o->kind = OPK_IMM; o->size = 1; o->imm_enc = (uint8_t)(c->pos | 1 << 4); o->imm = fetch8(c); break;
+    case F_Iw:  o->kind = OPK_IMM; o->size = 2; o->imm_enc = (uint8_t)(c->pos | 2 << 4); o->imm = fetch16(c); break;
+    case F_Iv:  o->kind = OPK_IMM; o->imm_enc = (uint8_t)(c->pos | in->opsize << 4); o->imm = in->opsize == 2 ? fetch16(c) : fetch32(c); break;
+    case F_Ibs: o->kind = OPK_IMM; o->imm_enc = (uint8_t)(c->pos | 1 << 4 | 0x80); o->imm = (int8_t)fetch8(c); if (in->opsize == 2) o->imm &= 0xFFFF; break;
     case F_1:   o->kind = OPK_IMM; o->size = 1; o->imm = 1; break;
     case F_AL:  o->kind = OPK_REG; o->reg = R_AL; o->size = 1; break;
     case F_CL:  o->kind = OPK_REG; o->reg = R_CL; o->size = 1; break;
