@@ -46,8 +46,11 @@ SF=7), so even the flag tables carry over.
 **Out (do not build toward these):**
 
 - 64-bit long mode. Never.
-- V86 mode, EMM386, Windows enhanced mode.
-- Paging. The DPMI host owns memory; guests never see a page table.
+- V86 mode and paging — **not never, later** (2026-09-23): every 386
+  memory manager (EMM386, JEMM, QEMM) runs DOS in V86 mode with paging for
+  UMBs and EMS, and Windows enhanced mode needs the same. Until that
+  campaign, booted images use HIMEMX without an EMM, and under the HLE the
+  DPMI host owns memory and guests never see a page table.
 - 16-bit PM (Windows standard mode) — maybe later.
 - **Cycle counting.** No per-instruction cycle accounting, ever. The
   pinned pending-instruction counter (already needed for interrupt
