@@ -300,7 +300,14 @@ int pc_poll(x86_cpu *c) {
     uint64_t period = irq0_period_ns();
     if (!pc.next_tick_ns) pc.next_tick_ns = pc.t0_ns + period;
     if (now >= pc.next_tick_ns) {
-        if (now - pc.next_tick_ns > 18 * period) pc.next_tick_ns = now;   /* don't storm after a stall */
+        /* Behind by more than one period (a stall, or a host too slow for
+         * the guest's rate — -V is thirty times slower): the missed ticks
+         * are dropped, as the 8259 would drop them, since it latches one
+         * IRQ 0 at most. Delivering the backlog instead came out
+         * back-to-back at consecutive polls with no guest instruction in
+         * between, and DOOM, which waits for its tick count to EQUAL
+         * start + 30, could see it jump past and spin forever. */
+        if (now - pc.next_tick_ns > period) pc.next_tick_ns = now;
         pc.irq_pending |= 1 << 8;
     }
 
