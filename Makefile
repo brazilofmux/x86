@@ -72,7 +72,7 @@ test-pm:
 
 # Paging and V86 transcript images: QEMU and dos-monster, diffed
 test-pg: $(TARGET)
-	cd tools/pmoracle && python3 pgrun.py pgtest.asm
+	cd tools/pmoracle && python3 pgrun.py pgtest.asm && python3 pgrun.py vmtest.asm
 
 test-pm-compare:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 compare.py

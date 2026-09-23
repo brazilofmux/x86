@@ -69,8 +69,11 @@ void pc_hle_return(x86_cpu *c, int mode) {
     pc.returned = 1;
     x86_load_seg(c, S_CS, cs);
     c->eip = ip;
-    if (mode == HLE_RET_IRET)
-        c->eflags = x86_flags_fixup(c, w == 4 ? fl : (c->eflags & 0xFFFF0000u) | fl);
+    if (mode == HLE_RET_IRET) {
+        uint32_t nf = w == 4 ? fl : (c->eflags & 0xFFFF0000u) | fl;
+        if (c->eflags & X86_VM) nf = (nf & ~(uint32_t)X86_IOPL) | (c->eflags & X86_IOPL);   /* V86 cannot change IOPL */
+        c->eflags = x86_flags_fixup(c, nf);
+    }
     else
         c->eflags = x86_flags_fixup(c, (c->eflags & ~(uint32_t)(X86_IF | X86_TF)) | (fl & (X86_IF | X86_TF)));
 }

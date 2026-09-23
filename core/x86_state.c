@@ -47,6 +47,7 @@ void x86_free(x86_cpu *c) {
  * processor is at CPL 0 until the first far transfer. */
 int x86_cpl(const x86_cpu *c) {
     if (!c->pmode) return 0;
+    if (c->eflags & X86_VM) return 3;                 /* virtual-8086 mode runs at CPL 3 */
     if (c->pe_window && c->seg[S_CS].sel == c->pe_cs_sel && c->seg[S_CS].base == c->pe_cs_base) return 0;
     return c->seg[S_CS].sel & 3;
 }
@@ -159,10 +160,11 @@ static void load_seg_pm(x86_cpu *c, int s, uint16_t sel) {
  * one surviving) and never for CS; the DPMI host resets its own on the
  * way down (x86_real_limits). */
 void x86_load_seg(x86_cpu *c, int s, uint16_t sel) {
-    if (c->pmode) { load_seg_pm(c, s, sel); return; }
+    if (c->pmode && !(c->eflags & X86_VM)) { load_seg_pm(c, s, sel); return; }
     c->seg[s].sel = sel;
     c->seg[s].base = (uint32_t)sel << 4;
-    if (s == S_CS || c->seg[s].limit < 0xFFFF) c->seg[s].limit = 0xFFFF;
+    /* virtual-8086 mode: every load is a 64K segment, whatever came before */
+    if (s == S_CS || c->seg[s].limit < 0xFFFF || (c->eflags & X86_VM)) c->seg[s].limit = 0xFFFF;
     c->seg[s].big = 0;
     c->seg[s].attr = 0;
     c->seg[s].usable = 1;

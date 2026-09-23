@@ -183,6 +183,9 @@ static void push_raw(x86_cpu *c, uint32_t v) {
     c->r[R_SP] = m == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
 }
 /* Vectors that push an error code. Software interrupts never do. */
+static int vec_is_fault(int v) {
+    return v == 0 || v == 5 || v == 6 || v == 7 || (v >= 10 && v <= 14) || v == 16 || v == 17;
+}
 static int vec_has_err(int v) {
     return v == 8 || (v >= 10 && v <= 14) || v == 17;
 }
@@ -204,12 +207,24 @@ static void need_iopl(x86_cpu *c) {
     if (c->pmode && x86_cpl(c) > iopl(c)) x86_fault(c, X86_EXC_GP, 0);
 }
 
+/* Protected-mode rules (descriptors, gates, privilege) apply: PE set and
+ * not virtual-8086 mode, which follows real mode's. */
+static inline int pm_rules(const x86_cpu *c) { return c->pmode && !(c->eflags & X86_VM); }
+
+/* PUSHF, POPF, INT n and IRET in virtual-8086 mode at IOPL < 3 go to the
+ * monitor as #GP(0). Returns 1 when the fault is raised. */
+static int v86_iopl_trap(x86_cpu *c) {
+    if ((c->eflags & X86_VM) && iopl(c) < 3) { x86_fault(c, X86_EXC_GP, 0); return 1; }
+    return 0;
+}
+
 /* IN, OUT, INS, OUTS. With CPL > IOPL the 386 asks the TSS's I/O permission
  * bitmap, whose offset is the word at TSS+66h: every bit covering the access
  * must be clear, and a bitmap that ends before them — or no room for one at
  * all — means #GP(0). The 286 has no bitmap. */
 int x86_io_permitted(x86_cpu *c, uint32_t port, int size) {
-    if (!c->pmode || x86_cpl(c) <= iopl(c)) return 1;
+    if (!c->pmode) return 1;
+    if (!(c->eflags & X86_VM) && x86_cpl(c) <= iopl(c)) return 1;   /* V86 always asks the bitmap */
     if (c->model < X86_MODEL_386 || !c->tr.usable || c->tr.limit < 0x67) return 0;
     uint32_t at = x86_sup_rd(c, c->tr.base, 0x66, 2) + (port >> 3);
     if (at + 1 > c->tr.limit) return 0;
@@ -225,7 +240,7 @@ static void io_check(x86_cpu *c, uint32_t port, int size) {
  * current value. (Neither faults for trying.) */
 static uint32_t flags_kept(const x86_cpu *c, int cpl) {
     if (!c->pmode) return 0;
-    uint32_t keep = 0;
+    uint32_t keep = X86_VM;                  /* only IRET from CPL 0 (or a task switch) sets VM */
     if (cpl > 0) keep |= X86_IOPL;
     if (cpl > iopl(c)) keep |= X86_IF;
     return keep;
@@ -312,8 +327,27 @@ static void push_on(x86_cpu *c, const x86_seg *ss, uint32_t *sp, int size, uint3
     c->pg_super = s;
 }
 
+/* IRET at CPL 0 with VM set in the EFLAGS image: the way into virtual-8086
+ * mode. The frame is nine dwords — EIP, CS, EFLAGS, ESP, SS, ES, DS, FS,
+ * GS — and every flag lands, since CPL 0 may set them all. Once VM is on,
+ * the segment loads are real mode's. */
+static void enter_v86(x86_cpu *c) {
+    uint32_t v[9];
+    for (int i = 0; i < 9; i++) v[i] = peek(c, 4u * (uint32_t)i, 4);
+    c->eflags = x86_flags_fixup(c, v[2] | X86_VM);
+    c->r[R_SP] = v[3];
+    x86_load_seg(c, S_CS, (uint16_t)v[1]);
+    x86_load_seg(c, S_SS, (uint16_t)v[4]);
+    x86_load_seg(c, S_ES, (uint16_t)v[5]);
+    x86_load_seg(c, S_DS, (uint16_t)v[6]);
+    x86_load_seg(c, S_FS, (uint16_t)v[7]);
+    x86_load_seg(c, S_GS, (uint16_t)v[8]);
+    c->eip = v[0];
+}
+
 /* Protected-mode interrupt and exception delivery through the IDT. */
 static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
+    int from_v86 = (c->eflags & X86_VM) != 0;
     uint32_t off = (uint32_t)vector * 8;
     if (off + 7 > c->idtr.limit) x86_fault(c, X86_EXC_GP, (off | 2));   /* IDT error codes set the IDT bit */
     uint32_t lo = x86_sup_rd(c, c->idtr.base, off, 4);
@@ -337,8 +371,15 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     int dpl = X86_AR_DPL(dattr);
     int conforming = (X86_AR_TYPE(dattr) & X86_TYPE_CONFORM) != 0;
     int newcpl = (conforming || dpl > cpl) ? cpl : dpl;
+    /* From virtual-8086 mode the handler must be ring-0 code, reached
+     * through the TSS's stack. */
+    if (from_v86 && (conforming || dpl != 0)) x86_fault(c, X86_EXC_GP, gsel & 0xFFFC);
 
     uint32_t flags = c->eflags, oldeip = c->eip;
+    /* A fault's EFLAGS image carries RF, so the handler's IRET does not
+     * re-trigger an instruction breakpoint; traps, INT n and interrupts
+     * push it as it is. */
+    if (!is_sw && c->exc_delivered && gate32 && vec_is_fault(vector)) flags |= X86_RF;
     uint16_t oldcs = c->seg[S_CS].sel, oldss = c->seg[S_SS].sel;
     uint32_t oldsp = c->r[R_SP];
     x86_seg stack = c->seg[S_SS];
@@ -353,6 +394,13 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
         if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_TS, nss & 0xFFFC);
         x86_unpack_desc(&stack, nss, slo, shi);
         sp = nsp;
+        if (from_v86) {
+            /* the real-mode segment registers go on the frame first */
+            push_on(c, &stack, &sp, gate32 ? 4 : 2, c->seg[S_GS].sel);
+            push_on(c, &stack, &sp, gate32 ? 4 : 2, c->seg[S_FS].sel);
+            push_on(c, &stack, &sp, gate32 ? 4 : 2, c->seg[S_DS].sel);
+            push_on(c, &stack, &sp, gate32 ? 4 : 2, c->seg[S_ES].sel);
+        }
         push_on(c, &stack, &sp, gate32 ? 4 : 2, oldss);
         push_on(c, &stack, &sp, gate32 ? 4 : 2, oldsp);
     }
@@ -366,6 +414,13 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
      * dword short. */
     if (vec_has_err(vector) && !is_sw && c->exc_delivered) push_on(c, &stack, &sp, gate32 ? 4 : 2, err);
 
+    if (from_v86) {
+        c->eflags &= ~(uint32_t)(X86_VM | X86_RF);
+        for (int k = 0; k < 6; k++) {                 /* and leave as null selectors */
+            if (k != S_ES && k != S_DS && k != S_FS && k != S_GS) continue;
+            c->seg[k].sel = 0; c->seg[k].base = 0; c->seg[k].limit = 0; c->seg[k].attr = 0; c->seg[k].usable = 0;
+        }
+    }
     load_cs_pm(c, gsel, newcpl);
     c->seg[S_SS] = stack;
     c->r[R_SP] = sp;
@@ -1097,9 +1152,11 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
     }
     case OP_PUSHF:
+        if (v86_iopl_trap(c)) break;
         push(c, in->opsize, in->opsize == 2 ? (c->eflags & 0xFFFF) : (c->eflags & 0x3FFFF & ~(X86_RF | X86_VM)));   /* 386: bits 18-31 push as 0 (measured) */
         break;
     case OP_POPF: {
+        if (v86_iopl_trap(c)) break;
         a = pop(c, in->opsize);
         uint32_t m = in->opsize == 2 ? 0xFFFF : 0xFFFFFFFFu;
         m &= ~flags_kept(c, x86_cpl(c));
@@ -1184,7 +1241,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             off = mrd(c, in, in->seg, ea, in->opsize);
             sel = mrd(c, in, in->seg, (ea + in->opsize) & admask(in), 2);
         }
-        if (c->pmode) { far_transfer_pm(c, (uint16_t)sel, off, in->op == OP_CALLF, in->opsize); break; }
+        if (pm_rules(c)) { far_transfer_pm(c, (uint16_t)sel, off, in->op == OP_CALLF, in->opsize); break; }
         check_target(c, off, in->opsize);        /* real mode: the new CS has the same 64K limit */
         if (in->op == OP_CALLF) {
             push(c, in->opsize, c->seg[S_CS].sel);
@@ -1201,7 +1258,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         set_ip(c, a, in->opsize);
         break;
     case OP_RETF: {
-        if (c->pmode) {
+        if (pm_rules(c)) {
             uint32_t imm = in->ops[0].kind == OPK_IMM ? in->ops[0].imm : 0;
             uint32_t nip = return_pm(c, in->opsize, 0, imm);
             c->eip = in->opsize == 2 ? (nip & 0xFFFF) : nip;
@@ -1217,6 +1274,25 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
     }
     case OP_IRET:
+        if (c->eflags & X86_VM) {
+            /* In virtual-8086 mode IRET is IOPL-sensitive; at IOPL 3 it is
+             * the real-mode IRET, except that IOPL and VM stay as they are. */
+            if (v86_iopl_trap(c)) break;
+            check_target(c, peek(c, 0, in->opsize), in->opsize);
+            peek(c, 2 * in->opsize, in->opsize);
+            a = pop(c, in->opsize);
+            b = pop(c, in->opsize);
+            uint32_t f = pop(c, in->opsize);
+            uint32_t m = (in->opsize == 2 ? 0xFFFF : 0xFFFFFFFFu) & ~(uint32_t)(X86_IOPL | X86_VM);
+            load_seg(c, S_CS, b);
+            set_ip(c, a, in->opsize);
+            c->eflags = x86_flags_fixup(c, (c->eflags & ~m) | (f & m));
+            break;
+        }
+        if (c->pmode && in->opsize == 4 && x86_cpl(c) == 0 && (peek(c, 8, 4) & X86_VM)) {
+            enter_v86(c);
+            break;
+        }
         if (c->pmode) {
             /* Pops EIP, CS, EFLAGS — and, only when the return is to a less
              * privileged level, ESP and SS as well. CS.RPL is what decides,
@@ -1245,6 +1321,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
         }
     case OP_INT:
+        if (v86_iopl_trap(c)) break;
         x86_interrupt(c, in->ops[0].imm, 1);
         break;
     case OP_INT3:
@@ -1358,7 +1435,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         c->halted = 1;
         break;
     case OP_ARPL:
-        if (!c->pmode) RAISE(X86_EXC_UD);
+        if (!pm_rules(c)) RAISE(X86_EXC_UD);
         a = rd_op(c, in, 0, ea); b = rd_op(c, in, 1, ea);
         if ((a & 3) < (b & 3)) { c->eflags |= X86_ZF; wr_op(c, in, 0, ea, (a & ~3u) | (b & 3)); }
         else c->eflags &= ~X86_ZF;
@@ -1388,7 +1465,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         break;
     }
     case OP_LLDT: case OP_LTR: {
-        if (!c->pmode) RAISE(X86_EXC_UD);
+        if (!pm_rules(c)) RAISE(X86_EXC_UD);
         need_cpl0(c);
         uint16_t lsel = (uint16_t)rd_op(c, in, 0, ea);
         x86_seg *g = in->op == OP_LLDT ? &c->ldtr : &c->tr;
@@ -1457,7 +1534,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
      * test for the three that read, since it is reachable from anywhere.
      * Every other flag is left alone. */
     case OP_LAR: case OP_LSL: case OP_VERR: case OP_VERW: {
-        if (!c->pmode) RAISE(X86_EXC_UD);
+        if (!pm_rules(c)) RAISE(X86_EXC_UD);
         int src = in->op == OP_LAR || in->op == OP_LSL ? 1 : 0;
         uint16_t lsel = (uint16_t)rd_op(c, in, src, ea);
         uint32_t dlo = 0, dhi = 0;
@@ -1600,6 +1677,8 @@ int x86_step(x86_cpu *c) {
                 /* 286: instructions longer than 10 bytes (prefix padding) are #GP */
                 if (c->model == X86_MODEL_286 && in.len > 10) x86_fault(c, X86_EXC_GP, 0);
                 execute(c, &in, start_ip);
+                /* RF lasts one instruction: IRET and POPF are the ones that load it */
+                if (in.op != OP_IRET && in.op != OP_POPF) c->eflags &= ~(uint32_t)X86_RF;
             }
             c->fault_armed = 0;
             c->pg_super = 0;                          /* a fault may have left an implicit access marked */
