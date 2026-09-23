@@ -109,6 +109,11 @@ static inline uint32_t topshift(int size) { return size == 1 ? 24 : size == 2 ? 
  * effective addresses straight off R_MEM, keys built with s_mode_bits. */
 static int s_flat;
 static uint64_t s_mode_bits;
+/* Virtual-8086 blocks (KEY_V86) are real-mode blocks at CPL 3: what V86
+ * does differently goes to the interpreter (classify_v86), and under
+ * paging (KEY_PAGED) every memory access goes through cpu->pgd_r/pgd_w
+ * (emit_paged). s_iopl3: CLI/STI/PUSHF behave as in real mode. */
+static int s_v86, s_paged, s_iopl3;
 /* Segmented 16-bit protected mode (a KEY_SEG16 block, see dbt_seg16_ok):
  * the real-mode shape with a limit check on every access. */
 static int s_seg16;
@@ -399,6 +404,7 @@ static a64_reg_t seg_ptr_reg(int s) {
 
 static void emit_flat_check(emit_t *e, a64_reg_t off);
 static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only);
+static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea);
 
 /* Flat EA: base + index << scale + disp, wrapping at 4 GB like the
  * CPU's 32-bit address arithmetic, then the range check (not for LEA,
@@ -428,9 +434,14 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
 
 /* Compute the effective address. Uses W_OFF (and X_SEGP for CS/FS/GS);
  * a bare [reg] form returns the pinned register itself. */
+static void emit_ea_real(emit_t *e, const x86_insn *in, ea_t *ea);
 static void emit_ea(emit_t *e, const x86_insn *in, ea_t *ea) {
     ea->seg = in->seg;
     if (s_flat) { emit_ea_flat(e, in, ea); return; }
+    emit_ea_real(e, in, ea);
+    if (s_paged && in->op != OP_LEA) emit_ea_paged(e, in, ea);
+}
+static void emit_ea_real(emit_t *e, const x86_insn *in, ea_t *ea) {
     ea->segp = seg_ptr_reg(in->seg);
     if (ea->segp == X_SEGP) emit_load_seg_ptr(e, X_SEGP, in->seg);
 
@@ -715,6 +726,80 @@ static void emit_wrap_slow_chunks(emit_t *e) {
  * check is unreachable code. The 8086/186 wrap instead: there the store
  * really does have to split, so both checks stay. */
 static int s_ea_checked;
+
+/* rd = rn + imm, any imm below 16M (two ADDs past 4K) */
+static void emit_add_x64_big(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_t imm) {
+    if (imm >> 12) { emit_add_x64_imm_lsl12(e, rd, rn, imm >> 12); rn = rd; }
+    if ((imm & 0xFFF) || rd != rn) emit_add_x64_imm(e, rd, rn, imm & 0xFFF);
+}
+
+/* V86 under paging: the identity host address segp + off becomes the
+ * physical one through the page's delta in cpu->pgd_r (pgd_w for a
+ * store, which also needs the page dirty already), left in X_SEGP.
+ * Anything else — no translation, an access crossing into the next page,
+ * or past the 64K offset (a #GP on the 386) — takes the slow path: the
+ * whole instruction through the interpreter, which walks, faults and sets
+ * accessed/dirty exactly. Every check precedes the instruction's first
+ * state change. Clobbers W_T1-W_T3; the result is in X_SEGP. */
+static void emit_paged(emit_t *e, a64_reg_t segp, a64_reg_t off, int size, int write) {
+    if (size > 1) {
+        emit_movz_w32(e, W_T1, (uint16_t)(0x10000 - size), 0);
+        emit_subs_w32(e, A64_WZR, off, W_T1);
+        flat_slow_site(e);
+        emit_b_cond(e, A64_COND_HI, 0);
+    }
+    emit_add_x64_w32_uxtw(e, W_T3, segp, off);                    /* identity host address */
+    emit_sub_x64(e, W_T2, W_T3, R_MEM);
+    emit_lsr_x64_imm(e, W_T2, W_T2, 12);                          /* linear page, < 0x110 */
+    emit_add_x64_big(e, X_SEGP, R_CPU, (uint32_t)(write ? offsetof(x86_cpu, pgd_w) : offsetof(x86_cpu, pgd_r)));
+    emit_ldr_x64_reg_lsl3(e, W_T2, X_SEGP, W_T2);                 /* delta, or X86_PGD_NONE */
+    (void)emit_tst_w32_imm(e, W_T2, 1);
+    flat_slow_site(e);
+    emit_b_cond(e, A64_COND_NE, 0);
+    if (size > 1) {
+        (void)emit_and_w32_imm(e, W_T1, W_T3, 0xFFF);
+        emit_cmp_w32_imm(e, W_T1, (uint32_t)(0x1000 - size));
+        flat_slow_site(e);
+        emit_b_cond(e, A64_COND_HI, 0);
+    }
+    emit_add_x64(e, X_SEGP, W_T3, W_T2);
+}
+
+/* Does the instruction write its memory operand (so the page must be
+ * writable and dirty)? When unsure, yes: a read of such a page only
+ * takes the slow path. */
+static int writes_mem_operand(const x86_insn *in) {
+    switch (in->op) {
+    case OP_CMP: case OP_TEST: case OP_PUSH: case OP_CALL: case OP_JMP: case OP_CALLF: case OP_JMPF:
+    case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS:
+    case OP_MOVZX: case OP_MOVSX: case OP_MUL: case OP_IMUL: case OP_DIV: case OP_IDIV:
+    case OP_BT:
+        return 0;
+    case OP_MOV: case OP_MOVSEG:
+        return in->ops[0].kind == OPK_MEM;
+    default:
+        return 1;
+    }
+}
+
+/* The EA of a paged V86 block, translated for the instruction's one
+ * memory access: its size is the memory operand's (a far pointer's four
+ * bytes for LES/LDS and indirect far transfers). */
+static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea) {
+    int size = in->opsize;
+    for (int i = 0; i < 3; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
+    switch (in->op) {
+    case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_JMPF: case OP_CALLF:
+        size = in->opsize + 2; break;
+    default: break;
+    }
+    emit_paged(e, ea->segp, ea->off, size, writes_mem_operand(in));
+    ea->segp = X_SEGP;
+    /* a real zero, not WZR: an ADD immediate (LES/LDS's selector at +2)
+     * reads register 31 as SP */
+    emit_movz_w32(e, W_OFF, 0, 0);
+    ea->off = W_OFF;
+}
 
 static void emit_read_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t dst) {
     if (s_seg16) {
@@ -1545,6 +1630,19 @@ static void emit_popa_flat(emit_t *e) {
  * the 386 in a segmented block, a dword. */
 static void emit_push_stk(emit_t *e, a64_reg_t val, int size) {
     if (s_flat) { emit_push32_flat(e, val); return; }
+    if (s_paged) {
+        /* one checked slot, then the store through its translation */
+        emit_sub_w32_imm(e, W_OFF, R_GPR(R_SP), (uint32_t)size);
+        (void)emit_and_w32_imm(e, W_OFF, W_OFF, 0xFFFF);
+        emit_paged(e, R_SSP, W_OFF, size, 1);
+        if (size == 4) emit_str_w32_imm(e, val, X_SEGP, 0); else emit_strh_imm(e, val, X_SEGP, 0);
+        emit_mov_x64_x64(e, W_T3, X_SEGP);
+        emit_smc_check_x3(e, size);
+        emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), (uint32_t)size);
+        (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+        emit_set16(e, R_SP, W_T2);
+        return;
+    }
     /* new SP in a temp until the store is known to succeed (fault: SP intact) */
     emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), (uint32_t)size);
     (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);   /* also strips ESP[31:16] for the address */
@@ -1561,6 +1659,16 @@ static void emit_push_stk(emit_t *e, a64_reg_t val, int size) {
 }
 static void emit_pop_stk(emit_t *e, a64_reg_t dst, int size) {
     if (s_flat) { emit_pop32_flat(e, dst); return; }
+    if (s_paged) {
+        a64_reg_t sp0 = emit_reg16(e, R_SP, W_OFF);
+        if (sp0 != W_OFF) emit_mov_w32_w32(e, W_OFF, sp0);
+        emit_paged(e, R_SSP, W_OFF, size, 0);
+        if (size == 4) emit_ldr_w32_imm(e, dst, X_SEGP, 0); else emit_ldrh_imm(e, dst, X_SEGP, 0);
+        emit_add_w32_imm(e, W_T2, W_OFF, (uint32_t)size);
+        (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
+        emit_set16(e, R_SP, W_T2);
+        return;
+    }
     a64_reg_t sp = emit_reg16(e, R_SP, W_T2);
     if (s_seg16) emit_limit_check(e, S_SS, sp, size);
     else emit_wrap_check(e, R_SSP, sp, dst, 0, 0);
@@ -1646,6 +1754,38 @@ static int classify_op(const x86_insn *in) {
 static int classify(const x86_insn *in) {
     if (in->opsize != 2 || in->adsize != 2) return C_REFUSE;   /* 386 forms: Phase B */
     return classify_op(in);
+}
+
+/* Virtual-8086 mode on top of the real-mode classes. What V86 does
+ * differently is the interpreter's: INT n (through the IDT, IOPL-
+ * sensitive), IRET and POPF (IOPL-sensitive, and they keep IOPL and VM),
+ * HLT (#GP); I/O is a helper (the interpreter asks the TSS bitmap). CLI, STI and PUSHF are real mode's at
+ * IOPL 3 only. Under paging an inline instruction gets one checked access
+ * (emit_paged), so those that touch memory twice — a string op, a far
+ * CALL or RET, PUSH/POP/CALL through memory — become helpers. */
+static int classify_v86(const x86_insn *in, int c) {
+    switch (in->op) {
+    case OP_INT: case OP_INT3: case OP_INTO: case OP_INT1: case OP_IRET: case OP_POPF: case OP_HLT:
+        return C_REFUSE;
+    case OP_IN: case OP_OUT: case OP_INS: case OP_OUTS:
+        return C_HELPER;           /* the interpreter asks the I/O bitmap and faults to the monitor */
+    case OP_CLI: case OP_STI: case OP_PUSHF:
+        if (!s_iopl3) return C_REFUSE;
+        break;
+    default: break;
+    }
+    if (!s_paged || c != C_INLINE) return c;
+    switch (in->op) {
+    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
+    case OP_CALLF: case OP_RETF:
+        return C_HELPER;
+    case OP_JMPF:
+        return in->ops[0].kind == OPK_IMM ? C_INLINE : C_HELPER;
+    case OP_PUSH: case OP_POP: case OP_CALL:
+        return in->ops[0].kind == OPK_MEM ? C_HELPER : C_INLINE;
+    default:
+        return c;
+    }
 }
 
 /* Protected mode, for now: everything the real-mode backend handles
@@ -2183,9 +2323,9 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     default:
         break;   /* classify() keeps everything else out */
     }
-    /* A flat memory operand has a slow path — the helper — which leaves
-     * no NZCV behind for a following Jcc to fuse on. */
-    if (s_flat && in->ea_valid && in->op != OP_LEA) s_nzcv.valid = 0;
+    /* A flat or paged memory operand has a slow path — the helper — which
+     * leaves no NZCV behind for a following Jcc to fuse on. */
+    if ((s_flat || s_paged) && in->ea_valid && in->op != OP_LEA) s_nzcv.valid = 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -2195,6 +2335,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
 /* Key of the static target ip within the block's CS. */
 static uint64_t target_key(const x86_cpu *cpu, uint32_t ip) {
     if (s_flat) return dbt_key(cpu->seg[S_CS].sel, cpu->seg[S_CS].base + ip) | s_mode_bits;
+    if (s_v86) return dbt_key(cpu->seg[S_CS].sel, cpu->seg[S_CS].base + (ip & 0xFFFF)) | s_mode_bits;
     uint32_t lin = (cpu->seg[S_CS].base + (ip & 0xFFFF)) & cpu->a20_mask;
     return dbt_key(cpu->seg[S_CS].sel, lin) | (s_seg16 ? s_mode_bits : 0);
 }
@@ -2214,10 +2355,10 @@ static void emit_dynamic_key(emit_t *e, const x86_cpu *cpu, a64_reg_t ip) {
     if (s_regs32) { emit_uxth_w32(e, W_T0, ip); ip = W_T0; }   /* may be a raw 32-bit register */
     emit_mov_w32_imm32(e, A64_W0, base);
     emit_add_w32(e, A64_W0, A64_W0, ip);
-    if (base + 0xFFFF > 0xFFFFF && cpu->a20_mask == 0xFFFFF)
+    if (!s_v86 && base + 0xFFFF > 0xFFFFF && cpu->a20_mask == 0xFFFFF)
         (void)emit_and_w32_imm(e, A64_W0, A64_W0, 0xFFFFF);
     emit_movk_x64(e, A64_W0, cpu->seg[S_CS].sel, 32);
-    if (s_seg16) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
+    if (s_seg16 || s_v86) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
 }
 
 /* Inline part of a conditional: guts + test + B.cond toward the taken
@@ -2283,8 +2424,9 @@ static void emit_load_cs_dynamic(emit_t *e, const x86_cpu *cpu) {
     emit_lsl_w32_imm(e, W_T0, W_SRC, 4);
     emit_str_w32_imm(e, W_T0, R_CPU, OFF_SEG_BASE(S_CS));
     emit_add_w32(e, A64_W0, W_T0, W_VAL);
-    if (cpu->a20_mask == 0xFFFFF) (void)emit_and_w32_imm(e, A64_W0, A64_W0, 0xFFFFF);
+    if (!s_v86 && cpu->a20_mask == 0xFFFFF) (void)emit_and_w32_imm(e, A64_W0, A64_W0, 0xFFFFF);
     emit_orr_x64_lsl(e, A64_W0, A64_W0, W_SRC, 32);
+    if (s_v86) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
 }
 static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t ip_after) {
     x86_cpu *cpu = dbt->cpu;
@@ -2331,8 +2473,9 @@ static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t
         emit_strh_imm(e, W_T0, R_CPU, OFF_SEG_SEL(S_CS));
         emit_mov_w32_imm32(e, W_T0, (uint32_t)sel << 4);
         emit_str_w32_imm(e, W_T0, R_CPU, OFF_SEG_BASE(S_CS));
-        uint32_t lin = (((uint32_t)sel << 4) + off) & cpu->a20_mask;
-        emit_edge(dbt, e, dbt_key(sel, lin));
+        uint32_t lin = ((uint32_t)sel << 4) + off;
+        if (!s_v86) lin &= cpu->a20_mask;
+        emit_edge(dbt, e, dbt_key(sel, lin) | (s_v86 ? s_mode_bits : 0));
     } else {
         emit_load_cs_dynamic(e, cpu);
         emit_dynamic_tail(e, dbt->exit_stub_off);
@@ -2477,6 +2620,18 @@ static void emit_pm_dynamic_key(emit_t *e, const x86_cpu *cpu, uint64_t mode_bit
     emit_movk_x64(e, A64_W0, (uint16_t)(mode_bits >> 48), 48);
 }
 
+/* X0 = the key of wherever a V86 helper left CS:IP (a far transfer run
+ * by the interpreter moves CS too): live selector and base, 16-bit IP. */
+static void emit_v86_dynamic_key(emit_t *e, uint64_t mode_bits) {
+    emit_ldr_w32_imm(e, A64_W0, R_CPU, OFF_EIP);
+    emit_uxth_w32(e, A64_W0, A64_W0);
+    emit_ldr_w32_imm(e, W_T0, R_CPU, OFF_SEG_BASE(S_CS));
+    emit_add_w32(e, A64_W0, A64_W0, W_T0);
+    emit_ldrh_imm(e, W_T1, R_CPU, OFF_SEG_SEL(S_CS));
+    emit_orr_x64_lsl(e, A64_W0, A64_W0, W_T1, 32);
+    emit_movk_x64(e, A64_W0, (uint16_t)(mode_bits >> 48), 48);
+}
+
 static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
     x86_cpu *cpu = dbt->cpu;
     s_flat = 0;
@@ -2558,7 +2713,7 @@ static uint32_t dyn_imm_at(const x86_dbt *dbt, const x86_insn *in, uint32_t insn
     if (in->ea_valid || in->ops[1].kind != OPK_IMM || !in->ops[1].imm_enc) return 0;
     uint32_t at = insn_lin + X86_IMM_AT(in->ops[1].imm_enc), n = X86_IMM_LEN(in->ops[1].imm_enc);
     for (uint32_t k = 0; k < n; k++)
-        if (dbt->smc_heat[at + k] < SMC_VOLATILE) return 0;
+        if (!dbt_smc_hot(dbt->smc_heat, dbt->smc_win, at + k, dbt_smc_window(dbt->cpu))) return 0;
     return at;
 }
 
@@ -2575,7 +2730,8 @@ static void emit_flat_slow_chunks(x86_dbt *dbt, emit_t *e) {
         emit_helper_op(dbt, e, &f->in);
         s_in_slow_chunk = 0;
         if (f->ender) {
-            emit_pm_dynamic_key(e, dbt->cpu, s_mode_bits);
+            if (s_v86) emit_v86_dynamic_key(e, s_mode_bits);
+            else emit_pm_dynamic_key(e, dbt->cpu, s_mode_bits);
             emit_dynamic_tail(e, dbt->exit_stub_off);
         } else {
             emit_b(e, (int32_t)f->back_off - (int32_t)emit_pos(e));
@@ -2601,10 +2757,35 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     /* HLE stub segment: the interpreter step dispatches the host service. */
     if (cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4)) return NULL;
 
-    if (cpu->pmode && (!(key & (KEY_FLAT | KEY_SEG16)) || cpu->a20_mask != 0xFFFFFFFFu)) return translate_pm(dbt, key);
-    s_flat = cpu->pmode && (key & KEY_FLAT) != 0;    /* from here on: real mode, a flat block, or a segmented 16-bit one */
-    s_seg16 = cpu->pmode && !s_flat;
+    s_v86 = (key & KEY_V86) != 0;
+    s_paged = (key & KEY_PAGED) != 0;
+    s_iopl3 = (key & KEY_IOPL3) != 0;
+    if (cpu->pmode && !s_v86 && (!(key & (KEY_FLAT | KEY_SEG16)) || cpu->a20_mask != 0xFFFFFFFFu)) return translate_pm(dbt, key);
+    s_flat = cpu->pmode && !s_v86 && (key & KEY_FLAT) != 0;    /* from here on: real mode or V86, a flat block, or a segmented 16-bit one */
+    s_seg16 = cpu->pmode && !s_v86 && !s_flat;
     s_mode_bits = key & 0x7FFF000000000000ull;
+    /* A paged V86 block lives on one code page mapped one-to-one, so its
+     * key (linear) and the code bitmap (physical) agree about it; the
+     * bytes are read straight from memory, without a walk's side effects. */
+    uint32_t code_page = 0, code_delta = 0;
+    if (s_paged) {
+        /* The block stays on one code page. Its key is linear; its bytes,
+         * and their code-bitmap marks, are wherever the page maps — one-
+         * to-one, or remapped (UMB code), which phys_alias lets the SMC
+         * sweep find. */
+        code_page = (cpu->seg[S_CS].base + (cpu->eip & 0xFFFF)) & 0xFFFFF000u;
+        uint32_t phys = x86_page_peek(cpu, code_page);
+        if (phys == X86_PG_BAD || phys + 0xFFFu >= cpu->mem_size) return NULL;
+        if (phys != (code_page & cpu->a20_mask)) {
+            uint16_t *alias = &dbt->phys_alias[phys >> 12];
+            if (*alias && *alias != (code_page >> 12) + 1) return NULL;   /* one alias per physical page */
+            *alias = (uint16_t)((code_page >> 12) + 1);
+            code_delta = phys - code_page;
+        }
+        (void)x86_phys_rd8(cpu, cpu->seg[S_CS].base + (cpu->eip & 0xFFFF));   /* the fetch's walk: accessed bits */
+        dbt->v86_code_page[code_page >> 12] = 1;
+        dbt->v86_code_phys[code_page >> 12] = (uint16_t)(phys >> 12);
+    }
 
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;
@@ -2630,13 +2811,32 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             uint32_t lin = cpu->seg[S_CS].base + ip;
             if (lin >= cpu->mem_size || cpu->mem_size - lin < 16) break;
             memcpy(buf, cpu->mem + lin, 16);
+        } else if (s_paged) {
+            uint32_t lin = cpu->seg[S_CS].base + ip;
+            if ((lin & 0xFFFFF000u) != code_page) break;
+            memcpy(buf, cpu->mem + lin + code_delta, 16);          /* identity: the mirror applies A20 */
         } else {
             fetch_at(cpu, ip, buf);
         }
         if (!x86_decode(&ctx, in)) break;
         if (!s_flat && ip + in->len > 0x10000) break;  /* IP wrap: leave it to the interp */
+        if (s_paged && ((cpu->seg[S_CS].base + ip + in->len - 1) & 0xFFFFF000u) != code_page) break;   /* runs off the page */
+        if (!s_flat) {
+            /* An instruction whose bytes keep being patched (FreeCOM
+             * rewrites its INT n's number before every call) stays out of
+             * blocks: the interpreter runs it from memory as it is, and
+             * the patches no longer invalidate the code around it. */
+            uint32_t at = cpu->seg[S_CS].base + ip + code_delta;
+            if (!s_v86 && !s_seg16) at &= cpu->a20_mask;
+            uint8_t now = dbt_smc_window(cpu);
+            int hot = 0;
+            for (uint32_t k = 0; k < in->len && at + k < cpu->mem_size; k++)
+                if (dbt_smc_hot(dbt->smc_heat, dbt->smc_win, at + k, now)) { hot = 1; break; }
+            if (hot) { dbt->smc_hot_refusals++; break; }
+        }
         if (s_seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
         int c = s_flat ? classify_flat(in) : s_seg16 ? classify_seg16(in) : classify(in);
+        if (s_v86) c = classify_v86(in, c);
         if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
         if (c == C_REFUSE) {
             dbt->refused_by_op[in->op]++;
@@ -2646,6 +2846,8 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         if (c == C_INLINE && is_uncond_ender(in->op)) r = R_UNCOND;
         else if (c == C_INLINE && is_cond_ender(in->op)) r = R_COND;
         else if ((s_flat || s_seg16) && c == C_HELPER && (is_near_transfer(in->op) || loads_segment(in))) r = R_HELPER_END;
+        else if (s_v86 && c == C_HELPER && (is_near_transfer(in->op) || in->op == OP_CALLF || in->op == OP_RETF || in->op == OP_JMPF))
+            r = R_HELPER_END;                          /* paged V86: a transfer run by the interpreter */
         cls[n_ops] = (uint8_t)c;
         role[n_ops] = (uint8_t)r;
         dyn_lin[n_ops] = s_flat && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip) : 0;
@@ -2722,7 +2924,8 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
              * which rebuilds the key, rather than probing with ours. */
             emit_helper_op(dbt, &e, in);
             emit_tail_prologue(&e, n_ops);
-            emit_pm_dynamic_key(&e, cpu, s_mode_bits);
+            if (s_v86) emit_v86_dynamic_key(&e, s_mode_bits);
+            else emit_pm_dynamic_key(&e, cpu, s_mode_bits);
             if (loads_segment(in)) emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
             else emit_dynamic_tail(&e, dbt->exit_stub_off);
             final_by_branch = 1;
@@ -2770,6 +2973,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             skip[2 * nskip + 1] = dyn_lin[i] + X86_IMM_LEN(decs[i].ops[1].imm_enc);
             nskip++;
         }
+    lin += code_delta;                               /* the bitmap is physical */
     dbt_mark_block_bytes_except(dbt, lin, lin + (ip - start_ip), skip, nskip);
     if (s_flat || s_seg16) dbt_watch_cs_desc(dbt);
     return entry;

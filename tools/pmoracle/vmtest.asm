@@ -146,6 +146,8 @@ pm32:
         loop .pt
         mov dword [PT0 + 0x31 * 4], 0x31000 | 3
         mov dword [PT0 + 0x32 * 4], 0x32000 | 5
+        mov dword [PT0 + 0x40 * 4], 0x34000 | 7         ; linear 40000 -> 34000 (as JEMM maps UMBs)
+        mov dword [0x34010], 0x11112222
         mov eax, PD
         mov cr3, eax
         mov eax, cr0
@@ -155,6 +157,8 @@ pm32:
         V86 33, f_pgsuper, IOPL3
         V86 34, f_pgro,    IOPL3
         V86 35, f_pgroread, IOPL3
+        V86 36, f_segload, IOPL3
+        V86 37, f_remap,   IOPL3
 
         mov esi, msg_done
         call puts
@@ -251,6 +255,43 @@ f_pgro:     mov ax, 0x3200
 f_pgroread: mov ax, 0x3200
             mov ds, ax
             mov eax, [0]
+            hlt
+f_segload:  mov bx, 3                       ; the FreeDOS pattern, a few times round
+.again:     call .cmp
+            dec bx
+            jnz .again
+            mov ax, ds
+            shl eax, 16
+            mov ax, es
+            hlt
+.cmp:       push ds
+            push es
+            push ax
+            mov ds, [cs:seg_pair]
+            mov es, [cs:seg_pair + 2]
+            mov ax, [ds:0x10]
+            cmp ax, [es:0x10]
+            jnz .out
+            mov ax, [ds:0x12]
+            cmp ax, [es:0x12]
+.out:       pop ax
+            pop es
+            pop ds
+            ret
+seg_pair:   dw 0x3000, 0x3001
+f_remap:    mov ax, 0x4000                  ; stack and data in the remapped page
+            mov ss, ax
+            mov sp, 0x0200
+            mov ds, ax
+            mov bx, 3
+.again:     call f_segload.cmp
+            push word [0x10]
+            pop cx
+            dec bx
+            jnz .again
+            mov ax, [0x10]
+            shl eax, 16
+            mov ax, cx
             hlt
         bits 32
 

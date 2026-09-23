@@ -56,6 +56,8 @@ void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
  * that: resetting the pool silently abandons all patch sites, sound
  * only because the code containing them is being discarded. */
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
+    memset(dbt->v86_code_page, 0, sizeof dbt->v86_code_page);
+    memset(dbt->phys_alias, 0, sizeof dbt->phys_alias);
     /* An empty slot is all-ones in both words (its code pointer is never
      * read while the key says empty), and so is LINK_NONE: two memsets. */
     memset(dbt->aux->cache, 0xFF, sizeof dbt->aux->cache);
@@ -146,11 +148,12 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
  * whose span reaches phys; clear the bitmap byte last, once no block
  * covers it (the rule paid for in blood: never leave a bitmap byte set
  * after its covering blocks are gone, never clear it before the sweep). */
-static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
+/* Invalidate every block whose start lies in [lin - max_block_bytes + 1,
+ * lin] and whose span reaches lin, under each mode variant. */
+static void sweep_blocks_at(x86_dbt *dbt, uint32_t lin) {
     uint32_t window = dbt->max_block_bytes;
-    if (dbt->smc_heat[phys] < 255) dbt->smc_heat[phys]++;
-    for (uint32_t k = 0; k < window && k <= phys; k++) {
-        uint32_t p = phys - k;
+    for (uint32_t k = 0; k < window && k <= lin; k++) {
+        uint32_t p = lin - k;
         for (int m = 0; m < KEY_MODE_VARIANTS; m++) {
             uint32_t slot = dbt_slot_mode(p, dbt_key_modes[m]);
             x86_block_entry *e = &dbt->aux->cache[slot];
@@ -165,15 +168,24 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
             if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = 1;
         }
     }
+}
+
+/* A store landed on a byte some cached block covers. Sweep the blocks
+ * keyed at it — and at its linear alias, when a remapped V86 code page
+ * sits on it — then clear the bitmap byte, last, once no block covers it
+ * (the rule paid for in blood: never leave a bitmap byte set after its
+ * covering blocks are gone, never clear it before the sweep). */
+static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
+    uint8_t now = dbt_smc_window(dbt->cpu);
+    if (dbt->smc_win[phys] != now) { dbt->smc_win[phys] = now; dbt->smc_heat[phys] = 0; }
+    if (dbt->smc_heat[phys] < 255) dbt->smc_heat[phys]++;
+    sweep_blocks_at(dbt, phys);
+    uint16_t alias = dbt->phys_alias[phys >> 12];
+    if (alias) sweep_blocks_at(dbt, ((uint32_t)(alias - 1) << 12) | (phys & 0xFFF));
     dbt->smc_invalidations++;
     dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
 }
 
-/* Every translation is stale (A20 flipped, a code descriptor changed).
- * This runs from inside a helper thunk as often as not, so only the
- * cache and the link registry are wiped here — the code buffer that is
- * executing us is rewound by the next translate — and the running block
- * is told to leave. */
 static void flush_under_running_code(x86_dbt *dbt) {
     dbt_cache_invalidate_all(dbt);
     dbt->flush_pending = 1;
@@ -225,6 +237,38 @@ void dbt_a20_changed(x86_cpu *cpu, int on) {
     if (!dbt) return;
     flush_under_running_code(dbt);
     dbt->a20_flushes++;
+}
+
+/* cpu->tlb_hook: the page tables may map differently now (CR3 load, PG
+ * toggled, A20). Paged V86 blocks were translated for pages mapped one-
+ * to-one, so they go — only when there are any. */
+void dbt_tlb_flushed(x86_cpu *cpu) {
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    if (!dbt) return;
+    dbt->tlb_flushes++;
+    /* A CR3 reload is how a memory manager flushes after any remap (JEMM
+     * with NOINVLPG does it for every A20 emulation), so dropping all
+     * translations each time thrashes. Only the code pages paged blocks
+     * stand on matter: re-peek each, and drop the V86 blocks of any that
+     * no longer maps where it did when they were translated. A V86 key's slot is its linear
+     * address XOR (16 << 16) — KEY_V86 folded — so a page's blocks sit in
+     * 4096 consecutive slots. */
+    for (uint32_t p = 0; p < X86_PGD_PAGES; p++) {
+        if (!dbt->v86_code_page[p]) continue;
+        uint32_t lin = p << 12;
+        uint32_t was = (uint32_t)dbt->v86_code_phys[p] << 12;
+        if ((cpu->cr0 & X86_CR0_PG) && x86_page_peek(cpu, lin) == was) continue;
+        if (dbt->phys_alias[was >> 12] == p + 1) dbt->phys_alias[was >> 12] = 0;
+        for (uint32_t k = 0; k < 4096; k++) {
+            uint32_t slot = dbt_slot_mode(lin + k, (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT));
+            x86_block_entry *e = &dbt->aux->cache[slot];
+            if (e->key == BLOCK_EMPTY_KEY || !(e->key & KEY_V86) || dbt_key_lin(e->key) != lin + k) continue;
+            evict_slot(dbt, slot);
+        }
+        if (cpu->jit_cur_lin >> 12 == p) cpu->jit_cur_hit = 1;
+        dbt->v86_code_page[p] = 0;
+        dbt->tlb_page_drops++;
+    }
 }
 
 /* The host wrote guest memory directly (loader, DOS file reads): run

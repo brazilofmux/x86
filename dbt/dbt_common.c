@@ -21,6 +21,8 @@
 #include <dlfcn.h>
 #include <sys/ucontext.h>
 
+static uint32_t io_record(x86_cpu *c, uint16_t port, int size);   /* -V: port reads logged for the shadow */
+
 /* NZCV nibble (N=8 Z=4 C=2 V=1) → x86 SF/ZF/CF/OF. The SUB variants
  * invert C (ARM carry = no borrow); INC/DEC drop CF so the emitter can
  * OR the preserved bit back in. */
@@ -73,7 +75,8 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->insn_tag  = calloc(INSN_POOL_SIZE, 1);
     dbt->insn_lin  = calloc(INSN_POOL_SIZE, sizeof(uint32_t));
     dbt->smc_heat  = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);     /* touched only where SMC happens */
-    if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool || !dbt->smc_heat) {
+    dbt->smc_win   = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);
+    if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool || !dbt->smc_heat || !dbt->smc_win) {
         fprintf(stderr, "dbt_init: out of memory\n");
         return -1;
     }
@@ -87,6 +90,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     cpu->jit_aux  = dbt->aux;
     cpu->smc_hook = dbt_smc_store;
     cpu->a20_hook = dbt_a20_changed;
+    cpu->tlb_hook = dbt_tlb_flushed;
     dbt_cache_invalidate_all(dbt);
 
     dbt->code_buf = mmap(NULL, CODE_BUF_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -136,7 +140,10 @@ void dbt_cleanup(x86_dbt *dbt) {
     if (dbt->shadow_live) x86_free(&dbt->shadow);
     if (dbt->cpu && dbt->cpu->device_read == dev_record) dbt->cpu->device_read = dbt->dev_read_real;
     free(dbt->devlog);
+    if (dbt->cpu && dbt->cpu->io_read == io_record) dbt->cpu->io_read = dbt->io_read_real;
+    free(dbt->iolog);
     free(dbt->smc_heat);
+    free(dbt->smc_win);
     free(dbt->aux); free(dbt->span); free(dbt->link_head); free(dbt->link_pool); free(dbt->insn_pool);
     free(dbt->insn_hits); free(dbt->insn_tag); free(dbt->insn_lin);
     memset(dbt, 0, sizeof(*dbt));
@@ -244,7 +251,26 @@ static void dump_block_bytes(const x86_cpu *c, uint64_t key, const char *tag) {
 }
 
 static void shadow_smc_none(x86_cpu *c, uint32_t p) { (void)c; (void)p; }
-static uint32_t shadow_io_read(x86_cpu *c, uint16_t port, int size) { (void)c; (void)port; (void)size; return 0xFFFFFFFFu; }
+static x86_dbt *s_replay_dbt;      /* the shadow has no dbt pointer of its own */
+/* Port reads: the real cpu's are logged (io_record), the shadow's replay
+ * them in order — an IN inside a JIT run (a V86 helper) has to see what
+ * the device said, and the shadow has no devices. */
+static uint32_t shadow_io_read(x86_cpu *c, uint16_t port, int size) {
+    (void)c; (void)port; (void)size;
+    x86_dbt *dbt = s_replay_dbt;
+    if (dbt && dbt->iolog_pos < dbt->iolog_n) return dbt->iolog[dbt->iolog_pos++];
+    return 0xFFFFFFFFu;             /* more reads than the real cpu made: a divergence -V will report */
+}
+static uint32_t io_record(x86_cpu *c, uint16_t port, int size) {
+    x86_dbt *dbt = (x86_dbt *)c->dbt;
+    uint32_t v = dbt->io_read_real(c, port, size);
+    if (dbt->iolog_n == dbt->iolog_cap) {
+        dbt->iolog_cap = dbt->iolog_cap ? dbt->iolog_cap * 2 : 4096;
+        dbt->iolog = realloc(dbt->iolog, dbt->iolog_cap * sizeof *dbt->iolog);
+    }
+    dbt->iolog[dbt->iolog_n++] = v;
+    return v;
+}
 static void shadow_io_write(x86_cpu *c, uint16_t port, uint32_t v, int size) { (void)c; (void)port; (void)v; (void)size; }
 
 /* -V: the real cpu's device reads go through dev_record, which logs what
@@ -262,7 +288,6 @@ static uint8_t dev_record(x86_cpu *c, uint32_t p) {
     dbt->devlog[dbt->devlog_n++] = v;
     return v;
 }
-static x86_dbt *s_replay_dbt;      /* the shadow has no dbt pointer of its own */
 static uint8_t dev_replay(x86_cpu *c, uint32_t p) {
     x86_dbt *dbt = s_replay_dbt;
     if (dbt->devlog_pos < dbt->devlog_n) return dbt->devlog[dbt->devlog_pos++];
@@ -277,6 +302,11 @@ static void dev_log_arm(x86_dbt *dbt) {
         cpu->device_read = dev_record;
     }
     dbt->devlog_n = dbt->devlog_pos = 0;
+    if (cpu->io_read && cpu->io_read != io_record) {
+        dbt->io_read_real = cpu->io_read;
+        cpu->io_read = io_record;
+    }
+    dbt->iolog_n = dbt->iolog_pos = 0;
 }
 
 static int at_hle(const x86_cpu *c) {
@@ -311,6 +341,7 @@ static void shadow_copy_regs(x86_dbt *dbt) {
     sh->device_read = cpu->device_read ? dev_replay : NULL;
     s_replay_dbt = dbt;
     sh->a20_hook = NULL;
+    sh->tlb_hook = NULL;
     sh->io_read = shadow_io_read;
     sh->io_write = shadow_io_write;
     sh->hle = NULL;
@@ -371,10 +402,12 @@ int dbt_run(x86_dbt *dbt) {
          * never clears the inhibit). The interpreter runs that one
          * instruction: it clears the inhibit, or renews it, exactly; the
          * poll above saw it and delivered nothing. */
-        /* Paging on, or V86 mode: the translator assumes linear ==
-         * physical and CPL 0 real-mode semantics, so the interpreter
-         * steps those (the V86/paging campaign's first milestones). */
-        int inhibited = cpu->int_inhibit != 0 || (cpu->cr0 & X86_CR0_PG) || (cpu->eflags & (X86_VM | X86_RF));
+        /* Paged protected-mode code (the memory manager's own) is the
+         * interpreter's; V86 code, paged or not, is translated as
+         * real-mode-shaped blocks (KEY_V86). RF lasts one instruction,
+         * which the interpreter runs and clears. */
+        int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF)
+                     || ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM));   /* paged PM: the interpreter's */
         x86_block_entry *be = inhibited ? NULL : dbt_cache_lookup(dbt, key);
         uint8_t *code = be ? be->code : NULL;
         if (!be && !inhibited) {
@@ -594,6 +627,9 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     fprintf(out, "  helper-class ops:       %llu (at translation)\n", (unsigned long long)dbt->helper_insns);
     fprintf(out, "  SMC invalidations:      %llu\n", (unsigned long long)dbt->smc_invalidations);
     if (dbt->a20_flushes) fprintf(out, "  A20 cache flushes:      %llu\n", (unsigned long long)dbt->a20_flushes);
+    if (dbt->smc_hot_refusals) fprintf(out, "  SMC-hot block ends:     %llu\n", (unsigned long long)dbt->smc_hot_refusals);
+    if (dbt->tlb_flushes) fprintf(out, "  TLB flushes:            %llu (code pages dropped: %llu)\n",
+                                  (unsigned long long)dbt->tlb_flushes, (unsigned long long)dbt->tlb_page_drops);
     if (dbt->desc_flushes) fprintf(out, "  CS descriptor flushes:  %llu\n", (unsigned long long)dbt->desc_flushes);
     fprintf(out, "  links created/patched/unpatched: %llu / %llu / %llu\n",
             (unsigned long long)dbt->links_created, (unsigned long long)dbt->links_patched,

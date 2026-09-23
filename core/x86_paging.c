@@ -18,7 +18,10 @@
  *
  * Outside an instruction — a BIOS service reading guest memory, or the
  * prefetch probing bytes it may not use — nothing is raised: the access
- * reads as open bus (X86_PG_BAD) and a probe notes the miss.
+ * reads as open bus (X86_PG_BAD) and a probe notes the miss. A probe has
+ * no side effects at all; the fetch then touches, for real, the pages
+ * the instruction actually occupies (x86_step), as translated code does
+ * for its block's page (dbt_translate_block).
  */
 #include "x86.h"
 #include <string.h>
@@ -38,8 +41,23 @@ static void phys_or8(x86_cpu *c, uint32_t p, uint8_t bits) {
     if (c->code_bitmap[p]) x86_store_hook(c, p);
 }
 
+/* The page tables' answer for a user access to LIN, without the side
+ * effects of a walk (no accessed bits, no TLB fill, no fault): the
+ * physical page address with A20 applied, or X86_PG_BAD when a user
+ * could not read it. For the translator, deciding whether a code page is
+ * mapped one-to-one. */
+uint32_t x86_page_peek(x86_cpu *c, uint32_t lin) {
+    uint32_t pde = phys_rd32(c, (c->cr3 & 0xFFFFF000u) | ((lin >> 20) & 0xFFCu));
+    if (!(pde & 1) || !(pde & 4)) return X86_PG_BAD;
+    uint32_t pte = phys_rd32(c, (pde & 0xFFFFF000u) | ((lin >> 10) & 0xFFCu));
+    if (!(pte & 1) || !(pte & 4)) return X86_PG_BAD;
+    return (pte & 0xFFFFF000u) & c->a20_mask;
+}
+
 void x86_tlb_flush(x86_cpu *c) {
     memset(c->tlb, 0, sizeof c->tlb);
+    for (int i = 0; i < X86_PGD_PAGES; i++) c->pgd_r[i] = c->pgd_w[i] = X86_PGD_NONE;
+    if (c->tlb_hook) c->tlb_hook(c);
 }
 
 uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
@@ -65,6 +83,9 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
         x86_fault(c, X86_EXC_PF, err);
         return X86_PG_BAD;
     }
+    /* A probe (the prefetch) looks without touching: the accessed bits
+     * and the caches are the business of the access that uses the byte. */
+    if (c->pg_probe) return ((pte & 0xFFFFF000u) | (lin & 0xFFF));
     phys_or8(c, pde_at, 0x20);                            /* accessed */
     phys_or8(c, pte_at, write ? 0x60 : 0x20);             /* accessed, dirty on a write */
     if (write) pte |= 0x40;
@@ -75,5 +96,13 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
            | ((both & 4) && (both & 2) ? X86_TLB_UW : 0)
            | ((pte & 0x40) ? X86_TLB_D : 0);
     t->phys = pte & 0xFFFFF000u;
+    /* the translator's tables, low linear pages only, user permissions */
+    uint32_t page = lin >> 12;
+    uint32_t phys = t->phys & c->a20_mask;
+    if (page < X86_PGD_PAGES && (both & 4) && phys + 0xFFFu < c->mem_size) {
+        int64_t d = (int64_t)phys - (int64_t)(lin & 0xFFFFF000u);
+        c->pgd_r[page] = d;
+        if ((both & 2) && (pte & 0x40)) c->pgd_w[page] = d;
+    }
     return t->phys | (lin & 0xFFF);
 }

@@ -1600,15 +1600,18 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
  * only the instruction decides whether it uses them: the prefetch probes
  * (no fault) and returns the index of the first byte that missed, 16 if
  * none; x86_step faults on it only if the instruction reaches it. */
-static int fetch_bytes(x86_cpu *c, uint8_t *buf) {
+static int fetch_bytes(x86_cpu *c, uint8_t *buf, int *cross_at) {
     uint32_t base = c->seg[S_CS].base, ip = c->eip;
     uint32_t m = c->seg[S_CS].big ? 0xFFFFFFFFu : 0xFFFF;
     int first_bad = 16;
+    *cross_at = 16;
     c->pg_probe = 1;
     for (int i = 0; i < 16; i++) {
         c->pg_miss = 0;
-        buf[i] = x86_phys_rd8(c, base + ((ip + i) & m));
+        uint32_t lin = base + ((ip + i) & m);
+        buf[i] = x86_phys_rd8(c, lin);
         if (c->pg_miss && first_bad == 16) first_bad = i;
+        if (*cross_at == 16 && ((lin ^ (base + ip)) & 0xFFFFF000u)) *cross_at = i;
     }
     c->pg_probe = 0;
     return first_bad;
@@ -1656,7 +1659,8 @@ int x86_step(x86_cpu *c) {
          * the fetch; the 286 wrapped IP instead. */
         c->exc = X86_EXC_GP;
     } else {
-        int first_bad = fetch_bytes(c, buf);
+        int cross_at;
+        int first_bad = fetch_bytes(c, buf, &cross_at);
         x86_dec_ctx ctx = { buf, c->model, c->seg[S_CS].big };
         if (!x86_decode(&ctx, &in)) {
             /* > 15 bytes of prefixes: the 8086 just keeps going; 386 #GP.
@@ -1669,10 +1673,15 @@ int x86_step(x86_cpu *c) {
             c->int_inhibit = 0;
             c->fault_armed = 1;
             if (_setjmp(c->fault_jb) == 0) {
-                /* the instruction runs into a page the prefetch did not find: #PF there */
-                if (first_bad < in.len) {
+                /* Under paging the fetch touches, for real, the pages the
+                 * instruction occupies: its first byte, and the first on
+                 * the next page if it runs onto it — accessed bits, or #PF
+                 * where the prefetch found nothing. */
+                if (c->cr0 & X86_CR0_PG) {
                     uint32_t m = c->seg[S_CS].big ? 0xFFFFFFFFu : 0xFFFF;
-                    (void)x86_phys_rd8(c, c->seg[S_CS].base + ((start_ip + (uint32_t)first_bad) & m));
+                    (void)x86_phys_rd8(c, c->seg[S_CS].base + start_ip);
+                    if (cross_at < in.len) (void)x86_phys_rd8(c, c->seg[S_CS].base + ((start_ip + (uint32_t)cross_at) & m));
+                    if (first_bad < in.len) (void)x86_phys_rd8(c, c->seg[S_CS].base + ((start_ip + (uint32_t)first_bad) & m));
                 }
                 /* 286: instructions longer than 10 bytes (prefix padding) are #GP */
                 if (c->model == X86_MODEL_286 && in.len > 10) x86_fault(c, X86_EXC_GP, 0);

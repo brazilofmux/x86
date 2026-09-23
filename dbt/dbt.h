@@ -89,7 +89,10 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_PMODE          (1ull << 48)
 #define KEY_BIG            (1ull << 49)   /* CS D bit: 32-bit default operand/address size */
 #define KEY_FLAT           (1ull << 50)   /* CS, DS, ES, SS all base 0, limit 4G, 32-bit (dbt_seg_flat) */
-#define KEY_SEG16          (1ull << 51)   /* 16-bit CS and SS, expand-up data segments: real-mode-shaped code with limits (dbt_seg16_ok) */
+#define KEY_SEG16          (1ull << 51)
+#define KEY_V86            (1ull << 52)   /* virtual-8086 mode: real-mode-shaped code at CPL 3 */
+#define KEY_IOPL3          (1ull << 53)   /* V86 at IOPL 3: CLI/STI/PUSHF behave as in real mode */
+#define KEY_PAGED          (1ull << 54)   /* V86 under paging: memory through cpu->pgd_r/pgd_w */   /* 16-bit CS and SS, expand-up data segments: real-mode-shaped code with limits (dbt_seg16_ok) */
 
 static inline uint64_t dbt_key(uint32_t cs_sel, uint32_t lin) { return ((uint64_t)cs_sel << 32) | lin; }
 static inline uint32_t dbt_key_lin(uint64_t key) { return (uint32_t)key; }
@@ -105,8 +108,8 @@ static inline uint32_t dbt_slot_mode(uint32_t lin, uint32_t mode) { return (lin 
 static inline uint32_t dbt_slot(uint64_t key) { return dbt_slot_mode((uint32_t)key, (uint32_t)(key >> KEY_MODE_SHIFT) & KEY_MODE_MASK); }
 /* Every mode-bit combination a key can carry: real; PM 16-bit; PM 32-bit;
  * flat; segmented 16-bit. The SMC sweep probes each. */
-#define KEY_MODE_VARIANTS 5
-static const uint32_t dbt_key_modes[KEY_MODE_VARIANTS] = { 0, 1, 3, 7, 9 };
+#define KEY_MODE_VARIANTS 6
+static const uint32_t dbt_key_modes[KEY_MODE_VARIANTS] = { 0, 1, 3, 7, 9, 16 };
 
 #ifndef MAX_BLOCK_INSNS
 #define MAX_BLOCK_INSNS    64
@@ -204,6 +207,17 @@ typedef struct {
     uint64_t jit_block_entries;
     uint64_t smc_invalidations;
     uint64_t a20_flushes;
+    uint8_t  v86_code_page[X86_PGD_PAGES];   /* paged V86 blocks were translated on this linear page... */
+    uint16_t v86_code_phys[X86_PGD_PAGES];   /* ...which was then mapped to this physical page */
+    /* A remapped code page (UMB code): the block keys are linear, the code
+     * bitmap and every SMC report physical. phys_alias[physical page] is
+     * the linear page + 1 whose blocks a store there must also sweep. One
+     * alias per physical page; a second linear page onto the same one is
+     * not translated. */
+    uint16_t phys_alias[X86_MEM_SIZE >> 12];
+    uint64_t smc_hot_refusals;      /* blocks ended before a patched instruction */
+    uint64_t tlb_flushes;           /* TLB flushes seen (CR3, PG, A20)... */
+    uint64_t tlb_page_drops;        /* ...and code pages whose blocks went because the page moved */
     uint64_t desc_flushes;
     uint64_t verify_blocks_checked;
     uint64_t links_created, links_patched, links_unpatched;
@@ -226,6 +240,7 @@ typedef struct {
      * block reads such an immediate from memory at run time instead of
      * baking it in, leaving the bytes unmarked. */
     uint8_t *smc_heat;
+    uint8_t *smc_win;               /* the window (insn_count >> SMC_WINDOW_SHIFT) a byte's heat belongs to */
     uint32_t last_block_bytes;
     int      flush_pending;         /* A20 changed under running code: rewind the code buffer at the next translate */
 
@@ -238,6 +253,10 @@ typedef struct {
     uint8_t (*dev_read_real)(x86_cpu *, uint32_t);
     uint8_t *devlog;
     uint32_t devlog_n, devlog_cap, devlog_pos;
+    /* the same for port reads (IN inside a run: a V86 helper) */
+    uint32_t (*io_read_real)(x86_cpu *, uint16_t, int);
+    uint32_t *iolog;
+    uint32_t iolog_n, iolog_cap, iolog_pos;
     int verify_mem_every;          /* compare guest memory every N block runs (0 = each) */
 
     x86_cpu shadow;                /* verify only; has its own memory */
@@ -263,6 +282,16 @@ void             dbt_cache_invalidate_all(x86_dbt *dbt);
 int  dbt_link_record(x86_dbt *dbt, uint64_t key, uint32_t site_off);
 void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code);
 #define SMC_VOLATILE 4
+/* Heat decays: it counts invalidations within one window of 2^26 guest
+ * instructions (and the one before). A patching loop crosses
+ * SMC_VOLATILE in a window; code reloaded now and then — a program
+ * EXECed again, FreeCOM swapping itself back in — never does, and so is
+ * never left to the interpreter for good. */
+#define SMC_WINDOW_SHIFT 26
+static inline uint8_t dbt_smc_window(const x86_cpu *c) { return (uint8_t)(c->insn_count >> SMC_WINDOW_SHIFT); }
+static inline int dbt_smc_hot(const uint8_t *heat, const uint8_t *win, uint32_t p, uint8_t now) {
+    return heat[p] >= SMC_VOLATILE && (uint8_t)(now - win[p]) <= 1;
+}
 void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end);
 void dbt_mark_block_bytes_except(x86_dbt *dbt, uint32_t start, uint32_t end, const uint32_t *skip, uint32_t nskip);
 void dbt_watch_cs_desc(x86_dbt *dbt);                     /* PM: flush if CS's descriptor is rewritten */
@@ -270,6 +299,7 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys);          /* cpu->smc_hook */
 void dbt_clear_code_bits(x86_cpu *cpu);                   /* forget translations, keep device marks */
 void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
 void dbt_a20_changed(x86_cpu *cpu, int on);
+void             dbt_tlb_flushed(x86_cpu *cpu);
 
 /* Backend hooks (dbt_a64.c) */
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key);
@@ -337,6 +367,13 @@ static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
  * linear = CS.base + EIP exactly and the exit stub can recover EIP as
  * linear - CS.base. */
 static inline uint64_t dbt_cpu_key(const x86_cpu *c) {
+    if (c->eflags & X86_VM) {
+        /* V86: CS.base + IP, not A20-masked (under paging the linear
+         * address is what the page tables see; the mask is physical) */
+        uint64_t b = KEY_V86 | ((c->eflags & X86_IOPL) == X86_IOPL ? KEY_IOPL3 : 0)
+                   | ((c->cr0 & X86_CR0_PG) ? KEY_PAGED : 0);
+        return dbt_key(c->seg[S_CS].sel, c->seg[S_CS].base + (c->eip & 0xFFFF)) | b;
+    }
     if (c->pmode) return dbt_key(c->seg[S_CS].sel, c->seg[S_CS].base + c->eip) | dbt_cpu_mode_bits(c);
     uint32_t lin = (c->seg[S_CS].base + (c->eip & 0xFFFF)) & c->a20_mask;
     return dbt_key(c->seg[S_CS].sel, lin);

@@ -79,6 +79,9 @@ typedef struct x86_seg {
     uint8_t  pad[3];
 } x86_seg;
 
+#define X86_PGD_PAGES 0x110                 /* linear pages 0 .. 10FFFFh: all of V86's reach */
+#define X86_PGD_NONE  1                     /* odd: no delta is (they are multiples of 4K) */
+
 typedef struct x86_cpu {
     /* General registers, encoding order. 8-bit view via x86_r8 macros. */
     uint32_t r[8];
@@ -186,6 +189,14 @@ typedef struct x86_cpu {
     uint8_t  pg_miss;       /* set by a probe that found no mapping */
     uint8_t  pad2;
     struct x86_tlbe { uint32_t tag, phys; } tlb[256];
+    /* The translator's view of the same translations, for V86 code (user
+     * accesses below 10FFF0h): per linear page, physical page minus linear
+     * page — added to an identity host address — or X86_PGD_NONE. Reads
+     * need U at both levels; writes need U and R/W and the dirty bit
+     * already set, so the first write to a page is the interpreter's.
+     * Filled by the page walk, cleared with the TLB (then tlb_hook). */
+    int64_t  pgd_r[X86_PGD_PAGES], pgd_w[X86_PGD_PAGES];
+    void   (*tlb_hook)(struct x86_cpu *);   /* DBT: translations flushed (CR3, PG, A20) */
 } x86_cpu;
 
 /* 8-bit register access: AL..BL are the low bytes of r[0..3], AH..BH are
@@ -238,10 +249,20 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 #define X86_PG_BAD  0xFFFFFFFFu              /* a probe's miss: reads as open bus */
 uint32_t x86_page_walk(struct x86_cpu *c, uint32_t lin, int write);
 void     x86_tlb_flush(struct x86_cpu *c);
+uint32_t x86_page_peek(struct x86_cpu *c, uint32_t lin);   /* user mapping of LIN's page, no side effects */
 int      x86_cpl(const struct x86_cpu *c);
 
 static inline uint32_t x86_lin(x86_cpu *c, uint32_t lin, int write) {
     if (!(c->cr0 & X86_CR0_PG)) return lin;
+    /* Low pages answer from the translator's tables first, so the
+     * interpreter and translated V86 code share one cache state there (a
+     * -V shadow walking a page the JIT still holds would set an accessed
+     * bit the JIT run never set). An entry there allows any access of its
+     * kind: present and user-readable, or user-writable and dirty. */
+    if ((lin >> 12) < X86_PGD_PAGES) {
+        int64_t d = write ? c->pgd_w[lin >> 12] : c->pgd_r[lin >> 12];
+        if (!(d & 1)) return (uint32_t)((int64_t)lin + d);
+    }
     struct x86_tlbe *t = &c->tlb[(lin >> 12) & 255];
     if ((t->tag & 0xFFFFF000u) == (lin & 0xFFFFF000u) && (t->tag & X86_TLB_V)) {
         uint32_t need = write ? X86_TLB_D : 0;

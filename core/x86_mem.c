@@ -119,6 +119,7 @@ int x86_set_a20(x86_cpu *c, int on) {
                       X86_MEM_SIZE + (on ? HMA_OFF : 0)) < 0) return -1;
     }
     c->a20_mask = mask;
+    x86_tlb_flush(c);                         /* cached translations hold A20-masked addresses */
     if (c->a20_hook) c->a20_hook(c, on);
     return 0;
 }
