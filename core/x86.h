@@ -108,6 +108,12 @@ typedef struct x86_cpu {
      * takes every interpreter read of the A0000-AFFFF window. */
     void   (*device_store)(struct x86_cpu *, uint32_t phys);
     uint8_t (*device_read)(struct x86_cpu *, uint32_t phys);
+    /* Device fast path for translated byte stores into the device window
+     * (planar VGA in its plain write mode, one plane enabled): the byte
+     * goes to dev_wplane[off] and the window byte becomes dev_rplane[off],
+     * which is all device_store would have done. NULL: call device_store.
+     * The device keeps these current as its registers change. */
+    uint8_t *dev_wplane, *dev_rplane;
     void   (*a20_hook)(struct x86_cpu *, int on);          /* DBT: the A20 gate changed */
     void   (*trace_exc)(struct x86_cpu *, int vec, uint32_t err);   /* oracle tracing */
 

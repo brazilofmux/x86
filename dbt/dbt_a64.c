@@ -72,6 +72,8 @@
 #define OFF_JIT_CUR_HIT offsetof(x86_cpu, jit_cur_hit)
 #define OFF_EXC         offsetof(x86_cpu, exc)
 #define OFF_INT_INHIBIT offsetof(x86_cpu, int_inhibit)
+#define OFF_DEV_WPLANE  offsetof(x86_cpu, dev_wplane)
+#define OFF_DEV_RPLANE  offsetof(x86_cpu, dev_rplane)
 
 #define ARITH  X86_ARITH_FLAGS   /* 0x8D5 — not a logical immediate, load it */
 
@@ -515,12 +517,36 @@ static void emit_smc_check_x3(emit_t *e, int size) {
     emit_ldst_reg(e, size == 4 ? 2 : size == 2 ? 1 : 0, 1, W_T2, W_T3, R_BMD, 3, 0);
     uint32_t skip = emit_pos(e);
     emit_cbz_w32(e, W_T2, 0);
+    uint32_t dev_done = 0, dev_miss1 = 0, dev_miss2 = 0;
+    if (size == 1) {
+        /* A byte into device memory and nothing else (no code, no
+         * descriptor): the device's fast path when it offers one — the
+         * plane write and the window refresh vga_store would do. */
+        (void)emit_subs_w32_imm(e, A64_WZR, W_T2, X86_BM_DEVICE);
+        dev_miss1 = emit_pos(e);
+        emit_b_cond(e, A64_COND_NE, 0);
+        emit_ldr_x64_imm(e, A64_W0, R_CPU, OFF_DEV_WPLANE);
+        dev_miss2 = emit_pos(e);
+        emit_cbz_x64(e, A64_W0, 0);
+        emit_sub_x64(e, A64_W1, W_T3, R_MEM);
+        emit_sub_x64_imm_lsl12(e, A64_W1, A64_W1, 0xA0);           /* offset in the A0000 window */
+        emit_ldrb_imm(e, A64_W2, W_T3, 0);
+        emit_strb_reg_uxtw(e, A64_W2, A64_W0, A64_W1);
+        emit_ldr_x64_imm(e, A64_W0, R_CPU, OFF_DEV_RPLANE);
+        emit_ldrb_reg_uxtw(e, A64_W2, A64_W0, A64_W1);
+        emit_strb_imm(e, A64_W2, W_T3, 0);
+        dev_done = emit_pos(e);
+        emit_b(e, 0);
+        emit_patch_cond19(e, dev_miss1, emit_pos(e));
+        emit_patch_cond19(e, dev_miss2, emit_pos(e));
+    }
     emit_mov_x64_x64(e, A64_W0, R_CPU);
     emit_sub_x64(e, A64_W1, W_T3, R_MEM);
     if (size > 1) (void)emit_orr_w32_imm(e, A64_W1, A64_W1, (uint32_t)size << 28);
     emit_thunk_args(e);
     emit_bl(e, (int32_t)s_smc_thunk_off - (int32_t)emit_pos(e));
     emit_patch_cond19(e, skip, emit_pos(e));
+    if (dev_done) emit_patch_b26(e, dev_done, emit_pos(e));
 }
 
 /* ---- Segment-limit slow paths ----
@@ -1087,8 +1113,8 @@ static int classify_flat(const x86_insn *in) {
         /* 32-bit, immediate count 1..31: one EXTR. CL counts, zero counts
          * and 16-bit forms (the 386's count > 16 quirk) stay helpers. */
         return in->ops[0].size == 4 && in->imm2 != 0xFFFFFFFFu && (in->imm2 & 31) ? C_INLINE : C_HELPER;
-    case OP_IMUL:
-        return in->opcode2 == 0xAF && in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* IMUL r32, r/m32 */
+    case OP_IMUL: case OP_MUL:
+        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* IMUL r32, r/m32; EDX:EAX = EAX * r/m32 */
     case OP_IMUL3:
         return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
     case OP_PUSH:
@@ -1161,7 +1187,7 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
         break;
     case OP_SHLD: case OP_SHRD:
         *wr = ARITH; break;          /* inline only with a nonzero immediate count */
-    case OP_IMUL: case OP_IMUL3:
+    case OP_IMUL: case OP_IMUL3: case OP_MUL:
         *wr = ARITH; break;
     case OP_CLC: case OP_STC: *wr = X86_CF; break;
     case OP_CMC: *wr = X86_CF; *rd = X86_CF; break;
@@ -1288,7 +1314,31 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         emit_write_operand(e, in, 0, &ea, W_T0);
         break;
     }
-    case OP_IMUL: case OP_IMUL3: {
+    case OP_MUL: case OP_IMUL:
+        if (in->op == OP_MUL || in->opcode2 != 0xAF) {
+            /* One-operand 32-bit MUL/IMUL: EDX:EAX = EAX * r/m32 (DOOM's
+             * FixedMul). CONTRACT (interp): SZP from the LOW half, AF
+             * clear, CF = OF = the high half is significant. */
+            int is_signed = in->op == OP_IMUL;
+            a64_reg_t src = emit_read_operand(e, in, 0, &ea, W_SRC);
+            if (is_signed) emit_smull(e, W_T0, R_GPR(R_AX), src);
+            else emit_umull(e, W_T0, R_GPR(R_AX), src);
+            emit_lsr_x64_imm(e, R_GPR(R_DX), W_T0, 32);
+            if (fmask) {
+                emit_tst_w32(e, W_T0, W_T0);
+                emit_flags_from_nzcv(e, T_ADD);
+                if (fmask & X86_PF) emit_flag_pf(e, W_T0);
+                if (is_signed) emit_cmp_x64_w32_sxtw(e, W_T0, W_T0);
+                else (void)emit_subs_w32_imm(e, A64_WZR, R_GPR(R_DX), 0);
+                emit_cset_w32(e, W_T2, A64_COND_NE);
+                emit_orr_w32(e, R_F, R_F, W_T2);
+                emit_orr_w32_lsl(e, R_F, R_F, W_T2, 11);
+            }
+            emit_mov_w32_w32(e, R_GPR(R_AX), W_T0);
+            break;
+        }
+        /* fall through: IMUL r32, r/m32 */
+    case OP_IMUL3: {
         /* 32-bit two- and three-operand IMUL. CONTRACT (interp, 386):
          * SZP from the HIGH half of the product, AF clear, CF = OF = the
          * product does not fit in 32 bits. */

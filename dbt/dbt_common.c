@@ -277,6 +277,7 @@ static void shadow_copy_regs(x86_dbt *dbt) {
     /* Devices belong to the real machine: the shadow sees their memory as
      * plain bytes and never reaches back into their state. */
     sh->device_store = NULL;
+    sh->dev_wplane = sh->dev_rplane = NULL;
     sh->device_read = cpu->device_read ? dev_replay : NULL;
     s_replay_dbt = dbt;
     sh->a20_hook = NULL;

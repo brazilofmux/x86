@@ -115,6 +115,7 @@ static uint8_t vga_read(x86_cpu *c, uint32_t p) {
  * across the same way the hardware would. */
 static void set_planar(x86_cpu *c, int on) {
     if (on == vga.planar) return;
+    c->dev_wplane = c->dev_rplane = NULL;                /* update_fast re-derives them after the register write */
     uint8_t *bm = c->code_bitmap;
     if (on) {
         for (uint32_t a = 0; a < WLEN; a++) vga.plane[a & 3][a] = c->mem[WIN + a];
@@ -129,6 +130,20 @@ static void set_planar(x86_cpu *c, int on) {
         c->device_read = NULL;
         vga.planar = 0;
         for (uint32_t a = 0; a < WLEN; a++) c->mem[WIN + a] = vga.plane[a & 3][a];
+    }
+}
+
+/* Keep the translator's fast store path (c->dev_wplane) in step with the
+ * registers: set only while a store is nothing but "this byte into the
+ * one plane the map mask enables" (vga_store's fast case with a single
+ * plane), with the window showing the read plane. */
+static void update_fast(x86_cpu *c) {
+    c->dev_wplane = c->dev_rplane = NULL;
+    if (!vga.planar) return;
+    uint8_t mm = vga.seq[2] & 0x0F;
+    if ((vga.gc[5] & 3) == 0 && vga.gc[3] == 0 && vga.gc[1] == 0 && vga.gc[8] == 0xFF && mm && !(mm & (mm - 1))) {
+        c->dev_wplane = vga.plane[__builtin_ctz(mm)];
+        c->dev_rplane = vga.plane[read_plane()];
     }
 }
 
@@ -197,6 +212,7 @@ int pc_vga_port_write(uint16_t port, uint32_t val, int size) {
     case 0x3C5:
         vga.seq[vga.seq_idx & 7] = v;
         if ((vga.seq_idx & 7) == 4) set_planar(c, mode13(c) && !(v & 0x08));
+        update_fast(c);
         return 1;
     case 0x3CE: vga.gc_idx = v; return 1;
     case 0x3CF:
@@ -204,6 +220,7 @@ int pc_vga_port_write(uint16_t port, uint32_t val, int size) {
             int was = read_plane();
             vga.gc[vga.gc_idx] = v;
             if (vga.planar && read_plane() != was) refresh_view(c);
+            update_fast(c);
         }
         return 1;
     case 0x3D4: vga.crtc_idx = v; return 1;
