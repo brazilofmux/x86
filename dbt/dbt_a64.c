@@ -78,7 +78,7 @@
 #define ARITH  X86_ARITH_FLAGS   /* 0x8D5 — not a logical immediate, load it */
 
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
-static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_fault_stub_off, s_fault_exit_off, s_exit_eip_off;
+static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_port_thunk_off, s_fault_stub_off, s_fault_exit_off, s_exit_eip_off;
 
 /* model >= 386: the pinned registers hold the whole 32-bit guest register,
  * so a 16-bit write merges into bits 15:0 and anything that consumes a
@@ -259,6 +259,27 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
         if (!is_exec) emit_str_w32_imm(&e, A64_W3, R_CPU, OFF_EIP);
         emit_b(&e, (int32_t)s_exit_eip_off - (int32_t)emit_pos(&e));
     }
+
+    /* ---- Port thunk: BL with X0 = cpu, W1 = port | size << 16, W2 =
+     * value, W3/W4 as above. Ports touch no guest register, so only the
+     * caller-saved pinned registers are parked; W0 comes back with the
+     * helper's verdict and the block acts on it (emit_out). ---- */
+    s_port_thunk_off = e.offset;
+    emit_stp_pre_sp(&e, A64_W29, A64_W30, -96);
+    emit_stp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
+    emit_stp_x64_off(&e, A64_W11, A64_W12, A64_SP, 32);
+    emit_stp_x64_off(&e, A64_W13, A64_W14, A64_SP, 48);
+    emit_stp_x64_off(&e, A64_W15, A64_W16, A64_SP, 64);
+    emit_str_x64_imm(&e, A64_W17, A64_SP, 80);
+    emit_ldr_x64_imm(&e, A64_W9, R_AUX, AUX_HELPERS + 8 * H_OUT);
+    emit_blr(&e, A64_W9);
+    emit_ldr_x64_imm(&e, A64_W17, A64_SP, 80);
+    emit_ldp_x64_off(&e, A64_W15, A64_W16, A64_SP, 64);
+    emit_ldp_x64_off(&e, A64_W13, A64_W14, A64_SP, 48);
+    emit_ldp_x64_off(&e, A64_W11, A64_W12, A64_SP, 32);
+    emit_ldp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
+    emit_ldp_post_sp(&e, A64_W29, A64_W30, 96);
+    emit_ret(&e);
 
     dbt->code_used = e.offset;
     __builtin___clear_cache((char *)dbt->code_buf, (char *)dbt->code_buf + e.offset);
@@ -1170,6 +1191,7 @@ static int classify_op(const x86_insn *in) {
     case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
     case OP_RET: case OP_CALLF: case OP_JMPF: case OP_RETF:
     case OP_INT: case OP_INT3:
+    case OP_OUT:
         return C_INLINE;
     case OP_PUSH:
         return C_INLINE;
@@ -1216,10 +1238,8 @@ static int classify_pm(const x86_insn *in) {
         return C_REFUSE;
     case OP_DIV: case OP_IDIV:
         return C_HELPER;          /* #DE is a fault: the thunk's fault exit delivers it */
-    /* OUT stays a fallback: a port can halt the machine (the oracle's exit
-     * port) or reach any other host state, which the instructions after it
-     * in a block must see, and under -V the shadow's stubbed ports could not
-     * follow. As a helper it was worth ~5% of DOOM. */
+    case OP_OUT:
+        return C_INLINE;          /* the port thunk (emit_out), in every kind of block */
     default:
         return classify_op(in) == C_REFUSE ? C_REFUSE : C_HELPER;
     }
@@ -1280,6 +1300,8 @@ static int classify_flat(const x86_insn *in) {
         return in->opsize == 4 ? C_INLINE : C_HELPER;
     case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
         return in->opsize == 4 && in->adsize == 4 ? C_INLINE : C_HELPER;
+    case OP_OUT:
+        return C_INLINE;
     default:
         return C_HELPER;
     }
@@ -1310,7 +1332,7 @@ static int op_may_fault(const x86_insn *in) {
  * loop) sees in full. */
 static int op_stores(const x86_insn *in) {
     switch (in->op) {
-    case OP_PUSH: case OP_PUSHA: case OP_CALL: case OP_CALLF: case OP_INT: case OP_INT3: return 1;
+    case OP_PUSH: case OP_PUSHA: case OP_CALL: case OP_CALLF: case OP_INT: case OP_INT3: case OP_OUT: return 1;
     case OP_CMP: case OP_TEST: case OP_LEA: return 0;
     case OP_XCHG: return in->ea_valid;
     default: return in->ops[0].kind == OPK_MEM;
@@ -1343,8 +1365,8 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
          * live-out set when it does shift. */
         if (in->ops[1].kind == OPK_IMM && (in->ops[1].imm & 0xFF)) *wr = ARITH;
         break;
-    case OP_DIV: case OP_IDIV:
-        *rd = ARITH; break;          /* #DE is an unplanned exit whose frame holds the flags */
+    case OP_DIV: case OP_IDIV: case OP_OUT:
+        *rd = ARITH; break;          /* #DE / #GP: an unplanned exit whose frame holds the flags */
     case OP_SETCC: {
         static const uint16_t need[8] = { X86_OF, X86_CF, X86_ZF, X86_CF | X86_ZF, X86_SF, X86_PF, X86_SF | X86_OF, X86_SF | X86_OF | X86_ZF };
         *rd = need[in->cond >> 1]; break;
@@ -1374,6 +1396,39 @@ static void emit_helper_op(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
     emit_mov_w32_imm32(e, A64_W1, idx);
     emit_thunk_args(e);
     emit_bl(e, (int32_t)s_exec_thunk_off - (int32_t)emit_pos(e));
+}
+
+/* OUT imm8/DX, AL/AX/EAX through the port thunk; exact (the interpreter's
+ * own io_write and permission check) and the block goes on — unless the
+ * helper says to leave: after the instruction (charged, EIP = ip_after)
+ * or at it with the #GP it recorded. Both exits spill R_F, so an OUT is
+ * an op_stores-style op with all flags live around it. */
+static void emit_out(emit_t *e, const x86_insn *in) {
+    int size = in->ops[1].size;
+    emit_mov_x64_x64(e, A64_W0, R_CPU);
+    if (in->ops[0].kind == OPK_IMM) emit_mov_w32_imm32(e, A64_W1, (in->ops[0].imm & 0xFF) | ((uint32_t)size << 16));
+    else {
+        emit_uxth_w32(e, A64_W1, R_GPR(R_DX));
+        (void)emit_orr_w32_imm(e, A64_W1, A64_W1, (uint32_t)size << 16);
+    }
+    if (size == 4) emit_mov_w32_w32(e, A64_W2, R_GPR(R_AX));
+    else if (size == 2) emit_uxth_w32(e, A64_W2, R_GPR(R_AX));
+    else (void)emit_and_w32_imm(e, A64_W2, R_GPR(R_AX), 0xFF);
+    emit_mov_w32_imm32(e, A64_W3, s_cur_ip_after);
+    emit_movz_w32(e, A64_W4, (uint16_t)s_cur_n_done, 0);
+    emit_bl(e, (int32_t)s_port_thunk_off - (int32_t)emit_pos(e));
+    uint32_t go_on = emit_pos(e);
+    emit_cbz_w32(e, A64_W0, 0);
+    emit_cmp_w32_imm(e, A64_W0, 2);
+    uint32_t leave = emit_pos(e);
+    emit_b_cond(e, A64_COND_NE, 0);
+    emit_mov_w32_imm32(e, A64_W3, s_cur_ip_start);              /* #GP: at the instruction, cpu->exc set */
+    emit_b(e, (int32_t)s_fault_exit_off - (int32_t)emit_pos(e));
+    emit_patch_cond19(e, leave, emit_pos(e));
+    emit_sub_x64(e, R_CNT, R_CNT, A64_W4);                       /* leave after it */
+    emit_str_w32_imm(e, A64_W3, R_CPU, OFF_EIP);
+    emit_b(e, (int32_t)s_exit_eip_off - (int32_t)emit_pos(e));
+    emit_patch_cond19(e, go_on, emit_pos(e));
 }
 
 static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32_t fmask) {
@@ -1460,6 +1515,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     }
     case OP_PUSHA: emit_pusha_flat(e); break;
     case OP_POPA:  emit_popa_flat(e); break;
+    case OP_OUT:   emit_out(e, in); break;
     case OP_MOV: {
         a64_reg_t v = emit_read_operand(e, in, 1, &ea, W_VAL);
         emit_write_operand(e, in, 0, &ea, v);
@@ -1942,7 +1998,8 @@ static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
         s_cur_ip_after = ip_afters[i];
         s_cur_ip_start = ip_afters[i] - decs[i].len;
         s_cur_n_done = i + 1;
-        emit_helper_op(dbt, &e, &decs[i]);
+        if (decs[i].op == OP_OUT) emit_out(&e, &decs[i]);
+        else emit_helper_op(dbt, &e, &decs[i]);
     }
     emit_tail_prologue(&e, n_ops);
     if (ends_dynamic) {

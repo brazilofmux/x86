@@ -134,6 +134,7 @@ _Static_assert((AUX_CACHE & 0xFFF) == 0, "AUX_CACHE must be reachable by ADD #im
 enum {
     H_EXEC = 0,        /* void (cpu, insn_index): interpreter's execute() */
     H_POST_STORE,      /* void (cpu, phys | bytes << 28): device and SMC hooks after a JIT store */
+    H_OUT,             /* uint32 (cpu, port | size << 16, value): OUT; 0 go on, 1 leave after it, 2 #GP */
     H__COUNT
 };
 
@@ -262,6 +263,7 @@ int      dbt_classify_op_pm(const x86_insn *in);   /* same, for a flat protected
 /* Helpers called from translated code (dbt_common.c) */
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index);
 void dbt_h_post_store(x86_cpu *cpu, uint32_t arg);
+uint32_t dbt_h_out(x86_cpu *cpu, uint32_t port_size, uint32_t value);
 
 /* The flat model: base 0, limit 4G, 32-bit, and for data segments
  * writable and expanding up. A block translated under KEY_FLAT addresses

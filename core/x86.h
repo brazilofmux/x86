@@ -283,6 +283,7 @@ void x86_interrupt(x86_cpu *c, int vector, int is_sw);
 /* Raise a fault from inside an instruction: records it and, when a step
  * is armed, abandons the instruction (longjmp). Never returns if armed. */
 void x86_fault(x86_cpu *c, int vector, uint32_t err);
+int  x86_io_permitted(x86_cpu *c, uint32_t port, int size);   /* the I/O permission check, without raising */
 
 /* Flags after POPF/IRET are model dependent: 8086 forces 12-15 set,
  * 286 real mode forces them clear, 386 allows IOPL/NT. */

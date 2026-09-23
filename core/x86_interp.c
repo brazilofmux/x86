@@ -208,13 +208,16 @@ static void need_iopl(x86_cpu *c) {
  * bitmap, whose offset is the word at TSS+66h: every bit covering the access
  * must be clear, and a bitmap that ends before them — or no room for one at
  * all — means #GP(0). The 286 has no bitmap. */
-static void io_check(x86_cpu *c, uint32_t port, int size) {
-    if (!c->pmode || x86_cpl(c) <= iopl(c)) return;
-    if (c->model < X86_MODEL_386 || !c->tr.usable || c->tr.limit < 0x67) x86_fault(c, X86_EXC_GP, 0);
+int x86_io_permitted(x86_cpu *c, uint32_t port, int size) {
+    if (!c->pmode || x86_cpl(c) <= iopl(c)) return 1;
+    if (c->model < X86_MODEL_386 || !c->tr.usable || c->tr.limit < 0x67) return 0;
     uint32_t at = x86_rd(c, c->tr.base, 0x66, 0xFFFFFFFFu, 2) + (port >> 3);
-    if (at + 1 > c->tr.limit) x86_fault(c, X86_EXC_GP, 0);
+    if (at + 1 > c->tr.limit) return 0;
     uint32_t bits = x86_rd(c, c->tr.base, at, 0xFFFFFFFFu, 2);
-    if (bits & ((((uint32_t)1 << size) - 1) << (port & 7))) x86_fault(c, X86_EXC_GP, 0);
+    return !(bits & ((((uint32_t)1 << size) - 1) << (port & 7)));
+}
+static void io_check(x86_cpu *c, uint32_t port, int size) {
+    if (!x86_io_permitted(c, port, size)) x86_fault(c, X86_EXC_GP, 0);
 }
 
 /* POPF and IRET only change what privilege allows: IOPL at CPL 0 alone, IF

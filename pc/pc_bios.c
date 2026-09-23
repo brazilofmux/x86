@@ -344,10 +344,17 @@ int pc_poll(x86_cpu *c) {
 static struct { uint16_t reload; uint16_t latch; int latched, rw_phase, mode_rw; } pit[3];
 static uint8_t pic_mask = 0xB8, pit_speaker;
 
-/* Channel 0's period: reload 0 means 65536, the BIOS's 54.9 ms. */
+/* Channel 0's period: reload 0 means 65536, the BIOS's 54.9 ms.
+ * X86_PIT_SCALE=N (measurement aid) makes the timer tick N times faster
+ * than wall clock, so code that spins on the tick count — DOOM's screen
+ * melt inside a timedemo, a third of its wall time — stops hiding what
+ * the translator does. Everything the guest times from IRQ 0 is off by
+ * the same factor, so only host seconds mean anything under it. */
 static uint64_t irq0_period_ns(void) {
+    static double scale;
+    if (scale == 0) { const char *s = getenv("X86_PIT_SCALE"); scale = s ? atof(s) : 1.0; if (scale <= 0) scale = 1.0; }
     uint64_t reload = pit[0].reload ? pit[0].reload : 65536;
-    return reload * 1000000000ull / PIT_HZ;
+    return (uint64_t)((double)reload * 1000000000.0 / (double)PIT_HZ / scale);
 }
 
 static uint16_t pit_now(int ch) {

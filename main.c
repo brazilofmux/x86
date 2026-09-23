@@ -401,6 +401,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);
     }
     if (use_jit) dbt_cleanup(&g_dbt);
+    /* X86_MEM_DUMP=<path>: the whole guest memory at exit, for locating
+     * hot blocks from a profile (ndisasm -b 32 -o ADDR -e ADDR). */
+    if (getenv("X86_MEM_DUMP")) {
+        FILE *f = fopen(getenv("X86_MEM_DUMP"), "wb");
+        if (f) { fwrite(cpu.mem, 1, cpu.mem_size, f); fclose(f); }
+    }
     x86_free(&cpu);
     return rc < 0 ? 1 : (pc.exit_requested ? pc.exit_code : 0);
 }

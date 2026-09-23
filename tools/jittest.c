@@ -296,7 +296,9 @@ static int fuzz_accept_pm(const x86_insn *in) {
         return in->ops[0].size == 4;   /* #DE goes through the IDT to a HLT (pm_flat_setup) */
     case OP_POP: case OP_PUSH:
         return in->ops[0].kind != OPK_SREG;
-    case OP_IN: case OP_OUT: case OP_INS: case OP_OUTS:
+    case OP_OUT:
+        return 1;                    /* no ports on this machine: exercises the port thunk */
+    case OP_IN: case OP_INS: case OP_OUTS:
         return 0;
     default:
         return dbt_classify_op_pm(in) != 0;

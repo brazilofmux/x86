@@ -73,6 +73,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     build_tables(dbt->aux);
     dbt->aux->helpers[H_EXEC]       = (void *)dbt_h_exec;
     dbt->aux->helpers[H_POST_STORE] = (void *)dbt_h_post_store;
+    dbt->aux->helpers[H_OUT]        = (void *)dbt_h_out;
 
     dbt->bm_lo    = cpu->mem_size;         /* nothing marked yet */
     cpu->dbt      = dbt;
@@ -161,6 +162,23 @@ void dbt_h_post_store(x86_cpu *cpu, uint32_t arg) {
     if (!n) n = 1;
     for (uint32_t i = 0; i < n; i++)
         if (cpu->code_bitmap[phys + i]) x86_store_hook(cpu, phys + i);
+}
+
+/* OUT from inside a block, through the port thunk (which saves only the
+ * caller-saved pinned registers: no spill, no reload). Returns 0 to go
+ * on with the block, 1 to leave after the instruction — the port halted
+ * the machine (the oracle's exit port), or flipped A20 and with it the
+ * cache under the running block — and 2 for #GP, cpu->exc set, to leave
+ * at the instruction. Ports never touch the guest registers or flags. */
+uint32_t dbt_h_out(x86_cpu *cpu, uint32_t port_size, uint32_t value) {
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    uint32_t port = port_size & 0xFFFF;
+    int size = (int)(port_size >> 16);
+    dbt->helper_by_op[OP_OUT]++;
+    if (!x86_io_permitted(cpu, port, size)) { cpu->exc = X86_EXC_GP; cpu->exc_err = 0; return 2; }
+    cpu->jit_cur_hit = 0;
+    if (cpu->io_write) cpu->io_write(cpu, (uint16_t)port, value, size);
+    return (cpu->halted || cpu->jit_cur_hit) ? 1 : 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -384,6 +402,10 @@ int dbt_run(x86_dbt *dbt) {
                 dbt->verify_blocks_checked++;
                 runs++;
 
+                /* An OUT inside the run halted the machine: only the real
+                 * cpu has ports, so the shadow, which ran the same
+                 * instructions, is told. */
+                if (cpu->halted) dbt->shadow.halted = 1;
                 int regs_ok = cpu_regs_equal(cpu, &dbt->shadow);
                 /* An OUT inside the run flipped A20: the shadow's ports are
                  * stubs, so it did not follow. Registers are compared as is;
