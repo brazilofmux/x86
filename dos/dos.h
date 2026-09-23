@@ -50,6 +50,15 @@ typedef struct {
     uint8_t  drive;
     uint16_t owner_psp;
     int      refs;           /* job-file-table slots (any PSP) that name this entry */
+    /* Files: the DOS file position is ours (the host fd's is unused: all
+     * I/O is pread/pwrite at pos), and a window of the file is cached
+     * (dos_int21.c, "File buffering"). */
+    int64_t  pos;
+    int      hostacc;        /* O_RDONLY / O_WRONLY / O_RDWR as the host fd was opened */
+    int      alias;          /* another open entry names the same host file: no buffering */
+    uint8_t *buf;            /* the window: file bytes [bstart, bstart + blen) */
+    int64_t  bstart;
+    uint32_t blen, dlo, dhi; /* dirty bytes [dlo, dhi) of the window when dlo < dhi */
     char     path[DOS_MAX_PATH];
 } dos_handle;
 
@@ -100,6 +109,8 @@ int  dos_exec(x86_cpu *cpu, const char *dos_path, int mode, uint16_t pblk_seg, u
 uint16_t dos_mem_alloc(uint16_t paras, uint16_t owner, uint16_t *largest);
 void dos_jft_inherit(x86_cpu *c, uint16_t psp);   /* a new PSP copied its parent's JFT: count the references */
 void dos_jft_release(x86_cpu *c, uint16_t psp);   /* a PSP is going away: drop every slot it holds */
+void dos_flush_all(void);
+void dos_flush_atexit(void);                          /* write every file window back (before a path is looked at, and at exit) */
 int  dos_mem_free(uint16_t seg);
 int  dos_mem_resize(uint16_t seg, uint16_t paras, uint16_t *largest);
 void dos_mem_free_owner(uint16_t owner);

@@ -119,6 +119,7 @@ void dos_init(x86_cpu *cpu, const char *root) {
     dos.cur_drive = 2;
     dos_mount(2, root);
     for (int i = 0; i < DOS_MAX_HANDLES; i++) dos.handles[i].fd = -1;
+    { static int registered; if (!registered) { registered = 1; atexit(dos_flush_atexit); } }   /* buffered file windows reach the disk */
     for (int i = 0; i < 5; i++) {
         dos.handles[i].fd = -2;
         dos.handles[i].refs = 1 << 20;                /* the standard devices never close */

@@ -142,12 +142,111 @@ static int new_handle(x86_cpu *c) {
     return h;
 }
 
+/* ---- File buffering ----
+ * DOS kept file data in its BUFFERS, so a program that reads and writes
+ * a record per call (the Micro Focus run-time: 106-byte sort work
+ * records, a seek and a read per indexed access) paid a memory copy.
+ * Here each call was a host system call. An open file now has a 32 KB
+ * window: reads are served from it, writes land in it (contiguously,
+ * the dirty part tracked), and it is written back when the window moves
+ * or the file closes, before any path is looked at (open, create,
+ * delete, rename, attributes, directory searches, EXEC: dos_flush_all),
+ * before the file's size or date is asked for, and at exit. Two entries
+ * naming the same host file (the file opened twice) are not buffered at
+ * all, so neither can see stale bytes. */
+#define FILE_WIN 32768u
+
+static void win_flush(dos_handle *dh) {
+    if (dh->buf && dh->dlo < dh->dhi) {
+        if (pwrite(dh->fd, dh->buf + dh->dlo, dh->dhi - dh->dlo, dh->bstart + dh->dlo) < 0) { /* reported by the next call */ }
+    }
+    dh->dlo = dh->dhi = 0;
+}
+static void win_drop(dos_handle *dh) { win_flush(dh); dh->blen = 0; }
+
+void dos_flush_all(void) {
+    for (int i = 5; i < DOS_MAX_HANDLES; i++)
+        if (dos.handles[i].fd >= 0 && !dos.handles[i].dev) win_flush(&dos.handles[i]);
+}
+void dos_flush_atexit(void) { dos_flush_all(); }
+
+/* Mark every open entry naming dh's host file (dh included) as aliased,
+ * their windows written back and dropped, if there is more than one. */
+static void win_alias_check(dos_handle *dh) {
+    int n = 0;
+    for (int i = 5; i < DOS_MAX_HANDLES; i++) {
+        dos_handle *o = &dos.handles[i];
+        if (o != dh && o->fd >= 0 && !o->dev && !strcmp(o->path, dh->path)) {
+            n++; win_drop(o); o->alias = 1;
+        }
+    }
+    dh->alias = n > 0;
+}
+
+/* Read up to len bytes at dh->pos into out; returns the count or -1. */
+static ssize_t file_read(dos_handle *dh, uint8_t *out, uint32_t len) {
+    if (dh->alias) { ssize_t n = pread(dh->fd, out, len, dh->pos); if (n > 0) dh->pos += n; return n; }
+    uint32_t done = 0;
+    while (done < len) {
+        if (dh->buf && dh->pos >= dh->bstart && dh->pos < dh->bstart + dh->blen) {
+            uint32_t at = (uint32_t)(dh->pos - dh->bstart), n = dh->blen - at;
+            if (n > len - done) n = len - done;
+            memcpy(out + done, dh->buf + at, n);
+            done += n; dh->pos += n;
+            continue;
+        }
+        win_drop(dh);
+        if (len - done >= FILE_WIN) {                       /* big reads go straight through */
+            ssize_t n = pread(dh->fd, out + done, len - done, dh->pos);
+            if (n < 0) return done ? (ssize_t)done : -1;
+            done += (uint32_t)n; dh->pos += n;
+            break;
+        }
+        if (!dh->buf && !(dh->buf = malloc(FILE_WIN))) return -1;
+        ssize_t n = pread(dh->fd, dh->buf, FILE_WIN, dh->pos);
+        if (n < 0) return done ? (ssize_t)done : -1;
+        dh->bstart = dh->pos; dh->blen = (uint32_t)n;
+        if (n == 0) break;                                  /* end of file */
+    }
+    return done;
+}
+
+/* Write len bytes at dh->pos; returns the count or -1. */
+static ssize_t file_write(dos_handle *dh, const uint8_t *in, uint32_t len) {
+    if (dh->hostacc == O_RDONLY) { errno = EBADF; return -1; }
+    if (dh->alias || len >= FILE_WIN) {
+        win_drop(dh);
+        ssize_t n = pwrite(dh->fd, in, len, dh->pos);
+        if (n > 0) dh->pos += n;
+        return n;
+    }
+    int in_win = dh->buf && dh->pos >= dh->bstart && dh->pos <= dh->bstart + dh->blen
+                 && dh->pos + len <= dh->bstart + FILE_WIN;
+    if (!in_win) {
+        win_drop(dh);
+        if (!dh->buf && !(dh->buf = malloc(FILE_WIN))) return -1;
+        dh->bstart = dh->pos; dh->blen = 0;
+    }
+    uint32_t at = (uint32_t)(dh->pos - dh->bstart);
+    memcpy(dh->buf + at, in, len);
+    if (dh->dlo >= dh->dhi) { dh->dlo = at; dh->dhi = at + len; }
+    else { if (at < dh->dlo) dh->dlo = at; if (at + len > dh->dhi) dh->dhi = at + len; }
+    if (at + len > dh->blen) dh->blen = at + len;
+    dh->pos += len;
+    return len;
+}
+
 /* Drop one JFT reference; the entry closes when nothing names it. */
 static void sft_release(int s) {
     if (s < 5 || s >= DOS_MAX_HANDLES || dos.handles[s].fd == -1) return;
     if (--dos.handles[s].refs > 0) return;
-    if (dos.handles[s].fd >= 0 && !dos.handles[s].dev) close(dos.handles[s].fd);
-    dos.handles[s].fd = -1;
+    dos_handle *dh = &dos.handles[s];
+    if (dh->fd >= 0 && !dh->dev) {
+        win_flush(dh);
+        close(dh->fd);
+    }
+    free(dh->buf); dh->buf = NULL; dh->blen = 0; dh->dlo = dh->dhi = 0;
+    dh->fd = -1;
 }
 
 void dos_jft_inherit(x86_cpu *c, uint16_t psp) {
@@ -182,6 +281,7 @@ static int is_device_name(const char *dos_path, uint8_t *dev) {
  * 2 create new (fail if exists), 3 create temp. */
 static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int attr) {
     (void)attr;
+    dos_flush_all();
     trace(c, "open \"%s\" mode %d%s", dos_path, mode, create ? " create" : "");
     int h = new_handle(c);
     if (h < 0) { err(c, DE_TOO_MANY_OPEN); return; }
@@ -215,6 +315,9 @@ static void do_open(x86_cpu *c, const char *dos_path, int mode, int create, int 
     dh->fd = fd; dh->dev = 0; dh->binary = 1; dh->mode = (uint8_t)mode; dh->owner_psp = dos.psp;
     dh->drive = (uint8_t)dos_path_drive(dos_path);
     snprintf(dh->path, sizeof dh->path, "%s", host);
+    dh->pos = 0; dh->hostacc = fcntl(fd, F_GETFL) & O_ACCMODE;
+    dh->buf = NULL; dh->blen = 0; dh->dlo = dh->dhi = 0; dh->bstart = 0;
+    win_alias_check(dh);
     if (pc.debug) trace(c, "open %s (%s) mode %02X create %d → %d", dos_path, host, mode, create, h);
     SET_AX(h); ok(c);
 }
@@ -247,11 +350,10 @@ static void do_read(x86_cpu *c, int h, uint32_t lin, uint16_t len) {
         return;
     }
     if (dh->dev) { SET_AX(0); ok(c); return; }
-    uint8_t *buf = malloc(len ? len : 1);
-    ssize_t n = read(dh->fd, buf, len);
-    if (n < 0) { free(buf); err(c, dos_errno()); return; }
+    uint8_t buf[65536];
+    ssize_t n = file_read(dh, buf, len);
+    if (n < 0) { err(c, dos_errno()); return; }
     for (ssize_t i = 0; i < n; i++) x86_phys_wr8(c, lin + (uint32_t)i, buf[i]);
-    free(buf);
     SET_AX(n); ok(c);
 }
 
@@ -264,15 +366,14 @@ static void do_write(x86_cpu *c, int h, uint32_t lin, uint16_t len) {
         return;
     }
     if (dh->dev) { SET_AX(len); ok(c); return; }
-    if (len == 0) {                                     /* truncate at current position */
-        off_t pos = lseek(dh->fd, 0, SEEK_CUR);
-        if (ftruncate(dh->fd, pos) < 0) { err(c, dos_errno()); return; }
+    if (len == 0) {                                     /* truncate (or extend) at the current position */
+        win_drop(dh);
+        if (ftruncate(dh->fd, dh->pos) < 0) { err(c, dos_errno()); return; }
         SET_AX(0); ok(c); return;
     }
-    uint8_t *buf = malloc(len);
+    uint8_t buf[65536];
     for (uint16_t i = 0; i < len; i++) buf[i] = x86_phys_rd8(c, lin + i);
-    ssize_t n = write(dh->fd, buf, len);
-    free(buf);
+    ssize_t n = file_write(dh, buf, len);
     if (n < 0) { err(c, dos_errno()); return; }
     SET_AX(n); ok(c);
 }
@@ -318,6 +419,18 @@ void dos_int21(x86_cpu *c, int vector) {
     if (pc.debug > 1) fprintf(stderr, "[dos] INT 21h AH=%02X AL=%02X BX=%04X CX=%04X DX=%04X from %04X:%04X @%llu\n", AH, AL, BX, CX, DX,
                               pc_rd16(c, c->seg[S_SS].sel, (uint16_t)(c->r[R_SP] + 2)), pc_rd16(c, c->seg[S_SS].sel, (uint16_t)c->r[R_SP]),
                               (unsigned long long)c->insn_count);
+    /* Anything that looks at a file by name, or at the disk, sees every
+     * buffered write first (FCB calls, directories, delete, attributes,
+     * EXEC, searches, rename, create, disk reset). */
+    switch (AH) {
+    case 0x0D: case 0x0F: case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
+    case 0x21: case 0x22: case 0x23: case 0x24: case 0x27: case 0x28:
+    case 0x39: case 0x3A: case 0x3B: case 0x41: case 0x43: case 0x4B: case 0x4E: case 0x4F:
+    case 0x56: case 0x5A: case 0x5B: case 0x6C:
+        dos_flush_all();
+        break;
+    default: break;
+    }
     switch (AH) {
     case 0x00: dos_terminate(c, 0, 0); break;
     case 0x01: SET_AL(con_in(c, 1)); break;
@@ -487,8 +600,17 @@ void dos_int21(x86_cpu *c, int vector) {
         if (!dh) { err(c, DE_INVALID_HANDLE); break; }
         if (dh->dev) { SET_AX(0); SET_DX(0); ok(c); break; }
         off_t off = (off_t)(int32_t)(((uint32_t)CX << 16) | DX);
-        off_t r = lseek(dh->fd, off, AL == 0 ? SEEK_SET : AL == 1 ? SEEK_CUR : SEEK_END);
-        if (r < 0) { err(c, DE_INVALID_FN); break; }
+        int64_t r;
+        if (AL == 0) r = off;
+        else if (AL == 1) r = dh->pos + off;
+        else {                                          /* from the end: the size with our dirty bytes in it */
+            struct stat st;
+            win_flush(dh);
+            if (fstat(dh->fd, &st) < 0) { err(c, dos_errno()); break; }
+            r = (int64_t)st.st_size + off;
+        }
+        if (AL > 2 || r < 0) { err(c, DE_INVALID_FN); break; }
+        dh->pos = r;
         SET_AX((uint32_t)r); SET_DX((uint32_t)r >> 16); ok(c);
         break;
     }
@@ -637,6 +759,7 @@ void dos_int21(x86_cpu *c, int vector) {
         if (!dh) { err(c, DE_INVALID_HANDLE); break; }
         if (AL == 0) {
             struct stat st; time_t t = time(NULL);
+            if (!dh->dev) win_flush(dh);
             if (!dh->dev && fstat(dh->fd, &st) == 0) t = st.st_mtime;
             uint16_t date, tm = dos_ftime(t, &date);
             SET_CX(tm); SET_DX(date);
@@ -705,7 +828,13 @@ void dos_int21(x86_cpu *c, int vector) {
         ok(c);
         break;
     }
-    case 0x68: ok(c); break;
+    case 0x68: {                                     /* commit */
+        dos_handle *dh = handle(c, BX);
+        if (!dh) { err(c, DE_INVALID_HANDLE); break; }
+        if (!dh->dev) win_flush(dh);
+        ok(c);
+        break;
+    }
     case 0x6C: {
         get_path(c, P_DS(SI), path, sizeof path);
         int action = DX, mode = BX & 0x7F;
