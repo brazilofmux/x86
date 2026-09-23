@@ -75,8 +75,8 @@ int x86_read_desc(x86_cpu *c, uint16_t sel, uint32_t *lo, uint32_t *hi) {
         limit = c->gdtr.limit;
     }
     if (off + 7 > limit) return 0;
-    *lo = x86_rd(c, base, off, 0xFFFFFFFFu, 4);
-    *hi = x86_rd(c, base, off + 4, 0xFFFFFFFFu, 4);
+    *lo = x86_sup_rd(c, base, off, 4);
+    *hi = x86_sup_rd(c, base, off + 4, 4);
     return 1;
 }
 
@@ -95,7 +95,7 @@ void x86_unpack_desc(x86_seg *g, uint16_t sel, uint32_t lo, uint32_t hi) {
 void x86_set_accessed(x86_cpu *c, uint16_t sel, uint32_t hi) {
     uint32_t base = (sel & 4) ? c->ldtr.base : c->gdtr.base;
     if (hi & (X86_TYPE_ACCESSED << 8)) return;
-    x86_wr(c, base, (sel & 0xFFF8) + 4, 0xFFFFFFFFu, 4, hi | (X86_TYPE_ACCESSED << 8));
+    x86_sup_wr(c, base, (sel & 0xFFF8) + 4, 4, hi | (X86_TYPE_ACCESSED << 8));
 }
 
 /* Load a data or stack segment register. CS goes through the control
@@ -199,6 +199,9 @@ void x86_reset(x86_cpu *c) {
     c->pmode = 0;
     c->pe_window = 0;
     x86_real_limits(c);
+    c->cr0 = 0; c->cr2 = 0; c->cr3 = 0;
+    c->pg_super = c->pg_probe = 0;
+    x86_tlb_flush(c);
     c->halted = 0;
     c->int_inhibit = 0;
     c->exc = -1;

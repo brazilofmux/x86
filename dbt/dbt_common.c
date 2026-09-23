@@ -371,7 +371,10 @@ int dbt_run(x86_dbt *dbt) {
          * never clears the inhibit). The interpreter runs that one
          * instruction: it clears the inhibit, or renews it, exactly; the
          * poll above saw it and delivered nothing. */
-        int inhibited = cpu->int_inhibit != 0;
+        /* Paging on, or V86 mode: the translator assumes linear ==
+         * physical and CPL 0 real-mode semantics, so the interpreter
+         * steps those (the V86/paging campaign's first milestones). */
+        int inhibited = cpu->int_inhibit != 0 || (cpu->cr0 & X86_CR0_PG) || (cpu->eflags & X86_VM);
         x86_block_entry *be = inhibited ? NULL : dbt_cache_lookup(dbt, key);
         uint8_t *code = be ? be->code : NULL;
         if (!be && !inhibited) {

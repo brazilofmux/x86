@@ -12,7 +12,7 @@ ifneq ($(SDL_CFLAGS),)
   SDL_LIBS   += -lSDL2
 endif
 
-CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c
+CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c
 CORE_OBJS = $(CORE_SRCS:.c=.o)
 
 DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_a64.c
@@ -69,6 +69,10 @@ test-boot: $(TARGET)
 
 test-pm:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 pmrun.py
+
+# Paging and V86 transcript images: QEMU and dos-monster, diffed
+test-pg: $(TARGET)
+	cd tools/pmoracle && python3 pgrun.py pgtest.asm
 
 test-pm-compare:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 compare.py

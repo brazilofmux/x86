@@ -211,9 +211,9 @@ static void need_iopl(x86_cpu *c) {
 int x86_io_permitted(x86_cpu *c, uint32_t port, int size) {
     if (!c->pmode || x86_cpl(c) <= iopl(c)) return 1;
     if (c->model < X86_MODEL_386 || !c->tr.usable || c->tr.limit < 0x67) return 0;
-    uint32_t at = x86_rd(c, c->tr.base, 0x66, 0xFFFFFFFFu, 2) + (port >> 3);
+    uint32_t at = x86_sup_rd(c, c->tr.base, 0x66, 2) + (port >> 3);
     if (at + 1 > c->tr.limit) return 0;
-    uint32_t bits = x86_rd(c, c->tr.base, at, 0xFFFFFFFFu, 2);
+    uint32_t bits = x86_sup_rd(c, c->tr.base, at, 2);
     return !(bits & ((((uint32_t)1 << size) - 1) << (port & 7)));
 }
 static void io_check(x86_cpu *c, uint32_t port, int size) {
@@ -304,15 +304,20 @@ static uint32_t return_pm(x86_cpu *c, int os, int extra, uint32_t imm) {
  * build the new frame before committing SS:ESP. */
 static void push_on(x86_cpu *c, const x86_seg *ss, uint32_t *sp, int size, uint32_t v) {
     *sp = (*sp - size) & (ss->big ? 0xFFFFFFFFu : 0xFFFFu);
+    /* a stack at CPL 0-2 is supervisor memory to the paging unit, even
+     * while CS still says where the transfer came from */
+    uint8_t s = c->pg_super;
+    if ((ss->sel & 3) < 3) c->pg_super = 1;
     x86_wr(c, ss->base, *sp, 0xFFFFFFFFu, size, v);
+    c->pg_super = s;
 }
 
 /* Protected-mode interrupt and exception delivery through the IDT. */
 static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     uint32_t off = (uint32_t)vector * 8;
     if (off + 7 > c->idtr.limit) x86_fault(c, X86_EXC_GP, (off | 2));   /* IDT error codes set the IDT bit */
-    uint32_t lo = x86_rd(c, c->idtr.base, off, 0xFFFFFFFFu, 4);
-    uint32_t hi = x86_rd(c, c->idtr.base, off + 4, 0xFFFFFFFFu, 4);
+    uint32_t lo = x86_sup_rd(c, c->idtr.base, off, 4);
+    uint32_t hi = x86_sup_rd(c, c->idtr.base, off + 4, 4);
     uint16_t gattr = (uint16_t)((hi >> 8) & 0xFF);
     int type = gattr & 0x1F;
     int gate32 = (type & 0x08) != 0;
@@ -342,8 +347,8 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     if (newcpl < cpl) {
         /* Inward: the stack comes from the TSS, and the interrupted one is
          * recorded on it. */
-        uint32_t nsp = x86_rd(c, c->tr.base, 4 + newcpl * 8, 0xFFFFFFFFu, 4);
-        uint16_t nss = (uint16_t)x86_rd(c, c->tr.base, 8 + newcpl * 8, 0xFFFFFFFFu, 2);
+        uint32_t nsp = x86_sup_rd(c, c->tr.base, 4 + newcpl * 8, 4);
+        uint16_t nss = (uint16_t)x86_sup_rd(c, c->tr.base, 8 + newcpl * 8, 2);
         uint32_t slo, shi;
         if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_TS, nss & 0xFFFC);
         x86_unpack_desc(&stack, nss, slo, shi);
@@ -430,8 +435,8 @@ static void far_transfer_pm(x86_cpu *c, uint16_t sel, uint32_t off, int is_call,
     if (is_call && newcpl < cpl) {
         /* Inward call: a fresh stack out of the TSS, the old one recorded on
          * it, and any parameters copied across. */
-        uint32_t nsp = x86_rd(c, c->tr.base, 4 + newcpl * 8, 0xFFFFFFFFu, 4);
-        uint16_t nss = (uint16_t)x86_rd(c, c->tr.base, 8 + newcpl * 8, 0xFFFFFFFFu, 2);
+        uint32_t nsp = x86_sup_rd(c, c->tr.base, 4 + newcpl * 8, 4);
+        uint16_t nss = (uint16_t)x86_sup_rd(c, c->tr.base, 8 + newcpl * 8, 2);
         uint32_t slo, shi;
         if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_TS, nss & 0xFFFC);
         x86_seg stack;
@@ -1362,7 +1367,8 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     /* System instructions: Phase B (DPMI host). */
     case OP_CLTS:
         need_cpl0(c);
-        break;                                  /* CR0.TS: no CR0 yet (Phase B); legal at CPL 0 */
+        c->cr0 &= ~8u;                          /* CR0.TS */
+        break;
     /* ---- descriptor tables and CR0 -------------------------------- */
     case OP_LGDT: case OP_LIDT: {
         need_cpl0(c);
@@ -1402,7 +1408,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         if (!X86_AR_P(dattr)) x86_fault(c, X86_EXC_NP, lsel & 0xFFFC);
         x86_unpack_desc(g, lsel, dlo, dhi);
         if (in->op == OP_LTR)                              /* mark the TSS busy */
-            x86_wr(c, c->gdtr.base, (lsel & 0xFFF8) + 4, 0xFFFFFFFFu, 4, dhi | 0x0200u);
+            x86_sup_wr(c, c->gdtr.base, (lsel & 0xFFF8) + 4, 4, dhi | 0x0200u);
         break;
     }
     case OP_SLDT: case OP_STR:
@@ -1421,13 +1427,25 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         need_cpl0(c);
         int cr = in->ops[0].kind == OPK_CR ? in->ops[0].reg : in->ops[1].reg;
         if (in->ops[0].kind == OPK_CR) {
+            uint32_t v = rd_op(c, in, 1, ea);
             if (cr == 0) {
-                c->cr0 = rd_op(c, in, 1, ea);
+                /* PG without PE is #GP(0) */
+                if ((v & X86_CR0_PG) && !(v & 1)) x86_fault(c, X86_EXC_GP, 0);
+                if ((v ^ c->cr0) & X86_CR0_PG) x86_tlb_flush(c);
+                c->cr0 = v;
                 if (!c->pmode && (c->cr0 & 1)) x86_pe_set(c);
                 c->pmode = (c->cr0 & 1) != 0;
+            } else if (cr == 2) {
+                c->cr2 = v;
+            } else if (cr == 3) {
+                c->cr3 = v;
+                x86_tlb_flush(c);                   /* the 386 flushes its whole TLB on a CR3 load */
+            } else {
+                RAISE(X86_EXC_UD);
             }
         } else {
-            wr_op(c, in, 0, ea, cr == 0 ? c->cr0 : 0);
+            if (cr != 0 && cr != 2 && cr != 3) RAISE(X86_EXC_UD);
+            wr_op(c, in, 0, ea, cr == 0 ? c->cr0 : cr == 2 ? c->cr2 : c->cr3);
         }
         break;
     }
@@ -1479,7 +1497,18 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         c->eflags = (c->eflags & ~(uint32_t)X86_ZF) | (good ? X86_ZF : 0);
         break;
     }
-    case OP_MOVDR: case OP_MOVTR:
+    case OP_MOVDR: {
+        /* The debug registers hold what they are given (JEMM saves and
+         * restores them); no breakpoint fires. DR4/DR5 are DR6/DR7. */
+        need_cpl0(c);
+        int to_dr = in->ops[0].kind == OPK_DR;
+        int dr = to_dr ? in->ops[0].reg : in->ops[1].reg;
+        if (dr == 4 || dr == 5) dr += 2;
+        if (to_dr) c->dr[dr] = rd_op(c, in, 1, ea);
+        else wr_op(c, in, 0, ea, c->dr[dr]);
+        break;
+    }
+    case OP_MOVTR:
     case OP_UD:
     default:
         (void)start_ip;
@@ -1490,10 +1519,22 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
 /* Gather up to 15 code bytes at CS:IP, honouring the 16-bit IP wrap in
  * real mode, into a bounce buffer. The JIT will decode in place when it
  * can; the oracle never needs to be clever. */
-static void fetch_bytes(x86_cpu *c, uint8_t *buf) {
+/* Under paging the 16 bytes may run into a page that is not there, and
+ * only the instruction decides whether it uses them: the prefetch probes
+ * (no fault) and returns the index of the first byte that missed, 16 if
+ * none; x86_step faults on it only if the instruction reaches it. */
+static int fetch_bytes(x86_cpu *c, uint8_t *buf) {
     uint32_t base = c->seg[S_CS].base, ip = c->eip;
     uint32_t m = c->seg[S_CS].big ? 0xFFFFFFFFu : 0xFFFF;
-    for (int i = 0; i < 16; i++) buf[i] = x86_phys_rd8(c, base + ((ip + i) & m));
+    int first_bad = 16;
+    c->pg_probe = 1;
+    for (int i = 0; i < 16; i++) {
+        c->pg_miss = 0;
+        buf[i] = x86_phys_rd8(c, base + ((ip + i) & m));
+        if (c->pg_miss && first_bad == 16) first_bad = i;
+    }
+    c->pg_probe = 0;
+    return first_bad;
 }
 
 void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
@@ -1526,6 +1567,7 @@ int x86_step(x86_cpu *c) {
         return c->halted ? 1 : 0;
     }
     c->exc_delivered = 0;
+    c->pg_super = 0;
 
     uint8_t buf[16];
     x86_insn in;
@@ -1537,7 +1579,7 @@ int x86_step(x86_cpu *c) {
          * the fetch; the 286 wrapped IP instead. */
         c->exc = X86_EXC_GP;
     } else {
-        fetch_bytes(c, buf);
+        int first_bad = fetch_bytes(c, buf);
         x86_dec_ctx ctx = { buf, c->model, c->seg[S_CS].big };
         if (!x86_decode(&ctx, &in)) {
             /* > 15 bytes of prefixes: the 8086 just keeps going; 386 #GP.
@@ -1550,11 +1592,17 @@ int x86_step(x86_cpu *c) {
             c->int_inhibit = 0;
             c->fault_armed = 1;
             if (_setjmp(c->fault_jb) == 0) {
+                /* the instruction runs into a page the prefetch did not find: #PF there */
+                if (first_bad < in.len) {
+                    uint32_t m = c->seg[S_CS].big ? 0xFFFFFFFFu : 0xFFFF;
+                    (void)x86_phys_rd8(c, c->seg[S_CS].base + ((start_ip + (uint32_t)first_bad) & m));
+                }
                 /* 286: instructions longer than 10 bytes (prefix padding) are #GP */
                 if (c->model == X86_MODEL_286 && in.len > 10) x86_fault(c, X86_EXC_GP, 0);
                 execute(c, &in, start_ip);
             }
             c->fault_armed = 0;
+            c->pg_super = 0;                          /* a fault may have left an implicit access marked */
         }
     }
     c->insn_count++;

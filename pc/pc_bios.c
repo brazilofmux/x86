@@ -462,6 +462,10 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         }
         pc.kbc_cmd = 0;                          /* keyboard commands (LEDs, typematic): swallowed */
         break;
+    case 0xE9:                                   /* the Bochs/QEMU debug console: a boot
+                                                  * image's transcript (tools/pmoracle) */
+        if (pc.booted) { fputc((int)(val & 0xFF), stdout); if ((val & 0xFF) == '\n') fflush(stdout); }
+        break;
     case 0xF4:                                   /* isa-debug-exit, as QEMU offers it:
                                                   * a boot image can say it is done */
         if (pc.booted) { pc.exit_requested = 1; pc.exit_code = (int)((val << 1) | 1); c->halted = 1; }

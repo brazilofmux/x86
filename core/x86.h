@@ -174,6 +174,18 @@ typedef struct x86_cpu {
 
     /* Stats */
     uint64_t insn_count;
+
+    /* Paging (386): CR0.PG, CR2 the last faulting linear address, CR3 the
+     * page directory. The TLB caches translations by linear page, direct
+     * mapped; each entry carries what may be done without a walk (see
+     * x86_lin). Last in the struct so the JIT's fixed offsets never move. */
+    uint32_t cr2, cr3;
+    uint32_t dr[8];
+    uint8_t  pg_super;      /* nonzero: implicit supervisor access (descriptor tables, TSS, a ring-0 frame) */
+    uint8_t  pg_probe;      /* nonzero: translate without faulting (instruction prefetch) */
+    uint8_t  pg_miss;       /* set by a probe that found no mapping */
+    uint8_t  pad2;
+    struct x86_tlbe { uint32_t tag, phys; } tlb[256];
 } x86_cpu;
 
 /* 8-bit register access: AL..BL are the low bytes of r[0..3], AH..BH are
@@ -209,17 +221,67 @@ static inline void x86_set_reg(x86_cpu *c, int i, int size, uint32_t v) {
 #define X86_BM_DEVICE 0x80
 void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 
+/* ---- Paging --------------------------------------------------------------
+ * With CR0.PG set every linear address goes through the page tables. A TLB
+ * entry's tag is the linear page with its low bits saying what the entry
+ * allows without a walk: TLB_V valid, TLB_U user access, TLB_UW user
+ * write, TLB_D dirty already set (so a write needs no update). Anything
+ * the tag does not allow walks (x86_page_walk), which sets accessed and
+ * dirty, checks the 386's rules — a user access needs U/S in both levels
+ * and a user write R/W in both; the supervisor writes anywhere, CR0.WP
+ * being a 486 thing — and raises #PF. */
+#define X86_CR0_PG  0x80000000u
+#define X86_TLB_V   0x001u
+#define X86_TLB_U   0x002u
+#define X86_TLB_UW  0x004u
+#define X86_TLB_D   0x008u
+#define X86_PG_BAD  0xFFFFFFFFu              /* a probe's miss: reads as open bus */
+uint32_t x86_page_walk(struct x86_cpu *c, uint32_t lin, int write);
+void     x86_tlb_flush(struct x86_cpu *c);
+int      x86_cpl(const struct x86_cpu *c);
+
+static inline uint32_t x86_lin(x86_cpu *c, uint32_t lin, int write) {
+    if (!(c->cr0 & X86_CR0_PG)) return lin;
+    struct x86_tlbe *t = &c->tlb[(lin >> 12) & 255];
+    if ((t->tag & 0xFFFFF000u) == (lin & 0xFFFFF000u) && (t->tag & X86_TLB_V)) {
+        uint32_t need = write ? X86_TLB_D : 0;
+        if (!c->pg_super && x86_cpl(c) == 3) need |= write ? X86_TLB_UW : X86_TLB_U;
+        if ((t->tag & need) == need) return t->phys | (lin & 0xFFF);
+    }
+    return x86_page_walk(c, lin, write);
+}
+
 static inline uint8_t x86_phys_rd8(x86_cpu *c, uint32_t lin) {
-    uint32_t p = lin & c->a20_mask;
+    uint32_t p = x86_lin(c, lin, 0);
+    if (p == X86_PG_BAD) return 0xFF;
+    p &= c->a20_mask;
     if (c->device_read && p - 0xA0000u < 0x10000u) return c->device_read(c, p);
     return p < c->mem_size ? c->mem[p] : 0xFF;
 }
 static inline void x86_phys_wr8(x86_cpu *c, uint32_t lin, uint8_t v) {
-    uint32_t p = lin & c->a20_mask;
+    uint32_t p = x86_lin(c, lin, 1);
+    if (p == X86_PG_BAD) return;
+    p &= c->a20_mask;
     if (p < c->mem_size) {
         c->mem[p] = v;
         if (c->code_bitmap[p]) x86_store_hook(c, p);
     }
+}
+
+/* Implicit supervisor accesses — descriptor tables, the TSS, a frame on an
+ * inner stack — are supervisor to the paging unit whatever the CPL. */
+static inline uint32_t x86_rd(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size);
+static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size, uint32_t v);
+static inline uint32_t x86_sup_rd(x86_cpu *c, uint32_t base, uint32_t off, int size) {
+    uint8_t s = c->pg_super; c->pg_super = 1;
+    uint32_t v = x86_rd(c, base, off, 0xFFFFFFFFu, size);
+    c->pg_super = s;
+    return v;
+}
+static inline void x86_sup_wr(x86_cpu *c, uint32_t base, uint32_t off, int size, uint32_t v) {
+    uint8_t s = c->pg_super; c->pg_super = 1;
+    x86_wr(c, base, off, 0xFFFFFFFFu, size, v);
+    c->pg_super = s;
 }
 
 /* Segment-relative access with in-segment offset wrap. offmask is
