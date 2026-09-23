@@ -11,6 +11,7 @@
  * Lifted in spirit from ~/z80/kaypro/kaypro_kbd.c.
  */
 #include "pc.h"
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -430,7 +431,18 @@ void pc_kbd_wait(x86_cpu *c) {
 static unsigned idle_run;
 static uint64_t idle_last_insn;
 
+/* Output and disk I/O between the polls: not an idle loop. FreeDOS checks
+ * for Ctrl-C around every character it prints, so a program writing
+ * through DOS polls INT 16h back to back exactly like one waiting for a
+ * key; without this, MEM's listing ran at a character a millisecond. */
+void pc_kbd_busy(void) { idle_run = 0; }
+
 static void idle_check(x86_cpu *c) {
+    /* A booted DOS idles itself (FreeDOS's FDAPM answers empty polls with
+     * HLT, which sleeps the host), and there the heuristic only misfires:
+     * FreeDOS checks for Ctrl-C around every DOS call, which polls exactly
+     * like an idle loop — MEM took 4.5 s, all of it asleep. */
+    if (pc.booted) return;
     if (c->insn_count - idle_last_insn > IDLE_GAP) idle_run = 0;
     idle_last_insn = c->insn_count;
     if (++idle_run < IDLE_RUN) return;

@@ -186,6 +186,7 @@ void pc_video_init(x86_cpu *c) {
 void pc_video_int10(x86_cpu *c, int vector) {
     (void)vector;
     int ah = x86_get_r8(c, R_AH), al = x86_get_r8(c, R_AL);
+    pc_kbd_busy();
     if (pc.debug > 1 && ah != 0x0E) fprintf(stderr, "[bios] INT 10h AH=%02X AL=%02X BX=%04X CX=%04X DX=%04X @%llu\n", ah, al,
                               x86_get_r16(c, R_BX), x86_get_r16(c, R_CX), x86_get_r16(c, R_DX), (unsigned long long)c->insn_count);
     int bh = x86_get_r8(c, R_BH), bl = x86_get_r8(c, R_BL);

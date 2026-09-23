@@ -41,8 +41,22 @@ void x86_free(x86_cpu *c) {
  * places say so.
  * --------------------------------------------------------------------- */
 
-/* CPL lives in the low two bits of CS, which is where the processor keeps it. */
-int x86_cpl(const x86_cpu *c) { return c->pmode ? (c->seg[S_CS].sel & 3) : 0; }
+/* CPL lives in the low two bits of CS, which is where the processor keeps
+ * it — once CS has been loaded in protected mode. Right after CR0.PE is
+ * set, CS still holds whatever real mode left (029Eh: low bits 2) and the
+ * processor is at CPL 0 until the first far transfer. */
+int x86_cpl(const x86_cpu *c) {
+    if (!c->pmode) return 0;
+    if (c->pe_window && c->seg[S_CS].sel == c->pe_cs_sel && c->seg[S_CS].base == c->pe_cs_base) return 0;
+    return c->seg[S_CS].sel & 3;
+}
+
+/* CR0.PE going 0 -> 1 (MOV CR0, LMSW): open the CPL-0 window. */
+void x86_pe_set(x86_cpu *c) {
+    c->pe_window = 1;
+    c->pe_cs_sel = c->seg[S_CS].sel;
+    c->pe_cs_base = c->seg[S_CS].base;
+}
 
 /* Fetch the 8 bytes of a descriptor. Returns 0 when the selector's index
  * falls outside its table, which is the caller's cue to raise #GP. */
@@ -138,14 +152,26 @@ static void load_seg_pm(x86_cpu *c, int s, uint16_t sel) {
     x86_set_accessed(c, sel, hi);
 }
 
+/* Real mode sets the selector and base and leaves the cached limit
+ * alone, which is what unreal mode is: HIMEMX loads DS/ES with 4 GB in
+ * protected mode, returns, and moves XMS with 32-bit offsets. We keep a
+ * limit only when it is above 64K (nothing real-mode relies on a smaller
+ * one surviving) and never for CS; the DPMI host resets its own on the
+ * way down (x86_real_limits). */
 void x86_load_seg(x86_cpu *c, int s, uint16_t sel) {
     if (c->pmode) { load_seg_pm(c, s, sel); return; }
     c->seg[s].sel = sel;
     c->seg[s].base = (uint32_t)sel << 4;
-    c->seg[s].limit = 0xFFFF;
+    if (s == S_CS || c->seg[s].limit < 0xFFFF) c->seg[s].limit = 0xFFFF;
     c->seg[s].big = 0;
     c->seg[s].attr = 0;
     c->seg[s].usable = 1;
+}
+
+/* Every segment back to 64K, as a DPMI host's descriptors would leave
+ * them before it clears PE. */
+void x86_real_limits(x86_cpu *c) {
+    for (int s = 0; s < 6; s++) c->seg[s].limit = 0xFFFF;
 }
 
 uint32_t x86_flags_fixup(x86_cpu *c, uint32_t f) {
@@ -171,6 +197,8 @@ void x86_reset(x86_cpu *c) {
     memset(c->r, 0, sizeof c->r);
     c->eflags = x86_flags_fixup(c, 0);
     c->pmode = 0;
+    c->pe_window = 0;
+    x86_real_limits(c);
     c->halted = 0;
     c->int_inhibit = 0;
     c->exc = -1;

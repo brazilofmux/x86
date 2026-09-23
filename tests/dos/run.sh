@@ -18,6 +18,10 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "smcfar $mode"    tests/dos/smcfar.out  ./dos-monster $mode tests/dos/smcfar.com
     check "fileio $mode"    tests/dos/fileio.out  ./dos-monster $mode -L 50000000 tests/dos/fileio.com
 done
+# unreal mode (HIMEMX's): PE set with a real-mode CS, a 4 GB DS kept across real-mode loads
+for mode in -i -j -V; do
+    check "unreal $mode"    tests/dos/unreal.out  ./dos-monster -m 386 $mode -L 1000000 tests/dos/unreal.com
+done
 # The VGA text renderer (-G on a text screen: attributes, blink off, line
 # drawing, a block cursor), compared as decoded pixels; and the BIOS's
 # INT 9 translation of modified keys fed as xterm sequences; the INT 33h

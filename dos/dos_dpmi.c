@@ -411,6 +411,7 @@ static void rm_enter(x86_cpu *c, int kind, int vector) {
 
     c->pmode = 0;
     c->cr0 &= ~1u;
+    x86_real_limits(c);
     x86_load_seg(c, S_SS, ss);
     c->r[R_SP] = sp;
     x86_load_seg(c, S_ES, (uint16_t)rs_rd(c, rms, 0x22, 2));
@@ -496,7 +497,7 @@ void dpmi_raw_switch(x86_cpu *c, int vector) {
     uint32_t sp = wide ? c->r[R_BX] : (c->r[R_BX] & 0xFFFF);
     uint32_t ip = wide ? c->r[R_DI] : (c->r[R_DI] & 0xFFFF);
     if (to_pm) { c->pmode = 1; c->cr0 |= 1u; c->eflags |= X86_IOPL; }
-    else       { c->pmode = 0; c->cr0 &= ~1u; }
+    else       { c->pmode = 0; c->cr0 &= ~1u; x86_real_limits(c); }
     x86_load_seg(c, S_CS, cs);                         /* first: in PM it sets CPL */
     c->eip = ip;
     x86_load_seg(c, S_DS, ds);
@@ -783,6 +784,7 @@ void dpmi_cb_return(x86_cpu *c, int vector) {
 
     c->pmode = 0;
     c->cr0 &= ~1u;
+    x86_real_limits(c);
     memcpy(c->r, r, sizeof r);
     x86_load_seg(c, S_SS, ss); c->r[R_SP] = sp;
     x86_load_seg(c, S_ES, es); x86_load_seg(c, S_DS, ds);

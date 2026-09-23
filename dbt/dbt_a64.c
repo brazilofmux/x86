@@ -1452,18 +1452,22 @@ static void emit_mul16(emit_t *e, int size, int is_signed, a64_reg_t src, uint32
 }
 
 /* Real-mode segment load (DS or ES): what x86_load_seg does outside
- * protected mode — selector, base = selector << 4, limit FFFF, usable,
- * attributes and D bit clear — and the pinned host pointer. sel holds
- * the selector in its low 16 bits. Clobbers W_T0..W_T2. */
+ * protected mode — selector, base = selector << 4, the limit raised to
+ * FFFF but an unreal one kept, usable, attributes and D bit clear — and
+ * the pinned host pointer. sel holds the selector in its low 16 bits.
+ * Clobbers W_T0..W_T2. */
 static void emit_load_seg_real(emit_t *e, int s, a64_reg_t sel) {
+    emit_ldr_w32_imm(e, W_T2, R_CPU, OFF_SEG_LIMIT(s));
+    emit_movz_w32(e, W_T1, 0xFFFF, 0);
+    emit_subs_w32(e, A64_WZR, W_T2, W_T1);
+    emit_csel_w32(e, W_T2, W_T2, W_T1, A64_COND_HI);                 /* max(limit, FFFF) */
+    emit_str_w32_imm(e, W_T2, R_CPU, OFF_SEG_LIMIT(s));
     emit_uxth_w32(e, W_T0, sel);
     emit_str_w32_imm(e, W_T0, R_CPU, OFF_SEG_SEL(s));                /* sel, attr = 0 */
     emit_movz_w32(e, W_T2, 1, 0);
     emit_strb_imm(e, W_T2, R_CPU, OFF_SEG_USABLE(s));
     emit_lsl_w32_imm(e, W_T1, W_T0, 4);
     emit_str_w32_imm(e, W_T1, R_CPU, OFF_SEG_BASE(s));
-    emit_movz_w32(e, W_T2, 0xFFFF, 0);
-    emit_str_w32_imm(e, W_T2, R_CPU, OFF_SEG_LIMIT(s));
     emit_strb_imm(e, A64_WZR, R_CPU, OFF_SEG_BIG(s));
     emit_add_x64_w32_uxtw(e, s == S_DS ? R_DSP : R_ESP, R_MEM, W_T1);
 }

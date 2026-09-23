@@ -36,13 +36,19 @@ SF=7), so even the flag tables carry over.
   clients detect us via INT 2Fh/1687h and never raw-switch, never touch
   CR0/CR3, never set up paging. The JIT sees "base 0, limit 4G" code:
   address = offset. Phase B: DOOM, Descent, Duke3D, Quake.
+- **Real DOS booted from disk images** (FreeDOS, MS-DOS) with the
+  machine underneath it: INT 13h over images, CMOS, extended memory
+  reported through INT 15h, and the XMS drivers that use it — HIMEM.SYS
+  and FreeDOS's HIMEMX. So **unreal mode** is in (added 2026-09-23):
+  real-mode segment loads keep a cached limit above 64K, and
+  32-bit-addressed real-mode code runs in the interpreter.
 
 **Out (do not build toward these):**
 
 - 64-bit long mode. Never.
 - V86 mode, EMM386, Windows enhanced mode.
 - Paging. The DPMI host owns memory; guests never see a page table.
-- Unreal/big-real mode. 16-bit PM (Windows standard mode) — maybe later.
+- 16-bit PM (Windows standard mode) — maybe later.
 - **Cycle counting.** No per-instruction cycle accounting, ever. The
   pinned pending-instruction counter (already needed for interrupt
   delivery) is the one pacing knob; if a 1988 game needs throttling,

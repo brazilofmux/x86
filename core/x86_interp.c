@@ -1414,13 +1414,18 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_LMSW:
         need_cpl0(c);
         c->cr0 = (c->cr0 & ~0xEu) | (rd_op(c, in, 0, ea) & 0xFu) | (c->cr0 & 1u);
+        if (!c->pmode && (c->cr0 & 1)) x86_pe_set(c);
         c->pmode = (c->cr0 & 1) != 0;              /* LMSW can set PE but never clear it */
         break;
     case OP_MOVCR: {
         need_cpl0(c);
         int cr = in->ops[0].kind == OPK_CR ? in->ops[0].reg : in->ops[1].reg;
         if (in->ops[0].kind == OPK_CR) {
-            if (cr == 0) { c->cr0 = rd_op(c, in, 1, ea); c->pmode = (c->cr0 & 1) != 0; }
+            if (cr == 0) {
+                c->cr0 = rd_op(c, in, 1, ea);
+                if (!c->pmode && (c->cr0 & 1)) x86_pe_set(c);
+                c->pmode = (c->cr0 & 1) != 0;
+            }
         } else {
             wr_op(c, in, 0, ea, cr == 0 ? c->cr0 : 0);
         }

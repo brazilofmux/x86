@@ -134,6 +134,8 @@ int pc_disk_swap(void) {
     return 0;
 }
 
+int pc_disk_floppy_type(int drive) { return fd[drive & 1].data ? fd[drive & 1].type : 0; }
+
 int pc_disk_present(int drive) {
     disk *d = drive & 0x80 ? &hd[drive & 1] : &fd[drive & 1];
     return (drive & 0x7E) == 0 && d->data != NULL;
@@ -175,6 +177,7 @@ static void int13(x86_cpu *c, int vector) {
     (void)vector;
     int ah = x86_get_r8(c, R_AH), dl = x86_get_r8(c, R_DL);
     disk *d = lookup(dl);
+    pc_kbd_busy();
     if (pc.debug > 1)
         fprintf(stderr, "[disk] INT 13h AX=%04X CX=%04X DX=%04X ES:BX=%04X:%04X\n", x86_get_r16(c, R_AX),
                 x86_get_r16(c, R_CX), x86_get_r16(c, R_DX), c->seg[S_ES].sel, x86_get_r16(c, R_BX));

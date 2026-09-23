@@ -114,6 +114,11 @@ static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
     for (int k = -12; k < 8; k++) fprintf(stderr, "%s%02X", k == 0 ? " | " : " ", x86_phys_rd8(c, lin + (uint32_t)k));
     fprintf(stderr, "\n");
     const char *dump = getenv("X86_EXC_MEMDUMP");       /* memory and registers at the first one */
+    if (c->pmode && n <= 3) {
+        fprintf(stderr, "      GDTR %08X/%04X:", c->gdtr.base, c->gdtr.limit);
+        for (uint32_t k = 0; k < 32 && k <= c->gdtr.limit; k++) fprintf(stderr, "%s%02X", k % 8 ? "" : " ", x86_phys_rd8(c, c->gdtr.base + k));
+        fprintf(stderr, "\n");
+    }
     if (n == 1 && dump) {
         x86_dump(c, stderr);
         FILE *f = fopen(dump, "wb");
@@ -306,9 +311,10 @@ int main(int argc, char **argv) {
         if (!pc_disk_present(boot_drive)) { fprintf(stderr, "-boot: no image for drive %02Xh\n", boot_drive); return 1; }
         x86_init(&cpu, model);
         pc_init(&cpu, tty);
-        pc_disk_install(&cpu);
-        pc.debug = debug;
         pc.booted = 1;
+        pc_disk_install(&cpu);
+        pc_cmos_init(&cpu);
+        pc.debug = debug;
         pc.boot_drive = boot_drive;
         pc.swap_disk = pc_disk_swap;
         pc_disk_boot(&cpu, boot_drive);
@@ -356,6 +362,7 @@ int main(int argc, char **argv) {
         x86_init(&cpu, model);
         pc_init(&cpu, tty);
         pc_disk_install(&cpu);
+        pc_cmos_init(&cpu);
         pc.debug = debug;
         dos_init(&cpu, root_abs);
         if (drive_a && dos_mount(0, drive_a) < 0) return 1;

@@ -110,6 +110,7 @@ static inline void     pc_wr16(x86_cpu *c, uint16_t seg, uint16_t off, uint16_t 
 void pc_video_init(x86_cpu *c);
 void pc_video_teletype(x86_cpu *c, uint8_t ch);          /* INT 10h/0E semantics, page 0 */
 void pc_video_int10(x86_cpu *c, int vector);
+void pc_kbd_busy(void);                                  /* the guest did work: not idle-polling */
 void pc_video_flush(int force);                          /* tty mode painter */
 void pc_video_shutdown(void);
 void pc_video_set_hud(const char *text);
@@ -157,6 +158,13 @@ int  pc_disk_swap(void);                                          /* ESC-+: next
 int  pc_disk_boot(x86_cpu *c, int drive);                          /* sector 0 to 0000:7C00 */
 void pc_disk_install(x86_cpu *c);
 void pc_mouse_reboot(x86_cpu *c);
+int  pc_disk_floppy_type(int drive);                              /* CMOS type 1-5, 0 none */
+/* pc_cmos.c */
+void pc_cmos_init(x86_cpu *c);                                    /* after the disks: POST's configuration */
+int  pc_cmos_port_read(uint16_t port, uint32_t *val);
+int  pc_cmos_port_write(uint16_t port, uint32_t val);
+uint32_t pc_ext_kb(const x86_cpu *c);                             /* extended memory reported, KB */
+int  pc_int15_memory(x86_cpu *c);                                 /* INT 15h 87h/88h/E801h/E820h */
 void pc_kbd_mouse_reporting(void);                        /* -t: the terminal reports mouse events */
 void pc_mouse_motion(int fx, int fy);                     /* pointer in a 640x480 frame */
 void pc_mouse_button(int button, int down);               /* 0 left, 1 right, 2 middle */

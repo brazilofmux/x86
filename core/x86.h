@@ -134,6 +134,13 @@ typedef struct x86_cpu {
      * ldtr/tr keep the cached descriptor the same way the segment registers
      * do, because that is what the processor actually consults. */
     struct { uint32_t base; uint16_t limit; } gdtr, idtr;
+    /* The real-mode CS still in place when CR0.PE was set: CPL is 0 until
+     * a protected-mode CS load replaces it (x86_cpl), however its low bits
+     * read — unreal-mode setups (HIMEMX) set PE, load DS/ES and clear PE
+     * without ever touching CS. */
+    uint16_t pe_cs_sel;
+    uint32_t pe_cs_base;
+    uint8_t  pe_window;
     x86_seg  ldtr, tr;
     uint32_t cr0;
 
@@ -261,6 +268,8 @@ void x86_free(x86_cpu *c);
 void x86_reset(x86_cpu *c);
 void x86_load_seg(x86_cpu *c, int s, uint16_t sel);
 int  x86_cpl(const x86_cpu *c);
+void x86_pe_set(x86_cpu *c);                 /* CR0.PE 0 -> 1 from real mode */
+void x86_real_limits(x86_cpu *c);            /* all segment limits back to 64K */
 int  x86_read_desc(x86_cpu *c, uint16_t sel, uint32_t *lo, uint32_t *hi);
 void x86_unpack_desc(x86_seg *g, uint16_t sel, uint32_t lo, uint32_t hi);
 void x86_set_accessed(x86_cpu *c, uint16_t sel, uint32_t hi);   /* real mode: base = sel<<4 */

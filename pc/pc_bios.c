@@ -205,11 +205,8 @@ static void a20_set(x86_cpu *c, int on);
 
 static void bios_int15(x86_cpu *c, int vector) {
     (void)vector;
+    if (pc_int15_memory(c)) return;              /* 87h, 88h, E801h, E820h: pc_cmos.c */
     switch (x86_get_r8(c, R_AH)) {
-    case 0x88:                                   /* extended memory size in KB */
-        x86_set_r16(c, R_AX, 0);
-        c->eflags &= ~X86_CF;
-        break;
     case 0x4F:                                   /* keyboard intercept: keep the key */
         c->eflags |= X86_CF;
         break;
@@ -385,6 +382,7 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     (void)size;
     uint32_t vv;
     if (pc_vga_port_read(port, &vv)) return vv;
+    if (pc_cmos_port_read(port, &vv)) return vv;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
         fprintf(stderr, "[port] in %02X → %02X @%llu\n", port, port == 0x60 ? pc.last_scancode : port == 0x61 ? pit_speaker : 0x14, (unsigned long long)c->insn_count);
     switch (port) {
@@ -419,6 +417,7 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
 static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     (void)size;
     if (pc_vga_port_write(port, val, size)) return;
+    if (pc_cmos_port_write(port, val)) return;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61 || port == 0x20))
         fprintf(stderr, "[port] out %02X ← %02X @%llu\n", port, val & 0xFF, (unsigned long long)c->insn_count);
     switch (port) {
@@ -544,6 +543,7 @@ void pc_reboot(x86_cpu *c) {
     pic_mask = 0xB8;
     post(c);
     pc_disk_install(c);
+    pc_cmos_init(c);
     pc_mouse_reboot(c);
     pc_video_init(c);
     pc_disk_boot(c, pc.boot_drive);

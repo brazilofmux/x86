@@ -30,6 +30,14 @@ pushes, and a push onto memory that had held translated code (SLICEREX's,
 freed, reused as the next program's stack) fired the SMC check, whose
 thunk did not save them. tests/dos/smcfar.com is the reduction.
 
+Configuration changed on c.img (mtools, CR LF kept): FDCONFIG.SYS gets
+MENU 6 — HIMEMX with DOS=HIGH, no JEMM (JEMMEX/JEMM386 need V86 mode,
+which the machine does not have yet) — as the default, with a 1-second
+menu (MENUDEFAULT=6,1); FDAUTO.BAT skips the CD-ROM probe for config 6
+(there is no IDE controller, and UDVD2 waits out its timeouts on four
+status ports). Boot to C:\> is ~3 s; MEM shows 16,448K XMS and "FreeDOS
+is resident in the high memory area".
+
 WordPerfect was added with mtools:
 
   mcopy -s -i disks/freedos/c.img@@32256 disks/WP51 ::/

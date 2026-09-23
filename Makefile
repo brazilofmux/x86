@@ -17,7 +17,7 @@ CORE_OBJS = $(CORE_SRCS:.c=.o)
 
 DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_a64.c
 DBT_OBJS  = $(DBT_SRCS:.c=.o)
-PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c
+PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c
 PC_OBJS   = $(PC_SRCS:.c=.o)
 DOS_SRCS  = dos/dos_load.c dos/dos_host.c dos/dos_int21.c dos/dos_dpmi.c
 DOS_OBJS  = $(DOS_SRCS:.c=.o)
