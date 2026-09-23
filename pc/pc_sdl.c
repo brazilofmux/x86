@@ -44,6 +44,7 @@ static const char *title_prog = "dos-monster";
 
 void pc_sdl_allow(int on, const char *prog) { allowed = on; if (prog) title_prog = prog; }
 void pc_sdl_text(int on) { text_window = on; }
+int pc_sdl_window_allowed(void) { return allowed; }
 
 static int open_window(void) {
     SDL_SetMainReady();
@@ -219,6 +220,11 @@ void pc_sdl_poll(x86_cpu *c, uint64_t now) {
                 SDL_RenderClear(ren);
                 SDL_RenderCopy(ren, graphics ? tex : ttex, NULL, NULL);
                 SDL_RenderPresent(ren);
+                /* the host's arrow goes while the program shows its own cursor */
+                int r, cl; uint16_t sm, cm;
+                int guest_cursor = text && pc_mouse_text_cursor(&r, &cl, &sm, &cm);
+                static int host_hidden = -1;
+                if (guest_cursor != host_hidden) { SDL_ShowCursor(guest_cursor ? SDL_DISABLE : SDL_ENABLE); host_hidden = guest_cursor; }
             }
         }
     }
@@ -241,6 +247,14 @@ void pc_sdl_poll(x86_cpu *c, uint64_t now) {
             exit(0);
         case SDL_KEYDOWN: key(&e.key, 1); break;
         case SDL_KEYUP:   key(&e.key, 0); break;
+        /* The renderer's logical size makes these 640x480-frame coordinates. */
+        case SDL_MOUSEMOTION: pc_mouse_motion(e.motion.x, e.motion.y); break;
+        case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
+            int b = e.button.button == SDL_BUTTON_LEFT ? 0 : e.button.button == SDL_BUTTON_RIGHT ? 1
+                  : e.button.button == SDL_BUTTON_MIDDLE ? 2 : -1;
+            pc_mouse_button(b, e.type == SDL_MOUSEBUTTONDOWN);
+            break;
+        }
         }
     }
 }
@@ -253,6 +267,7 @@ void pc_sdl_shutdown(void) {
 #else  /* no SDL: headless */
 void pc_sdl_allow(int on, const char *prog) { (void)on; (void)prog; }
 void pc_sdl_text(int on) { (void)on; }
+int pc_sdl_window_allowed(void) { return 0; }
 void pc_sdl_poll(x86_cpu *c, uint64_t now) { (void)c; (void)now; }
 void pc_sdl_shutdown(void) {}
 #endif

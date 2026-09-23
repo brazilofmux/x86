@@ -144,6 +144,14 @@ void pc_vga_set_dac(int i, const uint8_t rgb[3]);
 void pc_vga_status_read(void);                            /* port 3DAh read: resets the 3C0h flip-flop */
 void pc_sdl_allow(int on, const char *prog);              /* may a window open for graphics modes */
 void pc_sdl_text(int on);                                 /* -w: the window shows text modes too */
+int  pc_sdl_window_allowed(void);                         /* a window may open (so there is a mouse to have) */
+/* pc_mouse.c: the INT 33h driver, present when a window is */
+void pc_mouse_install(x86_cpu *c);
+void pc_kbd_mouse_reporting(void);                        /* -t: the terminal reports mouse events */
+void pc_mouse_motion(int fx, int fy);                     /* pointer in a 640x480 frame */
+void pc_mouse_button(int button, int down);               /* 0 left, 1 right, 2 middle */
+int  pc_mouse_poll(x86_cpu *c);                           /* call a pending event handler; 1 if it did */
+int  pc_mouse_text_cursor(int *row, int *col, uint16_t *screen_mask, uint16_t *cursor_mask);
 void pc_sdl_poll(x86_cpu *c, uint64_t now_ns);            /* frames at 70 Hz, window events */
 void pc_sdl_shutdown(void);
 

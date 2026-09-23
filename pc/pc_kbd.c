@@ -60,8 +60,19 @@ void pc_kbd_init(void) {
     }
 }
 
+static int mouse_reporting;
 void pc_kbd_shutdown(void) {
+    if (mouse_reporting) { fputs("\033[?1003l\033[?1006l", stdout); fflush(stdout); mouse_reporting = 0; }
     if (raw_active) { tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio); raw_active = 0; }
+}
+
+/* -t with the mouse driver: ask the terminal for every mouse event, in
+ * SGR form (next_key parses them). */
+void pc_kbd_mouse_reporting(void) {
+    if (!raw_active || mouse_reporting) return;
+    fputs("\033[?1003h\033[?1006h", stdout);
+    fflush(stdout);
+    mouse_reporting = 1;
 }
 
 /* ---- Raw scancode stream ------------------------------------------------
@@ -220,6 +231,33 @@ static int next_key(x86_cpu *c, int blocking) {
     uint8_t b = pending[0];
     int used = 1;
     uint8_t ascii = b, sc = scancode_for(b);
+    if (b == 0x1B && npending >= 3 && pending[1] == '[' && pending[2] == '<') {
+        /* xterm SGR mouse report: ESC [ < b ; col ; row M (press, motion)
+         * or m (release), 1-based cells. The terminal sends these in -t
+         * mode (pc_kbd_mouse_reporting), and scripts can too. */
+        int v[3] = { 0, 0, 0 }, k = 0, i = 3;
+        while (i < npending && k < 3) {
+            uint8_t d = pending[i];
+            if (d >= '0' && d <= '9') v[k] = v[k] * 10 + (d - '0');
+            else if (d == ';') k++;
+            else break;
+            i++;
+        }
+        if (i >= npending || (pending[i] != 'M' && pending[i] != 'm')) {   /* incomplete or garbled: drop it */
+            npending = 0;
+            return 0;
+        }
+        int release = pending[i] == 'm';
+        memmove(pending, pending + i + 1, (size_t)(npending - i - 1)); npending -= i + 1;
+        int cols = pc_rd16(c, BDA, 0x4A); if (!cols) cols = 80;
+        int rows = pc_rd8(c, BDA, 0x84) + 1;
+        int fx = (v[1] - 1) * 640 / cols + 320 / cols, fy = (v[2] - 1) * 480 / rows + 240 / rows;
+        pc_mouse_motion(fx, fy);
+        int btn = v[0] & 3;                        /* 0 left, 1 middle, 2 right; 64+: wheel */
+        if (!(v[0] & 32) && !(v[0] & 64) && btn != 3)
+            pc_mouse_button(btn == 0 ? 0 : btn == 2 ? 1 : 2, !release);
+        return 1;
+    }
     if (b == 0x1B && npending >= 3 && (pending[1] == '[' || pending[1] == 'O')) {
         /* CSI / SS3 sequences: arrows, home/end, function keys */
         /* CSI num [; mod] final — xterm: mod 2 shift, 3 alt, 5 ctrl */

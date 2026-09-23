@@ -295,6 +295,7 @@ int pc_poll(x86_cpu *c) {
     pc_video_flush(0);
     pc_sdl_poll(c, now);
     if (c->halted && pc.exit_requested) return 1;
+    if (pc_mouse_poll(c)) return 1;                  /* a program's mouse event handler, called */
 
     /* Keyboard: latch the next raw code and raise INT 9 once the previous
      * one has been taken (the guest's handler has returned). */

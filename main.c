@@ -171,6 +171,7 @@ static void pmring_exc(x86_cpu *c, int vec, uint32_t err) {
 
 static int run_interp(x86_cpu *c, uint64_t limit) {
     uint32_t n = 0;
+    uint64_t waits = pc.blocked_calls;
     for (;;) {
         if (g_pmring) {
             int k = (int)(pmring_n++ % PMRING);
@@ -191,7 +192,12 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
                 return 0;
             }
         }
-        if ((n++ & 4095) == 0 || c->halted) { host_poll(c); if (c->halted) return 0; }
+        /* Every 4096 instructions, or at once after the keyboard idle wait
+         * (1 ms a poll: 4096 instructions of a polling loop are seconds). */
+        if ((n++ & 4095) == 0 || c->halted || pc.blocked_calls != waits) {
+            waits = pc.blocked_calls;
+            host_poll(c); if (c->halted) return 0;
+        }
         if (limit && c->insn_count >= limit) { pmring_dump(c); return 0; }
         if (g_pmtrace_hi) {
             uint32_t lin = c->seg[S_CS].base + c->eip;
@@ -349,6 +355,12 @@ int main(int argc, char **argv) {
 
     pc_sdl_allow(window >= 0 ? window : isatty(1), prog ? prog : boot_img);
     pc_sdl_text(window == 1);
+    /* A mouse to take input from: the window, the -t terminal's mouse
+     * reports, or a script's (X86_MOUSE=1: SGR reports on stdin). */
+    if (pc_sdl_window_allowed() || tty || getenv("X86_MOUSE")) {
+        pc_mouse_install(&cpu);
+        if (tty) pc_kbd_mouse_reporting();
+    }
     if (g_pmtrace_hi) cpu.trace_exc = pm_trace_exc;
     else if (g_pmring) cpu.trace_exc = pmring_exc;
 

@@ -395,11 +395,17 @@ int pc_vga_text_frame(x86_cpu *c, uint8_t *rgb, int maxw, int maxh, int *w, int 
     int cs = vga.crtc[0x0A] & 0x1F, ce = vga.crtc[0x0B] & 0x1F;
     int cursor_on = !(vga.crtc[0x0A] & 0x20) && cs <= ce && !cursor_off;
     int stride = *w * 3;
+    int mrow = -1, mcol = -1; uint16_t msm = 0, mcm = 0;
+    if (!pc_mouse_text_cursor(&mrow, &mcol, &msm, &mcm)) mrow = -1;
     for (int r = 0; r < rows; r++)
         for (int col = 0; col < cols; col++) {
             uint32_t cell = start + (uint32_t)(r * cols + col);
             uint32_t a = base + ((cell * 2) & 0x7FFF);
             uint8_t chr = c->mem[a], at = c->mem[a + 1];
+            if (r == mrow && col == mcol) {           /* the mouse driver's software cursor */
+                uint16_t v = (uint16_t)(((at << 8) | chr) & msm) ^ mcm;
+                chr = (uint8_t)v; at = (uint8_t)(v >> 8);
+            }
             int fg = at & 0x0F, bg = at >> 4, hide = 0;
             if (blink_attr) { if ((bg & 8) && blink_off) hide = 1; bg &= 7; }
             if (mono) {                                   /* MDA attributes: 07 normal, 0F bright, 70 reverse */

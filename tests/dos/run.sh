@@ -19,7 +19,8 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
 done
 # The VGA text renderer (-G on a text screen: attributes, blink off, line
 # drawing, a block cursor), compared as decoded pixels; and the BIOS's
-# INT 9 translation of modified keys fed as xterm sequences.
+# INT 9 translation of modified keys fed as xterm sequences; the INT 33h
+# driver's event handler calls, fed xterm SGR mouse reports.
 mkdir -p tmp
 for mode in -j -V; do
     rm -f tmp/text.png
@@ -27,6 +28,8 @@ for mode in -j -V; do
     if [ "$(python3 tests/dos/pnghash.py tmp/text.png 2>/dev/null)" = "$(cat tests/dos/text.out)" ]; then echo "ok   text render $mode"; else echo "FAIL text render $mode"; fail=1; fi
     got=$( (printf '\033[1;5D\033[1;5C\033[1;5H\033[1;5F\033[5;5~\033[6;5~\033[1;2P\033[1;3R\033[12;5~\033[23~\033[24;2~a'; sleep 2; printf '\033') | ./dos-monster -W $mode -L 200000000 tests/dos/kbd.com 2>/dev/null | tr -d '\r')
     if [ "$got" = "$(cat tests/dos/kbd.out)" ]; then echo "ok   kbd codes $mode"; else echo "FAIL kbd codes $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
+    got=$( (sleep 1; printf '\033[<35;11;2M'; sleep 0.5; printf '\033[<0;11;2M'; sleep 0.5; printf '\033[<2;21;4M'; sleep 0.5; printf '\033[<2;21;4m'; sleep 0.5; printf '\033[<0;21;4m'; sleep 0.5; printf '\033') | X86_MOUSE=1 ./dos-monster -W $mode -L 400000000 tests/dos/mouse.com 2>/dev/null | tr -d '\r')
+    if [ "$got" = "$(cat tests/dos/mouse.out)" ]; then echo "ok   mouse events $mode"; else echo "FAIL mouse events $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
 done
 rm -f tmp/text.png
 # The DPMI clients only make sense on a 386: one source, assembled as a
