@@ -81,3 +81,16 @@ What it took, beyond FreeDOS:
 - The BIOS's INT 8 chains INT 1Ch through a real stub (INT 1Ch; IRET at
   F100:0000), so a V86 monitor reflects it like any other interrupt.
 - POST sets the tick count from the RTC, so TIME is right at boot.
+
+DOOM (shareware, disks/doom) under MS-DOS: run.sh copies it onto the
+EMM386 image and onto a plain HIMEM one. Under EMM386, DOS/4GW enters
+protected mode through VCPI and builds its own page tables; without it,
+it switches itself over XMS memory. Both needed:
+- a real master 8259: ICW1-4 (the vector base), OCW3 (port 20h reads the
+  IRR, or the ISR after 0Bh) and a mask that is honoured. DOS/4GW under
+  VCPI tells IRQ 0 from a double fault, both vector 8, by the ISR; a port
+  20h that read 0 made the first tick "exception 08h (double fault)".
+- the JIT fetching a paged code page mapped BELOW its linear address
+  (DOOM at 498000 on physical 3ED000): the decode added the 32-bit
+  physical-minus-linear delta to the host pointer unwrapped, 4 GB past
+  guest memory. pgtest's T0E runs code on such a page.

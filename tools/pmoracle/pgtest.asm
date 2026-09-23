@@ -8,7 +8,9 @@
 ; ring-3 stack 5000; page directory 10000, page tables 11000 (0-4 MB,
 ; identity, user read/write) and 12000 (4-8 MB, supervisor PDE). Test
 ; pages: 30000 user r/w, 31000 supervisor only, 32000 user read-only,
-; 33000 not present; linear 400000 maps physical 34000; nothing at 8 MB.
+; 33000 not present; linear 400000 maps physical 34000, 401000 maps
+; 35000 (code run there: a page mapped below its linear address, which
+; the JIT once fetched from 4 GB past guest memory); nothing at 8 MB.
         cpu 386
         org 0x7C00
 
@@ -130,6 +132,11 @@ pm32:
         xor eax, eax
         rep stosd
         mov dword [PT1 + 0], 0x34000 | 7           ; linear 400000 -> 34000, user bits
+        mov dword [PT1 + 4], 0x35000 | 3           ; linear 401000 -> 35000, code
+        mov esi, remap_code
+        mov edi, 0x35000
+        mov ecx, remap_code_end - remap_code
+        rep movsb
         mov eax, PD
         mov cr3, eax
         mov eax, cr0
@@ -198,6 +205,12 @@ pm32:
 .t13:   mov dword [PT0 + 0x33 * 4], 0x33000 | 6    ; and gone again
         mov eax, cr3
         mov cr3, eax
+        mov byte [tno], 14
+        mov dword [resume], .t20
+        mov eax, 0x401000                   ; code on a page mapped below its linear address
+        call eax
+        call ok_eax
+.t20:
 
         ; ---- ring 3: each case is a code fragment ending in INT 30h
         mov byte [tno], 20
@@ -264,6 +277,14 @@ r3_read_superpde: mov eax, [0x400010]
                 int RET_VEC
 r3_read_ro:     mov eax, [0x32000]
                 int RET_VEC
+
+; copied to physical 35000, run at linear 401000
+remap_code:
+        mov eax, 0x12345678
+        add eax, 0x11111111
+        xor eax, 0x0F0F0F0F
+        ret
+remap_code_end:
 
 ; the ring-3 return trap: report EAX, back to ring 0
 ret_trap:

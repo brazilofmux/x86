@@ -65,6 +65,26 @@ if [ -f disks/msdos622/c.img ]; then
         if python3 tools/expect.py -t 120 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 110 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
         then echo "ok   wp51 under ms-dos + emm386"; else echo "FAIL wp51 under ms-dos + emm386"; fail=1; fi
     fi
+    D=disks/doom/inst/DOOMS
+    if [ -f $D/DOOM.EXE ]; then
+        # DOOM (DOS/4GW) under EMM386: into protected mode through VCPI, its
+        # own page tables, the JIT on code pages mapped below their linear
+        # addresses. I_StartupMouse comes after zone, WAD, refresh and DPMI.
+        mmd -i tmp/boot-c.img@@32256 ::/DOOM
+        mcopy -i tmp/boot-c.img@@32256 $D/DOOM.EXE $D/DOOM1.WAD ::/DOOM/
+        printf 'C:.>$\tcd \\\\doom\\rdoom\\r\n*I_StartupMouse|rror \\(|xception\t\n' > tmp/boot-c.exp
+        if python3 tools/expect.py -t 90 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >tmp/boot-doom.out 2>&1 \
+           && ! grep -aq "rror (" tmp/boot-doom.out
+        then echo "ok   doom under ms-dos + emm386 (vcpi)"; else echo "FAIL doom under ms-dos + emm386 (vcpi)"; fail=1; fi
+        # and without EMM386: DOS/4GW switches itself, memory from HIMEM
+        cp disks/msdos622/c.img tmp/boot-c.img
+        mmd -i tmp/boot-c.img@@32256 ::/DOOM
+        mcopy -i tmp/boot-c.img@@32256 $D/DOOM.EXE $D/DOOM1.WAD ::/DOOM/
+        if python3 tools/expect.py -t 90 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >tmp/boot-doom.out 2>&1 \
+           && ! grep -aq "rror (" tmp/boot-doom.out
+        then echo "ok   doom under ms-dos + himem (xms)"; else echo "FAIL doom under ms-dos + himem (xms)"; fail=1; fi
+        rm -f tmp/boot-doom.out
+    fi
     rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-cfg.sys tmp/boot-auto.bat
 fi
 exit $fail

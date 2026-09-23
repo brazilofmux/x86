@@ -252,8 +252,15 @@ static void bios_int15(x86_cpu *c, int vector) {
 }
 
 /* ---- IRQ delivery ------------------------------------------------------ */
-static void deliver(x86_cpu *c, int vector) {
-    pc.irq_in_service |= 1 << (vector - 8);
+/* The master 8259: the mask (IRQs 0 and 1 are the ones we raise), the
+ * vector base from ICW2, and what a read of port 20h returns (OCW3: the
+ * request register, or the in-service register after 0Bh). DOS/4GW under
+ * a VCPI server tells IRQ 0 from a double fault, both vector 8, by
+ * reading the ISR; a port that read 0 made every tick a double fault. */
+static struct { uint8_t mask, base, icw_step, need_icw4, single, read_isr; } pic = { 0xB8, 8, 0, 0, 0, 0 };
+static void deliver(x86_cpu *c, int irq) {
+    int vector = pic.base + irq;
+    pc.irq_in_service |= 1 << irq;
     pc.irq_service_ns = pc_now_ns();
     if (pc.debug > 1) fprintf(stderr, "[irq] INT %02X → %04X:%04X @%llu\n", vector,
                               pc_rd16(c, 0, (uint16_t)(vector * 4 + 2)), pc_rd16(c, 0, (uint16_t)(vector * 4)), (unsigned long long)c->insn_count);
@@ -342,16 +349,16 @@ int pc_poll(x86_cpu *c) {
      * (until its EOI). A handler that never EOIs would hang a real PC;
      * we forgive it after 200 ms of wall clock. */
     if (pc.irq_in_service && now - pc.irq_service_ns > 200000000ull) pc.irq_in_service = 0;
-    if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1)) {
+    if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) {
         pc.irq_pending &= ~(1 << 8);
         pc.ticks_delivered++;
         pc.next_tick_ns += irq0_period_ns();
-        deliver(c, 8);
+        deliver(c, 0);
         return 1;
     }
-    if ((pc.irq_pending & (1 << 9)) && !(pc.irq_in_service & 3)) {
+    if ((pc.irq_pending & (1 << 9)) && !(pc.irq_in_service & 3) && !(pic.mask & 2)) {
         pc.irq_pending &= ~(1 << 9);
-        deliver(c, 9);
+        deliver(c, 1);
         return 1;
     }
     return 0;
@@ -366,7 +373,7 @@ int pc_poll(x86_cpu *c) {
  * stored. */
 #define PIT_HZ 1193182ull
 static struct { uint16_t reload; uint16_t latch; int latched, rw_phase, mode_rw; } pit[3];
-static uint8_t pic_mask = 0xB8, pit_speaker;
+static uint8_t pit_speaker;
 
 /* Channel 0's period: reload 0 means 65536, the BIOS's 54.9 ms.
  * X86_PIT_SCALE=N (measurement aid) makes the timer tick N times faster
@@ -419,8 +426,8 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
         return b;
     }
     case 0x43: return 0xFF;
-    case 0x20: return 0;
-    case 0x21: return pic_mask;
+    case 0x20: return pic.read_isr ? (uint32_t)(pc.irq_in_service & 0xFF) : (uint32_t)((pc.irq_pending >> 8) & 3);
+    case 0x21: return pic.mask;
     case 0x60:
         if (pc.kbc_out_full) { pc.kbc_out_full = 0; return pc.kbc_out; }
         pc.irq9_busy = 0; return pc.last_scancode;
@@ -463,9 +470,21 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         else { pit[ch].reload = (uint16_t)((pit[ch].reload & 0x00FF) | ((val & 0xFF) << 8)); pit[ch].rw_phase = 0; }
         break;
     }
-    case 0x21: pic_mask = (uint8_t)val; break;
+    case 0x21:
+        if (pic.icw_step == 2) {                 /* ICW2: the vector base; ICW3 next if cascaded */
+            pic.base = (uint8_t)(val & 0xF8);
+            pic.icw_step = !pic.single ? 3 : pic.need_icw4 ? 4 : 0;
+        } else if (pic.icw_step == 3) pic.icw_step = pic.need_icw4 ? 4 : 0;   /* ICW3 */
+        else if (pic.icw_step == 4) pic.icw_step = 0;                          /* ICW4 */
+        else pic.mask = (uint8_t)val;
+        break;
     case 0x20:                                   /* EOI: non-specific clears the highest in service */
-        if ((val & 0xE0) == 0x60) pc.irq_in_service &= ~(1 << (val & 7));
+        if (val & 0x10) {                        /* ICW1: mask cleared, IRR selected, ICW2.. follow */
+            pic.icw_step = 2; pic.need_icw4 = val & 1; pic.single = (val >> 1) & 1;
+            pic.mask = 0; pic.read_isr = 0;
+        }
+        else if ((val & 0x18) == 0x08) { if (val & 2) pic.read_isr = val & 1; }   /* OCW3 */
+        else if ((val & 0xE0) == 0x60) pc.irq_in_service &= ~(1 << (val & 7));
         else if (val == 0x20) for (int i = 0; i < 8; i++) if (pc.irq_in_service & (1 << i)) { pc.irq_in_service &= ~(1 << i); break; }
         break;
     case 0x61: pit_speaker = (uint8_t)(val & 0x0F); break;
@@ -585,7 +604,7 @@ void pc_reboot(x86_cpu *c) {
     pc.irq_pending = 0; pc.irq_in_service = 0; pc.irq9_busy = 0;
     pc.kbc_cmd = 0; pc.kbc_out_full = 0;
     memset(pit, 0, sizeof pit);
-    pic_mask = 0xB8;
+    pic.mask = 0xB8; pic.base = 8; pic.icw_step = 0; pic.read_isr = 0;
     post(c);
     pc_empty_upper_memory(c);
     pc_disk_install(c);

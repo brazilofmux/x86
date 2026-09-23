@@ -112,6 +112,7 @@ static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
     fprintf(stderr, "[exc] v=%02X err=%04X at %04X:%04X (%s) bytes before/after:", vec, err,
             c->seg[S_CS].sel, c->eip, c->pmode ? "pm" : "rm");
     for (int k = -12; k < 8; k++) fprintf(stderr, "%s%02X", k == 0 ? " | " : " ", x86_phys_rd8(c, lin + (uint32_t)k));
+    if (vec == 14) fprintf(stderr, " cr2=%08X", c->cr2);
     fprintf(stderr, "\n");
     const char *dump = getenv("X86_EXC_MEMDUMP");       /* memory and registers at the first one */
     if (c->pmode && (n <= 3 || vec == 11)) {

@@ -2839,7 +2839,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     s_esnull = (key & KEY_ESNULL) != 0;
     s_dsnull = (key & KEY_DSNULL) != 0;
     s_pg_user = s_flat && s_paged && (cpu->seg[S_CS].sel & 3) == 3;
-    uint32_t code_page = 0, code_delta = 0;
+    uint32_t code_page = 0, code_delta = 0;     /* physical - linear, mod 2^32: add it before indexing mem */
     if (s_paged) {
         /* A paged block (V86, or flat protected mode) stays on one code
          * page. Its key is linear; its bytes, and their code-bitmap
@@ -2882,7 +2882,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         if (s_flat && s_paged) {
             uint32_t lin = cpu->seg[S_CS].base + ip;
             if ((lin & 0xFFFFF000u) != code_page) break;
-            memcpy(buf, cpu->mem + lin + code_delta, 16);
+            memcpy(buf, cpu->mem + (uint32_t)(lin + code_delta), 16);
         } else if (s_flat) {
             /* flat CS: no limit to hit short of 4 GB; stay inside memory */
             uint32_t lin = cpu->seg[S_CS].base + ip;
@@ -2891,7 +2891,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         } else if (s_paged) {
             uint32_t lin = cpu->seg[S_CS].base + ip;
             if ((lin & 0xFFFFF000u) != code_page) break;
-            memcpy(buf, cpu->mem + lin + code_delta, 16);          /* identity: the mirror applies A20 */
+            memcpy(buf, cpu->mem + (uint32_t)(lin + code_delta), 16);          /* identity: the mirror applies A20 */
         } else {
             fetch_at(cpu, ip, buf);
         }

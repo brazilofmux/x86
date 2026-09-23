@@ -1651,6 +1651,7 @@ void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
     c->fault_armed = 1;
     if (_setjmp(c->fault_jb) == 0) execute(c, in, start_ip);
     c->fault_armed = 0;
+    c->pg_super = 0;             /* a fault may have left an implicit access marked */
     /* A fault (286+) or a trap-style exception restarts at the instruction
      * or continues after it, as x86_step would; the caller delivers it. */
     if (c->exc >= 0 && c->model >= X86_MODEL_286) c->eip = start_ip;
@@ -1660,6 +1661,7 @@ void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
 void x86_deliver_exception(x86_cpu *c) {
     int vec = c->exc;
     c->exc = -1;
+    if (c->trace_exc) c->trace_exc(c, vec, c->exc_err);
     c->exc_delivered = 1;
     x86_interrupt(c, vec, 0);
 }
