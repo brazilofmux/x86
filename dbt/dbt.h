@@ -94,6 +94,9 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_IOPL3          (1ull << 53)   /* V86 at IOPL 3: CLI/STI/PUSHF behave as in real mode */
 #define KEY_PAGED          (1ull << 54)   /* under paging: V86 through cpu->pgd_r/pgd_w, flat PM through cpu->tlb */
 #define KEY_ESNULL         (1ull << 55)   /* flat, but ES is null (a monitor entered from V86): ES accesses are the interpreter's */
+#define KEY_A20OFF         (1ull << 57)   /* translated with the A20 gate off: far targets and wraps bake the 1 MB mask
+                                             * (outside the slot hash: both states' blocks share a slot, and the SMC
+                                             * sweep and code-page drops find either by address) */
 #define KEY_DSNULL         (1ull << 56)   /* ...and the same for DS */   /* 16-bit CS and SS, expand-up data segments: real-mode-shaped code with limits (dbt_seg16_ok) */
 
 static inline uint64_t dbt_key(uint32_t cs_sel, uint32_t lin) { return ((uint64_t)cs_sel << 32) | lin; }
@@ -360,8 +363,9 @@ extern int dbt_seg16_enabled;   /* X86_NO_SEG16 clears it: segmented 16-bit PM b
 
 /* Mode bits of a key for the current segments. */
 static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
-    if (!c->pmode) return 0;
-    uint64_t b = KEY_PMODE | (c->seg[S_CS].big ? KEY_BIG : 0);
+    uint64_t a20 = c->a20_mask != 0xFFFFFFFFu ? KEY_A20OFF : 0;
+    if (!c->pmode) return a20;
+    uint64_t b = KEY_PMODE | a20 | (c->seg[S_CS].big ? KEY_BIG : 0);
     /* Flat: CS and SS flat, DS and ES flat or null — entering a monitor
      * from V86 mode nulls DS/ES/FS/GS, and its handler addresses through
      * SS until it loads its own (KEY_DSNULL/KEY_ESNULL: accesses through
@@ -386,12 +390,13 @@ static inline uint64_t dbt_cpu_key(const x86_cpu *c) {
         /* V86: CS.base + IP, not A20-masked (under paging the linear
          * address is what the page tables see; the mask is physical) */
         uint64_t b = KEY_V86 | ((c->eflags & X86_IOPL) == X86_IOPL ? KEY_IOPL3 : 0)
-                   | ((c->cr0 & X86_CR0_PG) ? KEY_PAGED : 0);
+                   | ((c->cr0 & X86_CR0_PG) ? KEY_PAGED : 0)
+                   | (c->a20_mask != 0xFFFFFFFFu ? KEY_A20OFF : 0);
         return dbt_key(c->seg[S_CS].sel, c->seg[S_CS].base + (c->eip & 0xFFFF)) | b;
     }
     if (c->pmode) return dbt_key(c->seg[S_CS].sel, c->seg[S_CS].base + c->eip) | dbt_cpu_mode_bits(c);
     uint32_t lin = (c->seg[S_CS].base + (c->eip & 0xFFFF)) & c->a20_mask;
-    return dbt_key(c->seg[S_CS].sel, lin);
+    return dbt_key(c->seg[S_CS].sel, lin) | dbt_cpu_mode_bits(c);   /* real mode: KEY_A20OFF or nothing */
 }
 
 #endif /* DBT_H */

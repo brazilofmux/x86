@@ -156,3 +156,16 @@ BIOS has to do its I/O as instructions, not from the host:
 Enhanced mode runs at ~35 MIPS: Windows' segmented 16-bit protected-mode
 code under paging is the interpreter's (only flat paged code and V86 are
 translated). That is the next speed campaign.
+
+tests/boot/bench.sh prints the milestones the speed campaign tracks
+(wall clock, this machine): power-on to C:\>, then "win" to a drawn
+Program Manager in each mode. At 2026-09-23 after the A20 change:
+
+  win /s   C:\> at  2.52 s   Program Manager  0.82 s later
+  win      C:\> at  2.52 s   Program Manager  1.33 s later
+
+(2 s of the 2.52 is MS-DOS's own "Starting MS-DOS..." F5/F8 pause.)
+Before it, C:\> took 12.6 s: HIMEM tests extended memory flipping A20
+around each chunk, ~14500 times, and every flip flushed the whole
+translation cache. The A20 state is now part of the block key
+(KEY_A20OFF), and a flip flushes nothing.

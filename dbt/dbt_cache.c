@@ -229,13 +229,18 @@ void dbt_clear_code_bits(x86_cpu *cpu) {
     dbt->bm_hi = 0;
 }
 
-/* cpu->a20_hook. Every block key and every baked far-transfer mask is
- * stale now (OUT 92h/60h, from inside a helper thunk as often as not). */
+/* cpu->a20_hook. A block's key says which A20 state it was translated in
+ * (KEY_A20OFF: its far targets and wraps baked that mask), so a flip
+ * needs no flush — the next lookup simply wants the other state's
+ * blocks, and this state's stay for when the gate flips back. HIMEM's
+ * memory test flips it thousands of times; flushing everything each time
+ * was 10 of the 12 seconds of an MS-DOS boot. The block running now
+ * leaves after the instruction (OUT 92h/60h, from a helper thunk). */
 void dbt_a20_changed(x86_cpu *cpu, int on) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     (void)on;
     if (!dbt) return;
-    flush_under_running_code(dbt);
+    cpu->jit_cur_hit = 1;
     dbt->a20_flushes++;
 }
 

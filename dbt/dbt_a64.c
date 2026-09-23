@@ -2425,7 +2425,7 @@ static uint64_t target_key(const x86_cpu *cpu, uint32_t ip) {
     if (s_flat) return dbt_key(cpu->seg[S_CS].sel, cpu->seg[S_CS].base + ip) | s_mode_bits;
     if (s_v86) return dbt_key(cpu->seg[S_CS].sel, cpu->seg[S_CS].base + (ip & 0xFFFF)) | s_mode_bits;
     uint32_t lin = (cpu->seg[S_CS].base + (ip & 0xFFFF)) & cpu->a20_mask;
-    return dbt_key(cpu->seg[S_CS].sel, lin) | (s_seg16 ? s_mode_bits : 0);
+    return dbt_key(cpu->seg[S_CS].sel, lin) | s_mode_bits;   /* real mode: KEY_A20OFF, if any */
 }
 
 /* X0 = key for a run-time ip in W register `ip` (16-bit canonical):
@@ -2446,7 +2446,7 @@ static void emit_dynamic_key(emit_t *e, const x86_cpu *cpu, a64_reg_t ip) {
     if (!s_v86 && base + 0xFFFF > 0xFFFFF && cpu->a20_mask == 0xFFFFF)
         (void)emit_and_w32_imm(e, A64_W0, A64_W0, 0xFFFFF);
     emit_movk_x64(e, A64_W0, cpu->seg[S_CS].sel, 32);
-    if (s_seg16 || s_v86) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
+    if (s_mode_bits) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
 }
 
 /* Inline part of a conditional: guts + test + B.cond toward the taken
@@ -2514,7 +2514,7 @@ static void emit_load_cs_dynamic(emit_t *e, const x86_cpu *cpu) {
     emit_add_w32(e, A64_W0, W_T0, W_VAL);
     if (!s_v86 && cpu->a20_mask == 0xFFFFF) (void)emit_and_w32_imm(e, A64_W0, A64_W0, 0xFFFFF);
     emit_orr_x64_lsl(e, A64_W0, A64_W0, W_SRC, 32);
-    if (s_v86) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
+    if (s_mode_bits) emit_movk_x64(e, A64_W0, (uint16_t)(s_mode_bits >> 48), 48);
 }
 static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t ip_after) {
     x86_cpu *cpu = dbt->cpu;
@@ -2563,7 +2563,7 @@ static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t
         emit_str_w32_imm(e, W_T0, R_CPU, OFF_SEG_BASE(S_CS));
         uint32_t lin = ((uint32_t)sel << 4) + off;
         if (!s_v86) lin &= cpu->a20_mask;
-        emit_edge(dbt, e, dbt_key(sel, lin) | (s_v86 ? s_mode_bits : 0));
+        emit_edge(dbt, e, dbt_key(sel, lin) | s_mode_bits);
     } else {
         emit_load_cs_dynamic(e, cpu);
         emit_dynamic_tail(e, dbt->exit_stub_off);

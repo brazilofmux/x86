@@ -428,12 +428,12 @@ static void live_screen(void) {
     pc_video_dump(pc.cpu, f);
     fclose(f);
     rename(tmp, path);
-    /* X86_SCREEN_PNG=FILE: the picture as well, once a second, for
+    /* X86_SCREEN_PNG=FILE: the picture as well, four times a second, for
      * graphics modes a text dump cannot show (expect.py's "shot") */
     static const char *png; static int png_checked; static uint64_t png_next;
     if (!png_checked) { png_checked = 1; png = getenv("X86_SCREEN_PNG"); }
     if (png && now >= png_next) {
-        png_next = now + 1000000000ull;
+        png_next = now + 250000000ull;
         snprintf(tmp, sizeof tmp, "%s.tmp.png", png);
         if (pc_video_png(pc.cpu, tmp) == 0) rename(tmp, png);
     }
