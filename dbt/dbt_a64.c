@@ -64,6 +64,8 @@
 #define OFF_SEG_SEL(i)  (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, sel))
 #define OFF_SEG_BASE(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, base))
 #define OFF_SEG_LIMIT(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, limit))
+#define OFF_SEG_BIG(i)  (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, big))
+_Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and attr share one word store");
 #define OFF_SEG_USABLE(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, usable))
 #define OFF_EXC_ERR     offsetof(x86_cpu, exc_err)
 #define OFF_INSN_COUNT  offsetof(x86_cpu, insn_count)
@@ -88,9 +90,13 @@ static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_port_thunk_off, s_fault_stu
  * 16-bit register as an address, a count or a branch target has to mask
  * it first. Below 386 they are canonical 16-bit and none of that applies. */
 static int s_regs32;
+/* cpu model of the block being classified (real-mode DIV is inline from the 286 on) */
+static int s_cls_model = X86_MODEL_286;
 
 static a64_reg_t emit_reg16(emit_t *e, int reg, a64_reg_t tmp);
 static void emit_set16(emit_t *e, int reg, a64_reg_t src);
+static void emit_push16(emit_t *e, a64_reg_t val);
+static void emit_pop16(emit_t *e, a64_reg_t dst);
 
 static inline uint32_t szmask(int size) { return size == 1 ? 0xFF : size == 2 ? 0xFFFF : 0xFFFFFFFFu; }
 static inline uint32_t topshift(int size) { return size == 1 ? 24 : size == 2 ? 16 : 0; }
@@ -1110,6 +1116,345 @@ static void emit_div32(emit_t *e, int is_signed, a64_reg_t src) {
     emit_mov_w32_w32(e, R_GPR(R_DX), W_T3);
 }
 
+/* DIV/IDIV r/m8 and r/m16 in real mode, 286 and later. CONTRACT
+ * (interp, 186+): flags unchanged; #DE (a fault at the instruction on the
+ * 286+) for a zero divisor or a quotient that does not fit. AX / r/m8 ->
+ * AL quotient, AH remainder; DX:AX / r/m16 -> AX, DX. The remainder takes
+ * the dividend's sign, as SDIV/MSUB give it. src must not be W_T0..W_T3. */
+static void emit_div16(emit_t *e, int size, int is_signed, a64_reg_t src) {
+    if (size == 1) {
+        if (is_signed) { emit_sxtb_w32(e, W_T3, src); emit_sxth_w32(e, W_T0, R_GPR(R_AX)); }
+        else           { emit_uxtb_w32(e, W_T3, src); emit_uxth_w32(e, W_T0, R_GPR(R_AX)); }
+    } else {
+        emit_uxth_w32(e, W_T0, R_GPR(R_AX));
+        emit_orr_w32_lsl(e, W_T0, W_T0, R_GPR(R_DX), 16);            /* DX:AX */
+        if (is_signed) emit_sxth_w32(e, W_T3, src); else emit_uxth_w32(e, W_T3, src);
+    }
+    fault_site(e, X86_EXC_DE);
+    emit_cbz_w32(e, W_T3, 0);
+    if (is_signed) emit_sdiv_w32(e, W_T2, W_T0, W_T3); else emit_udiv_w32(e, W_T2, W_T0, W_T3);
+    if (is_signed) {                                                 /* INT32_MIN / -1 lands here too */
+        if (size == 1) emit_sxtb_w32(e, W_T1, W_T2); else emit_sxth_w32(e, W_T1, W_T2);
+        emit_cmp_w32_w32(e, W_T1, W_T2);
+        fault_site(e, X86_EXC_DE);
+        emit_b_cond(e, A64_COND_NE, 0);
+    } else {
+        emit_lsr_w32_imm(e, W_T1, W_T2, size * 8);
+        fault_site(e, X86_EXC_DE);
+        emit_cbnz_w32(e, W_T1, 0);
+    }
+    emit_msub_w32(e, W_T1, W_T2, W_T3, W_T0);                        /* remainder */
+    if (size == 1) {
+        (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFF);
+        emit_bfi_w32(e, W_T2, W_T1, 8, 8);
+        emit_set16(e, R_AX, W_T2);
+    } else {
+        emit_uxth_w32(e, W_T2, W_T2);
+        emit_uxth_w32(e, W_T1, W_T1);
+        emit_set16(e, R_AX, W_T2);
+        emit_set16(e, R_DX, W_T1);
+    }
+}
+
+/* ---- String instructions (16-bit addressing, byte and word) ----
+ * The fast path does every check an iteration needs before it commits
+ * anything; a miss branches to a slow path that runs the instruction
+ * through the helper from the registers as they stand. The interpreter
+ * then raises the fault with its own pointer-commit rules (the 286
+ * advances a pointer before its access) or wraps (8086). REP is
+ * restartable, so the same holds for a loop that has already done some
+ * iterations. Checks: a word at offset FFFF in real mode; in a KEY_SEG16
+ * block, the segment's limit and usable bit. Byte accesses in real mode
+ * cannot miss, and emit nothing. Clobbers W_T1, W_T3. Returns whether a
+ * branch was emitted. `site` records it: the generic slow path
+ * (flat_slow_site) when NULL, else a list the caller patches itself. */
+typedef struct { uint32_t pos[8]; int n; } site_list_t;
+static int emit_str_check(emit_t *e, int seg, a64_reg_t off, int size, site_list_t *site) {
+    a64_cond_t miss;
+    if (s_seg16) {
+        a64_reg_t hi = off;
+        if (size > 1) { emit_add_w32_imm(e, W_T3, off, (uint32_t)size - 1); hi = W_T3; }
+        emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_LIMIT(seg));
+        emit_cmp_w32_w32(e, hi, W_T1);
+        emit_ldrb_imm(e, W_T1, R_CPU, OFF_SEG_USABLE(seg));
+        emit_ccmp_w32_imm(e, W_T1, 0, 0x4, A64_COND_LS);
+        miss = A64_COND_EQ;
+    } else if (size == 2) {
+        (void)emit_eor_w32_imm(e, W_T3, off, 0xFFFF);
+        if (site) site->pos[site->n++] = emit_pos(e); else flat_slow_site(e);
+        emit_cbz_w32(e, W_T3, 0);
+        return 1;
+    } else {
+        return 0;
+    }
+    if (site) site->pos[site->n++] = emit_pos(e); else flat_slow_site(e);
+    emit_b_cond(e, miss, 0);
+    return 1;
+}
+
+/* W2 = the pointer step: +size, or -size with DF set (DF lives in
+ * cpu->eflags, not in the pinned arithmetic flags). Clobbers W_T0. */
+static void emit_str_delta(emit_t *e, int size) {
+    emit_ldr_w32_imm(e, A64_W2, R_CPU, OFF_EFLAGS);
+    emit_ubfx_w32(e, A64_W2, A64_W2, 10, 1);                         /* DF */
+    emit_movz_w32(e, W_T0, (uint16_t)size, 0);
+    emit_sub_w32_lsl(e, A64_W2, W_T0, A64_W2, size == 1 ? 1 : 2);   /* size - 2*size*DF */
+}
+/* reg = (reg + W2) & FFFF, the upper half of a 386 register kept */
+static void emit_str_adv(emit_t *e, int reg) {
+    emit_add_w32(e, W_T0, R_GPR(reg), A64_W2);
+    (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
+    emit_set16(e, reg, W_T0);
+}
+static void emit_str_load(emit_t *e, a64_reg_t dst, a64_reg_t segp, a64_reg_t off, int size) {
+    if (size == 1) emit_ldrb_reg_uxtw(e, dst, segp, off); else emit_ldrh_reg_uxtw(e, dst, segp, off);
+}
+
+/* LODS, STOS, MOVS, CMPS, SCAS without a repeat prefix. */
+static void emit_string1(emit_t *e, const x86_insn *in, uint32_t fmask) {
+    int size = in->ops[0].size, seg = in->seg, bails = 0;
+    a64_reg_t segp = seg_ptr_reg(seg);
+    if (segp == X_SEGP) emit_load_seg_ptr(e, X_SEGP, seg);
+    switch (in->op) {
+    case OP_LODS:
+        emit_uxth_w32(e, W_OFF, R_GPR(R_SI));
+        emit_str_check(e, seg, W_OFF, size, NULL);
+        emit_str_load(e, W_VAL, segp, W_OFF, size);
+        emit_write_reg(e, R_AX, size, W_VAL);
+        emit_str_delta(e, size);
+        emit_str_adv(e, R_SI);
+        break;
+    case OP_STOS: {
+        emit_uxth_w32(e, W_OFF, R_GPR(R_DI));
+        emit_str_check(e, S_ES, W_OFF, size, NULL);
+        emit_str_delta(e, size);
+        emit_str_adv(e, R_DI);               /* before the store: its SMC exit leaves after the instruction */
+        a64_reg_t v = emit_read_reg(e, R_AX, size, W_VAL);
+        if (size == 1) emit_strb_reg_uxtw(e, v, R_ESP, W_OFF); else emit_strh_reg_uxtw(e, v, R_ESP, W_OFF);
+        emit_add_x64_w32_uxtw(e, W_T3, R_ESP, W_OFF);
+        emit_smc_check_x3(e, size);
+        break;
+    }
+    case OP_MOVS:
+        emit_uxth_w32(e, W_OFF, R_GPR(R_SI));
+        emit_uxth_w32(e, A64_W1, R_GPR(R_DI));
+        emit_str_check(e, seg, W_OFF, size, NULL);
+        emit_str_check(e, S_ES, A64_W1, size, NULL);
+        emit_str_load(e, W_VAL, segp, W_OFF, size);
+        emit_str_delta(e, size);
+        emit_str_adv(e, R_SI);
+        emit_str_adv(e, R_DI);
+        if (size == 1) emit_strb_reg_uxtw(e, W_VAL, R_ESP, A64_W1); else emit_strh_reg_uxtw(e, W_VAL, R_ESP, A64_W1);
+        emit_add_x64_w32_uxtw(e, W_T3, R_ESP, A64_W1);
+        emit_smc_check_x3(e, size);
+        break;
+    case OP_CMPS: case OP_SCAS:
+        if (in->op == OP_CMPS) {
+            emit_uxth_w32(e, W_OFF, R_GPR(R_SI));
+            bails |= emit_str_check(e, seg, W_OFF, size, NULL);
+        } else if (size == 1) {
+            (void)emit_and_w32_imm(e, W_VAL, R_GPR(R_AX), 0xFF);
+        } else {
+            emit_uxth_w32(e, W_VAL, R_GPR(R_AX));
+        }
+        emit_uxth_w32(e, A64_W1, R_GPR(R_DI));
+        bails |= emit_str_check(e, S_ES, A64_W1, size, NULL);
+        if (in->op == OP_CMPS) emit_str_load(e, W_VAL, segp, W_OFF, size);
+        emit_str_load(e, W_SRC, R_ESP, A64_W1, size);
+        emit_str_delta(e, size);
+        if (in->op == OP_CMPS) emit_str_adv(e, R_SI);
+        emit_str_adv(e, R_DI);
+        emit_alu(e, OP_CMP, size, W_VAL, W_SRC, W_VAL, fmask);
+        if (!bails) { s_nzcv.valid = 1; s_nzcv.table = T_SUB; s_nzcv.logical = 0; }
+        break;
+    default: break;
+    }
+}
+
+/* REPE/REPNE CMPS and SCAS. CONTRACT (interp): CX = 0 on entry does
+ * nothing, flags included; otherwise each iteration compares, advances,
+ * decrements CX, and the loop stops at CX = 0 or on the ZF condition,
+ * with the flags of the last comparison. The loop itself only tests for
+ * equality (ZF is exactly a == b); the full flags are built once, from
+ * the last pair, on the way out — and on the way to the slow path when
+ * an iteration has already run, since the helper then takes over from a
+ * state whose flags are the last comparison's. */
+static void emit_rep_cmp(emit_t *e, const x86_insn *in, uint32_t fmask) {
+    int size = in->ops[0].size, seg = in->seg, is_cmps = in->op == OP_CMPS;
+    int repe = in->rep == 0xF3;
+    a64_reg_t segp = seg_ptr_reg(seg);
+    site_list_t miss = { .n = 0 };
+    if (segp == X_SEGP) emit_load_seg_ptr(e, X_SEGP, seg);
+    emit_str_delta(e, size);
+    if (!is_cmps) {
+        if (size == 1) (void)emit_and_w32_imm(e, W_VAL, R_GPR(R_AX), 0xFF);
+        else emit_uxth_w32(e, W_VAL, R_GPR(R_AX));
+    }
+    emit_movz_w32(e, A64_W1, 0, 0);                                  /* no iteration yet */
+    a64_reg_t cx = emit_reg16(e, R_CX, W_T0);
+    uint32_t none = emit_pos(e);
+    emit_cbz_w32(e, cx, 0);
+    uint32_t top = emit_pos(e);
+    if (is_cmps) { emit_uxth_w32(e, W_OFF, R_GPR(R_SI)); emit_str_check(e, seg, W_OFF, size, &miss); }
+    emit_uxth_w32(e, A64_W0, R_GPR(R_DI));
+    emit_str_check(e, S_ES, A64_W0, size, &miss);
+    if (is_cmps) emit_str_load(e, W_VAL, segp, W_OFF, size);
+    emit_str_load(e, W_SRC, R_ESP, A64_W0, size);
+    if (is_cmps) emit_str_adv(e, R_SI);
+    emit_str_adv(e, R_DI);
+    emit_sub_w32_imm(e, W_T0, R_GPR(R_CX), 1);
+    (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
+    emit_set16(e, R_CX, W_T0);
+    emit_movz_w32(e, A64_W1, 1, 0);
+    emit_cmp_w32_w32(e, W_VAL, W_SRC);
+    uint32_t stop = emit_pos(e);
+    emit_b_cond(e, repe ? A64_COND_NE : A64_COND_EQ, 0);
+    emit_cbnz_w32(e, W_T0, (int32_t)top - (int32_t)emit_pos(e));   /* W_T0: the new CX */
+    emit_patch_cond19(e, stop, emit_pos(e));
+    emit_alu(e, OP_CMP, size, W_VAL, W_SRC, W_VAL, fmask);
+    uint32_t done_b = 0;
+    if (miss.n) {
+        done_b = emit_pos(e);
+        emit_b(e, 0);
+        for (int k = 0; k < miss.n; k++) emit_patch_cond19(e, miss.pos[k], emit_pos(e));
+        uint32_t skip = emit_pos(e);
+        emit_cbz_w32(e, A64_W1, 0);
+        emit_alu(e, OP_CMP, size, W_VAL, W_SRC, W_VAL, ARITH);
+        emit_patch_cond19(e, skip, emit_pos(e));
+        flat_slow_site(e);
+        emit_cbz_w32(e, A64_WZR, 0);                                 /* always: the helper, then after the instruction */
+    }
+    emit_patch_cond19(e, none, emit_pos(e));
+    if (done_b) emit_patch_b26(e, done_b, emit_pos(e));
+}
+
+/* REP MOVS and REP STOS. Each iteration checks its accesses (as above)
+ * and the destination's code-bitmap bytes before it stores anything: a
+ * set bit — translated code, a device, a watched descriptor — hands the
+ * rest of the loop to the helper, whose stores go through the hooks the
+ * interpreter's do. Every iteration before it has fully committed (both
+ * pointers, CX), and REP is restartable, so the helper simply carries
+ * on. The loop never stores into code, so it never needs the SMC exit
+ * that has no exact place to land in the middle of a repeat. */
+static void emit_rep_store(emit_t *e, const x86_insn *in) {
+    int size = in->ops[0].size, seg = in->seg, is_movs = in->op == OP_MOVS;
+    a64_reg_t segp = seg_ptr_reg(seg);
+    if (segp == X_SEGP) emit_load_seg_ptr(e, X_SEGP, seg);
+    emit_str_delta(e, size);
+    a64_reg_t cx = emit_reg16(e, R_CX, W_T0);
+    uint32_t none = emit_pos(e);
+    emit_cbz_w32(e, cx, 0);
+    uint32_t top = emit_pos(e);
+    if (is_movs) { emit_uxth_w32(e, W_OFF, R_GPR(R_SI)); emit_str_check(e, seg, W_OFF, size, NULL); }
+    emit_uxth_w32(e, A64_W1, R_GPR(R_DI));
+    emit_str_check(e, S_ES, A64_W1, size, NULL);
+    emit_add_x64_w32_uxtw(e, W_T3, R_ESP, A64_W1);                  /* X3 = host address of ES:DI */
+    emit_ldst_reg(e, size == 2 ? 1 : 0, 1, W_T2, W_T3, R_BMD, 3, 0); /* its bitmap byte(s) */
+    flat_slow_site(e);
+    emit_cbnz_w32(e, W_T2, 0);
+    a64_reg_t v;
+    if (is_movs) { emit_str_load(e, W_VAL, segp, W_OFF, size); v = W_VAL; }
+    else v = emit_read_reg(e, R_AX, size, W_VAL);
+    if (size == 1) emit_strb_imm(e, v, W_T3, 0); else emit_strh_imm(e, v, W_T3, 0);
+    if (is_movs) emit_str_adv(e, R_SI);
+    emit_str_adv(e, R_DI);
+    emit_sub_w32_imm(e, W_T0, R_GPR(R_CX), 1);
+    (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
+    emit_set16(e, R_CX, W_T0);
+    emit_cbnz_w32(e, W_T0, (int32_t)top - (int32_t)emit_pos(e));
+    emit_patch_cond19(e, none, emit_pos(e));
+}
+
+/* PUSHF with a 16-bit operand: FLAGS as the guest sees them, low word. */
+static void emit_pushf16(emit_t *e) {
+    emit_ldr_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+    emit_movz_w32(e, W_T1, ARITH, 0);
+    emit_bic_w32(e, W_T0, W_T0, W_T1);
+    emit_orr_w32(e, W_VAL, W_T0, R_F);
+    (void)emit_and_w32_imm(e, W_VAL, W_VAL, 0xFFFF);
+    emit_push16(e, W_VAL);
+}
+/* POPF with a 16-bit operand, real mode: the low word of EFLAGS
+ * replaced whole (no privilege rules outside protected mode), then
+ * x86_flags_fixup's per-model masks: bit 1 set, bits 3 and 5 clear; the
+ * 8086/186 read 12-15 as ones, the 286 in real mode as zeros, the 386
+ * clears bit 15 and VM. The interpreter has no single-step trap, so TF
+ * is only a bit here too; an IF that comes on is seen by the run loop
+ * at the block's end, where every interrupt is delivered. */
+static void emit_popf16(emit_t *e, int model) {
+    emit_pop16(e, W_VAL);
+    emit_uxth_w32(e, W_VAL, W_VAL);
+    if (model >= X86_MODEL_386) {
+        emit_ldr_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+        emit_and_w32_imm_any(e, W_T0, W_T0, 0xFFFF0000u & ~(uint32_t)X86_VM, W_T1);
+        emit_orr_w32(e, W_VAL, W_VAL, W_T0);
+        emit_and_w32_imm_any(e, W_VAL, W_VAL, ~0x8028u, W_T1);
+        (void)emit_orr_w32_imm(e, W_VAL, W_VAL, 0x2);
+    } else if (model == X86_MODEL_286) {
+        emit_and_w32_imm_any(e, W_VAL, W_VAL, 0x0FD7, W_T1);
+        (void)emit_orr_w32_imm(e, W_VAL, W_VAL, 0x2);
+    } else {
+        emit_and_w32_imm_any(e, W_VAL, W_VAL, 0xFFD7, W_T1);
+        emit_orr_w32_imm_any(e, W_VAL, W_VAL, 0xF002, W_T1);
+    }
+    emit_str_w32_imm(e, W_VAL, R_CPU, OFF_EFLAGS);
+    emit_movz_w32(e, W_T1, ARITH, 0);
+    emit_and_w32(e, R_F, W_VAL, W_T1);
+}
+
+/* MUL and one-operand IMUL, r/m8 and r/m16. CONTRACT (interp): AX (or
+ * DX:AX) = the product; all arithmetic flags cleared, then SF/ZF/PF from
+ * the low half and CF = OF = the high half matters (unsigned: nonzero;
+ * signed: not the low half's sign extension). src must not be W_T0..W_T3. */
+static void emit_mul16(emit_t *e, int size, int is_signed, a64_reg_t src, uint32_t fmask) {
+    if (size == 1) {
+        if (is_signed) { emit_sxtb_w32(e, W_T2, R_GPR(R_AX)); emit_sxtb_w32(e, W_T3, src); }
+        else { (void)emit_and_w32_imm(e, W_T2, R_GPR(R_AX), 0xFF); emit_uxtb_w32(e, W_T3, src); }
+    } else {
+        if (is_signed) { emit_sxth_w32(e, W_T2, R_GPR(R_AX)); emit_sxth_w32(e, W_T3, src); }
+        else { emit_uxth_w32(e, W_T2, R_GPR(R_AX)); emit_uxth_w32(e, W_T3, src); }
+    }
+    emit_mul_w32(e, W_T0, W_T2, W_T3);                               /* fits in 32 bits either way */
+    emit_uxth_w32(e, W_T2, W_T0);
+    emit_set16(e, R_AX, W_T2);
+    if (size == 2) {
+        emit_lsr_w32_imm(e, W_T1, W_T0, 16);
+        emit_set16(e, R_DX, W_T1);
+    }
+    if (!fmask) return;
+    if (is_signed) {
+        if (size == 1) emit_sxtb_w32(e, W_T1, W_T0); else emit_sxth_w32(e, W_T1, W_T0);
+        emit_cmp_w32_w32(e, W_T1, W_T0);
+    } else {
+        emit_lsr_w32_imm(e, W_T1, W_T0, size * 8);
+        (void)emit_subs_w32_imm(e, A64_WZR, W_T1, 0);
+    }
+    emit_cset_w32(e, W_T3, A64_COND_NE);
+    emit_lsl_w32_imm(e, W_T1, W_T0, 32 - 8 * (uint32_t)size);
+    emit_tst_w32(e, W_T1, W_T1);                                     /* N, Z of the low half; C = V = 0 */
+    emit_flags_from_nzcv(e, T_ADD);
+    if (fmask & X86_PF) emit_flag_pf(e, W_T0);
+    emit_orr_w32(e, R_F, R_F, W_T3);
+    emit_orr_w32_lsl(e, R_F, R_F, W_T3, 11);
+}
+
+/* Real-mode segment load (DS or ES): what x86_load_seg does outside
+ * protected mode — selector, base = selector << 4, limit FFFF, usable,
+ * attributes and D bit clear — and the pinned host pointer. sel holds
+ * the selector in its low 16 bits. Clobbers W_T0..W_T2. */
+static void emit_load_seg_real(emit_t *e, int s, a64_reg_t sel) {
+    emit_uxth_w32(e, W_T0, sel);
+    emit_str_w32_imm(e, W_T0, R_CPU, OFF_SEG_SEL(s));                /* sel, attr = 0 */
+    emit_movz_w32(e, W_T2, 1, 0);
+    emit_strb_imm(e, W_T2, R_CPU, OFF_SEG_USABLE(s));
+    emit_lsl_w32_imm(e, W_T1, W_T0, 4);
+    emit_str_w32_imm(e, W_T1, R_CPU, OFF_SEG_BASE(s));
+    emit_movz_w32(e, W_T2, 0xFFFF, 0);
+    emit_str_w32_imm(e, W_T2, R_CPU, OFF_SEG_LIMIT(s));
+    emit_strb_imm(e, A64_WZR, R_CPU, OFF_SEG_BIG(s));
+    emit_add_x64_w32_uxtw(e, s == S_DS ? R_DSP : R_ESP, R_MEM, W_T1);
+}
+
 /* ----------------------------------------------------------------------
  * Stack
  * ---------------------------------------------------------------------- */
@@ -1240,25 +1585,42 @@ static int classify_op(const x86_insn *in) {
         return C_INLINE;
     case OP_POP:
         if (in->ops[0].kind != OPK_SREG) return C_INLINE;
-        return in->ops[0].reg == S_CS ? C_REFUSE : C_HELPER;   /* POP CS: 8086 control transfer */
+        if (in->ops[0].reg == S_CS) return C_REFUSE;           /* POP CS: 8086 control transfer */
+        return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES ? C_INLINE : C_HELPER;   /* SS: interrupt shadow */
+    case OP_LES: case OP_LDS:
+        return C_INLINE;
+    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
+        /* through DS/ES/SS only; REP MOVS/STOS/LODS stay helpers: an
+         * SMC exit inside a storing loop has no exact place to land */
+        if (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return C_HELPER;
+        if (in->rep && in->op == OP_LODS) return C_HELPER;
+        return C_INLINE;
+    case OP_DIV: case OP_IDIV:
+        return s_cls_model >= X86_MODEL_286 ? C_INLINE : C_HELPER;  /* 8086 microcode quirks; 186 #DE is a trap */
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
         return is_shift_inline(in) ? C_INLINE : C_HELPER;
+    case OP_MUL:
+        return C_INLINE;
+    case OP_IMUL:
+        return in->opcode2 == 0xAF ? C_HELPER : C_INLINE;   /* one-operand form inline */
+    case OP_PUSHF: case OP_POPF:
+        return C_INLINE;                                     /* 16-bit (classify); POPF real mode only (classify_seg16) */
     case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR: case OP_SETMO:
-    case OP_MUL: case OP_IMUL: case OP_IMUL3:
+    case OP_IMUL3:
     case OP_AAD: case OP_AAA: case OP_AAS: case OP_DAA: case OP_DAS: case OP_SALC:
     case OP_XLAT: case OP_SAHF: case OP_LAHF:
-    case OP_PUSHA: case OP_POPA: case OP_PUSHF: case OP_POPF: case OP_ENTER: case OP_LEAVE:
-    case OP_MOVS: case OP_CMPS: case OP_STOS: case OP_LODS: case OP_SCAS:
-    case OP_LES: case OP_LDS:
+    case OP_PUSHA: case OP_POPA: case OP_ENTER: case OP_LEAVE:
     case OP_BT: case OP_BTS: case OP_BTR: case OP_BTC: case OP_BSF: case OP_BSR:
     case OP_SHLD: case OP_SHRD: case OP_CMPXCHG: case OP_XADD: case OP_BSWAP:
         return C_HELPER;
     case OP_AAM:
         return in->ops[0].imm ? C_HELPER : C_REFUSE;
     case OP_MOVSEG:
-        /* Loading CS (8086 only) is a control transfer in disguise. */
-        if (in->ops[0].kind == OPK_SREG && in->ops[0].reg == S_CS) return C_REFUSE;
-        return C_HELPER;
+        /* Loading CS (8086 only) is a control transfer in disguise; SS
+         * opens an interrupt shadow, FS/GS are the 386's own. */
+        if (in->ops[0].kind != OPK_SREG) return C_INLINE;
+        if (in->ops[0].reg == S_CS) return C_REFUSE;
+        return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES ? C_INLINE : C_HELPER;
     default:
         return C_REFUSE;
     }
@@ -1358,6 +1720,8 @@ static int classify_flat(const x86_insn *in) {
  * ending the block when it loads a segment (loads_segment), or refused. */
 static int classify_seg16(const x86_insn *in) {
     if (classify_pm(in) == C_REFUSE) return C_REFUSE;
+    if (loads_segment(in)) return C_HELPER;                  /* descriptor loads: the interpreter's */
+    if (in->op == OP_POPF) return C_HELPER;                  /* IOPL and IF under privilege rules */
     if (in->adsize != 2) return C_HELPER;
     if (in->ea_valid && in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return C_HELPER;
     switch (in->op) {
@@ -1401,6 +1765,8 @@ static int op_may_fault(const x86_insn *in) {
         return 1;
     case OP_INT: case OP_INT3:
         return 1;                     /* the frame carries FLAGS: all of them must be materialized */
+    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
+        return in->ops[0].size >= 2 || s_seg16;    /* the slow path's helper can fault, frame and all */
     default: break;
     }
     for (int i = 0; i < 2; i++)
@@ -1415,6 +1781,8 @@ static int op_may_fault(const x86_insn *in) {
 static int op_stores(const x86_insn *in) {
     switch (in->op) {
     case OP_PUSH: case OP_PUSHA: case OP_CALL: case OP_CALLF: case OP_INT: case OP_INT3: case OP_OUT: return 1;
+    case OP_STOS: case OP_MOVS: return 1;
+    case OP_LODS: case OP_CMPS: case OP_SCAS: return 0;
     case OP_CMP: case OP_TEST: case OP_LEA: return 0;
     case OP_XCHG: return in->ea_valid;
     default: return in->ops[0].kind == OPK_MEM;
@@ -1448,7 +1816,12 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
         if (in->ops[1].kind == OPK_IMM && (in->ops[1].imm & 0xFF)) *wr = ARITH;
         break;
     case OP_DIV: case OP_IDIV: case OP_OUT:
-        *rd = ARITH; break;          /* #DE / #GP: an unplanned exit whose frame holds the flags */
+        *rd = ARITH; break;
+    case OP_CMPS: case OP_SCAS:
+        if (!in->rep) *wr = ARITH;   /* repeated: none when CX = 0, so a pass-through */
+        break;
+    case OP_PUSHF: *rd = ARITH; break;
+    case OP_POPF:  *wr = ARITH; break;          /* #DE / #GP: an unplanned exit whose frame holds the flags */
     case OP_SETCC: {
         static const uint16_t need[8] = { X86_OF, X86_CF, X86_ZF, X86_CF | X86_ZF, X86_SF, X86_PF, X86_SF | X86_OF, X86_SF | X86_OF | X86_ZF };
         *rd = need[in->cond >> 1]; break;
@@ -1583,7 +1956,8 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     }
     case OP_DIV: case OP_IDIV: {
         a64_reg_t src = emit_read_operand(e, in, 0, &ea, W_SRC);
-        emit_div32(e, in->op == OP_IDIV, src);
+        if (size == 4) emit_div32(e, in->op == OP_IDIV, src);
+        else emit_div16(e, size, in->op == OP_IDIV, src);
         break;
     }
     case OP_SETCC: {
@@ -1595,6 +1969,34 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         emit_write_operand(e, in, 0, &ea, W_VAL);
         break;
     }
+    case OP_MOVSEG:
+        if (d->kind == OPK_SREG) {                                   /* MOV DS/ES, r/m16 (classify) */
+            a64_reg_t v = emit_read_operand(e, in, 1, &ea, W_VAL);
+            emit_load_seg_real(e, d->reg, v);
+        } else {                                                     /* MOV r/m16, sreg */
+            a64_reg_t v = emit_read_operand(e, in, 1, &ea, W_VAL);
+            emit_write_operand(e, in, 0, &ea, v);
+        }
+        break;
+    case OP_LDS: case OP_LES: {
+        /* offset then selector, each read (and on the 286 limit-checked)
+         * before anything is written, as the interpreter does */
+        emit_read_mem(e, &ea, 2, W_VAL);
+        emit_add_w32_imm(e, W_T0, ea.off, 2);
+        (void)emit_and_w32_imm(e, W_T0, W_T0, 0xFFFF);
+        ea_t ea2 = { ea.segp, W_T0, ea.seg };
+        emit_read_mem(e, &ea2, 2, W_SRC);
+        emit_write_reg(e, d->reg, 2, W_VAL);
+        emit_load_seg_real(e, in->op == OP_LDS ? S_DS : S_ES, W_SRC);
+        break;
+    }
+    case OP_LODS: case OP_STOS: case OP_MOVS: case OP_CMPS: case OP_SCAS:
+        if (!in->rep) emit_string1(e, in, fmask);
+        else if (in->op == OP_CMPS || in->op == OP_SCAS) emit_rep_cmp(e, in, fmask);
+        else emit_rep_store(e, in);                                  /* MOVS, STOS (classify) */
+        break;
+    case OP_PUSHF: emit_pushf16(e); break;
+    case OP_POPF:  emit_popf16(e, dbt->cpu->model); break;
     case OP_PUSHA: emit_pusha_flat(e); break;
     case OP_POPA:  emit_popa_flat(e); break;
     case OP_OUT:   emit_out(e, in); break;
@@ -1638,6 +2040,11 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         break;
     }
     case OP_MUL: case OP_IMUL:
+        if (size < 4 && (in->op == OP_MUL || in->opcode2 != 0xAF)) {
+            a64_reg_t src = emit_read_operand(e, in, 0, &ea, W_SRC);
+            emit_mul16(e, size, in->op == OP_IMUL, src, fmask);
+            break;
+        }
         if (in->op == OP_MUL || in->opcode2 != 0xAF) {
             /* One-operand 32-bit MUL/IMUL: EDX:EAX = EAX * r/m32 (DOOM's
              * FixedMul). CONTRACT (interp): SZP from the LOW half, AF
@@ -1740,6 +2147,11 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         break;
     }
     case OP_POP:
+        if (d->kind == OPK_SREG) {                                   /* POP DS/ES (classify) */
+            emit_pop16(e, W_VAL);
+            emit_load_seg_real(e, d->reg, W_VAL);
+            break;
+        }
         /* POP [mem] on the 386 leaves SP where it was if the destination
          * faults (CONTRACT, measured): check it before the pop. The EA
          * never involves SP with 16-bit addressing. */
@@ -2192,6 +2604,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     uint32_t n_ops = 0;
     uint8_t buf[16];
     x86_dec_ctx ctx = { buf, cpu->model, (uint8_t)s_flat };
+    s_cls_model = cpu->model;
 
     while (n_ops < MAX_BLOCK_INSNS) {
         x86_insn *in = &decs[n_ops];

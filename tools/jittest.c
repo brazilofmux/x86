@@ -262,9 +262,15 @@ static int fuzz_accept(const x86_insn *in) {
     switch (in->op) {
     case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
     case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INTO:
-    case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_POPF: case OP_HLT:
+    case OP_LSS: case OP_LFS: case OP_LGS: case OP_POPF: case OP_HLT:
         return 0;
-    case OP_POP: case OP_PUSH:
+    case OP_LES: case OP_LDS:
+        return 1;              /* DS/ES anywhere in the first megabyte: all of it is memory here */
+    case OP_MOVSEG:            /* loads of DS and ES; stores of any segment register */
+        return in->ops[0].kind != OPK_SREG || in->ops[0].reg == S_DS || in->ops[0].reg == S_ES;
+    case OP_POP:
+        return in->ops[0].kind != OPK_SREG || in->ops[0].reg == S_DS || in->ops[0].reg == S_ES;
+    case OP_PUSH:
         return in->ops[0].kind != OPK_SREG;
     case OP_IN: case OP_OUT:
         return 1;
@@ -647,6 +653,15 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
      * register must neither use nor disturb them. */
     for (int i = 0; i < 8; i++) cpu.r[i] = model >= X86_MODEL_386 ? rnd() : rnd() & 0xFFFF;
     cpu.r[R_SP] &= 0xFFFFFFFEu;
+    /* A quarter of the time SI and DI sit at the segment's end, where a
+     * word string access straddles offset FFFF: the wrap (8086/186) or
+     * the #GP with its pointer-commit rules (286/386) — the string
+     * emitters' slow path. */
+    if ((rnd() & 3) == 0) {
+        cpu.r[R_SI] = (cpu.r[R_SI] & 0xFFFF0000u) | (0xFFFEu + (rnd() & 1));
+        cpu.r[R_DI] = (cpu.r[R_DI] & 0xFFFF0000u) | (0xFFFEu + (rnd() & 1));
+        cpu.r[R_CX] = (cpu.r[R_CX] & 0xFFFF0000u) | (rnd() & 7);
+    }
     cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
     cpu.eip = 0x100;
     memcpy(cpu.mem + 0x10100, prog, plen);
@@ -658,6 +673,17 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
         cpu.mem[v * 4 + 2] = 0x00; cpu.mem[v * 4 + 3] = 0x90;
     }
     cpu.mem[0x90000] = 0xCF;
+    /* Faults end the run: #DE (0), #SS (12), #GP (13) restart the faulting
+     * instruction on the 286+, and an IRET-and-retry would spin until the
+     * instruction limit — with -V comparing memory after every one-insn
+     * run, minutes per seed. (INT 0/0Ch/0Dh in a program halt it too.) */
+    static const int stop_vec[] = { 0, 12, 13 };
+    for (int k = 0; k < 3; k++) {
+        int v = stop_vec[k];
+        cpu.mem[v * 4 + 0] = 0x00; cpu.mem[v * 4 + 1] = 0x00;
+        cpu.mem[v * 4 + 2] = 0x00; cpu.mem[v * 4 + 3] = 0x91;
+    }
+    cpu.mem[0x91000] = 0xF4;
     for (int i = 0; i < 0x30000; i++) cpu.mem[0x30000 + i] = (uint8_t)rnd();
     for (int i = 0; i < 0x10000; i++) cpu.mem[0x70000 + i] = (uint8_t)rnd();
 
@@ -671,6 +697,7 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
     dbt.verify = 1;
     dbt.insn_limit = 1000000;
     int rc = dbt_run(&dbt);
+    if (verbose) { fprintf(stderr, "insns %llu, halted %d, eip %04X:%04X\n", (unsigned long long)cpu.insn_count, cpu.halted, cpu.seg[S_CS].sel, cpu.eip); dbt_print_stats(&dbt, stderr); }
     if (rc != 0 || verbose) {
         fprintf(stderr, "%s seed=%llu model=%d len=%d:", rc ? "FAIL" : "ok", (unsigned long long)seed, model, len);
         for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);

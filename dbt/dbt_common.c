@@ -625,8 +625,11 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
                 if (dbt->insn_hits[i] && (!found || dbt->insn_hits[i] > dbt->insn_hits[best])) { best = i; found = 1; }
             if (!found) break;
             char buf[64];
-            fprintf(out, "    %10u [%-4s] %06X %s\n", dbt->insn_hits[best], tags[dbt->insn_tag[best]],
-                    dbt->insn_lin[best], x86_disasm(&dbt->insn_pool[best], buf, sizeof buf));
+            const x86_insn *hi = &dbt->insn_pool[best];
+            int str = hi->op == OP_MOVS || hi->op == OP_CMPS || hi->op == OP_STOS || hi->op == OP_LODS || hi->op == OP_SCAS;
+            fprintf(out, "    %10u [%-4s] %06X %s%s\n", dbt->insn_hits[best], tags[dbt->insn_tag[best]],
+                    dbt->insn_lin[best], x86_disasm(hi, buf, sizeof buf),
+                    !str ? "" : hi->ops[0].size == 1 ? " (byte)" : hi->ops[0].size == 2 ? " (word)" : " (dword)");
             dbt->insn_hits[best] = 0;
         }
     }
