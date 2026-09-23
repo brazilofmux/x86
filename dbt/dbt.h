@@ -88,6 +88,7 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
  * protected mode for the code segment's default size. */
 #define KEY_PMODE          (1ull << 48)
 #define KEY_BIG            (1ull << 49)   /* CS D bit: 32-bit default operand/address size */
+#define KEY_FLAT           (1ull << 50)   /* CS, DS, ES, SS all base 0, limit 4G, 32-bit (dbt_seg_flat) */
 
 static inline uint64_t dbt_key(uint32_t cs_sel, uint32_t lin) { return ((uint64_t)cs_sel << 32) | lin; }
 static inline uint32_t dbt_key_lin(uint64_t key) { return (uint32_t)key; }
@@ -132,7 +133,7 @@ _Static_assert((AUX_CACHE & 0xFFF) == 0, "AUX_CACHE must be reachable by ADD #im
 
 enum {
     H_EXEC = 0,        /* void (cpu, insn_index): interpreter's execute() */
-    H_POST_STORE,      /* void (cpu, phys): SMC invalidation after a JIT store */
+    H_POST_STORE,      /* void (cpu, phys | bytes << 28): device and SMC hooks after a JIT store */
     H__COUNT
 };
 
@@ -243,14 +244,33 @@ void     dbt_emit_trampoline(x86_dbt *dbt);
 void     dbt_arch_patch_link(x86_dbt *dbt, uint32_t site_off, uint8_t *target);
 
 int      dbt_classify_op(const x86_insn *in);   /* 0 refuse, 1 inline, 2 helper */
+int      dbt_classify_op_pm(const x86_insn *in);   /* same, for a flat protected-mode block */
 
 /* Helpers called from translated code (dbt_common.c) */
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index);
+void dbt_h_post_store(x86_cpu *cpu, uint32_t arg);
 
-/* Mode bits of a key for the current CS. */
+/* The flat model: base 0, limit 4G, 32-bit, and for data segments
+ * writable and expanding up. A block translated under KEY_FLAT addresses
+ * memory as mem + offset with no base add and no limit check (no access
+ * through these segments can fault), and ends after anything that loads
+ * a segment register, so the assumption holds for as long as it runs;
+ * everything else that changes a segment returns to the run loop, which
+ * recomputes the key. */
+static inline int dbt_seg_flat(const x86_seg *g, int code) {
+    if (!g->usable || g->base != 0 || g->limit != 0xFFFFFFFFu || !g->big || !X86_AR_S(g->attr)) return 0;
+    if (code) return (g->attr & X86_TYPE_CODE) != 0;
+    return !(g->attr & X86_TYPE_CODE) && (g->attr & X86_TYPE_WRITABLE) && !(g->attr & X86_TYPE_EXPDOWN);
+}
+
+/* Mode bits of a key for the current segments. */
 static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
     if (!c->pmode) return 0;
-    return KEY_PMODE | (c->seg[S_CS].big ? KEY_BIG : 0);
+    uint64_t b = KEY_PMODE | (c->seg[S_CS].big ? KEY_BIG : 0);
+    if (dbt_seg_flat(&c->seg[S_CS], 1) && dbt_seg_flat(&c->seg[S_DS], 0)
+        && dbt_seg_flat(&c->seg[S_ES], 0) && dbt_seg_flat(&c->seg[S_SS], 0))
+        b |= KEY_FLAT;
+    return b;
 }
 
 /* Current block key for the cpu's CS:EIP. Real mode masks for A20 and

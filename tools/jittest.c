@@ -272,6 +272,122 @@ static int fuzz_accept(const x86_insn *in) {
     }
 }
 
+/* Flat 32-bit protected mode (-P): what may go into a random block. No
+ * control transfer, no segment load, nothing that raises (DIV, BOUND,
+ * INTO, #UD) or changes TF/IOPL (POPF), no gates. */
+static int fuzz_accept_pm(const x86_insn *in) {
+    if (in->seg_override == S_CS || in->seg_override == S_FS || in->seg_override == S_GS) return 0;
+    if (in->lock) return 0;
+    /* ECX is a random 32-bit value as soon as anything writes it: a REP
+     * string op could then run for 4G iterations (on both machines). The
+     * string ops are helpers anyway. */
+    if (in->rep && (in->op == OP_MOVS || in->op == OP_CMPS || in->op == OP_STOS || in->op == OP_LODS || in->op == OP_SCAS))
+        return 0;
+    switch (in->op) {
+    case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
+    case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INTO: case OP_INT: case OP_INT3:
+    case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_POPF: case OP_HLT:
+    case OP_DIV: case OP_IDIV: case OP_AAM: case OP_BOUND: case OP_ENTER: case OP_UD:
+        return 0;
+    case OP_POP: case OP_PUSH:
+        return in->ops[0].kind != OPK_SREG;
+    case OP_IN: case OP_OUT: case OP_INS: case OP_OUTS:
+        return 0;
+    default:
+        return dbt_classify_op_pm(in) != 0;
+    }
+}
+
+/* One random flat-PM block: CS/DS/ES/SS all base 0, limit 4G, 32-bit;
+ * code at CODE_PM in extended memory, the general registers pointing
+ * into a random data window (ECX kept small: it is REP's and LOOP's
+ * count), so memory operands mostly take the JIT's fast path and
+ * sometimes — disp32, ECX as a base — its out-of-range slow path. */
+#define CODE_PM 0x120000u
+#define DATA_PM 0x400000u
+static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
+    rng_state = seed ? seed : 0x9E3779B97F4A7C15ull;
+    uint8_t prog[2048]; int plen = 0;
+    for (int i = 0; i < len; ) {
+        uint8_t tmp[16];
+        x86_insn in;
+        for (int k = 0; k < 16; k++) tmp[k] = (uint8_t)rnd();
+        x86_dec_ctx c2 = { tmp, X86_MODEL_386, 1 };
+        if (!x86_decode(&c2, &in) || in.len > 10 || !fuzz_accept_pm(&in)) continue;
+        if ((rnd() % 6) == 0) {
+            static const uint8_t cc[] = { 0xE0, 0xE1, 0xE2, 0xE3 };
+            int dbl = (rnd() % 3) == 0;
+            if (dbl) {
+                uint32_t r = rnd();
+                prog[plen++] = (r & 3) ? (uint8_t)(0x70 + ((r >> 4) & 15)) : cc[(r >> 4) & 3];
+                prog[plen++] = (uint8_t)(2 + in.len);
+                i++;
+            }
+            uint32_t r2 = rnd();
+            prog[plen++] = (r2 & 3) ? (uint8_t)(0x70 + ((r2 >> 4) & 15)) : cc[(r2 >> 4) & 3];
+            prog[plen++] = (uint8_t)in.len;
+            i++;
+        }
+        memcpy(prog + plen, tmp, in.len); plen += in.len; i++;
+    }
+    prog[plen++] = 0xF4;
+
+    x86_cpu cpu;
+    x86_init(&cpu, X86_MODEL_386);
+    x86_set_a20(&cpu, 1);
+    cpu.pmode = 1;
+    cpu.cr0 |= 1;
+    static const uint16_t sels[6] = { 0x10, 0x08, 0x10, 0x10, 0, 0 };
+    for (int s = 0; s < 6; s++) {
+        x86_seg *g = &cpu.seg[s];
+        memset(g, 0, sizeof *g);
+        g->sel = sels[s];
+        if (!sels[s]) continue;
+        g->usable = 1;
+        g->base = 0;
+        g->limit = 0xFFFFFFFFu;
+        g->big = 1;
+        g->attr = (uint16_t)((s == S_CS ? 0x9B : 0x93) | 0xC00);
+    }
+    cpu.gdtr.base = 0x110000; cpu.gdtr.limit = 0x17;
+    for (int i = 0; i < 8; i++) cpu.r[i] = DATA_PM + (rnd() & 0xFFFFF);
+    cpu.r[R_CX] = rnd() & 0xFF;
+    cpu.r[R_SP] = DATA_PM + 0x80000 + (rnd() & 0xFFFC);
+    cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
+    cpu.eip = CODE_PM;
+    memcpy(cpu.mem + CODE_PM, prog, plen);
+    for (uint32_t i = 0; i < 0x110000; i++) cpu.mem[DATA_PM + i] = (uint8_t)rnd();
+
+    if (verbose) {
+        fprintf(stderr, "seed=%llu:", (unsigned long long)seed);
+        for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
+        fprintf(stderr, "\n");
+    }
+    x86_dbt dbt;
+    if (dbt_init(&dbt, &cpu) < 0) return 1;
+    dbt.verify = 1;
+    dbt.verify_mem_every = 1;
+    dbt.insn_limit = 1000000;
+    int rc = dbt_run(&dbt);
+    if (verbose) dbt_print_stats(&dbt, stderr);
+    if (rc != 0 || verbose) {
+        fprintf(stderr, "%s seed=%llu pm len=%d:", rc ? "FAIL" : "ok", (unsigned long long)seed, len);
+        for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
+        fprintf(stderr, "\n");
+        uint32_t ip = 0; uint8_t buf[16]; x86_insn in; char d[128];
+        while (ip < (uint32_t)plen) {
+            memcpy(buf, prog + ip, 16);
+            x86_dec_ctx c3 = { buf, X86_MODEL_386, 1 };
+            if (!x86_decode(&c3, &in)) break;
+            fprintf(stderr, "    %06X: %s\n", CODE_PM + ip, x86_disasm(&in, d, sizeof d));
+            ip += in.len;
+        }
+    }
+    dbt_cleanup(&dbt);
+    x86_free(&cpu);
+    return rc != 0;
+}
+
 static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
     rng_state = seed ? seed : 0x9E3779B97F4A7C15ull;
     uint8_t prog[2048]; int plen = 0;
@@ -313,8 +429,10 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
     x86_load_seg(&cpu, S_DS, 0x3000);
     x86_load_seg(&cpu, S_ES, 0x5000);
     x86_load_seg(&cpu, S_SS, 0x7000);
-    for (int i = 0; i < 8; i++) cpu.r[i] = rnd() & 0xFFFF;
-    cpu.r[R_SP] &= 0xFFFE;
+    /* 386: random upper halves too — a 16-bit op on a pinned 32-bit
+     * register must neither use nor disturb them. */
+    for (int i = 0; i < 8; i++) cpu.r[i] = model >= X86_MODEL_386 ? rnd() : rnd() & 0xFFFF;
+    cpu.r[R_SP] &= 0xFFFFFFFEu;
     cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
     cpu.eip = 0x100;
     memcpy(cpu.mem + 0x10100, prog, plen);
@@ -360,7 +478,7 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
 }
 
 int main(int argc, char **argv) {
-    int model = X86_MODEL_8086, prog = -1, fuzz = 0, len = 20, verify = 1, strict = 0, stats = 0, verbose = 0;
+    int model = X86_MODEL_8086, prog = -1, fuzz = 0, len = 20, verify = 1, strict = 0, stats = 0, verbose = 0, pm = 0;
     uint64_t seed = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) { int m = atoi(argv[++i]); model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 386 ? X86_MODEL_386 : X86_MODEL_286; }
@@ -373,14 +491,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-S")) strict = 1;
         else if (!strcmp(argv[i], "-s")) stats = 1;
         else if (!strcmp(argv[i], "-v")) verbose = 1;
-        else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "-P")) pm = 1;
+        else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] [-P] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
     }
     if (prog >= 0) return run_prog(prog, model, verify, strict, stats);
     if (fuzz) {
         int fails = 0;
-        for (int i = 0; i < fuzz; i++) fails += fuzz_one(model, len, seed + (uint64_t)i, verbose);
-        printf("fuzz: %d/%d failed (seeds %llu..%llu, model %d, len %d)\n", fails, fuzz,
-               (unsigned long long)seed, (unsigned long long)(seed + fuzz - 1), model, len);
+        for (int i = 0; i < fuzz; i++)
+            fails += pm ? fuzz_one_pm(len, seed + (uint64_t)i, verbose) : fuzz_one(model, len, seed + (uint64_t)i, verbose);
+        printf("fuzz: %d/%d failed (seeds %llu..%llu, %s, len %d)\n", fails, fuzz,
+               (unsigned long long)seed, (unsigned long long)(seed + fuzz - 1), pm ? "flat PM" : "real mode", len);
         return fails != 0;
     }
     return 2;

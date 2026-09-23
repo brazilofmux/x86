@@ -56,7 +56,8 @@ test-sst386: tools/sst
 # JIT vs interpreter: built-in programs plus a fuzz sweep, all under -V lockstep
 test-jit: tools/jittest
 	./tools/jittest -p 0 && ./tools/jittest -p 1 && ./tools/jittest -m 286 -p 0 && \
-	./tools/jittest -f 2000 && ./tools/jittest -m 286 -f 2000
+	./tools/jittest -f 2000 && ./tools/jittest -m 286 -f 2000 && ./tools/jittest -m 386 -f 2000 && \
+	./tools/jittest -P -f 3000 && ./tools/jittest -P -f 1000 -r 100000 -n 40
 
 # DOS-level smoke tests (tests/dos/run.sh; uses disks/tp55 when present)
 test-dos: $(TARGET)

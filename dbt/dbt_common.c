@@ -68,7 +68,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     }
     build_tables(dbt->aux);
     dbt->aux->helpers[H_EXEC]       = (void *)dbt_h_exec;
-    dbt->aux->helpers[H_POST_STORE] = (void *)x86_store_hook;   /* device memory, then code */
+    dbt->aux->helpers[H_POST_STORE] = (void *)dbt_h_post_store;
 
     dbt->bm_lo    = cpu->mem_size;         /* nothing marked yet */
     cpu->dbt      = dbt;
@@ -141,6 +141,17 @@ void dbt_cleanup(x86_dbt *dbt) {
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     x86_exec_decoded(cpu, &dbt->insn_pool[insn_index]);
+}
+
+/* A translated store of 1, 2 or 4 bytes (count in bits 31:28, 0 meaning
+ * 1) found a nonzero code-bitmap entry somewhere under it: run the store
+ * hook — device memory, then SMC — for each byte, as the interpreter's
+ * byte-wise stores would. */
+void dbt_h_post_store(x86_cpu *cpu, uint32_t arg) {
+    uint32_t phys = arg & 0x0FFFFFFFu, n = arg >> 28;
+    if (!n) n = 1;
+    for (uint32_t i = 0; i < n; i++)
+        if (cpu->code_bitmap[phys + i]) x86_store_hook(cpu, phys + i);
 }
 
 /* ----------------------------------------------------------------------

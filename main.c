@@ -29,6 +29,7 @@ static void usage(const char *prog) {
     printf("  -s          print statistics on exit\n");
     printf("  -d          trace DOS and DPMI calls (-d -d: every call, with registers)\n");
     printf("  -L N        stop after N instructions\n");
+    printf("  -T SECS     stop after SECS seconds of wall-clock time\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
     printf("  -G FILE     write the mode 13h screen to FILE as a PNG on exit\n");
     printf("  -w / -W     do / do not open a window for graphics modes (default: if stdout is a terminal)\n");
@@ -45,8 +46,15 @@ static int g_stats;
 static uint64_t g_last_insns, g_last_ns;
 
 /* Host events between block runs; also keeps the HUD fresh. */
+static double g_time_limit;       /* -T: stop after this many wall-clock seconds (0 = never) */
+
 static int host_poll(x86_cpu *c) {
     int changed = pc_poll(c);
+    if (g_time_limit > 0) {
+        static uint64_t t0;
+        if (!t0) t0 = pc.now_ns;
+        if ((double)(pc.now_ns - t0) > g_time_limit * 1e9) { c->halted = 1; return 1; }
+    }
     static int rate = -1;
     if (rate < 0) rate = getenv("X86_RATE") != NULL;
     if (rate) {
@@ -225,6 +233,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-A") && i + 1 < argc) drive_a = argv[++i];
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) drive_b = argv[++i];
         else if (!strcmp(argv[i], "-L") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-T") && i + 1 < argc) g_time_limit = atof(argv[++i]);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "-G") && i + 1 < argc) gdump = argv[++i];
         else if (!strcmp(argv[i], "-w")) window = 1;
