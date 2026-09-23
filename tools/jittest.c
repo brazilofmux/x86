@@ -290,8 +290,10 @@ static int fuzz_accept_pm(const x86_insn *in) {
     case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
     case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INTO: case OP_INT: case OP_INT3:
     case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_POPF: case OP_HLT:
-    case OP_DIV: case OP_IDIV: case OP_AAM: case OP_BOUND: case OP_ENTER: case OP_UD:
+    case OP_AAM: case OP_BOUND: case OP_ENTER: case OP_UD:
         return 0;
+    case OP_DIV: case OP_IDIV:
+        return in->ops[0].size == 4;   /* #DE goes through the IDT to a HLT (pm_flat_setup) */
     case OP_POP: case OP_PUSH:
         return in->ops[0].kind != OPK_SREG;
     case OP_IN: case OP_OUT: case OP_INS: case OP_OUTS:
@@ -307,6 +309,7 @@ static int fuzz_accept_pm(const x86_insn *in) {
  * count), so memory operands mostly take the JIT's fast path and
  * sometimes — disp32, ECX as a base — its out-of-range slow path. */
 #define CODE_PM 0x120000u
+#define DE_STUB_PM (CODE_PM + 0x1000u)
 #define DATA_PM 0x400000u
 
 /* A flat 32-bit protected-mode machine: CS/DS/ES/SS base 0, limit 4G. */
@@ -328,6 +331,14 @@ static void pm_flat_setup(x86_cpu *cpu) {
         g->attr = (uint16_t)((s == S_CS ? 0x9B : 0x93) | 0xC00);
     }
     cpu->gdtr.base = 0x110000; cpu->gdtr.limit = 0x17;
+    /* GDT (null, flat code 08, flat data 10) and an IDT whose #DE gate
+     * lands on a HLT: a DIV that faults ends the run on both machines. */
+    static const uint32_t gdt[6] = { 0, 0, 0x0000FFFF, 0x00CF9B00, 0x0000FFFF, 0x00CF9300 };
+    memcpy(cpu->mem + 0x110000, gdt, sizeof gdt);
+    uint32_t gate[2] = { (DE_STUB_PM & 0xFFFF) | (0x08u << 16), (DE_STUB_PM & 0xFFFF0000u) | 0x8E00u };
+    memcpy(cpu->mem + 0x110100, gate, sizeof gate);
+    cpu->idtr.base = 0x110100; cpu->idtr.limit = 7;
+    cpu->mem[DE_STUB_PM] = 0xF4;
     cpu->eip = CODE_PM;
 }
 

@@ -481,11 +481,24 @@ static uint32_t s_nfslow;
 static const x86_insn *s_cur_insn;   /* the instruction being emitted, for its slow path */
 static uint32_t s_dyn_imm_lin;       /* nonzero: read the current instruction's immediate from this linear address */
 static int s_cur_ender;
+static int s_in_slow_chunk;          /* emitting a flat slow-path chunk (stats tag) */
+
+/* Record a slow-path entry for the current instruction; the caller emits
+ * the branch to it (a B.cond or CBZ/CBNZ, all imm19) right after. */
+static void flat_slow_site(emit_t *e) {
+    if (s_nfslow >= FLAT_SLOW_MAX) { fprintf(stderr, "dbt: flat slow-path table overflow\n"); abort(); }
+    flat_slow_t *f = &s_fslow[s_nfslow++];
+    f->patch_off = emit_pos(e);
+    f->back_off = 0;
+    f->ip_after = s_cur_ip_after;
+    f->n_done = s_cur_n_done;
+    f->ender = s_cur_ender;
+    f->in = *s_cur_insn;
+}
 
 /* store_only: the instruction writes this address and never reads it,
  * so the VGA window need not be avoided. */
 static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only) {
-    if (s_nfslow >= FLAT_SLOW_MAX) { fprintf(stderr, "dbt: flat slow-path table overflow\n"); abort(); }
     a64_cond_t slow = A64_COND_NE;
     if (store_only) {
         (void)emit_tst_w32_imm(e, off, ~(FLAT_TOP - 1));              /* off >= 16 MB */
@@ -498,16 +511,35 @@ static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only) {
         emit_ccmp_w32_imm(e, W_T3, 0xA, 0x4, A64_COND_EQ);
         slow = A64_COND_EQ;
     }
-    flat_slow_t *f = &s_fslow[s_nfslow++];
-    f->patch_off = emit_pos(e);
-    f->back_off = 0;
-    f->ip_after = s_cur_ip_after;
-    f->n_done = s_cur_n_done;
-    f->ender = s_cur_ender;
-    f->in = *s_cur_insn;
+    flat_slow_site(e);
     emit_b_cond(e, slow, 0);
 }
 static void emit_flat_check(emit_t *e, a64_reg_t off) { emit_flat_check_as(e, off, 0); }
+
+/* ---- Inline faults in flat blocks ----
+ * A flat access never faults, but an inline op can (#DE). The site
+ * branches to a chunk after the block that enters the fault stub with
+ * the instruction's start EIP: nothing of the instruction has been
+ * committed, and its flags are all live (op_flag_effects). */
+typedef struct { uint32_t patch_off, ip_start, n_done; uint8_t vector; } fault_site_t;
+static fault_site_t s_fault[64];
+static uint32_t s_nfault;
+
+static void fault_site(emit_t *e, uint8_t vector) {
+    if (s_nfault >= 64) { fprintf(stderr, "dbt: fault site table overflow\n"); abort(); }
+    s_fault[s_nfault++] = (fault_site_t){ emit_pos(e), s_cur_ip_start, s_cur_n_done, vector };
+}
+static void emit_fault_chunks(emit_t *e) {
+    for (uint32_t k = 0; k < s_nfault; k++) {
+        fault_site_t *f = &s_fault[k];
+        emit_patch_cond19(e, f->patch_off, emit_pos(e));
+        emit_mov_w32_imm32(e, A64_W3, f->ip_start);
+        emit_movz_w32(e, A64_W4, (uint16_t)f->n_done, 0);
+        emit_movz_w32(e, A64_W5, f->vector, 0);
+        emit_b(e, (int32_t)s_fault_stub_off - (int32_t)emit_pos(e));
+    }
+    s_nfault = 0;
+}
 
 /* Post-store SMC check for the `size` bytes at host address X3: one
  * load of their bitmap entries (LDRB/LDRH/LDR — a word store that starts
@@ -818,13 +850,22 @@ static void emit_alu(emit_t *e, int op, int size, a64_reg_t a, a64_reg_t b, a64_
         table = T_SUB;
         break;
     case OP_ADC: case OP_SBB:
+        (void)emit_and_w32_imm(e, A64_W2, R_F, X86_CF);    /* W2 = CF in */
+        if (size == 4) {
+            /* Full width: the host's own carry-in. ADCS computes a+b+C
+             * with the flags of that sum, which is x86's ADC; SBCS
+             * computes a-b-!C, so C = !CF going in and the T_SUB row
+             * (CF = !C) reads the borrow back out. */
+            if (op == OP_ADC) { emit_cmp_w32_imm(e, A64_W2, 1); emit_adcs_w32(e, W_T0, a, b); }
+            else { emit_subs_w32(e, A64_WZR, A64_WZR, A64_W2); emit_sbcs_w32(e, W_T0, a, b); table = T_SUB; }
+            break;
+        }
         /* ADCS would add the carry at bit 0, below the shifted field.
          * Fold it into the operand instead: b' = b + CF, then a ± b'
          * with plain ADDS/SUBS. The one corner case, b = all-ones with
          * CF set, makes b' << sh vanish and loses the guest carry; the
          * result and OF are still right there (a ± 0), so just OR the
          * lost bit back into CF after the table. */
-        (void)emit_and_w32_imm(e, A64_W2, R_F, X86_CF);    /* W2 = CF in */
         /* W1 = b' (W_T1 is the NZCV temp). On 386 a word operand can be a
          * whole 32-bit register: mask it, or its upper half lands in the
          * carry-out bit OR'd into F below. */
@@ -857,7 +898,7 @@ static void emit_alu(emit_t *e, int op, int size, a64_reg_t a, a64_reg_t b, a64_
         break;
     }
     emit_flags_from_nzcv(e, table);
-    if (op == OP_ADC || op == OP_SBB) {
+    if ((op == OP_ADC || op == OP_SBB) && size < 4) {
         emit_orr_w32_lsr(e, R_F, R_F, A64_W1, 8 * size);
         /* Second corner: b' = b + CF landing exactly on the sign bit
          * (b = 7F.., CF = 1) reads as -2^(n-1) in the field where the
@@ -946,6 +987,74 @@ static void emit_shift_imm(emit_t *e, int op, int size, uint32_t cnt, a64_reg_t 
     if (fmask & X86_PF) emit_flag_pf(e, res);
 }
 
+/* SHL/SHR/SAR r/m32 by CL. CONTRACT (interp, 186+): count & 31; a zero
+ * count changes nothing, flags included. Otherwise as the immediate
+ * forms: AF cleared, SHL OF = MSB(res)^CF, SHR OF = MSB(a) for count 1
+ * else 0, SAR OF = 0. res may alias a. */
+static void emit_shift_cl(emit_t *e, int op, a64_reg_t a, a64_reg_t res, uint32_t fmask) {
+    int shl = op == OP_SHL || op == OP_SAL;
+    if (!fmask) {
+        /* the variable shifts take the count modulo 32 themselves */
+        if (shl) emit_lslv_w32(e, res, a, R_GPR(R_CX));
+        else if (op == OP_SHR) emit_lsrv_w32(e, res, a, R_GPR(R_CX));
+        else emit_asrv_w32(e, res, a, R_GPR(R_CX));
+        return;
+    }
+    (void)emit_and_w32_imm(e, W_T2, R_GPR(R_CX), 0x1F);
+    uint32_t zero = emit_pos(e);
+    emit_cbz_w32(e, W_T2, 0);
+    emit_sub_w32_imm(e, W_T3, W_T2, 1);
+    if (shl) {
+        /* a << (cnt-1), doubled: C is the last bit out, V = MSB(res)^CF */
+        emit_lslv_w32(e, W_T0, a, W_T3);
+        emit_adds_w32(e, W_T0, W_T0, W_T0);
+        emit_flags_from_nzcv(e, T_ADD);
+        emit_mov_w32_w32(e, res, W_T0);
+    } else {
+        /* W_T0 = a shifted by cnt-1: its bit 0 is CF, and for SHR its
+         * MSB is OF — MSB(a) when cnt is 1, and 0 for any larger count. */
+        if (op == OP_SHR) { emit_lsrv_w32(e, W_T0, a, W_T3); emit_lsr_w32_imm(e, res, W_T0, 1); }
+        else              { emit_asrv_w32(e, W_T0, a, W_T3); emit_asr_w32_imm(e, res, W_T0, 1); }
+        emit_tst_w32(e, res, res);                                    /* N, Z; C = V = 0 */
+        emit_flags_from_nzcv(e, T_ADD);
+        (void)emit_and_w32_imm(e, W_T3, W_T0, 1);
+        emit_orr_w32(e, R_F, R_F, W_T3);
+        if (op == OP_SHR) {
+            emit_lsr_w32_imm(e, W_T3, W_T0, 31);
+            emit_orr_w32_lsl(e, R_F, R_F, W_T3, 11);
+        }
+    }
+    if (fmask & X86_PF) emit_flag_pf(e, res);
+    emit_patch_cond19(e, zero, emit_pos(e));
+}
+
+/* DIV/IDIV r/m32: EDX:EAX by src. CONTRACT (interp, 186+): flags
+ * unchanged; #DE for a zero divisor or a quotient outside 32 bits (which
+ * for IDIV includes INT64_MIN / -1: SDIV returns INT64_MIN, out of
+ * range). Every check precedes the register writes, so the fault sees
+ * the instruction uncommitted. src must not be W_T0..W_T3. */
+static void emit_div32(emit_t *e, int is_signed, a64_reg_t src) {
+    fault_site(e, X86_EXC_DE);
+    emit_cbz_w32(e, src, 0);
+    emit_orr_x64_lsl(e, W_T0, R_GPR(R_AX), R_GPR(R_DX), 32);        /* X6 = EDX:EAX (pinned regs are zero-extended) */
+    if (is_signed) {
+        emit_sxtw_x64_w32(e, W_T3, src);
+        emit_sdiv_x64(e, W_T2, W_T0, W_T3);
+        emit_cmp_x64_w32_sxtw(e, W_T2, W_T2);                        /* fits in int32? */
+        fault_site(e, X86_EXC_DE);
+        emit_b_cond(e, A64_COND_NE, 0);
+        emit_msub_x64(e, W_T3, W_T2, W_T3, W_T0);                    /* r = dividend - q * divisor */
+    } else {
+        emit_udiv_x64(e, W_T2, W_T0, src);
+        emit_lsr_x64_imm(e, W_T3, W_T2, 32);
+        fault_site(e, X86_EXC_DE);
+        emit_cbnz_x64(e, W_T3, 0);
+        emit_msub_x64(e, W_T3, W_T2, src, W_T0);
+    }
+    emit_mov_w32_w32(e, R_GPR(R_AX), W_T2);
+    emit_mov_w32_w32(e, R_GPR(R_DX), W_T3);
+}
+
 /* ----------------------------------------------------------------------
  * Stack
  * ---------------------------------------------------------------------- */
@@ -972,6 +1081,45 @@ static void emit_pop32_flat(emit_t *e, a64_reg_t dst) {
     emit_flat_check(e, R_GPR(R_SP));
     emit_ldr_w32_reg_uxtw(e, dst, R_MEM, R_GPR(R_SP));
     emit_add_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
+}
+
+/* PUSHAD/POPAD on the flat stack. CONTRACT (interp, 386): PUSHAD stores
+ * EAX ECX EDX EBX ESP EBP ESI EDI downward, ESP as it was before the
+ * instruction; POPAD skips the ESP slot. Both ends of the 32-byte frame
+ * are range-checked, then PUSHAD checks the frame's code-bitmap bytes
+ * before storing anything: any set bit (code, device, descriptor) takes
+ * the slow path, which replays the whole instruction through the
+ * interpreter, per-byte store hooks and all. Four LDP/STP do the rest. */
+static void emit_pusha_flat(emit_t *e) {
+    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 32);
+    emit_flat_check_as(e, W_T2, 1);
+    emit_sub_w32_imm(e, W_T3, R_GPR(R_SP), 4);
+    emit_flat_check_as(e, W_T3, 1);
+    emit_add_x64_w32_uxtw(e, W_T3, R_MEM, W_T2);                    /* X3 = host address of the frame */
+    emit_add_x64(e, W_T0, R_BMD, W_T3);
+    emit_ldp_x64_off(e, W_T2, W_T1, W_T0, 0);
+    emit_orr_x64(e, W_T2, W_T2, W_T1);
+    emit_ldp_x64_off(e, W_T1, W_T0, W_T0, 16);
+    emit_orr_x64(e, W_T2, W_T2, W_T1);
+    emit_orr_x64(e, W_T2, W_T2, W_T0);
+    flat_slow_site(e);
+    emit_cbnz_x64(e, W_T2, 0);
+    emit_stp_w32_off(e, R_GPR(R_DI), R_GPR(R_SI), W_T3, 0);
+    emit_stp_w32_off(e, R_GPR(R_BP), R_GPR(R_SP), W_T3, 8);
+    emit_stp_w32_off(e, R_GPR(R_BX), R_GPR(R_DX), W_T3, 16);
+    emit_stp_w32_off(e, R_GPR(R_CX), R_GPR(R_AX), W_T3, 24);
+    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 32);
+}
+static void emit_popa_flat(emit_t *e) {
+    emit_flat_check(e, R_GPR(R_SP));
+    emit_add_w32_imm(e, W_T2, R_GPR(R_SP), 28);
+    emit_flat_check(e, W_T2);
+    emit_add_x64_w32_uxtw(e, W_T3, R_MEM, R_GPR(R_SP));
+    emit_ldp_w32_off(e, R_GPR(R_DI), R_GPR(R_SI), W_T3, 0);
+    emit_ldp_w32_off(e, R_GPR(R_BP), W_T0, W_T3, 8);                 /* the ESP image is discarded */
+    emit_ldp_w32_off(e, R_GPR(R_BX), R_GPR(R_DX), W_T3, 16);
+    emit_ldp_w32_off(e, R_GPR(R_CX), R_GPR(R_AX), W_T3, 24);
+    emit_add_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 32);
 }
 
 /* emit_push16/emit_pop16 are the stack operations of whatever block is
@@ -1106,9 +1254,16 @@ static int classify_flat(const x86_insn *in) {
     case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
         return C_INLINE;
     case OP_ADC: case OP_SBB:
-        return in->ops[0].size < 4 ? C_INLINE : C_HELPER;   /* the carry fold needs bit 32 */
+        return C_INLINE;
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
+        if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* by CL */
         return is_shift_inline(in) ? C_INLINE : C_HELPER;
+    case OP_DIV: case OP_IDIV:
+        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
+    case OP_SETCC:
+        return C_INLINE;
+    case OP_PUSHA: case OP_POPA:
+        return in->opsize == 4 ? C_INLINE : C_HELPER;
     case OP_SHLD: case OP_SHRD:
         /* 32-bit, immediate count 1..31: one EXTR. CL counts, zero counts
          * and 16-bit forms (the 386's count > 16 quirk) stay helpers. */
@@ -1155,7 +1310,7 @@ static int op_may_fault(const x86_insn *in) {
  * loop) sees in full. */
 static int op_stores(const x86_insn *in) {
     switch (in->op) {
-    case OP_PUSH: case OP_CALL: case OP_CALLF: case OP_INT: case OP_INT3: return 1;
+    case OP_PUSH: case OP_PUSHA: case OP_CALL: case OP_CALLF: case OP_INT: case OP_INT3: return 1;
     case OP_CMP: case OP_TEST: case OP_LEA: return 0;
     case OP_XCHG: return in->ea_valid;
     default: return in->ops[0].kind == OPK_MEM;
@@ -1183,8 +1338,17 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
     case OP_INC: case OP_DEC:
         *wr = ARITH & ~X86_CF; break;
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-        if (in->ops[1].imm & 0xFF) *wr = ARITH;
+        /* A CL count writes every flag or, when zero, none: the union
+         * over both is a pass-through (rd = wr = 0) that computes the
+         * live-out set when it does shift. */
+        if (in->ops[1].kind == OPK_IMM && (in->ops[1].imm & 0xFF)) *wr = ARITH;
         break;
+    case OP_DIV: case OP_IDIV:
+        *rd = ARITH; break;          /* #DE is an unplanned exit whose frame holds the flags */
+    case OP_SETCC: {
+        static const uint16_t need[8] = { X86_OF, X86_CF, X86_ZF, X86_CF | X86_ZF, X86_SF, X86_PF, X86_SF | X86_OF, X86_SF | X86_OF | X86_ZF };
+        *rd = need[in->cond >> 1]; break;
+    }
     case OP_SHLD: case OP_SHRD:
         *wr = ARITH; break;          /* inline only with a nonzero immediate count */
     case OP_IMUL: case OP_IMUL3: case OP_MUL:
@@ -1203,6 +1367,8 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
 static void emit_helper_op(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
     uint32_t idx = dbt->insn_used++;
     dbt->insn_pool[idx] = *in;
+    dbt->insn_tag[idx] = (uint8_t)(!s_flat ? 0 : s_in_slow_chunk ? 2 : 1);
+    dbt->insn_lin[idx] = dbt->cpu->seg[S_CS].base + s_cur_ip_start;
     dbt->helper_insns++;
     emit_mov_x64_x64(e, A64_W0, R_CPU);
     emit_mov_w32_imm32(e, A64_W1, idx);
@@ -1211,6 +1377,7 @@ static void emit_helper_op(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
 }
 
 static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32_t fmask) {
+    nzcv_state nz_in = s_nzcv;          /* what the previous op left, for SETcc */
     s_nzcv.valid = 0;                   /* only the op just emitted can leave NZCV usable */
     if (cls == C_HELPER) { emit_helper_op(dbt, e, in); return; }
 
@@ -1229,10 +1396,10 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         a64_reg_t res = (wr && d->kind == OPK_REG && (d->size == 4 || (d->size == 2 && !s_regs32))) ? a : W_VAL;
         emit_alu(e, in->op, size, a, b, res, fmask);
         if (wr && res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
-        /* ADC/SBB fix OF up after the table, so their NZCV is not the
-         * guest's; a memory destination would clobber NZCV in the SMC
+        /* Narrow ADC/SBB fix OF up after the table, so their NZCV is not
+         * the guest's; a memory destination would clobber NZCV in the SMC
          * helper. Everything else leaves it usable for a following Jcc. */
-        if (in->op != OP_ADC && in->op != OP_SBB && d->kind != OPK_MEM) {
+        if ((size == 4 || (in->op != OP_ADC && in->op != OP_SBB)) && d->kind != OPK_MEM) {
             s_nzcv.valid = 1;
             s_nzcv.table = (in->op == OP_SUB || in->op == OP_CMP) ? T_SUB : T_ADD;
             s_nzcv.logical = in->op == OP_AND || in->op == OP_TEST || in->op == OP_OR || in->op == OP_XOR;
@@ -1267,14 +1434,32 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         break;
     }
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR: {
+        int by_cl = in->ops[1].kind == OPK_REG;
         uint32_t cnt = in->ops[1].imm & 0xFF;
-        if (cnt == 0) break;
+        if (!by_cl && cnt == 0) break;
         a64_reg_t a = emit_read_operand(e, in, 0, &ea, W_VAL);
         a64_reg_t res = (d->kind == OPK_REG && (d->size == 4 || (d->size == 2 && !s_regs32))) ? a : W_VAL;
-        emit_shift_imm(e, in->op, size, cnt, a, res, fmask);
+        if (by_cl) emit_shift_cl(e, in->op, a, res, fmask);   /* 32-bit only (classify_flat) */
+        else emit_shift_imm(e, in->op, size, cnt, a, res, fmask);
         if (res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
         break;
     }
+    case OP_DIV: case OP_IDIV: {
+        a64_reg_t src = emit_read_operand(e, in, 0, &ea, W_SRC);
+        emit_div32(e, in->op == OP_IDIV, src);
+        break;
+    }
+    case OP_SETCC: {
+        /* The previous op's NZCV is still the guest's only with no
+         * memory operand: the flat range check in emit_ea writes it. */
+        int fused = nz_in.valid && !in->ea_valid ? fuse_cond(in->cond, nz_in.table, nz_in.logical) : -1;
+        a64_cond_t c = fused >= 0 ? (a64_cond_t)fused : emit_test_cond(e, in->cond);
+        emit_cset_w32(e, W_VAL, c);
+        emit_write_operand(e, in, 0, &ea, W_VAL);
+        break;
+    }
+    case OP_PUSHA: emit_pusha_flat(e); break;
+    case OP_POPA:  emit_popa_flat(e); break;
     case OP_MOV: {
         a64_reg_t v = emit_read_operand(e, in, 1, &ea, W_VAL);
         emit_write_operand(e, in, 0, &ea, v);
@@ -1808,7 +1993,9 @@ static void emit_flat_slow_chunks(x86_dbt *dbt, emit_t *e) {
         emit_patch_cond19(e, f->patch_off, emit_pos(e));
         s_cur_ip_after = f->ip_after;
         s_cur_n_done = f->n_done;
+        s_in_slow_chunk = 1;
         emit_helper_op(dbt, e, &f->in);
+        s_in_slow_chunk = 0;
         if (f->ender) {
             emit_pm_dynamic_key(e, dbt->cpu, s_mode_bits);
             emit_dynamic_tail(e, dbt->exit_stub_off);
@@ -1912,6 +2099,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     s_wrap_exact = cpu->model < X86_MODEL_286;
     s_regs32 = cpu->model >= X86_MODEL_386;
     s_nwrap = 0;
+    s_nfault = 0;
     s_nzcv.valid = 0;                 /* nothing carries into a block: its first op may be a Jcc */
     s_ea_checked = 0;
     uint32_t budget_patch = emit_pos(&e);
@@ -1983,6 +2171,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
      * out-of-range paths. */
     emit_wrap_slow_chunks(&e);
     emit_flat_slow_chunks(dbt, &e);
+    emit_fault_chunks(&e);
 
     /* Budget-exhausted exit: nothing executed, next = this block. */
     emit_patch_tb14(&e, budget_patch, emit_pos(&e));

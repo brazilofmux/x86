@@ -62,6 +62,9 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->link_head = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));
     dbt->link_pool = calloc(LINK_POOL_SIZE, sizeof(x86_link));
     dbt->insn_pool = calloc(INSN_POOL_SIZE, sizeof(x86_insn));
+    dbt->insn_hits = calloc(INSN_POOL_SIZE, sizeof(uint32_t));
+    dbt->insn_tag  = calloc(INSN_POOL_SIZE, 1);
+    dbt->insn_lin  = calloc(INSN_POOL_SIZE, sizeof(uint32_t));
     dbt->smc_heat  = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);     /* touched only where SMC happens */
     if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool || !dbt->smc_heat) {
         fprintf(stderr, "dbt_init: out of memory\n");
@@ -127,6 +130,7 @@ void dbt_cleanup(x86_dbt *dbt) {
     free(dbt->devlog);
     free(dbt->smc_heat);
     free(dbt->aux); free(dbt->span); free(dbt->link_head); free(dbt->link_pool); free(dbt->insn_pool);
+    free(dbt->insn_hits); free(dbt->insn_tag); free(dbt->insn_lin);
     memset(dbt, 0, sizeof(*dbt));
 }
 
@@ -144,6 +148,7 @@ void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     const x86_insn *in = &dbt->insn_pool[insn_index];
     dbt->helper_by_op[in->op]++;
+    dbt->insn_hits[insn_index]++;
     x86_exec_decoded(cpu, in);
 }
 
@@ -569,6 +574,25 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
         dbt->helper_by_op[best] = 0;
     }
     fprintf(out, "\n");
+    if (getenv("X86_HELPER_DETAIL")) {
+        /* The hottest pooled instructions themselves, with where they were
+         * emitted from: [pm] all-helper block, [flat] helper in a flat
+         * block, [slow] a flat inline op's out-of-range path. */
+        static const char *tags[3] = { "pm", "flat", "slow" };
+        uint32_t n = strtoul(getenv("X86_HELPER_DETAIL"), NULL, 0);
+        if (!n) n = 40;
+        fprintf(out, "  hottest helper insns:\n");
+        for (uint32_t k = 0; k < n; k++) {
+            uint32_t best = 0; int found = 0;
+            for (uint32_t i = 0; i < dbt->insn_used; i++)
+                if (dbt->insn_hits[i] && (!found || dbt->insn_hits[i] > dbt->insn_hits[best])) { best = i; found = 1; }
+            if (!found) break;
+            char buf[64];
+            fprintf(out, "    %10u [%-4s] %06X %s\n", dbt->insn_hits[best], tags[dbt->insn_tag[best]],
+                    dbt->insn_lin[best], x86_disasm(&dbt->insn_pool[best], buf, sizeof buf));
+            dbt->insn_hits[best] = 0;
+        }
+    }
     fprintf(out, "  interp fallbacks by op (dynamic):");
     for (int n = 0; n < 12; n++) {
         int best = -1;

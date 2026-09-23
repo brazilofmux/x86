@@ -468,6 +468,18 @@ static inline void emit_udiv_w32(emit_t *e, a64_reg_t rd, a64_reg_t rn, a64_reg_
     emit_inst(e, inst);
 }
 
+/* 64-bit divide and multiply-subtract (Xd = Xa - Xn * Xm). */
+static inline void emit_sdiv_x64(emit_t *e, a64_reg_t rd, a64_reg_t rn, a64_reg_t rm) {
+    emit_inst(e, 0x9AC00C00u | ((uint32_t)(rm & 0x1F) << 16) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));
+}
+static inline void emit_udiv_x64(emit_t *e, a64_reg_t rd, a64_reg_t rn, a64_reg_t rm) {
+    emit_inst(e, 0x9AC00800u | ((uint32_t)(rm & 0x1F) << 16) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));
+}
+static inline void emit_msub_x64(emit_t *e, a64_reg_t rd, a64_reg_t rn, a64_reg_t rm, a64_reg_t ra) {
+    emit_inst(e, 0x9B008000u | ((uint32_t)(rm & 0x1F) << 16) | ((uint32_t)(ra & 0x1F) << 10)
+                 | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F));
+}
+
 /* SMULL Xd, Wn, Wm  (signed 32x32 → 64) — supports MULH variants. */
 static inline void emit_smull(emit_t *e, a64_reg_t rd, a64_reg_t rn, a64_reg_t rm) {
     uint32_t inst = 0x9B207C00u | ((uint32_t)(rm & 0x1F) << 16)
@@ -838,6 +850,12 @@ static inline void emit_cbz_x64(emit_t *e, a64_reg_t rt, int32_t byte_offset) {
     int32_t imm19 = byte_offset >> 2;
     assert(imm19 >= -(1 << 18) && imm19 < (1 << 18));
     uint32_t inst = 0xB4000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | (rt & 0x1F);
+    emit_inst(e, inst);
+}
+static inline void emit_cbnz_x64(emit_t *e, a64_reg_t rt, int32_t byte_offset) {
+    int32_t imm19 = byte_offset >> 2;
+    assert(imm19 >= -(1 << 18) && imm19 < (1 << 18));
+    uint32_t inst = 0xB5000000u | (((uint32_t)imm19 & 0x7FFFFu) << 5) | (rt & 0x1F);
     emit_inst(e, inst);
 }
 
