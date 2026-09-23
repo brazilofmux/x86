@@ -90,6 +90,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     cpu->jit_aux  = dbt->aux;
     cpu->smc_hook = dbt_smc_store;
     cpu->a20_hook = dbt_a20_changed;
+    cpu->dev_hook = dbt_dev_changed;
     cpu->tlb_hook = dbt_tlb_flushed;
     dbt_cache_invalidate_all(dbt);
 
@@ -135,6 +136,7 @@ void dbt_cleanup(x86_dbt *dbt) {
         dbt_clear_code_bits(dbt->cpu);
         dbt->cpu->dbt = NULL;
         dbt->cpu->smc_hook = NULL;
+        dbt->cpu->dev_hook = NULL;
     }
     if (dbt->code_buf && dbt->code_buf != MAP_FAILED) munmap(dbt->code_buf, CODE_BUF_SIZE);
     if (dbt->shadow_live) x86_free(&dbt->shadow);
@@ -341,6 +343,7 @@ static void shadow_copy_regs(x86_dbt *dbt) {
     sh->device_read = cpu->device_read ? dev_replay : NULL;
     s_replay_dbt = dbt;
     sh->a20_hook = NULL;
+    sh->dev_hook = NULL;
     sh->tlb_hook = NULL;
     sh->io_read = shadow_io_read;
     sh->io_write = shadow_io_write;

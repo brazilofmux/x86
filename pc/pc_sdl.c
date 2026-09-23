@@ -204,18 +204,24 @@ static int draw_text(x86_cpu *c) {
 
 void pc_sdl_poll(x86_cpu *c, uint64_t now) {
     if (!allowed) return;
-    static uint8_t rgb[320 * 200 * 3];
+    static uint8_t rgb[640 * 480 * 3];
+    static int gw = 320, gh = 200;
     if (now >= next_frame_ns) {
         next_frame_ns = now + FRAME_NS;
         frames++;
-        int graphics = pc_vga_frame(c, rgb) == 0;
+        int fw = 0, fh = 0;
+        int graphics = pc_vga_frame(c, rgb, &fw, &fh) == 0;
         int text = !graphics && text_window;
         if ((graphics || text) && !win && open_window() < 0) return;
         if (win) {
             if (text && draw_text(c) < 0) text = 0;
             if ((graphics || text) && !shown) { SDL_ShowWindow(win); shown = 1; }
             if (!graphics && !text && shown) { SDL_HideWindow(win); shown = 0; }
-            if (graphics) SDL_UpdateTexture(tex, NULL, rgb, 320 * 3);
+            if (graphics && (fw != gw || fh != gh)) {    /* the mode changed size: a texture to match */
+                SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, fw, fh);
+                if (t) { SDL_DestroyTexture(tex); tex = t; gw = fw; gh = fh; }
+            }
+            if (graphics && fw == gw) SDL_UpdateTexture(tex, NULL, rgb, gw * 3);
             if (graphics || text) {
                 SDL_RenderClear(ren);
                 SDL_RenderCopy(ren, graphics ? tex : ttex, NULL, NULL);

@@ -10,6 +10,9 @@ expression matches the last three non-blank lines of the screen (where a
 prompt and the cursor are; a pattern starting with * is searched in the
 whole screen, for dialogs drawn mid-screen). Keys use Python escapes: \\r is Enter, \\x1b+
 puts the next diskette of an -fda sequence in. "delay SECONDS" pauses.
+"send KEYS" types without waiting for anything (graphics modes, where
+there is no text to match); "shot FILE" copies the latest picture of the
+screen (the emulator rewrites it once a second) to FILE.
 Blank lines and # comments are ignored. After each send the next step
 waits for the screen to change, so a prompt still showing is not taken
 twice. Exits 0 when every step matched (the emulator is stopped a
@@ -47,18 +50,34 @@ def main():
         if line.startswith("delay "):
             steps.append(("delay", float(line.split()[1]), False))
             continue
+        if line.startswith("send "):
+            steps.append(("send", line[5:].encode().decode("unicode_escape").encode("latin-1"), False))
+            continue
+        if line.startswith("shot "):
+            steps.append(("shot", line[5:].strip(), False))
+            continue
         pat, _, keys = line.partition("\t")
         whole = pat.startswith("*")                 # *PATTERN: anywhere on the screen
         if whole: pat = pat[1:]
         steps.append((re.compile(pat), keys.encode().decode("unicode_escape").encode("latin-1"), whole))
     scr = os.path.join(tempfile.mkdtemp(), "screen.txt")
-    env = dict(os.environ, X86_SCREEN=scr)
+    env = dict(os.environ, X86_SCREEN=scr, X86_SCREEN_PNG=scr + ".png")
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
     deadline = time.time() + timeout
     last_sent = None                            # the screen as it was when keys last went in
     for pat, keys, whole in steps:
         if pat == "delay":
             time.sleep(keys); continue
+        if pat == "send":
+            last_sent = screen(scr)
+            p.stdin.write(keys); p.stdin.flush()
+            continue
+        if pat == "shot":
+            try:
+                with open(scr + ".png", "rb") as src, open(keys, "wb") as dst: dst.write(src.read())
+            except OSError as ex:
+                sys.stderr.write("expect: shot %s: %s\n" % (keys, ex))
+            continue
         while True:
             s = screen(scr)
             if s and s != last_sent and pat.search(s if whole else tail(s)):

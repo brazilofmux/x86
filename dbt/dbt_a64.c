@@ -408,6 +408,8 @@ static a64_reg_t seg_ptr_reg(int s) {
 static void emit_flat_check(emit_t *e, a64_reg_t off);
 static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only);
 static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea);
+static void flat_slow_site(emit_t *e);
+static int s_devread;
 static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write);
 static int writes_mem_operand(const x86_insn *in);
 static int flat_access_size(const x86_insn *in);
@@ -451,7 +453,16 @@ static void emit_ea(emit_t *e, const x86_insn *in, ea_t *ea) {
     ea->seg = in->seg;
     if (s_flat) { emit_ea_flat(e, in, ea); return; }
     emit_ea_real(e, in, ea);
-    if (s_paged && in->op != OP_LEA) emit_ea_paged(e, in, ea);
+    if (s_paged && in->op != OP_LEA) { emit_ea_paged(e, in, ea); return; }
+    if (s_devread && in->op != OP_LEA && !(in->op == OP_MOV && in->ops[0].kind == OPK_MEM)) {
+        /* host address - mem, bits 31:16 == 0xA: the window */
+        emit_add_x64_w32_uxtw(e, W_T3, ea->segp, ea->off);
+        emit_sub_x64(e, W_T3, W_T3, R_MEM);
+        emit_lsr_x64_imm(e, W_T3, W_T3, 16);
+        emit_cmp_w32_imm(e, W_T3, 0xA);
+        flat_slow_site(e);
+        emit_b_cond(e, A64_COND_EQ, 0);
+    }
 }
 static void emit_ea_real(emit_t *e, const x86_insn *in, ea_t *ea) {
     ea->segp = seg_ptr_reg(in->seg);
@@ -745,6 +756,11 @@ static void emit_wrap_slow_chunks(emit_t *e) {
  * check is unreachable code. The 8086/186 wrap instead: there the store
  * really does have to split, so both checks stay. */
 static int s_ea_checked;
+/* The block was translated while a device answers reads in the VGA
+ * window (the planar VGA: reads load its latches). Real-mode-shaped and
+ * segmented blocks then send any read that lands there down the slow
+ * path, the interpreter's, as flat blocks always do; cpu->dev_hook
+ * retranslates when that changes. (Declared above emit_ea.) */
 
 /* rd = rn + imm, any imm below 16M (two ADDs past 4K) */
 static void emit_add_x64_big(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_t imm) {
@@ -2837,6 +2853,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     s_seg16 = cpu->pmode && !s_v86 && !s_flat;
     s_mode_bits = key & 0x7FFF000000000000ull;
     s_esnull = (key & KEY_ESNULL) != 0;
+    s_devread = cpu->device_read != NULL;
     s_dsnull = (key & KEY_DSNULL) != 0;
     s_pg_user = s_flat && s_paged && (cpu->seg[S_CS].sel & 3) == 3;
     uint32_t code_page = 0, code_delta = 0;     /* physical - linear, mod 2^32: add it before indexing mem */
@@ -2914,6 +2931,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         if (s_seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
         int c = s_flat ? classify_flat(in) : s_seg16 ? classify_seg16(in) : classify(in);
         if (s_v86) c = classify_v86(in, c);
+        if (s_devread && !s_flat && c == C_INLINE
+            && (in->op == OP_MOVS || in->op == OP_LODS || in->op == OP_CMPS || in->op == OP_SCAS))
+            c = C_HELPER;                              /* a read through SI/DI may be the window's */
         if (s_flat && c == C_INLINE) {
             if (s_esnull && in->ea_valid && in->seg == S_ES) c = C_HELPER;          /* #GP: the interpreter's */
             if (s_dsnull && in->ea_valid && in->seg == S_DS) c = C_HELPER;

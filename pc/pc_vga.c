@@ -1,4 +1,5 @@
-/* pc_vga.c — the VGA as far as mode 13h and its unchained form need it
+/* pc_vga.c — the VGA as far as mode 13h, its unchained form and the
+ * 16-colour planar modes (12h: 640x480, Windows' VGA driver) need it
  *
  * Mode 13h is 320x200 with one byte per pixel, and in its normal "chain-4"
  * form the A000 window is simply the framebuffer: guest memory holds it and
@@ -18,6 +19,11 @@
  * reads directly. The interpreter reads through vga_read, which is exact:
  * it also loads the latches and honours read mode 1. Translated code does
  * not load latches — the one thing that differs, and -V would say so.
+ *
+ * Mode 12h (and the EGA modes 0Dh, 0Eh, 10h) is planar from the start:
+ * each byte of a plane holds eight pixels, one bit of each pixel's
+ * four-bit colour, through the attribute controller's palette (and its
+ * colour plane enable) into the DAC.
  *
  * The DAC (256 six-bit RGB entries, loaded through 3C8h/3C9h) and the CRTC
  * start address and pitch are kept for whoever draws the screen: the
@@ -46,7 +52,7 @@ static struct {
     uint8_t gc[9], gc_idx;
     uint8_t crtc[0x19], crtc_idx;
     uint8_t latch[4];
-    int     planar;                  /* mode 13h with chain-4 off */
+    int     planar;                  /* mode 13h with chain-4 off, or a 16-colour mode */
     uint8_t dac[256][3];
     uint8_t dac_widx, dac_wcomp, dac_ridx, dac_rcomp;
     uint8_t ac[0x15], ac_idx, ac_flip;   /* attribute controller: 3C0h index/data flip-flop */
@@ -54,7 +60,18 @@ static struct {
 
 extern const uint8_t pc_font8[256 * 8], pc_font14[256 * 14], pc_font16[256 * 16];
 
-static int mode13(x86_cpu *c) { return (pc_rd8(c, PC_BDA_SEG, 0x49) & 0x7F) == 0x13; }
+static int bios_mode(x86_cpu *c) { return pc_rd8(c, PC_BDA_SEG, 0x49) & 0x7F; }
+static int mode13(x86_cpu *c) { return bios_mode(c) == 0x13; }
+/* The 16-colour planar graphics modes, and their size. */
+static int mode16(x86_cpu *c, int *w, int *h) {
+    switch (bios_mode(c)) {
+    case 0x0D: *w = 320; *h = 200; return 1;
+    case 0x0E: *w = 640; *h = 200; return 1;
+    case 0x10: *w = 640; *h = 350; return 1;
+    case 0x12: *w = 640; *h = 480; return 1;
+    default: return 0;
+    }
+}
 static int read_plane(void) { return vga.gc[4] & 3; }
 
 /* ---- planar memory ------------------------------------------------------ */
@@ -136,12 +153,14 @@ static void set_planar(x86_cpu *c, int on) {
         c->device_read = vga_read;
         vga.planar = 1;
         refresh_view(c);
+        if (c->dev_hook) c->dev_hook(c);                 /* translated reads must now avoid the window */
     } else {
         for (uint32_t a = 0; a < WLEN; a++) bm[WIN + a] &= (uint8_t)~X86_BM_DEVICE;
         c->device_store = NULL;
         c->device_read = NULL;
         vga.planar = 0;
         for (uint32_t a = 0; a < WLEN; a++) c->mem[WIN + a] = vga.plane[a & 3][a];
+        if (c->dev_hook) c->dev_hook(c);
     }
 }
 
@@ -224,6 +243,16 @@ void pc_vga_set_mode(x86_cpu *c, int mode) {
             memset(c->mem + WIN, 0, 320 * 200);
             memset(vga.plane, 0, sizeof vga.plane);
         }
+    } else if ((mode & 0x7F) == 0x0D || (mode & 0x7F) == 0x0E || (mode & 0x7F) == 0x10 || (mode & 0x7F) == 0x12) {
+        text_default(c);                                 /* the same EGA DAC and palette */
+        vga.ac[0x10] = 0x01;                             /* graphics */
+        vga.seq[4] = 0x06;                               /* extended memory, odd/even off, chain-4 off */
+        vga.gc[6] = 0x05;                                /* graphics, A000 64K */
+        vga.crtc[0x09] = 0;
+        vga.crtc[0x13] = (mode & 0x7F) == 0x0D ? 0x14 : 0x28;   /* 40 or 80 bytes a line */
+        vga.crtc[0x17] = 0xE3;
+        set_planar(c, 1);
+        if (!(mode & 0x80)) { memset(vga.plane, 0, sizeof vga.plane); refresh_view(c); }
     } else {
         text_default(c);
     }
@@ -266,7 +295,7 @@ int pc_vga_port_write(uint16_t port, uint32_t val, int size) {
     case 0x3C4: vga.seq_idx = v; return 1;
     case 0x3C5:
         vga.seq[vga.seq_idx & 7] = v;
-        if ((vga.seq_idx & 7) == 4) set_planar(c, mode13(c) && !(v & 0x08));
+        if ((vga.seq_idx & 7) == 4) { int w, h; set_planar(c, (mode13(c) && !(v & 0x08)) || mode16(c, &w, &h)); }
         update_fast(c);
         return 1;
     case 0x3CE: vga.gc_idx = v; return 1;
@@ -313,12 +342,38 @@ static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t l
     fwrite(cb, 1, 4, f);
 }
 
-/* The mode 13h screen as an 8-bit RGB PNG: 0, or -1 if the screen is not in
- * mode 13h or the file cannot be written. */
-/* The current mode 13h picture as 320x200 RGB24 rows: 0, or -1 if the
- * screen is not in mode 13h. The window and the PNG writer both use it. */
-int pc_vga_frame(x86_cpu *c, uint8_t *rgb) {
+/* A 16-colour mode's picture: a pixel is one bit from each plane at the
+ * CRTC start address plus y lines of the pitch plus x/8, the four bits
+ * masked by the colour plane enable, then the attribute palette (with
+ * the colour select register's top bits) into the DAC. */
+static void frame16(uint8_t *rgb, int w, int h) {
+    uint8_t lut[16][3];
+    for (int i = 0; i < 16; i++) {
+        int d = (vga.ac[i] & 0x3F) | ((vga.ac[0x14] & 0x0C) << 4);
+        for (int k = 0; k < 3; k++) { uint8_t v = vga.dac[d][k]; lut[i][k] = (uint8_t)((v << 2) | (v >> 4)); }
+    }
+    uint32_t start = ((uint32_t)vga.crtc[0x0C] << 8) | vga.crtc[0x0D];
+    uint32_t pitch = (uint32_t)vga.crtc[0x13] * 2;
+    uint8_t en = vga.ac[0x12] & 0x0F;
+    for (int y = 0; y < h; y++)
+        for (int xb = 0; xb < w / 8; xb++) {
+            uint32_t a = (start + (uint32_t)y * pitch + (uint32_t)xb) & 0xFFFF;
+            uint8_t p0 = vga.plane[0][a], p1 = vga.plane[1][a], p2 = vga.plane[2][a], p3 = vga.plane[3][a];
+            uint8_t *px = rgb + ((size_t)y * (size_t)w + (size_t)xb * 8) * 3;
+            for (int b = 7; b >= 0; b--, px += 3) {
+                int ci = (((p0 >> b) & 1) | (((p1 >> b) & 1) << 1) | (((p2 >> b) & 1) << 2) | (((p3 >> b) & 1) << 3)) & en;
+                px[0] = lut[ci][0]; px[1] = lut[ci][1]; px[2] = lut[ci][2];
+            }
+        }
+}
+
+/* The current graphics picture as RGB24 rows, *w by *h (at most 640x480):
+ * mode 13h at 320x200, or a 16-colour mode at its size. 0, or -1 if the
+ * screen is in neither. The window and the PNG writer both use it. */
+int pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h) {
+    if (mode16(c, w, h)) { frame16(rgb, *w, *h); return 0; }
     if (!mode13(c)) return -1;
+    *w = 320; *h = 200;
     uint8_t lut[256][3];
     for (int i = 0; i < 256; i++)
         for (int k = 0; k < 3; k++) {
@@ -331,14 +386,15 @@ int pc_vga_frame(x86_cpu *c, uint8_t *rgb) {
     return 0;
 }
 
-/* The screen as an 8-bit RGB PNG: mode 13h at 320x200, a text mode as
+/* The screen as an 8-bit RGB PNG: mode 13h at 320x200, a 16-colour mode
+ * at its own size, a text mode as
  * the VGA draws it (720x400 for 80x25), blink and cursor in their "on"
  * phase. 0, or -1 if neither or the file cannot be written. */
 int pc_video_png(x86_cpu *c, const char *path) {
     enum { MW = 1188, MH = 480 };
     static uint8_t rgb[MW * MH * 3], raw[MH * (1 + MW * 3)];
     int W = 320, H = 200;
-    if (pc_vga_frame(c, rgb) < 0 && pc_vga_text_frame(c, rgb, MW, MH, &W, &H, 0) < 0) return -1;
+    if (pc_vga_frame(c, rgb, &W, &H) < 0 && pc_vga_text_frame(c, rgb, MW, MH, &W, &H, 0) < 0) return -1;
     for (int y = 0; y < H; y++) {
         raw[y * (1 + W * 3)] = 0;                        /* filter: none */
         memcpy(raw + y * (1 + W * 3) + 1, rgb + y * W * 3, (size_t)W * 3);

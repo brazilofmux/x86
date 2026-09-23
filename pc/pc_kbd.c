@@ -353,11 +353,14 @@ void pc_kbd_poll(x86_cpu *c) {
     if (raw_active) { while (next_key(c, 0)) { } return; }
     /* "Idle-polling" = several keyboard queries since the last key; a
      * single poll is often a flush, and a key fed then is lost. */
-    /* A program that takes its keys from IRQ 1 and port 60h (DOOM) never
-     * polls the BIOS at all; after a second of that silence, feed anyway. */
+    /* A program that takes its keys from IRQ 1 and port 60h (DOOM,
+     * Windows) is not polling the BIOS: after 250 ms without that, feed
+     * anyway. "Not polling" is fewer than the 8 reads above, not none —
+     * Windows' INT 16h calls now and then, and waiting for total silence
+     * stopped its keys after the first. */
     static uint64_t last_fed;
     int polled = pc.kbd_reads >= reads_at_last + 8;
-    int silent = pc.kbd_reads == reads_at_last && now - last_fed >= 1000000000ull;
+    int silent = !polled && now - last_fed >= 250000000ull;
     if (now < next_ok || !(polled || silent)) return;
     if (next_key(c, 0)) { next_ok = now + 20000000ull; reads_at_last = pc.kbd_reads; last_fed = now; }
 }

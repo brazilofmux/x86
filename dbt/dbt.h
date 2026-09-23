@@ -305,6 +305,7 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys);          /* cpu->smc_hook */
 void dbt_clear_code_bits(x86_cpu *cpu);                   /* forget translations, keep device marks */
 void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
 void dbt_a20_changed(x86_cpu *cpu, int on);
+void dbt_dev_changed(x86_cpu *cpu);
 void             dbt_tlb_flushed(x86_cpu *cpu);
 int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user);
 

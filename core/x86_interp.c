@@ -345,6 +345,24 @@ static void enter_v86(x86_cpu *c) {
     c->eip = v[0];
 }
 
+/* The stack for an inward transfer to NEWCPL, from the current TSS: a
+ * 386 TSS holds ESP0 at 4 and SS0 at 8 (8 bytes a ring), a 286 TSS SP0 at
+ * 2 and SS0 at 4 (4 a ring) — DOSX's, under Windows standard mode. A null
+ * selector there is #TS. */
+static uint16_t tss_stack(x86_cpu *c, int newcpl, uint32_t *sp) {
+    int t286 = (X86_AR_TYPE(c->tr.attr) & 0x8) == 0;      /* types 1/3: 286; 9/B: 386 */
+    uint16_t ss;
+    if (t286) {
+        *sp = x86_sup_rd(c, c->tr.base, 2 + (uint32_t)newcpl * 4, 2);
+        ss = (uint16_t)x86_sup_rd(c, c->tr.base, 4 + (uint32_t)newcpl * 4, 2);
+    } else {
+        *sp = x86_sup_rd(c, c->tr.base, 4 + (uint32_t)newcpl * 8, 4);
+        ss = (uint16_t)x86_sup_rd(c, c->tr.base, 8 + (uint32_t)newcpl * 8, 2);
+    }
+    if ((ss & 0xFFFC) == 0) x86_fault(c, X86_EXC_TS, 0);
+    return ss;
+}
+
 /* Protected-mode interrupt and exception delivery through the IDT. */
 static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     int from_v86 = (c->eflags & X86_VM) != 0;
@@ -392,8 +410,8 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     if (newcpl < cpl) {
         /* Inward: the stack comes from the TSS, and the interrupted one is
          * recorded on it. */
-        uint32_t nsp = x86_sup_rd(c, c->tr.base, 4 + newcpl * 8, 4);
-        uint16_t nss = (uint16_t)x86_sup_rd(c, c->tr.base, 8 + newcpl * 8, 2);
+        uint32_t nsp;
+        uint16_t nss = tss_stack(c, newcpl, &nsp);
         uint32_t slo, shi;
         if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_TS, nss & 0xFFFC);
         x86_unpack_desc(&stack, nss, slo, shi);
@@ -494,8 +512,8 @@ static void far_transfer_pm(x86_cpu *c, uint16_t sel, uint32_t off, int is_call,
     if (is_call && newcpl < cpl) {
         /* Inward call: a fresh stack out of the TSS, the old one recorded on
          * it, and any parameters copied across. */
-        uint32_t nsp = x86_sup_rd(c, c->tr.base, 4 + newcpl * 8, 4);
-        uint16_t nss = (uint16_t)x86_sup_rd(c, c->tr.base, 8 + newcpl * 8, 2);
+        uint32_t nsp;
+        uint16_t nss = tss_stack(c, newcpl, &nsp);
         uint32_t slo, shi;
         if (!x86_read_desc(c, nss, &slo, &shi)) x86_fault(c, X86_EXC_TS, nss & 0xFFFC);
         x86_seg stack;

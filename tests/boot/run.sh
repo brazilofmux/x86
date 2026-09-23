@@ -87,4 +87,15 @@ if [ -f disks/msdos622/c.img ]; then
     fi
     rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-cfg.sys tmp/boot-auto.bat
 fi
+if [ -f disks/win311/c.img ] && mdir -i disks/win311/c.img@@32256 ::/WINDOWS/WIN.COM >/dev/null 2>&1; then
+    # Windows 3.11 (tests/boot/wininstall.sh) in standard mode: DOSX, the
+    # 16-bit protected-mode kernel, VGA mode 12h. Program Manager is up
+    # when its title bar (active: 0,0,170) is where it draws it.
+    cp disks/win311/c.img tmp/boot-c.img
+    printf 'C:.>$\twin /s\\r\ndelay 40\nshot tmp/boot-win.png\n' > tmp/boot-c.exp
+    python3 tools/expect.py -t 90 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+    if [ "$(python3 tools/pngpix.py tmp/boot-win.png 150,61 2>/dev/null)" = "150,61 0 0 170" ]
+    then echo "ok   windows 3.11 standard mode (program manager)"; else echo "FAIL windows 3.11 standard mode"; fail=1; fi
+    rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-win.png
+fi
 exit $fail

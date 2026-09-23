@@ -239,6 +239,15 @@ void dbt_a20_changed(x86_cpu *cpu, int on) {
     dbt->a20_flushes++;
 }
 
+/* cpu->dev_hook. Real-mode-shaped and segmented blocks check their reads
+ * against the VGA window only when translated with a device answering
+ * reads there (the planar VGA), so turning it on or off retranslates. */
+void dbt_dev_changed(x86_cpu *cpu) {
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    if (!dbt) return;
+    flush_under_running_code(dbt);
+}
+
 /* cpu->tlb_hook: the page tables may map differently now (CR3 load, PG
  * toggled, A20). Paged V86 blocks were translated for pages mapped one-
  * to-one, so they go — only when there are any. */

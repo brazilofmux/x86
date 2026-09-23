@@ -118,6 +118,7 @@ typedef struct x86_cpu {
      * The device keeps these current as its registers change. */
     uint8_t *dev_wplane, *dev_rplane;
     void   (*a20_hook)(struct x86_cpu *, int on);          /* DBT: the A20 gate changed */
+    void   (*dev_hook)(struct x86_cpu *);                  /* DBT: device_read came or went (blocks bake it in) */
     void   (*trace_exc)(struct x86_cpu *, int vec, uint32_t err);   /* oracle tracing */
 
     /* Set while the very next HLE trap is the delivery of a CPU exception

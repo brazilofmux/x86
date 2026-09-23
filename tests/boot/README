@@ -94,3 +94,35 @@ it switches itself over XMS memory. Both needed:
   (DOOM at 498000 on physical 3ED000): the decode added the 32-bit
   physical-minus-linear delta to the host pointer unwrapped, 4 GB past
   guest memory. pgtest's T0E runs code on such a page.
+
+Windows 3.11 (disks/win311/, git-ignored: the user's OEM 3.5" diskettes
+in oem/DISK1-6.IMG, and c.img installed from them)
+--------------------------------------------------------------------
+
+  tests/boot/wininstall.sh           # ~3 min: MS-DOS disk + Setup, end to end
+
+The diskettes are flattened into C:\WININST (no CD-ROM on the machine;
+Setup finds each disk's files by the DISKn markers). Setup's second half
+is Windows itself in standard mode, drawn in VGA mode 12h, so the script
+drives it blind with expect.py's "send" and "delay"; "shot FILE" saves
+the picture (X86_SCREEN_PNG, rewritten once a second) for looking at.
+run.sh starts "win /s" and checks Program Manager's title bar pixel
+(tools/pngpix.py). Plain "win" (386 enhanced mode) says "Video
+initialization failed" — the next campaign.
+
+What standard mode needed:
+- an inward CALL through a gate or an interrupt reading its new stack
+  from a 286 TSS (SP0 at 2, SS0 at 4, four bytes a ring). DOSX has one;
+  the 386 layout read a null SS, and the #SS handler's own CALL faulted
+  on it forever. A null SS there is #TS now.
+- VGA modes 0Dh/0Eh/10h/12h: planar from the mode set, drawn through
+  the attribute palette (pc_vga_frame reports its size; the window and
+  -G follow).
+- translated reads of the VGA window while the planar VGA answers them:
+  blocks translated then send such reads (and MOVS/LODS/CMPS/SCAS) to
+  the interpreter, which loads the latches; cpu->dev_hook retranslates
+  when the planar form comes or goes. Without it Windows' fills and
+  copies through the latches drew nothing.
+- scripted keys for a program that reads IRQ 1 but calls INT 16h now
+  and then: fed after 250 ms without BIOS polling, not only after total
+  silence (Windows took the first key and no more).

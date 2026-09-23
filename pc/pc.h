@@ -119,7 +119,7 @@ void pc_video_flush(int force);                          /* tty mode painter */
 void pc_video_shutdown(void);
 void pc_video_set_hud(const char *text);
 void pc_video_dump(x86_cpu *c, FILE *f);                 /* the text buffer as 25 lines of UTF-8 */
-int  pc_video_png(x86_cpu *c, const char *path);         /* the mode 13h screen; -1 if not in 13h */
+int  pc_video_png(x86_cpu *c, const char *path);         /* the screen: text, 13h or 16-colour; -1 if none */
 int  pc_vga_port_read(uint16_t port, uint32_t *val);     /* 1 if the port is the VGA's */
 int  pc_vga_port_write(uint16_t port, uint32_t val, int size);
 void pc_vga_set_mode(x86_cpu *c, int mode);             /* INT 10h AH=00, after the BDA */
@@ -140,7 +140,7 @@ void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode);
 int  pc_kbd_raw_pending(void);
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */
-int  pc_vga_frame(x86_cpu *c, uint8_t *rgb);              /* 320x200 RGB24; -1 if not in mode 13h */
+int  pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h);   /* RGB24, at most 640x480; -1 if not graphics */
 int  pc_vga_text_frame(x86_cpu *c, uint8_t *rgb, int maxw, int maxh, int *w, int *h, unsigned frame);   /* -1 if not text */
 void pc_vga_set_cursor_pos(uint16_t words);               /* CRTC 0E/0F, as the BIOS keeps them */
 void pc_vga_set_start(uint16_t words);                    /* CRTC 0C/0D: the displayed page */
