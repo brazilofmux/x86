@@ -35,6 +35,20 @@ if [ -f disks/tp55/TPC.EXE ]; then
         case "$got" in *exhausted*) echo "FAIL ide $mode (did not quit)"; fail=1;; *) echo "ok   ide $mode";; esac
     done
 fi
+if [ -f disks/cobol50/COBOL.EXE ]; then
+    # MS COBOL 5.0 (Micro Focus underneath), from the user's diskettes expanded
+    # into disks/cobol50: compile, link and run a sample, all under -V. The
+    # compiler is a large real-mode program; its run-time rearranges the PSP's
+    # job file table, which is what gave the DOS layer a real one.
+    rm -rf tmp/cobtest && mkdir -p tmp && cp -r disks/cobol50 tmp/cobtest
+    got=$(./dos-monster -V -C tmp/cobtest -L 4000000000 tmp/cobtest/COBOL.EXE "DIOPHANT;" </dev/null 2>/dev/null | tr -d '\r')
+    case "$got" in *"no errors"*) echo "ok   cobol compile -V";; *) echo "FAIL cobol compile -V"; echo "$got" | tail -3; fail=1;; esac
+    ./dos-monster -V -C tmp/cobtest -L 4000000000 tmp/cobtest/LINK.EXE "diophant,,,lcobol+cobapi/nod/st:8192;" </dev/null >/dev/null 2>&1
+    if [ -f tmp/cobtest/DIOPHANT.EXE ]; then echo "ok   cobol link -V"; else echo "FAIL cobol link -V"; fail=1; fi
+    got=$(printf '3\r5\r1\r' | ./dos-monster -V -C tmp/cobtest -L 4000000000 tmp/cobtest/DIOPHANT.EXE 2>/dev/null | tr -d '\r')
+    if [ "$got" = "$(cat tests/dos/cobol.out)" ]; then echo "ok   cobol run -V"; else echo "FAIL cobol run -V"; echo "$got" | tail -3; fail=1; fi
+    rm -rf tmp/cobtest
+fi
 if [ -f disks/WP51/WP.EXE ]; then
     # WordPerfect 5.1 (installed by its own INSTALL.EXE under dos-monster): type a line.
     # -L only bounds a runaway: WP idles near 1 BIPS, so it must not double as a timer.

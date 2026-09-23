@@ -41,3 +41,4 @@ tools/pmoracle/pmtest.img
 
 # Python bytecode from the oracle harness
 __pycache__/
+/tmp/
