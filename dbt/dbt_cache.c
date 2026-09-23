@@ -58,6 +58,9 @@ void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
     dbt->n_pcode = 0;
     memset(dbt->phys_alias, 0, sizeof dbt->phys_alias);
+    memset(dbt->space_used, 0, sizeof dbt->space_used);   /* ids start over; the current space is 0 */
+    dbt->space_next = 0;
+    if (dbt->cpu && (dbt->cpu->cr0 & X86_CR0_PG)) dbt_space_current(dbt);
     /* An empty slot is all-ones in both words (its code pointer is never
      * read while the key says empty), and so is LINK_NONE: two memsets. */
     memset(dbt->aux->cache, 0xFF, sizeof dbt->aux->cache);
@@ -253,49 +256,88 @@ void dbt_dev_changed(x86_cpu *cpu) {
     flush_under_running_code(dbt);
 }
 
+/* Drop code page I's paged blocks (those of its address space) and the
+ * entry's alias. The caller compacts the list. A page's blocks sit in
+ * 4096 consecutive slots per key mode (its linear address XOR the folded
+ * mode bits): V86, and flat 32-bit PM. */
+static void drop_code_page(x86_dbt *dbt, uint32_t i) {
+    static const uint32_t modes[2] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
+                                       (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT) };
+    uint32_t lin = dbt->pcode[i].lin_page << 12, was = dbt->pcode[i].phys_page << 12;
+    uint64_t space = (uint64_t)dbt->pcode[i].space << KEY_SPACE_SHIFT;
+    if (dbt->phys_alias[was >> 12] == dbt->pcode[i].lin_page + 1) dbt->phys_alias[was >> 12] = 0;
+    for (int m = 0; m < 2; m++)
+        for (uint32_t k = 0; k < 4096; k++) {
+            uint32_t slot = dbt_slot_mode(lin + k, modes[m]);
+            x86_block_entry *e = &dbt->aux->cache[slot];
+            if (e->key == BLOCK_EMPTY_KEY || !(e->key & KEY_PAGED) || dbt_key_lin(e->key) != lin + k
+                || (e->key & KEY_SPACE_MASK) != space) continue;
+            evict_slot(dbt, slot);
+        }
+    if ((dbt->cpu->jit_cur_lin & 0xFFFFF000u) == lin) dbt->cpu->jit_cur_hit = 1;
+    dbt->tlb_page_drops++;
+}
+
+/* The space CR3 names, registered if new — the oldest one making room,
+ * its blocks gone — and made cpu->pg_space. */
+void dbt_space_current(x86_dbt *dbt) {
+    x86_cpu *cpu = dbt->cpu;
+    uint32_t cr3 = cpu->cr3 & 0xFFFFF000u;
+    for (int i = 0; i < DBT_SPACES; i++)
+        if (dbt->space_used[i] && dbt->space_cr3[i] == cr3) { cpu->pg_space = (uint8_t)i; return; }
+    uint8_t id = dbt->space_next;
+    dbt->space_next = (uint8_t)((id + 1) % DBT_SPACES);
+    if (dbt->space_used[id]) {
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < dbt->n_pcode; i++) {
+            if (dbt->pcode[i].space == id) { drop_code_page(dbt, i); continue; }
+            dbt->pcode[kept++] = dbt->pcode[i];
+        }
+        dbt->n_pcode = kept;
+        dbt->space_evictions++;
+    }
+    dbt->space_used[id] = 1;
+    dbt->space_cr3[id] = cr3;
+    cpu->pg_space = id;
+}
+
 /* cpu->tlb_hook: the page tables may map differently now (CR3 load, PG
- * toggled, A20). Paged V86 blocks were translated for pages mapped one-
- * to-one, so they go — only when there are any. */
+ * toggled, A20). A CR3 reload is how a memory manager flushes after any
+ * remap (JEMM with NOINVLPG does it for every A20 emulation), and a VCPI
+ * client switches spaces on every call down to DOS, so dropping
+ * translations wholesale thrashes: DOOM under EMM386 retranslated itself
+ * every time DOS/4GW reflected an interrupt. Only the code pages of the
+ * space now current are re-peeked, and only those that moved lose their
+ * blocks; another space's are checked when it is current again (its
+ * tables may have changed meanwhile, but using them takes a CR3 load,
+ * which comes back here). With paging off no paged block is reachable,
+ * and nothing is dropped. */
 void dbt_tlb_flushed(x86_cpu *cpu) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     if (!dbt) return;
     dbt->tlb_flushes++;
-    /* A CR3 reload is how a memory manager flushes after any remap (JEMM
-     * with NOINVLPG does it for every A20 emulation), so dropping all
-     * translations each time thrashes. Only the code pages paged blocks
-     * stand on matter: re-peek each, and drop the paged blocks of any that
-     * no longer maps where it did when they were translated. A page's
-     * blocks sit in 4096 consecutive slots per key mode (its linear
-     * address XOR the folded mode bits): V86, and flat 32-bit PM. */
-    static const uint32_t modes[2] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
-                                       (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT) };
+    if (!(cpu->cr0 & X86_CR0_PG)) return;
+    dbt_space_current(dbt);
+    uint8_t sp = cpu->pg_space;
     uint32_t kept = 0;
     for (uint32_t i = 0; i < dbt->n_pcode; i++) {
-        uint32_t lin = dbt->pcode[i].lin_page << 12, was = dbt->pcode[i].phys_page << 12;
-        if ((cpu->cr0 & X86_CR0_PG) && x86_page_peek(cpu, lin, dbt->pcode[i].user) == was) {
+        if (dbt->pcode[i].space != sp
+            || x86_page_peek(cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user) == dbt->pcode[i].phys_page << 12) {
             dbt->pcode[kept++] = dbt->pcode[i];
             continue;
         }
-        if (dbt->phys_alias[was >> 12] == dbt->pcode[i].lin_page + 1) dbt->phys_alias[was >> 12] = 0;
-        for (int m = 0; m < 2; m++)
-            for (uint32_t k = 0; k < 4096; k++) {
-                uint32_t slot = dbt_slot_mode(lin + k, modes[m]);
-                x86_block_entry *e = &dbt->aux->cache[slot];
-                if (e->key == BLOCK_EMPTY_KEY || !(e->key & KEY_PAGED) || dbt_key_lin(e->key) != lin + k) continue;
-                evict_slot(dbt, slot);
-            }
-        if ((cpu->jit_cur_lin & 0xFFFFF000u) == lin) cpu->jit_cur_hit = 1;
-        dbt->tlb_page_drops++;
+        drop_code_page(dbt, i);
     }
     dbt->n_pcode = kept;
 }
 
 /* A paged block is being translated on LIN_PAGE, which maps to PHYS_PAGE
- * (both page numbers): note it for dbt_tlb_flushed. 0 if the list is
- * full — the caller then does not translate. */
+ * (both page numbers) in the current space: note it for dbt_tlb_flushed.
+ * 0 if the list is full — the caller then does not translate. */
 int dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user) {
+    uint8_t sp = dbt->cpu->pg_space;
     for (uint32_t i = 0; i < dbt->n_pcode; i++)
-        if (dbt->pcode[i].lin_page == lin_page) {
+        if (dbt->pcode[i].lin_page == lin_page && dbt->pcode[i].space == sp) {
             dbt->pcode[i].phys_page = phys_page;
             dbt->pcode[i].user = (uint8_t)user;
             return 1;
@@ -304,6 +346,7 @@ int dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int 
     dbt->pcode[dbt->n_pcode].lin_page = lin_page;
     dbt->pcode[dbt->n_pcode].phys_page = phys_page;
     dbt->pcode[dbt->n_pcode].user = (uint8_t)user;
+    dbt->pcode[dbt->n_pcode].space = sp;
     dbt->n_pcode++;
     return 1;
 }

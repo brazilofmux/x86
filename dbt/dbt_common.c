@@ -500,6 +500,8 @@ int dbt_run(x86_dbt *dbt) {
         /* Refused: one interpreter step. Timed (sampled 1 in 16) since on
          * a running system these are the host-service traps. */
         dbt->interp_fallback_insns++;
+        dbt->fallback_by_class[(cpu->int_inhibit || (cpu->eflags & X86_RF)) ? 5 : !cpu->pmode ? 0 : (cpu->eflags & X86_VM) ? 1
+                               : (dbt_cpu_mode_bits(cpu) & KEY_FLAT) ? 2 : (cpu->cr0 & X86_CR0_PG) ? 3 : 4]++;
         if (dbt->pmprof && cpu->insn_count >= dbt->pmprof_after && cpu->pmode && !(cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4))) {
             uint32_t lin = cpu->seg[S_CS].base + cpu->eip;
             uint8_t fb[16];
@@ -685,6 +687,11 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             dbt->insn_hits[best] = 0;
         }
     }
+    if (dbt->interp_fallback_insns)
+        fprintf(out, "  interp fallbacks by class: real %llu, v86 %llu, pm flat %llu, pm paged non-flat %llu, pm other %llu, shadow/RF %llu\n",
+                (unsigned long long)dbt->fallback_by_class[0], (unsigned long long)dbt->fallback_by_class[1],
+                (unsigned long long)dbt->fallback_by_class[2], (unsigned long long)dbt->fallback_by_class[3],
+                (unsigned long long)dbt->fallback_by_class[4], (unsigned long long)dbt->fallback_by_class[5]);
     fprintf(out, "  interp fallbacks by op (dynamic):");
     for (int n = 0; n < 12; n++) {
         int best = -1;

@@ -94,6 +94,8 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_IOPL3          (1ull << 53)   /* V86 at IOPL 3: CLI/STI/PUSHF behave as in real mode */
 #define KEY_PAGED          (1ull << 54)   /* under paging: V86 through cpu->pgd_r/pgd_w, flat PM through cpu->tlb */
 #define KEY_ESNULL         (1ull << 55)   /* flat, but ES is null (a monitor entered from V86): ES accesses are the interpreter's */
+#define KEY_SPACE_SHIFT    58             /* paged keys: which address space (CR3) the block was translated in, */
+#define KEY_SPACE_MASK     (0xFull << KEY_SPACE_SHIFT)   /* 16 at a time (dbt_tlb_flushed); outside the slot hash */
 #define KEY_A20OFF         (1ull << 57)   /* translated with the A20 gate off: far targets and wraps bake the 1 MB mask
                                              * (outside the slot hash: both states' blocks share a slot, and the SMC
                                              * sweep and code-page drops find either by address) */
@@ -215,9 +217,17 @@ typedef struct {
     /* Code pages paged blocks were translated on (V86 or flat protected
      * mode), with the physical page each mapped to then: a TLB flush
      * re-peeks them and drops the blocks of any that moved. */
-#define DBT_PCODE_MAX 512
-    struct { uint32_t lin_page, phys_page; uint8_t user; } pcode[DBT_PCODE_MAX];
+#define DBT_PCODE_MAX 2048
+    struct { uint32_t lin_page, phys_page; uint8_t user, space; } pcode[DBT_PCODE_MAX];
     uint32_t n_pcode;
+    /* The address spaces paged blocks were translated in: CR3 values, by
+     * the id their keys carry (KEY_SPACE). A VCPI client switches between
+     * its page tables and its server's on every call down to DOS; the
+     * other space's blocks wait, unchecked, until it is current again. */
+#define DBT_SPACES 16
+    uint32_t space_cr3[DBT_SPACES];
+    uint8_t  space_used[DBT_SPACES], space_next;
+    uint64_t space_evictions;
     /* A remapped code page (UMB code, a memory manager mapped high): the
      * block keys are linear, the code bitmap and every SMC report
      * physical. phys_alias[physical page] is the linear page + 1 whose
@@ -232,6 +242,7 @@ typedef struct {
     uint64_t links_created, links_patched, links_unpatched;
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
     uint64_t fallback_by_op[OP__COUNT];  /* which op the interpreter actually ran (dynamic) */
+    uint64_t fallback_by_class[6];       /* ...and where: real, V86, PM flat, PM paged not flat, PM other, inhibited */
     uint64_t helper_by_op[OP__COUNT];    /* which op helper calls ran (dynamic) — the promotion list */
     /* X86_PMPROF=1: what protected-mode code actually executes, to decide
      * what the backend learns first. Indexed [op][opsize==4][adsize==4]. */
@@ -311,6 +322,7 @@ void dbt_a20_changed(x86_cpu *cpu, int on);
 void dbt_dev_changed(x86_cpu *cpu);
 void             dbt_tlb_flushed(x86_cpu *cpu);
 int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user);
+void             dbt_space_current(x86_dbt *dbt);   /* register CR3's space, set cpu->pg_space */
 
 /* Backend hooks (dbt_a64.c) */
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key);
@@ -374,7 +386,7 @@ static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
         && (dbt_seg_flat(&c->seg[S_DS], 0) || !c->seg[S_DS].usable)
         && (dbt_seg_flat(&c->seg[S_ES], 0) || !c->seg[S_ES].usable)) {
         b |= KEY_FLAT | (c->seg[S_ES].usable ? 0 : KEY_ESNULL) | (c->seg[S_DS].usable ? 0 : KEY_DSNULL);
-        if (c->cr0 & X86_CR0_PG) b |= KEY_PAGED;
+        if (c->cr0 & X86_CR0_PG) b |= KEY_PAGED | (uint64_t)c->pg_space << KEY_SPACE_SHIFT;
     }
     else if (dbt_seg16_enabled && dbt_seg16_ok(c))
         b |= KEY_SEG16;
@@ -390,7 +402,7 @@ static inline uint64_t dbt_cpu_key(const x86_cpu *c) {
         /* V86: CS.base + IP, not A20-masked (under paging the linear
          * address is what the page tables see; the mask is physical) */
         uint64_t b = KEY_V86 | ((c->eflags & X86_IOPL) == X86_IOPL ? KEY_IOPL3 : 0)
-                   | ((c->cr0 & X86_CR0_PG) ? KEY_PAGED : 0)
+                   | ((c->cr0 & X86_CR0_PG) ? KEY_PAGED | (uint64_t)c->pg_space << KEY_SPACE_SHIFT : 0)
                    | (c->a20_mask != 0xFFFFFFFFu ? KEY_A20OFF : 0);
         return dbt_key(c->seg[S_CS].sel, c->seg[S_CS].base + (c->eip & 0xFFFF)) | b;
     }

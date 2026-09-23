@@ -411,6 +411,7 @@ static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea);
 static void flat_slow_site(emit_t *e);
 static int s_devread;
 static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write);
+enum { PG_READ = 0, PG_RMW = 1, PG_STORE = 2 };   /* emit_pgflat's access kinds */
 static int writes_mem_operand(const x86_insn *in);
 static int flat_access_size(const x86_insn *in);
 
@@ -439,7 +440,9 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
     }
     if (in->op == OP_LEA) return;
     if (s_paged) {
-        emit_pgflat(e, ea->off, flat_access_size(in), writes_mem_operand(in));
+        /* a MOV to memory only stores: the VGA window is fine for that */
+        int store_only = in->op == OP_MOV && in->ops[0].kind == OPK_MEM;
+        emit_pgflat(e, ea->off, flat_access_size(in), !writes_mem_operand(in) ? PG_READ : store_only ? PG_STORE : PG_RMW);
         ea->segp = X_SEGP;
         return;
     }
@@ -564,7 +567,7 @@ typedef struct {
 static flat_slow_t s_fslow[FLAT_SLOW_MAX];
 static uint32_t s_nfslow;
 static const x86_insn *s_cur_insn;   /* the instruction being emitted, for its slow path */
-static uint32_t s_dyn_imm_lin;       /* nonzero: read the current instruction's immediate from this linear address */
+static uint32_t s_dyn_imm_lin;       /* nonzero: read the current instruction's immediate from this physical address */
 static int s_cur_ender;
 static int s_in_slow_chunk;          /* emitting a flat slow-path chunk (stats tag) */
 
@@ -770,7 +773,8 @@ static void emit_add_x64_big(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_t imm
 
 /* A flat block under paging: the access at linear OFF (size bytes)
  * through the interpreter's own TLB. The entry for its page must match
- * and allow it — valid, plain RAM (X86_TLB_MEM), dirty for a store, and
+ * and allow it — valid, plain RAM (X86_TLB_MEM; for a pure store,
+ * PG_STORE, X86_TLB_WMEM: the VGA window too), dirty for a store, and
  * the user bits at CPL 3 — and the access must stay on the page; then
  * X_SEGP = R_MEM + physical page - linear page, so the flat emitters'
  * [base + off] addressing (off+2, off+4 included) lands in the right
@@ -787,7 +791,7 @@ static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write) {
     (void)emit_tst_w32_imm(e, W_T1, 0xFFFFF000u);               /* the entry is for this page */
     flat_slow_site(e);
     emit_b_cond(e, A64_COND_NE, 0);
-    uint32_t need = X86_TLB_V | X86_TLB_MEM | (write ? X86_TLB_D : 0)
+    uint32_t need = X86_TLB_V | (write == PG_STORE ? X86_TLB_WMEM : X86_TLB_MEM) | (write ? X86_TLB_D : 0)
                   | (s_pg_user ? (write ? X86_TLB_UW : X86_TLB_U) : 0);
     emit_movz_w32(e, W_T1, (uint16_t)need, 0);
     emit_bic_w32(e, W_T1, W_T1, A64_W0);                         /* a needed bit missing? */
@@ -2786,11 +2790,12 @@ static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
 
 /* An inline op whose immediate keeps being patched (every byte of it at
  * SMC_VOLATILE heat) reads it from memory at run time: returns the
- * immediate's linear address, or 0 to bake it in as usual. Only ops that
+ * immediate's physical address (INSN_AT is the instruction's; a flat
+ * block's code is where its page maps), or 0 to bake it in as usual. Only ops that
  * read the immediate as a value through emit_read_operand, and only with
  * no memory operand — a flat memory operand has a slow path that replays
  * the pooled decode, immediate and all. */
-static uint32_t dyn_imm_at(const x86_dbt *dbt, const x86_insn *in, uint32_t insn_lin) {
+static uint32_t dyn_imm_at(const x86_dbt *dbt, const x86_insn *in, uint32_t insn_at) {
     switch (in->op) {
     case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
     case OP_TEST: case OP_MOV:
@@ -2799,7 +2804,7 @@ static uint32_t dyn_imm_at(const x86_dbt *dbt, const x86_insn *in, uint32_t insn
         return 0;
     }
     if (in->ea_valid || in->ops[1].kind != OPK_IMM || !in->ops[1].imm_enc) return 0;
-    uint32_t at = insn_lin + X86_IMM_AT(in->ops[1].imm_enc), n = X86_IMM_LEN(in->ops[1].imm_enc);
+    uint32_t at = insn_at + X86_IMM_AT(in->ops[1].imm_enc), n = X86_IMM_LEN(in->ops[1].imm_enc);
     for (uint32_t k = 0; k < n; k++)
         if (!dbt_smc_hot(dbt->smc_heat, dbt->smc_win, at + k, dbt_smc_window(dbt->cpu))) return 0;
     return at;
@@ -2952,7 +2957,11 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             r = R_HELPER_END;                          /* paged V86: a transfer run by the interpreter */
         cls[n_ops] = (uint8_t)c;
         role[n_ops] = (uint8_t)r;
-        dyn_lin[n_ops] = s_flat && !s_paged && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip) : 0;
+        /* physical, so under paging too (a paged block's page, and with it
+         * code_delta, holds for the block's life): DOOM's renderer patches
+         * its own immediates, and under EMM386 each patch was an SMC
+         * invalidation — ten million of them, 24x slower than bare DOS */
+        dyn_lin[n_ops] = s_flat && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip + code_delta) : 0;
         ip_afters[n_ops] = ip + in->len;
         n_ops++;
         ip += in->len;

@@ -131,6 +131,7 @@ typedef struct x86_cpu {
     void    *jit_aux;       /* DBT aux block base, reloaded by helper-call sequences */
     uint64_t jit_budget;    /* insn budget handed to the trampoline (exit stub math) */
     uint64_t jit_cnt_save;  /* pinned budget register parked across helper calls */
+    uint8_t  pg_space;      /* DBT: id of the address space CR3 names (paged block keys carry it) */
     uint32_t jit_cur_lin;   /* linear address of the block making a helper call... */
     uint32_t jit_cur_hit;   /* ...set by the SMC sweep if that block got invalidated */
 
@@ -249,6 +250,8 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 #define X86_TLB_UW  0x004u
 #define X86_TLB_D   0x008u
 #define X86_TLB_MEM 0x010u                   /* the physical page is plain RAM (not past memory, not the VGA read window): translated code may use it */
+#define X86_TLB_WMEM 0x020u                  /* ...or at least take a pure store there: plain RAM, or the VGA window, where the
+                                              * store lands and the code bitmap hands it to the device (as unpaged flat code does) */
 #define X86_PG_BAD  0xFFFFFFFFu              /* a probe's miss: reads as open bus */
 uint32_t x86_page_walk(struct x86_cpu *c, uint32_t lin, int write);
 void     x86_tlb_flush(struct x86_cpu *c);

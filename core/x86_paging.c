@@ -61,6 +61,16 @@ static int plain_ram(const x86_cpu *c, uint32_t phys) {
     return phys + 0xFFFu < c->mem_size && (phys & 0xFFFF0000u) != 0xA0000u;
 }
 
+/* Can translated code store to a physical page straight? Plain RAM, and
+ * also the VGA window: the byte lands in memory and the code bitmap's
+ * device bit hands it to the VGA — only a read there must be the
+ * device's (the latches). DOOM under WIN386's DPMI draws through paging. */
+static uint32_t tlb_mem_bits(const x86_cpu *c, uint32_t phys) {
+    uint32_t p = phys & c->a20_mask;
+    if (plain_ram(c, phys)) return X86_TLB_MEM | X86_TLB_WMEM;
+    return p + 0xFFFu < c->mem_size ? X86_TLB_WMEM : 0;
+}
+
 /* A low page answered from the translator's delta tables (x86_lin) goes
  * into the TLB as well, which is where translated protected-mode code
  * looks: the same translation, the permissions the tables imply. */
@@ -70,7 +80,7 @@ uint32_t x86_tlb_from_pgd(x86_cpu *c, uint32_t lin) {
     struct x86_tlbe *t = &c->tlb[page & 255];
     t->tag = (lin & 0xFFFFF000u) | X86_TLB_V | X86_TLB_U
            | (!(c->pgd_w[page] & 1) ? X86_TLB_UW | X86_TLB_D : 0)
-           | (plain_ram(c, phys) ? X86_TLB_MEM : 0);
+           | tlb_mem_bits(c, phys);
     t->phys = phys;
     return phys | (lin & 0xFFF);
 }
@@ -116,7 +126,7 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
            | ((both & 4) ? X86_TLB_U : 0)
            | ((both & 4) && (both & 2) ? X86_TLB_UW : 0)
            | ((pte & 0x40) ? X86_TLB_D : 0)
-           | (plain_ram(c, pte & 0xFFFFF000u) ? X86_TLB_MEM : 0);
+           | tlb_mem_bits(c, pte & 0xFFFFF000u);
     t->phys = pte & 0xFFFFF000u;
     /* the translator's tables, low linear pages only, user permissions */
     uint32_t page = lin >> 12;
