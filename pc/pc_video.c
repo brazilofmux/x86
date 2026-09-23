@@ -169,6 +169,10 @@ static void set_mode(x86_cpu *c, int mode) {
     pc_wr8(c, BDA, 0x89, 0x51);
     pc_wr8(c, BDA, 0x8A, 0x08);
     pc_vga_set_mode(c, mode);                    /* graphics state follows the mode, text or 13h */
+    /* INT 43h: the graphics modes' character set, as the VGA BIOS sets it */
+    uint16_t f43 = (m == 0x0F || m == 0x10) ? PC_FONT14_OFF : (m == 0x11 || m == 0x12) ? PC_FONT16_OFF
+                 : (m >= 4 && m <= 6) ? PC_FONT8_AT_OFF : PC_FONT8_OFF;
+    pc_wr16(c, 0, 0x43 * 4, f43); pc_wr16(c, 0, 0x43 * 4 + 2, PC_HLE_SEG);
     pc_vga_set_cursor_pos(0);
     if (m != 0x13 && !(mode & 0x80))
         for (int i = 0; i < PC_ROWS * PC_COLS; i++)
@@ -194,6 +198,15 @@ void pc_video_int10(x86_cpu *c, int vector) {
     switch (ah) {
     case 0x00:
         set_mode(c, al);
+        if (pc.booted) {
+            /* ... and then the registers again, by OUT instructions from
+             * the native half (tools/vgabios.asm), which IRETs: a V86
+             * monitor that virtualizes the VGA sees the mode change. */
+            pc_vga_rom_mode(c, al);
+            x86_load_seg(c, S_CS, PC_STUB_SEG);
+            c->eip = PC_STUB_VGAPROG;
+            pc.returned = 1;
+        }
         break;
     case 0x01:
         pc_wr16(c, BDA, 0x60, x86_get_r16(c, R_CX));
@@ -298,10 +311,22 @@ void pc_video_int10(x86_cpu *c, int vector) {
         case 0x01: case 0x11: h = 14; break;       /* the ROM 8x14 set: 28 rows */
         case 0x02: case 0x12: h = 8; break;        /* 8x8: 50 rows */
         case 0x04: case 0x14: h = 16; break;       /* 8x16: 25 rows */
-        case 0x30: {
+        case 0x30: {                               /* font information: ES:BP by BH */
             int ch = pc_rd8(c, BDA, 0x85);
             x86_set_r16(c, R_CX, (uint16_t)(ch ? ch : 16));
             x86_set_r8(c, R_DL, (uint8_t)(rows(c) - 1));
+            uint16_t seg = PC_HLE_SEG, off;
+            switch (bh) {
+            case 0: off = pc_rd16(c, 0, 0x1F * 4); seg = pc_rd16(c, 0, 0x1F * 4 + 2); break;
+            case 1: off = pc_rd16(c, 0, 0x43 * 4); seg = pc_rd16(c, 0, 0x43 * 4 + 2); break;
+            case 2: off = PC_FONT14_OFF; break;
+            case 3: off = PC_FONT8_OFF; break;
+            case 4: off = (uint16_t)(PC_FONT8_OFF + 128 * 8); break;
+            case 6: off = PC_FONT16_OFF; break;
+            default: off = PC_FONT8_OFF + 256 * 8 - 1; break;   /* 9-dot alternates: none (a lone 00h) */
+            }
+            x86_load_seg(c, S_ES, seg);
+            x86_set_r16(c, R_BP, off);
             break;
         }
         }

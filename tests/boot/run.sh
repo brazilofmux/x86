@@ -96,6 +96,14 @@ if [ -f disks/win311/c.img ] && mdir -i disks/win311/c.img@@32256 ::/WINDOWS/WIN
     python3 tools/expect.py -t 90 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
     if [ "$(python3 tools/pngpix.py tmp/boot-win.png 150,61 2>/dev/null)" = "150,61 0 0 170" ]
     then echo "ok   windows 3.11 standard mode (program manager)"; else echo "FAIL windows 3.11 standard mode"; fail=1; fi
+    # 386 enhanced mode (plain "win": WIN386, its VxDs, DOS in V86 under
+    # paging), and an MS-DOS Prompt in it: a second VM, full screen, whose
+    # prompt and VER come out as text; EXIT returns to Program Manager.
+    cp disks/win311/c.img tmp/boot-c.img
+    printf 'C:.>$\twin\\r\ndelay 60\nsend \\x1b[C\\x1b[C\\x1b[C\\x1b[C\ndelay 3\nsend \\r\n*C:.WINDOWS>\tver\\r\n*MS-DOS Version 6.22\texit\\r\ndelay 30\nshot tmp/boot-win.png\n' > tmp/boot-c.exp
+    python3 tools/expect.py -t 200 tmp/boot-c.exp -- ./dos-monster -m 386 -W -T 190 -hda tmp/boot-c.img -boot c >/dev/null 2>&1 && ok=1 || ok=0
+    if [ $ok = 1 ] && [ "$(python3 tools/pngpix.py tmp/boot-win.png 150,61 2>/dev/null)" = "150,61 0 0 170" ]
+    then echo "ok   windows 3.11 enhanced mode, ms-dos prompt vm"; else echo "FAIL windows 3.11 enhanced mode"; fail=1; fi
     rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-win.png
 fi
 exit $fail

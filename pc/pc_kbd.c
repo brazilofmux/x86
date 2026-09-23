@@ -150,11 +150,26 @@ void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode) {
 /* Default INT 9: the code latched at port 60h was ours, so the make
  * code's (ascii, scancode) goes into the buffer. Shift/ctrl makes and
  * all breaks are dropped; E0-prefixed keys keep ascii 0. */
+static void kbd_translate(x86_cpu *c, uint8_t code);
+
+/* INT 9 as the HLE shim serves it: the latch read and the EOI in the host. */
 void pc_kbd_int9(x86_cpu *c, int vector) {
     (void)vector;
     pc.irq9_busy = 0;
     pc.irq_in_service &= ~2;                     /* the BIOS handler's EOI */
-    uint8_t code = pc.last_scancode;
+    kbd_translate(c, pc.last_scancode);
+}
+
+/* A booted machine's INT 9 is the native stub (PC_STUB_INT9): it reads
+ * port 60h and sends the EOI itself, as instructions a V86 monitor traps
+ * (WIN386's keyboard and PIC VxDs keep their virtual state from them),
+ * and calls here in between with the scancode in AL. */
+void pc_kbd_trap(x86_cpu *c, int vector) {
+    (void)vector;
+    kbd_translate(c, x86_get_r8(c, R_AL));
+}
+
+static void kbd_translate(x86_cpu *c, uint8_t code) {
     /* a command's acknowledgement or resend request, not a key: the AT
      * BIOS notes it in 40:97 (bit 4 ACK, bit 5 RESEND), where whoever sent
      * the command waits for it (MS-DOS's IO.SYS setting the LEDs) */

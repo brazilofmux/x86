@@ -107,8 +107,10 @@ is Windows itself in standard mode, drawn in VGA mode 12h, so the script
 drives it blind with expect.py's "send" and "delay"; "shot FILE" saves
 the picture (X86_SCREEN_PNG, rewritten once a second) for looking at.
 run.sh starts "win /s" and checks Program Manager's title bar pixel
-(tools/pngpix.py). Plain "win" (386 enhanced mode) says "Video
-initialization failed" — the next campaign.
+(tools/pngpix.py); then plain "win", 386 enhanced mode, opens an MS-DOS
+Prompt (a V86 VM beside Windows, full screen), runs VER there and EXITs
+back to Program Manager. Inside the VM MEM shows 581K free and 1024K of
+EMS, WIN386's own.
 
 What standard mode needed:
 - an inward CALL through a gate or an interrupt reading its new stack
@@ -126,3 +128,31 @@ What standard mode needed:
 - scripted keys for a program that reads IRQ 1 but calls INT 16h now
   and then: fed after 250 ms without BIOS polling, not only after total
   silence (Windows took the first key and no more).
+
+What 386 enhanced mode needed — WIN386 virtualizes the VGA, the PIC and
+the keyboard, and keeps its virtual state from the I/O it traps, so the
+BIOS has to do its I/O as instructions, not from the host:
+- INT 10h AH=00 programs the mode's registers by OUTs (tools/vgabios.asm,
+  the native half, from standard VGA parameter tables at F100:0400). The
+  VDD read the CRTC back to learn the screen's geometry; the host's own
+  writes left its copy at the previous mode ("Video initialization
+  failed"). The tables themselves were new: every register of modes 0-7,
+  0Dh-13h, misc output at 3C2h/3CCh.
+- INT 8's EOI is the stub's OUT 20h, and a booted machine's INT 9 is a
+  native stub (F100:0010): IN 60h, the host's translation (trap F5h, code
+  in AL), OUT 20h. The host EOI left IRQ 0 in service in the VM's virtual
+  PIC, which then delivered nothing below it — no keys.
+- the 8042: status bit 0 while a scancode waits (VKD looks before it
+  reads), the command byte (read 20h, write 60h), self tests, AD/AE, and
+  only 60h/D1h-D4h take a data byte: command 20h had been swallowing the
+  keyboard's F3h, which then never got its ACK. The keyboard answers
+  FF/F2/EE/F4/F5 and ACKs a command's data byte.
+- ROM fonts in guest memory (F000:C000/D000/E000, FA6E; INT 1Fh, 43h) for
+  INT 10h AX=1130h's ES:BP.
+- the display follows the VGA registers, not the BIOS data area's mode
+  byte, which WIN386 keeps per VM: the picture flickered between the DOS
+  VM's text and Windows' mode 12h as the VMs took turns.
+
+Enhanced mode runs at ~35 MIPS: Windows' segmented 16-bit protected-mode
+code under paging is the interpreter's (only flat paged code and V86 are
+translated). That is the next speed campaign.

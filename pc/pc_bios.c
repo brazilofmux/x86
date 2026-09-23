@@ -149,7 +149,6 @@ static void hle_dispatch(x86_cpu *c, int vector) {
 /* ---- Timer ------------------------------------------------------------- */
 static void bios_int8(x86_cpu *c, int vector) {
     (void)vector;
-    pc.irq_in_service &= ~1;                     /* the BIOS handler's EOI */
     uint32_t t = pc_rd16(c, PC_BDA_SEG, 0x6C) | ((uint32_t)pc_rd16(c, PC_BDA_SEG, 0x6E) << 16);
     t++;
     if (t >= 0x1800B0) { t = 0; pc_wr8(c, PC_BDA_SEG, 0x70, 1); }
@@ -162,7 +161,11 @@ static void bios_int8(x86_cpu *c, int vector) {
      * EMM386 reads the CD 1C at CS:IP; a delivery made by the host instead
      * went through its IDT and ended at 0000:0000. The HLE DPMI host's
      * protected mode keeps the direct call. */
+    /* The EOI likewise: the stub's OUT 20h after INT 1Ch, as the AT BIOS
+     * sends it. Done here in the host, WIN386's virtual PIC never saw it,
+     * kept IRQ 0 in service and delivered nothing below it (the keyboard). */
     if (c->pmode && !(c->eflags & X86_VM)) {
+        pc.irq_in_service &= ~1;                 /* the HLE DPMI host's: no stub */
         pc_hle_return(c, HLE_RET_IRET);
         x86_interrupt(c, 0x1C, 0);
         return;
@@ -306,12 +309,12 @@ int pc_poll(x86_cpu *c) {
      * the first — one key lost, the next one twice ("HHlo"). The EOI, or
      * our INT 9, says the code has been used. */
     static uint64_t last_code_ns;
-    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !(pc.irq_in_service & 2)
+    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !(pc.irq_in_service & 2) && !pc.kbd_disabled
         && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
         uint8_t code;
         pc_kbd_raw_next(&code);
         pc.last_scancode = code;
-        pc.irq_pending |= 1 << 9;
+        if (pc.kbc_cmdbyte & 1) pc.irq_pending |= 1 << 9;   /* IRQ 1, if the command byte enables it */
         pc.irq9_busy = 1;                        /* until the handler reads port 60h */
         last_code_ns = now;
     }
@@ -436,7 +439,10 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
          * AT's own timing reference (IO.SYS counts its toggles while it
          * waits for the keyboard; a bit that never moved hung it) */
         return (uint32_t)((pit_speaker & 0x0F) | ((pc_now_ns() / 15085u) & 1u) << 4);
-    case 0x64: return (uint32_t)(0x14 | (pc.kbc_out_full ? 1 : 0));   /* 8042 status: not busy; bit 0 = response ready */
+    /* 8042 status: not busy, system flag; bit 0 = output buffer full — a
+     * controller reply, or a scancode latched for IRQ 1 and not yet read
+     * (WIN386's keyboard VxD looks here before it reads port 60h) */
+    case 0x64: return (uint32_t)(0x14 | (pc.kbc_out_full || pc.irq9_busy ? 1 : 0));
     case 0x92: return (uint32_t)(c->a20_mask != 0xFFFFFu ? 2 : 0);
     case 0x3DA: {                                /* CGA status: toggle retrace bits */
         static uint8_t t; t ^= 0x09;
@@ -489,24 +495,57 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         break;
     case 0x61: pit_speaker = (uint8_t)(val & 0x0F); break;
     case 0x64:
+        /* The 8042's commands. Only 60h and D1h-D4h take a data byte
+         * (kbc_cmd); a command that took one by mistake swallowed the
+         * next byte meant for the keyboard — WIN386's F3h never got its
+         * ACK, and its keyboard driver stalled. */
         switch (val & 0xFF) {
+        case 0x20: pc.kbc_out = pc.kbc_cmdbyte; pc.kbc_out_full = 1; break;    /* read command byte */
+        case 0x60: case 0xD1: case 0xD2: case 0xD3: case 0xD4:
+            pc.kbc_cmd = (uint8_t)val; break;                                  /* data follows on 60h */
+        case 0xA7: case 0xA8: break;                                           /* auxiliary port off/on: none */
+        case 0xA9: pc.kbc_out = 0x00; pc.kbc_out_full = 1; break;              /* aux interface test: ok */
+        case 0xAA: pc.kbc_out = 0x55; pc.kbc_out_full = 1; break;              /* self test: passed */
+        case 0xAB: pc.kbc_out = 0x00; pc.kbc_out_full = 1; break;              /* keyboard interface test: ok */
+        case 0xAD: pc.kbd_disabled |= 1; break;                                /* keyboard interface off */
+        case 0xAE: pc.kbd_disabled &= (uint8_t)~1; break;                      /* ... on */
+        case 0xC0: pc.kbc_out = 0xBF; pc.kbc_out_full = 1; break;              /* input port: not inhibited, colour */
         case 0xD0: pc.kbc_out = a20_out_port(c); pc.kbc_out_full = 1; break;   /* read output port */
-        case 0xD1: pc.kbc_cmd = 0xD1; break;                                   /* write output port: data follows */
         case 0xDD: a20_set(c, 0); break;
         case 0xDF: a20_set(c, 1); break;
-        case 0xAD: case 0xAE: break;                                           /* keyboard disable/enable: no-op */
+        case 0xE0: pc.kbc_out = 0x00; pc.kbc_out_full = 1; break;              /* test inputs */
         case 0xFE: pc_request_reset(c, "8042 CPU reset"); break;
-        default: pc.kbc_cmd = (uint8_t)val; break;                             /* others: swallow any data byte */
+        default: break;
         }
         break;
-    case 0x60:
-        if (pc.kbc_cmd == 0xD1) {
-            if (!(val & 1)) pc_request_reset(c, "8042 output port reset bit");
-            a20_set(c, (val >> 1) & 1);
+    case 0x60: {
+        uint8_t v = (uint8_t)val;
+        switch (pc.kbc_cmd) {
+        case 0x60: pc.kbc_cmdbyte = v; break;                                  /* write command byte */
+        case 0xD1:
+            if (!(v & 1)) pc_request_reset(c, "8042 output port reset bit");
+            a20_set(c, (v >> 1) & 1);
+            break;
+        case 0xD2: pc_kbd_raw_reply(v); break;                                 /* as if the keyboard sent it */
+        case 0xD3: case 0xD4: break;                                           /* to the auxiliary port: none */
+        default:
+            /* a byte for the keyboard itself. Replies go in front of any
+             * queued keys, last first (pc_kbd_raw_reply inserts at the head). */
+            if (pc.kbd_cmd) { pc.kbd_cmd = 0; pc_kbd_raw_reply(0xFA); break; }   /* the command's data byte */
+            switch (v) {
+            case 0xFF: pc_kbd_raw_reply(0xAA); pc_kbd_raw_reply(0xFA); pc.kbd_disabled &= (uint8_t)~2; break;   /* reset: ACK, self test passed */
+            case 0xF2: pc_kbd_raw_reply(0x41); pc_kbd_raw_reply(0xAB); pc_kbd_raw_reply(0xFA); break;           /* identify: MF2, translated */
+            case 0xEE: pc_kbd_raw_reply(0xEE); break;                          /* echo */
+            case 0xED: case 0xF3: case 0xF0: case 0xFB: case 0xFC: case 0xFD:
+                pc.kbd_cmd = v; pc_kbd_raw_reply(0xFA); break;                 /* a data byte follows */
+            case 0xF4: pc.kbd_disabled &= (uint8_t)~2; pc_kbd_raw_reply(0xFA); break;   /* enable scanning */
+            case 0xF5: pc.kbd_disabled |= 2; pc_kbd_raw_reply(0xFA); break;             /* default, scanning off */
+            default: pc_kbd_raw_reply(0xFA); break;
+            }
         }
-        else if (!pc.kbc_cmd) pc_kbd_raw_reply(0xFA);   /* a byte for the keyboard itself (LEDs, typematic): ACK */
         pc.kbc_cmd = 0;
         break;
+    }
     case 0xE9:                                   /* the Bochs/QEMU debug console: a boot
                                                   * image's transcript (tools/pmoracle) */
         if (pc.booted) { fputc((int)(val & 0xFF), stdout); if ((val & 0xFF) == '\n') fflush(stdout); }
@@ -530,6 +569,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
  * IRET, the reset vector, the BIOS data area. Run at power-on and again
  * at every reboot, so it only writes. */
 static void post(x86_cpu *cpu) {
+    pc.kbc_cmdbyte = 0x45; pc.kbd_disabled = 0; pc.kbd_cmd = 0;   /* 8042: IRQ 1 on, system flag, translate */
     /* Stub segment: one IRET per vector, plus the ROM signature bytes.
      * Like a real BIOS, every vector nobody serves points at one shared
      * dummy IRET — the AT BIOS's own is at F000:FF53, and software knows
@@ -542,10 +582,26 @@ static void post(x86_cpu *cpu) {
         pc_wr16(cpu, 0, (uint16_t)(v * 4 + 2), PC_HLE_SEG);
     }
     pc_wr8(cpu, PC_HLE_SEG, PC_HLE_DUMMY_IRET, 0xCF);
+    /* The ROM fonts, where the video BIOS hands them out (AX=1130h) and a
+     * VxD copies them from; INT 1Fh names the 8x8 set's upper half, INT
+     * 43h the graphics font (the mode set changes it). */
+    for (int i = 0; i < 256 * 16; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(PC_FONT16_OFF + i), pc_font16[i]);
+    for (int i = 0; i < 256 * 14; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(PC_FONT14_OFF + i), pc_font14[i]);
+    for (int i = 0; i < 256 * 8; i++)  pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(PC_FONT8_OFF + i), pc_font8[i]);
+    for (int i = 0; i < 128 * 8; i++)  pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(PC_FONT8_AT_OFF + i), pc_font8[i]);
+    pc_wr16(cpu, 0, 0x1F * 4, (uint16_t)(PC_FONT8_OFF + 128 * 8)); pc_wr16(cpu, 0, 0x1F * 4 + 2, PC_HLE_SEG);
+    pc_wr16(cpu, 0, 0x43 * 4, PC_FONT8_AT_OFF);                    pc_wr16(cpu, 0, 0x43 * 4 + 2, PC_HLE_SEG);
     /* Native BIOS code (outside the trap segment's base, so it runs):
      * INT 8's tail, INT 1Ch then IRET. */
-    static const uint8_t int1c_tail[3] = { 0xCD, 0x1C, 0xCF };
-    for (int i = 0; i < 3; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT1C + i), int1c_tail[i]);
+    /* INT 1Ch; push ax; mov al,20h; out 20h,al (EOI); pop ax; iret */
+    static const uint8_t int1c_tail[] = { 0xCD, 0x1C, 0x50, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF };
+    for (size_t i = 0; i < sizeof int1c_tail; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT1C + i), int1c_tail[i]);
+    /* push ax; in al,60h; pushf; call far F000:PC_TRAP_KBD; cli;
+     * mov al,20h; out 20h,al; pop ax; iret */
+    static const uint8_t int9[] = { 0x50, 0xE4, 0x60, 0x9C, 0x9A, PC_TRAP_KBD, 0x00, 0x00, 0xF0,
+                                    0xFA, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF };
+    for (size_t i = 0; i < sizeof int9; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT9 + i), int9[i]);
+    pc_vga_rom(cpu);                             /* INT 10h's mode set, programmed by OUTs */
     /* FFFF:0000, the reset vector: JMP F000:FFF0, which traps (TRAP_RESET) */
     static const uint8_t jmp[5] = { 0xEA, 0xF0, 0xFF, 0x00, 0xF0 };
     for (int i = 0; i < 5; i++) pc_wr8(cpu, 0xFFFF, (uint16_t)i, jmp[i]);
@@ -571,6 +627,14 @@ static void post(x86_cpu *cpu) {
  * space; writable zeros looked like adapter RAM, and it found no room for
  * its page frame. A booted machine
  * only: under the HLE DOS nothing scans for it. */
+/* A booted machine takes IRQ 1 through the native INT 9 (PC_STUB_INT9),
+ * whose port 60h read and EOI a V86 monitor sees. The HLE shim keeps the
+ * host's handler, which drains keys straight through (drain_raw_here). */
+void pc_native_irq_vectors(x86_cpu *c) {
+    pc_wr16(c, 0, 9 * 4, PC_STUB_INT9);
+    pc_wr16(c, 0, 9 * 4 + 2, PC_STUB_SEG);
+}
+
 void pc_empty_upper_memory(x86_cpu *c) {
     memset(c->mem + 0xC0000, 0xFF, 0x30000);
     for (uint32_t p = 0xC0000; p < 0xF0000; p++) c->code_bitmap[p] |= X86_BM_EMPTY;   /* stores put the FFh back */
@@ -607,6 +671,7 @@ void pc_reboot(x86_cpu *c) {
     pic.mask = 0xB8; pic.base = 8; pic.icw_step = 0; pic.read_isr = 0;
     post(c);
     pc_empty_upper_memory(c);
+    pc_native_irq_vectors(c);
     pc_disk_install(c);
     pc_cmos_init(c);
     pc_mouse_reboot(c);
@@ -641,6 +706,7 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     pc_set_service(0x10, pc_video_int10, HLE_RET_FLAGS);
     pc_set_service(0x16, pc_kbd_int16, HLE_RET_FLAGS);
     pc_set_service(0x09, pc_kbd_int9, HLE_RET_IRET);
+    pc_set_trap(PC_TRAP_KBD, pc_kbd_trap, HLE_RET_IRET);
 
     pc_video_init(cpu);
     pc_kbd_init();

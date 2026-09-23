@@ -28,7 +28,21 @@
 /* Return convention of a service after pc_hle_dispatch ran it. */
 enum { HLE_RET_FLAGS, HLE_RET_IRET };
 #define PC_STUB_SEG     0xF100     /* native BIOS stubs: in the ROM area, but not the trap segment's base */
-#define PC_STUB_INT1C   0x0000     /* INT 1Ch; IRET — INT 8's tail */
+#define PC_STUB_INT1C   0x0000     /* INT 1Ch; EOI; IRET — INT 8's tail */
+#define PC_STUB_INT9    0x0010     /* a booted machine's INT 9: IN 60h, translate (PC_TRAP_KBD), EOI */
+#define PC_TRAP_KBD     0xF5       /* F000:00F5: the host's scancode translation, code in AL */
+#define PC_STUB_VGAVARS 0x00F0     /* INT 10h AH=00's native half: its ROM variables (table, DAC, DAC length) */
+#define PC_STUB_VGAPROG 0x0100     /*   the code (tools/vgabios.asm) */
+#define PC_STUB_VGATAB  0x0400     /*   the modes' parameter tables, 64 bytes apart */
+#define PC_STUB_DAC64   0x0800     /*   the EGA 64-colour DAC set */
+#define PC_STUB_DAC256  0x0900     /*   mode 13h's 256 */
+/* The ROM fonts, in the BIOS segment where INT 10h AX=1130h points (data:
+ * only execution there traps). 8x8's first half also at the AT's FA6E. */
+#define PC_FONT16_OFF   0xC000
+#define PC_FONT14_OFF   0xD000
+#define PC_FONT8_OFF    0xE000
+#define PC_FONT8_AT_OFF 0xFA6E
+extern const uint8_t pc_font8[256 * 8], pc_font14[256 * 14], pc_font16[256 * 16];
 #define PC_HLE_DUMMY_IRET 0xFF53   /* where every unserved vector points, as on an AT (traps as vector 53h) */
 #define PC_HLE_DPMI_ENTRY 0x00FD   /* offset in the HLE segment; the trap vector is eip & FFh */
 #define PC_HLE_DPMI_RMRET 0x00FC   /* a real-mode excursion (INT 31h 0300-0302) has returned here */
@@ -54,6 +68,9 @@ typedef struct pc_state {
     uint8_t  kbc_cmd;                /* 8042: command awaiting its data byte on port 60h (0 = none) */
     uint8_t  kbc_out;                /* 8042: pending response for port 60h (with kbc_out_full) */
     uint8_t  kbc_out_full;
+    uint8_t  kbc_cmdbyte;            /* 8042 command byte: bit 0 IRQ 1 enable, 2 system flag, 6 translate */
+    uint8_t  kbd_disabled;           /* 8042 ADh (keyboard interface off), or the keyboard's F5 (scanning off) */
+    uint8_t  kbd_cmd;                /* keyboard command awaiting its data byte (EDh LEDs, F3h rate, F0h set) */
     int      kbd_raw;                /* host terminal is in raw mode */
     uint64_t kbd_reads;              /* guest keyboard reads/polls; paces scripted input */
     uint64_t next_slow_ns;           /* pc_poll: when its periodic work is next due */
@@ -97,6 +114,8 @@ void pc_set_service(int vector, pc_service_fn fn, int ret_mode);
 void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted machine reboots */
 void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
 void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads as an empty bus */
+void pc_native_irq_vectors(x86_cpu *c);  /* booted machines: INT 9 through the native stub */
+void pc_kbd_trap(x86_cpu *c, int vector);   /* PC_TRAP_KBD: translate the scancode in AL */
 void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);
 void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
@@ -140,6 +159,8 @@ void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode);
 int  pc_kbd_raw_pending(void);
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */
+void pc_vga_rom(x86_cpu *c);                               /* POST: the native mode-set code and its tables */
+void pc_vga_rom_mode(x86_cpu *c, int mode);                /* point its ROM variables at MODE's table */
 int  pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h);   /* RGB24, at most 640x480; -1 if not graphics */
 int  pc_vga_text_frame(x86_cpu *c, uint8_t *rgb, int maxw, int maxh, int *w, int *h, unsigned frame);   /* -1 if not text */
 void pc_vga_set_cursor_pos(uint16_t words);               /* CRTC 0E/0F, as the BIOS keeps them */

@@ -316,6 +316,7 @@ int main(int argc, char **argv) {
         pc_init(&cpu, tty);
         pc.booted = 1;
         pc_empty_upper_memory(&cpu);
+        pc_native_irq_vectors(&cpu);
         pc_disk_install(&cpu);
         pc_cmos_init(&cpu);
         pc.debug = debug;
