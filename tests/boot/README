@@ -38,6 +38,13 @@ menu (MENUDEFAULT=6,1); FDAUTO.BAT skips the CD-ROM probe for config 6
 status ports). Boot to C:\> is ~3 s; MEM shows 16,448K XMS and "FreeDOS
 is resident in the high memory area".
 
+With the V86/paging campaign (milestones 1-2, the interpreter) the stock
+menu entries work too: 2 (JEMMEX) runs DOS in virtual-8086 mode with
+paging — UMBs, COMMAND and FDAPM loaded high, 629K conventional free — and
+WordPerfect runs under it; 3 (JEMM386) adds 16M of EMS. All of it runs in
+the interpreter until the JIT learns V86 and paging, so for now the
+default stays entry 6.
+
 WordPerfect was added with mtools:
 
   mcopy -s -i disks/freedos/c.img@@32256 disks/WP51 ::/

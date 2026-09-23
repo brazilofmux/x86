@@ -24,6 +24,15 @@ if [ -f disks/freedos/c.img ]; then
         printf 'C:.>$\tcd \\\\wp51\\rwp\\r\nDoc 1 Pg 1\tThe quick brown fox, under FreeDOS.\nFreeDOS\\.\t\n' > tmp/boot-wp.exp
         if python3 tools/expect.py -t 120 tmp/boot-wp.exp -- ./dos-monster -m 386 -W -T 110 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
         then echo "ok   wp51 under freedos"; else echo "FAIL wp51 under freedos"; fail=1; fi
+        # the same under JEMMEX (menu 2): DOS in virtual-8086 mode with paging, UMBs
+        cp disks/freedos/c.img tmp/boot-c.img            # a clean disk each: WP leaves its lock files
+        printf 'Selection=\t2\nC:.>$\tmem\\r\nfree upper memory block\t\n' > tmp/boot-wp.exp
+        if python3 tools/expect.py -t 120 tmp/boot-wp.exp -- ./dos-monster -m 386 -W -T 110 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+        then echo "ok   freedos under jemmex (v86)"; else echo "FAIL freedos under jemmex (v86)"; fail=1; fi
+        cp disks/freedos/c.img tmp/boot-c.img
+        printf 'Selection=\t2\nC:.>$\tcd \\\\wp51\\rwp\\r\nDoc 1 Pg 1\tHello from V86.\nV86\\.\t\n' > tmp/boot-wp.exp
+        if python3 tools/expect.py -t 120 tmp/boot-wp.exp -- ./dos-monster -m 386 -W -T 110 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+        then echo "ok   wp51 under jemmex (v86)"; else echo "FAIL wp51 under jemmex (v86)"; fail=1; fi
         rm -f tmp/boot-wp.exp
     fi
     rm -f tmp/boot-c.img tmp/boot-c.exp
