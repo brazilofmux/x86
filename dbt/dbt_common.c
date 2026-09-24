@@ -695,9 +695,13 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     fprintf(out, "  max block bytes:        %u\n", (unsigned)dbt->max_block_bytes);
     fprintf(out, "  code used:              %u bytes, %u pooled insns\n", dbt->code_used, dbt->insn_used);
     {
+        /* The pool restarts at a flush; its hit counters do not (a slot
+         * reused after a flush carries the hits of both its tenants), so
+         * the scans run to the high-water mark. */
+        if (dbt->insn_used > dbt->insn_high) dbt->insn_high = dbt->insn_used;
         uint64_t by_tag[3] = { 0, 0, 0 };
-        for (uint32_t i = 0; i < dbt->insn_used; i++) by_tag[dbt->insn_tag[i]] += dbt->insn_hits[i];
-        fprintf(out, "  helper calls from:      all-helper PM blocks %llu, flat blocks %llu, flat slow paths %llu\n",
+        for (uint32_t i = 0; i < dbt->insn_high; i++) by_tag[dbt->insn_tag[i]] += dbt->insn_hits[i];
+        fprintf(out, "  helper calls from:      all-helper PM blocks %llu, helper ops in mixed blocks %llu, slow paths %llu\n",
                 (unsigned long long)by_tag[0], (unsigned long long)by_tag[1], (unsigned long long)by_tag[2]);
     }
     fprintf(out, "  helper calls by op (dynamic):");
@@ -714,15 +718,16 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     fprintf(out, "\n");
     if (getenv("X86_HELPER_DETAIL")) {
         /* The hottest pooled instructions themselves, with where they were
-         * emitted from: [pm] all-helper block, [flat] helper in a flat
-         * block, [slow] a flat inline op's out-of-range path. */
-        static const char *tags[3] = { "pm", "flat", "slow" };
+         * emitted from: [pm] all-helper block, [body] a helper op in a
+         * block that inlines others, [slow] an inline op's out-of-line
+         * path. */
+        static const char *tags[3] = { "pm", "body", "slow" };
         uint32_t n = strtoul(getenv("X86_HELPER_DETAIL"), NULL, 0);
         if (!n) n = 40;
         fprintf(out, "  hottest helper insns:\n");
         for (uint32_t k = 0; k < n; k++) {
             uint32_t best = 0; int found = 0;
-            for (uint32_t i = 0; i < dbt->insn_used; i++)
+            for (uint32_t i = 0; i < dbt->insn_high; i++)
                 if (dbt->insn_hits[i] && (!found || dbt->insn_hits[i] > dbt->insn_hits[best])) { best = i; found = 1; }
             if (!found) break;
             char buf[64];

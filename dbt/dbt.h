@@ -202,6 +202,7 @@ typedef struct {
      * allocated; reset together with the code buffer. */
     x86_insn *insn_pool;
     uint32_t  insn_used;
+    uint32_t  insn_high;                 /* high-water mark of insn_used across flushes (stats scan this far) */
     uint32_t *insn_hits;           /* per pooled insn: dynamic helper calls (stats) */
     uint8_t  *insn_tag;            /* per pooled insn: 0 all-helper PM block, 1 flat block helper, 2 flat slow path */
     uint32_t *insn_lin;            /* per pooled insn: its linear address (stats) */

@@ -98,25 +98,30 @@ static inline int R_GPR(int i) { return i == R_SP ? X64_R12 : i; }
 #define OFF_SEG_BIG(i)  ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, big)))
 _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and attr share one dword store");
 #define OFF_EXC         ((int32_t)offsetof(x86_cpu, exc))
+#define OFF_EXC_ERR     ((int32_t)offsetof(x86_cpu, exc_err))
 #define OFF_INSN_COUNT  ((int32_t)offsetof(x86_cpu, insn_count))
 #define OFF_JIT_BUDGET  ((int32_t)offsetof(x86_cpu, jit_budget))
 #define OFF_JIT_CNT     ((int32_t)offsetof(x86_cpu, jit_cnt_save))
 #define OFF_JIT_CUR_LIN ((int32_t)offsetof(x86_cpu, jit_cur_lin))
 #define OFF_JIT_CUR_HIT ((int32_t)offsetof(x86_cpu, jit_cur_hit))
 #define OFF_JIT_FLAGS   ((int32_t)offsetof(x86_cpu, jit_flags))
+#define OFF_DEV_WPLANE  ((int32_t)offsetof(x86_cpu, dev_wplane))
+#define OFF_DEV_RPLANE  ((int32_t)offsetof(x86_cpu, dev_rplane))
 
 #define ARITH  X86_ARITH_FLAGS
 
 #define M(base, disp) x64_m((base), (disp))
 
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
-static uint32_t s_exec_thunk_off, s_exit_eip_off;
+static uint32_t s_exec_thunk_off, s_post_thunk_off, s_port_thunk_off, s_exit_eip_off;
 
 /* -V strict mode: every block returns to dbt_run (no links, no probe). */
 static int s_strict_exit = -1;
 static uint64_t s_mode_bits;
 static int s_regs32;          /* 386: the pinned registers hold 32 bits, 16-bit values need masking as addresses */
 static int s_flat;            /* a flat block: 32-bit code and addresses off R_MEM, no segment arithmetic */
+static int s_seg16;           /* segmented 16-bit protected mode: the real-mode shape with limit checks in place of wrap checks */
+static int s_ss32;            /* ...on a 32-bit stack (SS.B): pushes and pops move all of ESP */
 static uint32_t s_dyn_imm_lin; /* nonzero: read the current instruction's immediate from this physical address */
 /* Flat blocks address memory as R_MEM + offset; the fast path is everything
  * below 16 MB, less (for reads, while a device answers them) the VGA
@@ -262,6 +267,64 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8);             /* drop the return address */
     m = M(R_CPU, OFF_JIT_CNT);     emit_alu_mr(&e, 8, X64_ALU_SUB, &m, W_T3);
     emit_jmp_rel32_to(&e, s_exit_eip_off);
+
+    /* ---- Post-store thunk: CALLed after a store landed on bytes the code
+     * bitmap marks, with R8 = phys | size << 28, R9 = the block's linear
+     * address, R10 = ip after the instruction, R11 = instructions executed
+     * so far including it. Runs the store hook (device memory, then SMC)
+     * with only the caller-saved pinned registers parked: no spill, no
+     * reload; the guest's flags are in the slot already and its DF rides
+     * in RFLAGS across the call. If the sweep invalidated the running
+     * block, it leaves at ip-after; else it returns. ---- */
+    s_post_thunk_off = e.offset;
+    emit_pushfq(&e);
+    emit_push_r(&e, X64_RAX); emit_push_r(&e, X64_RCX); emit_push_r(&e, X64_RDX);
+    emit_push_r(&e, X64_RSI); emit_push_r(&e, X64_RDI);
+    emit_push_r(&e, W_T2); emit_push_r(&e, W_T3);
+    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8);             /* 16-byte alignment for the call */
+    m = M(R_CPU, OFF_JIT_CUR_LIN); emit_mov_mr(&e, 4, &m, W_T1);
+    m = M(R_CPU, OFF_JIT_CUR_HIT); emit_mov_mi(&e, 4, &m, 0);
+    emit_mov_rr(&e, 8, X64_RDI, R_CPU);
+    emit_mov_rr(&e, 4, X64_RSI, W_T0);
+    emit_cld(&e);
+    emit_mov_ri(&e, 8, X64_RAX, (uint64_t)(uintptr_t)dbt_h_post_store);
+    emit_call_r(&e, X64_RAX);
+    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8);
+    emit_pop_r(&e, W_T3); emit_pop_r(&e, W_T2);
+    emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
+    emit_pop_r(&e, X64_RDX); emit_pop_r(&e, X64_RCX); emit_pop_r(&e, X64_RAX);
+    emit_popfq(&e);
+    m = M(R_CPU, OFF_JIT_CUR_HIT); emit_alu_mi(&e, 4, X64_ALU_CMP, &m, 0);
+    uint32_t hit = emit_jcc_rel8(&e, X64_CC_NE);
+    emit_ret(&e);
+    emit_patch_rel8(&e, hit, emit_pos(&e));
+    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8);             /* drop the return address */
+    m = M(R_CPU, OFF_EIP);         emit_mov_mr(&e, 4, &m, W_T2);
+    m = M(R_CPU, OFF_JIT_CNT);     emit_alu_mr(&e, 8, X64_ALU_SUB, &m, W_T3);
+    emit_jmp_rel32_to(&e, s_exit_eip_off);
+
+    /* ---- Port thunk: CALLed for OUT with R8 = port | size << 16, R9 =
+     * the value. Same parking as the post-store thunk; the guest's flags
+     * are all in the slot (an OUT sees every flag live). Returns
+     * dbt_h_out's verdict in R8: 0 go on, 1 leave after the instruction,
+     * 2 #GP at it. ---- */
+    s_port_thunk_off = e.offset;
+    emit_pushfq(&e);
+    emit_push_r(&e, X64_RAX); emit_push_r(&e, X64_RCX); emit_push_r(&e, X64_RDX);
+    emit_push_r(&e, X64_RSI); emit_push_r(&e, X64_RDI);
+    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8);
+    emit_mov_rr(&e, 8, X64_RDI, R_CPU);
+    emit_mov_rr(&e, 4, X64_RSI, W_T0);
+    emit_mov_rr(&e, 4, X64_RDX, W_T1);
+    emit_cld(&e);
+    emit_mov_ri(&e, 8, X64_RAX, (uint64_t)(uintptr_t)dbt_h_out);
+    emit_call_r(&e, X64_RAX);
+    emit_mov_rr(&e, 4, W_T0, X64_RAX);
+    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8);
+    emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
+    emit_pop_r(&e, X64_RDX); emit_pop_r(&e, X64_RCX); emit_pop_r(&e, X64_RAX);
+    emit_popfq(&e);
+    emit_ret(&e);
 
     dbt->code_used = e.offset;
 }
@@ -542,13 +605,18 @@ static void emit_slow_chunks(x86_dbt *dbt, emit_t *e) {
     s_nslow = 0;
 }
 
+
 /* ----------------------------------------------------------------------
  * Operands
  * ---------------------------------------------------------------------- */
 typedef struct {
     int segp;      /* host register: mem + segment base */
     int off;       /* host register: the 16-bit offset (zero-extended) */
+    int seg;       /* the segment register (S_*), for a seg16 block's limit check */
 } ea_t;
+
+/* The stack's width in the block: ESP whole on a flat or SS32 stack, SP alone otherwise. */
+static int sp_width(void) { return s_flat || s_ss32 ? 4 : 2; }
 
 /* Host pointer for segment s: R_DSP for DS, else built into `into`. */
 static int emit_seg_ptr(emit_t *e, int s, int into) {
@@ -566,6 +634,7 @@ static int is_high8(const x86_operand *o);
  * the guest's address arithmetic). Flag-free. */
 static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
     ea->segp = R_MEM;
+    ea->seg = in->seg;
     int hi = is_high8(&in->ops[0]) || is_high8(&in->ops[1]);
     if (in->base < 0 && in->index < 0) { emit_mov_ri(e, 4, W_T0, (uint32_t)in->disp); ea->off = W_T0; return; }
     if (in->index < 0 && in->disp == 0 && !hi) { ea->off = R_GPR(in->base); return; }
@@ -583,6 +652,7 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
 static void emit_ea(emit_t *e, const x86_insn *in, ea_t *ea) {
     if (s_flat) { emit_ea_flat(e, in, ea); return; }
     ea->segp = emit_seg_ptr(e, in->seg, W_T1);
+    ea->seg = in->seg;
     if (in->base < 0 && in->index < 0) {
         emit_mov_ri(e, 4, W_T0, (uint32_t)in->disp & 0xFFFF);
         ea->off = W_T0;
@@ -604,7 +674,61 @@ static x64_mem_t ea_mem(const ea_t *ea) { return x64_mi(ea->segp, ea->off, 0, 0)
 /* Checks before an access at ea of `size` bytes: a word at FFFFh (the
  * 8086 wraps in-segment, the 286+ raises #GP: the helper does either),
  * and for a store the code bitmap. RFLAGS must be free here. */
+/* ---- Fault sites (seg16) ----
+ * A limit check that fails raises #GP — or #SS through SS on the 386 —
+ * with error code 0 at the instruction, nothing of it committed: every
+ * check precedes its instruction's first state change, and an op that
+ * can fault has every flag live-in (op_may_fault), so the slot is whole. */
+typedef struct { uint32_t patch_off, ip_start, n_done; uint8_t vector; } fault_site_t;
+#define FAULT_MAX 128
+static fault_site_t s_fault[FAULT_MAX];
+static uint32_t s_nfault;
+static uint32_t s_check_busy;    /* scratch registers (1 << reg) holding values across an access check */
+
+static void fault_site(emit_t *e, int cc, uint8_t vector) {
+    if (s_nfault >= FAULT_MAX) { fprintf(stderr, "dbt: fault site table overflow\n"); abort(); }
+    s_fault[s_nfault++] = (fault_site_t){ emit_jcc_rel32(e, cc), s_cur_ip_start, s_cur_n_done, vector };
+}
+static void emit_fault_chunks(emit_t *e) {
+    for (uint32_t k = 0; k < s_nfault; k++) {
+        fault_site_t *f = &s_fault[k];
+        emit_patch_rel32(e, f->patch_off, emit_pos(e));
+        x64_mem_t m = M(R_CPU, OFF_EXC);     emit_mov_mi(e, 4, &m, f->vector);
+        m = M(R_CPU, OFF_EXC_ERR);           emit_mov_mi(e, 4, &m, 0);
+        m = M(R_CPU, OFF_EIP);               emit_mov_mi(e, 4, &m, f->ip_start);
+        if (f->n_done) { m = M(R_CPU, OFF_JIT_CNT); emit_alu_mi(e, 8, X64_ALU_SUB, &m, f->n_done); }
+        emit_jmp_rel32_to(e, s_exit_eip_off);
+    }
+    s_nfault = 0;
+}
+
+/* KEY_SEG16 access check: off + size - 1 <= limit and the segment usable
+ * (a null one has limit 0, which alone would let offset 0 through). Both
+ * from the cpu at run time: the block runs under whatever the code has
+ * loaded since. In 64-bit arithmetic (an SS32 offset near 4G must not
+ * wrap the sum). Clobbers RFLAGS and a scratch that is not the ea's. */
+static void emit_limit_check(emit_t *e, int seg, int segp, int off, int size) {
+    uint8_t vec = (uint8_t)(seg == S_SS && s_regs32 ? X86_EXC_SS : X86_EXC_GP);
+    /* a scratch for the arithmetic: W_T3, else W_T2, else W_T3 parked on
+     * the host stack (POP [mem] holds the stack's pointer and offset in
+     * both while the destination's are in W_T0/W_T1) */
+    uint32_t busy = s_check_busy | (1u << off) | (1u << segp);
+    int t = W_T3, park = 0;
+    if (busy & (1u << W_T3)) t = W_T2;
+    if (busy & (1u << t)) { t = W_T3; park = 1; emit_push_r(e, t); }
+    x64_mem_t m = M(R_CPU, OFF_SEG_LIMIT(seg));
+    emit_mov_rm(e, 4, t, &m);                               /* zero-extended */
+    emit_alu_rr(e, 8, X64_ALU_SUB, t, off);                 /* limit - off, exact as a signed 64-bit value */
+    emit_alu_ri(e, 8, X64_ALU_CMP, t, (uint32_t)(size - 1));
+    if (park) emit_pop_r(e, t);                             /* (flags survive a pop) */
+    fault_site(e, X64_CC_L, vec);
+    m = M(R_CPU, OFF_SEG_USABLE(seg));
+    emit_alu_mi(e, 1, X64_ALU_CMP, &m, 0);
+    fault_site(e, X64_CC_E, vec);
+}
+
 static void emit_check_wrap(emit_t *e, const ea_t *ea, int size) {
+    if (s_seg16) { emit_limit_check(e, ea->seg, ea->segp, ea->off, size); return; }
     if (size < 2) return;
     emit_alu_ri(e, 2, X64_ALU_CMP, ea->off, 0xFFFF);
     slow_site(e, X64_CC_E);
@@ -613,6 +737,98 @@ static void emit_check_smc(emit_t *e, const ea_t *ea, int size) {
     x64_mem_t m = x64_mi(ea->segp, ea->off, 0, (int32_t)X86_BM_DELTA);
     emit_alu_mi(e, size, X64_ALU_CMP, &m, 0);
     slow_site(e, X64_CC_NE);
+}
+
+/* Post-store paths: a plain store lands first and its bitmap bytes are
+ * tested after (one compare of 1, 2 or 4 bytes; a wider store that
+ * starts just before a block still reaches into it). Nonzero goes to an
+ * out-of-line chunk: bytes that are device memory and nothing else, with
+ * the device offering its single-plane fast path (cpu->dev_wplane), are
+ * copied into the write plane and the window bytes refreshed from the
+ * read plane inline; anything else — code, a descriptor, an empty bus,
+ * the device's other modes — runs the store hook through the post-store
+ * thunk. Entered with RFLAGS free (the checks before the store saved the
+ * live bits) and nothing of the instruction left in the scratch. */
+typedef struct {
+    uint32_t patch_off, back_off;
+    uint32_t ip_after, n_done;
+    int segp, off;
+    uint8_t size;
+} post_site_t;
+#define POST_MAX 128
+static post_site_t s_post[POST_MAX];
+static uint32_t s_npost;
+
+static void emit_post_store(emit_t *e, const ea_t *ea, int size) {
+    if (s_npost >= POST_MAX) { fprintf(stderr, "dbt: post-store table overflow\n"); abort(); }
+    x64_mem_t m = x64_mi(ea->segp, ea->off, 0, (int32_t)X86_BM_DELTA);
+    emit_alu_mi(e, size, X64_ALU_CMP, &m, 0);
+    post_site_t *p = &s_post[s_npost++];
+    p->patch_off = emit_jcc_rel32(e, X64_CC_NE);
+    p->back_off = emit_pos(e);
+    p->ip_after = s_cur_ip_after;
+    p->n_done = s_cur_n_done;
+    p->segp = ea->segp; p->off = ea->off;
+    p->size = (uint8_t)size;
+}
+
+/* Leave sites: an inline op whose helper asked to leave the block (R8
+ * nonzero after the port thunk): 2 is a fault at the instruction, else
+ * leave after it; either way charge the instructions done including it. */
+typedef struct { uint32_t patch_off, ip_after, ip_start, n_done; } leave_site_t;
+#define LEAVE_MAX 64
+static leave_site_t s_leave[LEAVE_MAX];
+static uint32_t s_nleave;
+
+static void emit_leave_chunks(emit_t *e) {
+    for (uint32_t k = 0; k < s_nleave; k++) {
+        leave_site_t *l = &s_leave[k];
+        emit_patch_rel32(e, l->patch_off, emit_pos(e));
+        x64_mem_t m = M(R_CPU, OFF_JIT_CNT);
+        emit_alu_mi(e, 8, X64_ALU_SUB, &m, l->n_done);
+        emit_mov_ri(e, 4, W_T1, l->ip_after);
+        emit_mov_ri(e, 4, W_T2, l->ip_start);
+        emit_alu_ri(e, 4, X64_ALU_CMP, W_T0, 2);
+        emit_cmov_rr(e, 4, X64_CC_E, W_T1, W_T2);
+        m = M(R_CPU, OFF_EIP);
+        emit_mov_mr(e, 4, &m, W_T1);
+        emit_jmp_rel32_to(e, s_exit_eip_off);
+    }
+    s_nleave = 0;
+}
+
+static void emit_post_chunks(emit_t *e) {
+    static const uint32_t dev_rep[5] = { 0, 0x80, 0x8080, 0, 0x80808080u };
+    for (uint32_t k = 0; k < s_npost; k++) {
+        post_site_t *p = &s_post[k];
+        int size = p->size;
+        emit_patch_rel32(e, p->patch_off, emit_pos(e));
+        x64_mem_t m = x64_mi(p->segp, p->off, 0, 0);
+        emit_lea(e, 8, W_T3, &m);
+        emit_alu_rr(e, 8, X64_ALU_SUB, W_T3, R_MEM);                    /* W_T3 = phys */
+        m = x64_mi(R_MEM, W_T3, 0, (int32_t)X86_BM_DELTA);
+        emit_alu_mi(e, size, X64_ALU_CMP, &m, dev_rep[size]);
+        uint32_t miss1 = emit_jcc_rel8(e, X64_CC_NE);
+        m = M(R_CPU, OFF_DEV_WPLANE); emit_mov_rm(e, 8, W_T2, &m);
+        emit_test_rr(e, 8, W_T2, W_T2);
+        uint32_t miss2 = emit_jcc_rel8(e, X64_CC_E);
+        m = x64_mi(R_MEM, W_T3, 0, 0);          emit_mov_rm(e, size, W_T0, &m);   /* the bytes just stored */
+        m = x64_mi(W_T2, W_T3, 0, -0xA0000);    emit_mov_mr(e, size, &m, W_T0);   /* into the write plane */
+        m = M(R_CPU, OFF_DEV_RPLANE); emit_mov_rm(e, 8, W_T2, &m);
+        m = x64_mi(W_T2, W_T3, 0, -0xA0000);    emit_mov_rm(e, size, W_T0, &m);   /* the window shows the read plane */
+        m = x64_mi(R_MEM, W_T3, 0, 0);          emit_mov_mr(e, size, &m, W_T0);
+        emit_jmp_rel32_to(e, p->back_off);
+        emit_patch_rel8(e, miss1, emit_pos(e));
+        emit_patch_rel8(e, miss2, emit_pos(e));
+        emit_mov_rr(e, 4, W_T0, W_T3);
+        if (size > 1) emit_alu_ri(e, 4, X64_ALU_OR, W_T0, (uint32_t)size << 28);
+        emit_mov_ri(e, 4, W_T1, s_cur_lin);
+        emit_mov_ri(e, 4, W_T2, p->ip_after);
+        emit_mov_ri(e, 4, W_T3, p->n_done);
+        emit_call_rel32_to(e, s_post_thunk_off);
+        emit_jmp_rel32_to(e, p->back_off);
+    }
+    s_npost = 0;
 }
 
 /* The high bytes: an instruction naming AH..BH cannot also name R8..R15,
@@ -646,24 +862,26 @@ static int host_reg(const x86_operand *o) { return o->size == 1 ? o->reg : R_GPR
 static void emit_push16(emit_t *e, int val) {
     x64_mem_t m = M(X64_R12, -2);
     emit_lea(e, 4, W_T0, &m);
-    emit_movzx_rr(e, 4, W_T0, 2, W_T0);
-    ea_t ea = { emit_seg_ptr(e, S_SS, W_T1), W_T0 };
+    if (!s_ss32) emit_movzx_rr(e, 4, W_T0, 2, W_T0);
+    ea_t ea = { emit_seg_ptr(e, S_SS, W_T1), W_T0, S_SS };
+    s_check_busy |= 1u << val;
     emit_check_wrap(e, &ea, 2);
+    s_check_busy &= ~(1u << val);
     emit_check_smc(e, &ea, 2);
     m = ea_mem(&ea);
     emit_mov_mr(e, 2, &m, val);
-    emit_mov_rr(e, 2, X64_R12, W_T0);
+    emit_mov_rr(e, sp_width(), X64_R12, W_T0);
 }
 /* POP into register dst (16 bits; dst may be W_T2 or W_T3). */
 static void emit_pop16(emit_t *e, int dst) {
-    ea_t ea = { emit_seg_ptr(e, S_SS, W_T1), X64_R12 };
-    if (s_regs32) { emit_movzx_rr(e, 4, W_T0, 2, X64_R12); ea.off = W_T0; }
+    ea_t ea = { emit_seg_ptr(e, S_SS, W_T1), X64_R12, S_SS };
+    if (s_regs32 && !s_ss32) { emit_movzx_rr(e, 4, W_T0, 2, X64_R12); ea.off = W_T0; }
     emit_check_wrap(e, &ea, 2);
     x64_mem_t m = ea_mem(&ea);
     emit_mov_rm(e, 2, dst, &m);
     m = M(X64_R12, 2);
     emit_lea(e, 4, W_T0, &m);
-    emit_mov_rr(e, 2, X64_R12, W_T0);
+    emit_mov_rr(e, sp_width(), X64_R12, W_T0);
 }
 
 static void emit_check_flat(emit_t *e, const ea_t *ea, int size, int store, int reads);
@@ -673,14 +891,14 @@ static void emit_check_flat(emit_t *e, const ea_t *ea, int size, int store, int 
 static void emit_push32(emit_t *e, int val) {
     x64_mem_t m = M(X64_R12, -4);
     emit_lea(e, 4, W_T0, &m);
-    ea_t ea = { R_MEM, W_T0 };
+    ea_t ea = { R_MEM, W_T0, S_SS };
     emit_check_flat(e, &ea, 4, 1, 0);
     m = ea_mem(&ea);
     emit_mov_mr(e, 4, &m, val);
     emit_mov_rr(e, 4, X64_R12, W_T0);
 }
 static void emit_pop32(emit_t *e, int dst) {
-    ea_t ea = { R_MEM, X64_R12 };
+    ea_t ea = { R_MEM, X64_R12, S_SS };
     emit_check_flat(e, &ea, 4, 0, 1);
     x64_mem_t m = ea_mem(&ea);
     emit_mov_rm(e, 4, dst, &m);
@@ -766,7 +984,7 @@ static int inline_ok(const dbt_block *b, const x86_insn *in) {
     case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
     case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
     case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD: case OP_CLI: case OP_STI:
-    case OP_SETCC:
+    case OP_SETCC: case OP_OUT:
     case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE: case OP_RET:
         return 1;
     case OP_PUSH:   /* (the 8086's FE /6, a byte push, is the interpreter's) */
@@ -803,6 +1021,29 @@ static int inline_ok(const dbt_block *b, const x86_insn *in) {
     }
 }
 
+/* Segmented 16-bit protected mode: the real-mode list, less what the
+ * interpreter keeps in protected mode (far transfers, interrupt frames,
+ * segment loads, POPF/CLI/STI: the front end's) and what this backend
+ * has no limit-checked form of yet: the string ops, PUSHF, 32-bit
+ * operands. */
+static int inline_ok_seg16(const dbt_block *b, const x86_insn *in) {
+    switch (in->op) {
+    case OP_CALLF: case OP_JMPF: case OP_RETF: case OP_INT: case OP_INT3: case OP_IRET:
+    case OP_LDS: case OP_LES: case OP_PUSHF: case OP_POPF: case OP_CLI: case OP_STI:
+    case OP_MOVS: case OP_STOS: case OP_CMPS: case OP_SCAS: case OP_LODS:
+        return 0;
+    case OP_MOVSEG:
+        return in->ops[0].kind != OPK_SREG;
+    case OP_POP:
+        if (in->ops[0].kind == OPK_SREG) return 0;
+        break;
+    default:
+        break;
+    }
+    if (in->ea_valid && in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return 0;
+    return inline_ok(b, in);
+}
+
 /* Flat protected mode: 32-bit code and addressing through DS/ES/SS. */
 static int inline_ok_flat(const x86_insn *in) {
     if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS))) return 0;
@@ -812,7 +1053,7 @@ static int inline_ok_flat(const x86_insn *in) {
     case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
     case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
     case OP_MOVZX: case OP_MOVSX: case OP_SETCC: case OP_LAHF: case OP_SAHF:
-    case OP_MUL: case OP_IMUL: case OP_IMUL3:
+    case OP_MUL: case OP_IMUL: case OP_IMUL3: case OP_OUT:
         return 1;
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR: case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR:
         if (in->ops[1].kind == OPK_IMM) return (in->ops[1].imm & 0xFF) < (uint32_t)in->ops[0].size * 8;
@@ -846,8 +1087,9 @@ static int inline_ok_flat(const x86_insn *in) {
 
 /* The front end asks: real-mode-shaped blocks and flat ones, unpaged. */
 int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
-    if (b->seg16 || b->v86 || b->paged || getenv("X86_X64_HELPERS")) return 0;
+    if (b->v86 || b->paged || getenv("X86_X64_HELPERS")) return 0;
     if (b->flat) return inline_ok_flat(in);
+    if (b->seg16) return inline_ok_seg16(b, in);
     return inline_ok(b, in);
 }
 
@@ -963,7 +1205,7 @@ static void emit_op_alu(emit_t *e, const x86_insn *in, const ea_t *ea, uint32_t 
 }
 
 static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_in, uint32_t live_out) {
-    ea_t ea = { 0, 0 };
+    ea_t ea = { 0, 0, 0 };
     x64_mem_t m;
     int size = in->ops[0].size;
     const x86_operand *d = &in->ops[0], *s = &in->ops[1];
@@ -1027,12 +1269,14 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
 
     case OP_MOV:
         if (d->kind == OPK_MEM) {
-            emit_checks_rw(e, &ea, size, 1, 0, live_in);
+            /* the store lands, then its bitmap bytes are looked at (emit_post_store) */
+            emit_checks_rw(e, &ea, size, 0, 0, live_in);
             m = ea_mem(&ea);
             if (s->kind == OPK_IMM && s_dyn_imm_lin) emit_mov_mr(e, size, &m, emit_dyn_imm(e, s));
             else if (s->kind == OPK_IMM) emit_mov_mi(e, size, &m, s->imm);
             else if (is_high8(s)) { emit_high8_open(e, s->reg); emit_mov_mr(e, size, &m, s->reg & 3); emit_high8_close(e, s->reg); }
             else emit_mov_mr(e, size, &m, host_reg(s));
+            emit_post_store(e, &ea, size);
             slow_back(e, s_rf);
             return;
         }
@@ -1048,6 +1292,24 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         else if (s->kind == OPK_IMM) emit_mov_ri(e, size, host_reg(d), s->imm);
         else emit_mov_rr(e, size, host_reg(d), host_reg(s));
         return;
+
+    case OP_OUT: {
+        /* Through the port thunk; RFLAGS is free (every flag is live-in
+         * at an OUT, so fl_save put them all in the slot). The port can
+         * halt the machine or flip A20 (leave after the instruction) or
+         * refuse it (#GP at it, cpu->exc set): both out of line. */
+        int psize = s->size;
+        fl_save(e, live_in);
+        if (d->kind == OPK_IMM) emit_mov_ri(e, 4, W_T0, (d->imm & 0xFF) | ((uint32_t)psize << 16));
+        else { emit_movzx_rr(e, 4, W_T0, 2, R_GPR(R_DX)); emit_alu_ri(e, 4, X64_ALU_OR, W_T0, (uint32_t)psize << 16); }
+        if (psize == 4) emit_mov_rr(e, 4, W_T1, R_GPR(R_AX));
+        else emit_movzx_rr(e, 4, W_T1, psize, R_GPR(R_AX));
+        emit_call_rel32_to(e, s_port_thunk_off);
+        emit_test_rr(e, 4, W_T0, W_T0);
+        if (s_nleave >= LEAVE_MAX) { fprintf(stderr, "dbt: leave-site table overflow\n"); abort(); }
+        s_leave[s_nleave++] = (leave_site_t){ emit_jcc_rel32(e, X64_CC_NE), s_cur_ip_after, s_cur_ip_start, s_cur_n_done };
+        return;
+    }
 
     case OP_MOVSEG:
         if (d->kind == OPK_SREG) {                               /* MOV DS/ES, r/m16 */
@@ -1116,7 +1378,9 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         if (d->kind == OPK_MEM) {
             emit_setcc_r(e, hc, W_T2);
             emit_ea(e, in, &ea);                                 /* after the condition: its slot path uses W_T2/W_T3, this W_T0/W_T1 */
+            s_check_busy |= 1u << W_T2;
             emit_checks(e, &ea, 1, 1, live_out);
+            s_check_busy &= ~(1u << W_T2);
             m = ea_mem(&ea);
             emit_mov_mr(e, 1, &m, W_T2);
             slow_back(e, s_rf);
@@ -1165,10 +1429,10 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
              * before every check has passed (a fault leaves SP intact) */
             int w = s_flat ? 4 : 2;
             emit_checks_rw(e, &ea, w, 1, 0, live_in);
-            ea_t sp = { s_flat ? R_MEM : emit_seg_ptr(e, S_SS, W_T3), X64_R12 };
+            ea_t sp = { s_flat ? R_MEM : emit_seg_ptr(e, S_SS, W_T3), X64_R12, S_SS };
             if (s_flat) emit_check_flat(e, &sp, 4, 0, 1);
             else {
-                if (s_regs32) { emit_movzx_rr(e, 4, W_T2, 2, X64_R12); sp.off = W_T2; }
+                if (s_regs32 && !s_ss32) { emit_movzx_rr(e, 4, W_T2, 2, X64_R12); sp.off = W_T2; }
                 emit_check_wrap(e, &sp, 2);
             }
             m = ea_mem(&sp);
@@ -1176,7 +1440,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
             m = ea_mem(&ea);
             emit_mov_mr(e, w, &m, W_T2);
             m = M(X64_R12, w); emit_lea(e, 4, W_T2, &m);
-            emit_mov_rr(e, w, X64_R12, W_T2);
+            emit_mov_rr(e, sp_width(), X64_R12, W_T2);
             slow_back(e, 0);
             return;
         }
@@ -1302,9 +1566,9 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         m = x64_mi(X64_RBX, W_T2, 0, 0); emit_lea(e, 4, W_T2, &m);
         if (!s_flat) emit_movzx_rr(e, 4, W_T2, 2, W_T2);
         int segp = s_flat ? R_MEM : emit_seg_ptr(e, in->seg, W_T1);
-        if (s_flat) { ea_t xe = { R_MEM, W_T2 }; emit_checks(e, &xe, 1, 0, live_in); }
+        if (s_flat || s_seg16) { ea_t xe = { segp, W_T2, in->seg }; emit_checks(e, &xe, 1, 0, live_in); }
         m = x64_mi(segp, W_T2, 0, 0); emit_mov_rm(e, 1, X64_AL, &m);
-        if (s_flat) slow_back(e, s_rf);
+        if (s_flat || s_seg16) slow_back(e, s_rf);
         return;
     }
 
@@ -1363,7 +1627,7 @@ static void emit_frame_checks(emit_t *e, int nslots) {
     emit_seg_ptr(e, S_SS, W_T3);
     for (int k = 1; k <= nslots; k++) {
         emit_frame_slot(e, 2 * k);
-        ea_t ea = { W_T3, W_T2 };
+        ea_t ea = { W_T3, W_T2, S_SS };
         emit_check_wrap(e, &ea, 2);
         emit_check_smc(e, &ea, 2);
     }
@@ -1419,10 +1683,10 @@ static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t
         emit_seg_ptr(e, S_SS, W_T3);
         int sp = X64_R12;
         if (s_regs32) { emit_movzx_rr(e, 4, W_T2, 2, X64_R12); sp = W_T2; }
-        ea_t lo = { W_T3, sp };
+        ea_t lo = { W_T3, sp, S_SS };
         emit_check_wrap(e, &lo, 2);
         m = M(sp, 2); emit_lea(e, 4, W_T1, &m); emit_movzx_rr(e, 4, W_T1, 2, W_T1);
-        ea_t hi = { W_T3, W_T1 };
+        ea_t hi = { W_T3, W_T1, S_SS };
         emit_check_wrap(e, &hi, 2);
         m = ea_mem(&hi); emit_movzx_rm(e, 4, W_T0, 2, &m);                     /* selector */
         m = ea_mem(&lo); emit_movzx_rm(e, 4, W_T1, 2, &m);                     /* ip */
@@ -1566,14 +1830,14 @@ static void emit_string1(emit_t *e, const x86_insn *in, uint32_t live_in) {
     fl_save(e, live_in);
     emit_str_segs(e, in, rd_si);
     if (s_flat) {
-        if (rd_si) { ea_t ea = { R_MEM, X64_RSI }; emit_check_flat(e, &ea, size, 0, 1); }
-        if (use_di) { ea_t ea = { R_MEM, X64_RDI }; emit_check_flat(e, &ea, size, wr_di, !wr_di || in->op == OP_MOVS ? 0 : 1); }
+        if (rd_si) { ea_t ea = { R_MEM, X64_RSI, in->seg }; emit_check_flat(e, &ea, size, 0, 1); }
+        if (use_di) { ea_t ea = { R_MEM, X64_RDI, S_ES }; emit_check_flat(e, &ea, size, wr_di, !wr_di || in->op == OP_MOVS ? 0 : 1); }
     } else {
         emit_str_save_hi(e);
         int si16 = X64_RSI, di16 = X64_RDI;
         if (s_regs32) { emit_movzx_rr(e, 4, W_T0, 2, X64_RSI); emit_movzx_rr(e, 4, W_T3, 2, X64_RDI); si16 = W_T0; di16 = W_T3; }
-        if (rd_si) { ea_t ea = { W_T1, si16 }; emit_check_wrap(e, &ea, size); }
-        if (use_di) { ea_t ea = { W_T2, di16 }; emit_check_wrap(e, &ea, size); if (wr_di) emit_check_smc(e, &ea, size); }
+        if (rd_si) { ea_t ea = { W_T1, si16, in->seg }; emit_check_wrap(e, &ea, size); }
+        if (use_di) { ea_t ea = { W_T2, di16, S_ES }; emit_check_wrap(e, &ea, size); if (wr_di) emit_check_smc(e, &ea, size); }
         emit_str_trunc(e, rd_si, use_di);
     }
     /* negated bases for the flag-free way back (CMPS/SCAS leave flags) */
@@ -1984,18 +2248,20 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
             if (w == 4) emit_mov_rr(e, 4, W_T3, host_reg(&in->ops[0])); else emit_movzx_rr(e, 4, W_T3, 2, host_reg(&in->ops[0]));
         }
         emit_mov_ri(e, 4, W_T2, w == 4 ? ip_after : (uint16_t)ip_after);
+        if (dyn) s_check_busy |= 1u << W_T3;                     /* the target rides across the push's checks */
         emit_push_stk(e, W_T2);
+        s_check_busy &= ~(1u << W_T3);
         if (dyn) { emit_dynamic_key(e, W_T3); emit_dynamic_tail(dbt, e); }
         else emit_edge(dbt, e, target_key(ip_after + in->ops[0].imm));
         break;
     }
     default: {   /* RET */
-        int w = s_flat ? 4 : 2;
+        (void)0;
         emit_pop_stk(e, W_T3);
         if (in->ops[0].kind == OPK_IMM) {
             m = M(X64_R12, (int32_t)(in->ops[0].imm & 0xFFFF));
             emit_lea(e, 4, W_T2, &m);
-            emit_mov_rr(e, w, X64_R12, W_T2);
+            emit_mov_rr(e, sp_width(), X64_R12, W_T2);
         }
         emit_dynamic_key(e, W_T3);
         emit_dynamic_tail(dbt, e);
@@ -2024,14 +2290,17 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
     s_mode_bits = b->mode_bits;
     s_regs32 = b->regs32;
     s_flat = b->flat;
+    s_seg16 = b->seg16;
+    s_ss32 = b->ss32;
     s_model = b->model;
     s_cpu = cpu;
     s_blk = b;
     s_rf = 0;
-    s_nslow = 0;
+    s_nslow = 0; s_npost = 0; s_nleave = 0; s_nfault = 0;
     /* what this backend emits inline so far: real-mode-shaped blocks
-     * without paging; everything else is helpers, and transfers end them */
-    int inl = !b->all_helper && !b->seg16 && !b->v86 && !b->paged && !getenv("X86_X64_HELPERS");
+     * (real mode, segmented 16-bit PM) and flat ones, without paging;
+     * everything else is helpers, and transfers end them */
+    int inl = !b->all_helper && !b->v86 && !b->paged && !getenv("X86_X64_HELPERS");
 
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;
@@ -2105,8 +2374,12 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
         emit_edge(dbt, &e, target_key(b->ip_afters[sides[k].op] + in->ops[0].imm));
     }
 
-    /* Slow paths of the checked instructions. */
+    /* Slow paths of the checked instructions, and the marked-byte paths
+     * of the plain stores. */
     emit_slow_chunks(dbt, &e);
+    emit_post_chunks(&e);
+    emit_leave_chunks(&e);
+    emit_fault_chunks(&e);
 
     /* Budget-exhausted exit: nothing executed, next = this block. */
     emit_patch_rel32(&e, budget_patch, emit_pos(&e));

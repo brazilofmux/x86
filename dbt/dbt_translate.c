@@ -196,6 +196,8 @@ static int op_may_fault(const dbt_block *b, const x86_insn *in) {
         return 1;                     /* the frame carries FLAGS: all of them must be materialized */
     case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
         return in->ops[0].size >= 2 || b->seg16;    /* the slow path's helper can fault, frame and all */
+    case OP_XLAT:
+        return b->seg16;                            /* an implicit byte read: only a limit can fault it */
     default: break;
     }
     for (int i = 0; i < 2; i++)

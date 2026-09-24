@@ -70,6 +70,7 @@ void dbt_cache_invalidate_all(x86_dbt *dbt) {
     dbt->link_free = LINK_NONE;
     dbt_clear_code_bits(dbt->cpu);
     dbt->max_block_bytes = 0;
+    if (dbt->insn_used > dbt->insn_high) dbt->insn_high = dbt->insn_used;
     dbt->insn_used = 0;
 }
 
