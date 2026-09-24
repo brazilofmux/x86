@@ -251,6 +251,9 @@ void dbt_golden_close(x86_dbt *dbt, FILE *out) {
 /* The x87 (translated code steps it in the interpreter, but a divergence
  * anywhere else shows up here too), field by field: no padding compared. */
 static int fpu_equal(const x86_fpu *a, const x86_fpu *b) {
+    if (a->c1_kind != b->c1_kind || (a->c1_kind && (a->c1_a != b->c1_a || a->c1_b != b->c1_b || a->c1_r != b->c1_r
+        || a->c1_ase != b->c1_ase || a->c1_bse != b->c1_bse || a->c1_op != b->c1_op || a->c1_cw != b->c1_cw)))
+        return 0;
     for (int i = 0; i < 8; i++) if (a->sig[i] != b->sig[i] || a->sexp[i] != b->sexp[i]) return 0;
     return a->cw == b->cw && a->sw == b->sw && a->empty == b->empty && a->fop == b->fop
         && a->fcs == b->fcs && a->fds == b->fds && a->fip == b->fip && a->fdp == b->fdp;

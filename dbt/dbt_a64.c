@@ -77,6 +77,8 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 #define OFF_JIT_CUR_LIN offsetof(x86_cpu, jit_cur_lin)
 #define OFF_JIT_CUR_HIT offsetof(x86_cpu, jit_cur_hit)
 #define OFF_EXC         offsetof(x86_cpu, exc)
+#define OFF_CR0         offsetof(x86_cpu, cr0)
+#define OFF_FPU_SW      (offsetof(x86_cpu, fpu) + offsetof(x86_fpu, sw))
 #define OFF_INT_INHIBIT offsetof(x86_cpu, int_inhibit)
 #define OFF_DEV_WPLANE  offsetof(x86_cpu, dev_wplane)
 #define OFF_DEV_RPLANE  offsetof(x86_cpu, dev_rplane)
@@ -1902,6 +1904,28 @@ static void emit_out(emit_t *e, const x86_insn *in) {
     emit_patch_cond19(e, go_on, emit_pos(e));
 }
 
+/* WAIT: nothing to do unless CR0 has both TS and MP (#NM) or the x87
+ * has an unmasked exception pending (ES: #MF, or FERR#) — then the
+ * interpreter's, through the exec thunk. Without a coprocessor WAIT
+ * does nothing at all. */
+static void emit_wait(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
+    if (!dbt->cpu->has_fpu) return;
+    _Static_assert(OFF_CR0 % 4 == 0 && OFF_CR0 <= 16380, "cr0 within LDR's reach");
+    emit_add_x64_big(e, A64_W1, R_CPU, (uint32_t)OFF_FPU_SW);
+    emit_ldrh_imm(e, A64_W0, A64_W1, 0);
+    emit_ldr_w32_imm(e, A64_W1, R_CPU, (uint32_t)OFF_CR0);
+    uint32_t no_ts = emit_pos(e);
+    emit_tbz_x64(e, A64_W1, 3, 0);                     /* TS clear */
+    uint32_t mp = emit_pos(e);
+    emit_tbnz_x64(e, A64_W1, 1, 0);                    /* TS and MP: slow */
+    emit_patch_tb14(e, no_ts, emit_pos(e));
+    uint32_t quiet = emit_pos(e);
+    emit_tbz_x64(e, A64_W0, 7, 0);                     /* no ES: done */
+    emit_patch_tb14(e, mp, emit_pos(e));
+    emit_helper_op(dbt, e, in);
+    emit_patch_tb14(e, quiet, emit_pos(e));
+}
+
 static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32_t fmask) {
     nzcv_state nz_in = s_nzcv;          /* what the previous op left, for SETcc */
     s_nzcv.valid = 0;                   /* only the op just emitted can leave NZCV usable */
@@ -2016,6 +2040,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     case OP_PUSHA: emit_pusha_flat(e); break;
     case OP_POPA:  emit_popa_flat(e); break;
     case OP_OUT:   emit_out(e, in); break;
+    case OP_WAIT:  emit_wait(dbt, e, in); break;
     case OP_MOV: {
         a64_reg_t v = emit_read_operand(e, in, 1, &ea, W_VAL);
         emit_write_operand(e, in, 0, &ea, v);
@@ -2552,7 +2577,7 @@ static int a64_real_inline(const x86_insn *in) {
     case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
     case OP_RET: case OP_CALLF: case OP_JMPF: case OP_RETF:
     case OP_INT: case OP_INT3:
-    case OP_OUT:
+    case OP_OUT: case OP_WAIT:
     case OP_MOVZX: case OP_MOVSX: case OP_SETCC:
     case OP_PUSH: case OP_POP: case OP_LES: case OP_LDS: case OP_MOVSEG:
     case OP_DIV: case OP_IDIV: case OP_MUL: case OP_PUSHF: case OP_POPF:
@@ -2582,7 +2607,7 @@ static int a64_flat_inline(const x86_insn *in) {
     case OP_NOP: case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
     case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
     case OP_ADC: case OP_SBB:
-    case OP_SETCC: case OP_OUT:
+    case OP_SETCC: case OP_OUT: case OP_WAIT:
         return 1;
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
         if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4;   /* by CL */

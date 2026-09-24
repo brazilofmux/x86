@@ -103,8 +103,8 @@ static inline void set_st(x86_cpu *c, int i, fx v) {
 static inline void pop(x86_cpu *c) { F.empty |= (uint8_t)(1u << phys(c, 0)); set_top(c, top(c) + 1); }
 static inline void push(x86_cpu *c, fx v) { set_top(c, top(c) - 1); set_st(c, 0, v); }
 
-static inline void set_cc(x86_cpu *c, uint16_t cc) { F.sw = (uint16_t)((F.sw & ~SW_CC) | cc); }
-static inline void set_c1(x86_cpu *c, int on) { F.sw = (uint16_t)(on ? F.sw | SW_C1 : F.sw & ~SW_C1); }
+static inline void set_cc(x86_cpu *c, uint16_t cc) { F.c1_kind = 0; F.sw = (uint16_t)((F.sw & ~SW_CC) | cc); }
+static inline void set_c1(x86_cpu *c, int on) { F.c1_kind = 0; F.sw = (uint16_t)(on ? F.sw | SW_C1 : F.sw & ~SW_C1); }
 
 /* Sticky flags, and ES/B while any of them is unmasked. */
 static void flag(x86_cpu *c, uint16_t ex) {
@@ -224,14 +224,7 @@ static int arith(x86_cpu *c, int op, fx a, fx b, fx *out) {
     /* x87 underflow unmasked is any tiny result, exact or not */
     if (!(F.cw & SW_UE) && !(ex & SW_UE) && (r.signExp & 0x7FFF) == 0 && r.signif && !(ex & (SW_IE | SW_ZE)))
         ex |= SW_UE;
-    int up = 0;
-    if ((ex & SW_PE) && !(ex & (SW_IE | SW_ZE))) {
-        uint8_t save = softfloat_exceptionFlags;
-        softfloat_roundingMode = softfloat_round_minMag;
-        fx t = sf_op(op, a, b);
-        up = !same(t, r);
-        softfloat_exceptionFlags = save;
-    }
+    int up = 0, owe = (ex & SW_PE) && !(ex & (SW_IE | SW_ZE));
     set_c1(c, 0);
     if (unmasked(c, ex & (SW_IE | SW_ZE))) { flag(c, ex & (SW_IE | SW_ZE)); return 0; }
     int wrap_oe = (ex & SW_OE) && unmasked(c, SW_OE), wrap_ue = !wrap_oe && (ex & SW_UE) && unmasked(c, SW_UE);
@@ -245,11 +238,34 @@ static int arith(x86_cpu *c, int op, fx a, fx b, fx *out) {
         up = 0;
         if (pe) { softfloat_roundingMode = softfloat_round_minMag; up = !same(sf_op(op, sa, sb), r); }
         ex = (uint16_t)((ex & ~(SW_OE | SW_UE | SW_PE)) | (wrap_oe ? SW_OE : SW_UE) | pe);
+        owe = 0;
     }
     set_c1(c, up);
+    if (owe) {                                         /* C1 owed: see x86_fpu.h */
+        F.c1_kind = 1; F.c1_op = (uint8_t)op; F.c1_cw = F.cw;
+        F.c1_ase = a.signExp; F.c1_a = a.signif; F.c1_bse = b.signExp; F.c1_b = b.signif;
+        F.c1_rse = r.signExp; F.c1_r = r.signif;
+    }
     flag(c, ex);
     *out = r;
     return 1;
+}
+
+/* An owed C1: round again toward zero; up if that is not what was kept. */
+void x86_fpu_sync(x86_cpu *c) {
+    if (!F.c1_kind) return;
+    uint8_t rm = softfloat_roundingMode, prec = extF80_roundingPrecision, fl = softfloat_exceptionFlags;
+    softfloat_roundingMode = softfloat_round_minMag;
+    int up;
+    if (F.c1_kind == 1) {
+        extF80_roundingPrecision = pc_bits[(F.c1_cw >> 8) & 3];
+        up = !same(sf_op(F.c1_op, mk(F.c1_ase, F.c1_a), mk(F.c1_bse, F.c1_b)), mk(F.c1_rse, F.c1_r));
+    } else {
+        fx v = mk(F.c1_ase, F.c1_a);
+        up = (F.c1_op ? extF80_to_f64(v).v : extF80_to_f32(v).v) != F.c1_r;
+    }
+    softfloat_roundingMode = rm; extF80_roundingPrecision = prec; softfloat_exceptionFlags = fl;
+    set_c1(c, up);
 }
 
 /* ---- comparisons -------------------------------------------------------- */
@@ -366,15 +382,13 @@ static int to_real(x86_cpu *c, fx v, int dbl, uint64_t *bits) {
         uint64_t e = dbl ? (r >> 52) & 0x7FF : (r >> 23) & 0xFF;
         if (e == 0) ex |= SW_UE;
     }
-    int up = 0;
-    if ((ex & SW_PE) && !(ex & SW_IE)) {
-        softfloat_roundingMode = softfloat_round_minMag;
-        uint64_t t = dbl ? extF80_to_f64(v).v : extF80_to_f32(v).v;
-        up = t != r;
-    }
     if (unmasked(c, ex & (SW_IE | SW_OE | SW_UE))) { flag(c, ex & (SW_IE | SW_OE | SW_UE)); return 0; }
     flag(c, ex);
-    set_c1(c, up);
+    set_c1(c, 0);
+    if ((ex & SW_PE) && !(ex & SW_IE)) {               /* C1 owed: see x86_fpu.h */
+        F.c1_kind = 2; F.c1_op = (uint8_t)dbl; F.c1_cw = F.cw;
+        F.c1_ase = v.signExp; F.c1_a = v.signif; F.c1_r = r;
+    }
     *bits = r;
     return 1;
 }
@@ -1020,7 +1034,7 @@ static uint16_t tag_word(const x86_cpu *c) {
 }
 
 static void finit(x86_cpu *c) {
-    F.cw = 0x037F; F.sw = 0; F.empty = 0xFF;
+    F.cw = 0x037F; F.sw = 0; F.empty = 0xFF; F.c1_kind = 0;
     F.fop = 0; F.fip = F.fdp = 0; F.fcs = F.fds = 0;
     F.ferr = 0;
 }
@@ -1042,7 +1056,8 @@ static uint32_t get32(const uint8_t *b) { return (uint32_t)b[0] | ((uint32_t)b[1
 /* The environment image: 14 bytes (16-bit) or 28 (32-bit). The real-mode
  * layouts carry 20-bit (32-bit: 32-bit) linear pointers, CS/DS x 16 +
  * offset; reserved halves of the 32-bit layouts read FFFF. */
-static int env_image(const x86_cpu *c, int os32, uint8_t *b) {
+static int env_image(x86_cpu *c, int os32, uint8_t *b) {
+    x86_fpu_sync(c);
     uint16_t tw = tag_word(c);
     if (!real_fmt(c)) {
         if (os32) {
@@ -1077,6 +1092,7 @@ static int env_image(const x86_cpu *c, int os32, uint8_t *b) {
 
 static void env_load(x86_cpu *c, int os32, const uint8_t *b) {
     uint16_t tw;
+    F.c1_kind = 0;
     if (os32) { F.cw = get16(b + 0); F.sw = get16(b + 4); tw = get16(b + 8); }
     else { F.cw = get16(b + 0); F.sw = get16(b + 2); tw = get16(b + 4); }
     if (!real_fmt(c)) {
@@ -1215,7 +1231,7 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
             }
         }
         if (esc == 5 && (reg == 4 || reg == 6 || reg == 7)) {
-            if (reg == 7) { wr_n(c, in, ea, 2, 2, F.sw); return; }   /* FNSTSW m16 */
+            if (reg == 7) { x86_fpu_sync(c); wr_n(c, in, ea, 2, 2, F.sw); return; }   /* FNSTSW m16 */
             uint8_t b[28 + 80];
             if (reg == 6) {                                    /* FNSAVE */
                 int n = env_image(c, os32, b);
@@ -1248,6 +1264,7 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
         }
         if (esc == 7 && reg == 4) {                            /* FNSTSW AX */
             if (rm) ud(c);
+            x86_fpu_sync(c);
             x86_set_r16(c, R_AX, F.sw);
             return;
         }

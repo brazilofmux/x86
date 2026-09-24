@@ -75,6 +75,13 @@ static int classify_sem(const x86_insn *in) {
         return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES ? C_INLINE : C_HELPER;   /* SS: interrupt shadow */
     case OP_DIV: case OP_IDIV:
         return s_cls_model >= X86_MODEL_286 ? C_INLINE : C_HELPER;  /* 8086 microcode quirks; 186 #DE is a trap */
+    case OP_ESC:
+        /* the x87 (or, without one, the ESC's bus cycle), in the block:
+         * the interpreter's execute on the decoded instruction, #NM, #MF,
+         * #PF and #AC through the thunk's fault exit */
+        return C_HELPER;
+    case OP_WAIT:
+        return C_INLINE;           /* a backend may test for nothing pending inline, else the helper */
     case OP_AAM:
         return in->ops[0].imm ? C_HELPER : C_REFUSE;
     case OP_MOVSEG:
@@ -260,6 +267,7 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
         if (!in->rep) *wr = ARITH;   /* repeated: none when CX = 0, so a pass-through */
         break;
     case OP_PUSHF: *rd = ARITH; break;
+    case OP_WAIT:  *rd = ARITH; break;          /* its slow path may fault (#NM, #MF): the frame holds the flags */
     case OP_POPF:  *wr = ARITH; break;          /* #DE / #GP: an unplanned exit whose frame holds the flags */
     case OP_SETCC: {
         static const uint16_t need[8] = { X86_OF, X86_CF, X86_ZF, X86_CF | X86_ZF, X86_SF, X86_PF, X86_SF | X86_OF, X86_SF | X86_OF | X86_ZF };

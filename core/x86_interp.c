@@ -109,7 +109,8 @@ static void ac_fault(x86_cpu *c, uint32_t lin, int size, int write) {
     x86_fault(c, X86_EXC_AC, 0);
 }
 static inline void ac_check(x86_cpu *c, uint32_t base, uint32_t off, int size, int write) {
-    if (__builtin_expect(((base + off) & (uint32_t)(size - 1)) != 0, 0)) ac_fault(c, base + off, size, write);
+    if (__builtin_expect(((base + off) & (uint32_t)(size - 1)) != 0, 0) && (c->cr0 & X86_CR0_AM))
+        ac_fault(c, base + off, size, write);
 }
 static inline uint32_t mrd(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, int size) {
     limit_check(c, seg, off, size);
@@ -124,16 +125,37 @@ static inline void mwr(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, in
 
 /* The FPU's operands (core/x86_fpu.c): N bytes as one access — limit
  * and alignment checked for the whole — before any byte moves. */
+/* The common case in one piece: no paging, no offset wrap, no A20 fold,
+ * all of it RAM outside the VGA read window — and, for a store, no byte
+ * the code bitmap watches (translated code, a device): then it is a copy.
+ * Anything else takes the byte loop. Returns the physical address or ~0. */
+static inline uint32_t fpu_flat(const x86_cpu *c, uint32_t base, uint32_t off, int n, uint32_t m) {
+    if (c->cr0 & X86_CR0_PG) return ~0u;
+    uint32_t last = off + (uint32_t)n - 1;
+    if ((last & m) != last || last < off) return ~0u;
+    uint32_t lin = base + off, p = lin & c->a20_mask;
+    if (((lin + (uint32_t)n - 1) & c->a20_mask) != p + (uint32_t)n - 1 || p + (uint32_t)n > c->mem_size) return ~0u;
+    if (c->device_read && p + (uint32_t)n > 0xA0000u && p < 0xB0000u) return ~0u;
+    return p;
+}
 void x86_fpu_mrd(x86_cpu *c, const x86_insn *in, uint32_t off, int n, int align, uint8_t *buf) {
     uint32_t base = c->seg[in->seg].base, m = wrapmask(c, admask(in));
     limit_check(c, in->seg, off, n);
     ac_check(c, base, off, align, 0);
+    uint32_t p = fpu_flat(c, base, off, n, m);
+    if (p != ~0u) { memcpy(buf, c->mem + p, (size_t)n); return; }
     for (int i = 0; i < n; i++) buf[i] = x86_phys_rd8(c, base + ((off + (uint32_t)i) & m));
 }
 void x86_fpu_mwr(x86_cpu *c, const x86_insn *in, uint32_t off, int n, int align, const uint8_t *buf) {
     uint32_t base = c->seg[in->seg].base, m = wrapmask(c, admask(in));
     limit_check(c, in->seg, off, n);
     ac_check(c, base, off, align, 1);
+    uint32_t p = fpu_flat(c, base, off, n, m);
+    if (p != ~0u) {
+        int watched = 0;
+        for (int i = 0; i < n; i++) watched |= c->code_bitmap[p + (uint32_t)i];
+        if (!watched) { memcpy(c->mem + p, buf, (size_t)n); return; }
+    }
     for (int i = 0; i < n; i++) x86_phys_wr8(c, base + ((off + (uint32_t)i) & m), buf[i]);
 }
 
