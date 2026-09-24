@@ -900,10 +900,13 @@ static uint32_t bt_common(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t 
     int size = in->ops[0].size;
     uint32_t idx = rd_op(c, in, 1, ea);
     if (in->ops[0].kind == OPK_MEM && in->ops[1].kind == OPK_REG) {
-        int32_t s = sext(idx, size);
-        int32_t elem = (s >= 0) ? s / (size * 8) : -((-s + size * 8 - 1) / (size * 8));
+        /* the signed bit offset, floor-divided by the width: an arithmetic
+         * shift in 64 bits (INT_MIN has no 32-bit negation) */
+        int64_t s = (int32_t)sext(idx, size);
+        int shift = size == 4 ? 5 : size == 2 ? 4 : 3;
+        int64_t elem = s >> shift;
         *addr = (ea + (uint32_t)(elem * size)) & admask(in);
-        *bitpos = (uint32_t)(s - elem * size * 8);
+        *bitpos = (uint32_t)(s & (size * 8 - 1));
     } else {
         *addr = ea;
         *bitpos = idx & (size * 8 - 1);
