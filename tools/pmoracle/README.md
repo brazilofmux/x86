@@ -72,6 +72,11 @@ does not, an rfb display in place of the missing nogui, and no
 `-debugger` flag). `pgrun.py --bochs` compares a transcript image against
 Bochs instead of QEMU, and `--bochs-only` prints Bochs's transcript:
 `c486test.bochs` is `python3 pgrun.py c486test.asm --bochs-only`.
+For the x87, keep the recorded `fputest.bochs` (Homebrew's Bochs): Ubuntu's
+2.7 differs from it on 35 of 6,648 lines, all transcendental, and on the
+ten outside the adjudicated list (FPATAN with a result of pi/2 or 3pi/4:
+the wrong quadrant, or UE on an exact-looking pi/2) the newer Bochs and
+ours agree.
 
 ## What it covers so far
 

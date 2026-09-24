@@ -1137,8 +1137,9 @@ static int fbstp(x86_cpu *c, const x86_insn *in, uint32_t ea) {
         if (ex) up = !same(extF80_roundToInt(ca, softfloat_round_minMag, false), r);
         v = extF80_to_i64(r, softfloat_round_minMag, false);
         if (softfloat_exceptionFlags & softfloat_flag_invalid) bad = 1;
-        if (v < 0) v = -v;
-        if (v > INT64_C(999999999999999999)) bad = 1;
+        uint64_t mag = v < 0 ? 0 - (uint64_t)v : (uint64_t)v;   /* (INT64_MIN has no signed negation) */
+        if (mag > UINT64_C(999999999999999999)) bad = 1;
+        else v = (int64_t)mag;
     }
     if (bad) {
         flag(c, SW_IE);
