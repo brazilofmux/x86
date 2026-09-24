@@ -1264,7 +1264,7 @@ static void emit_check_flat(emit_t *e, ea_t *ea, int size, int store, int reads)
         emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, 0x10000);
         slow_site(e, X64_CC_B);
     }
-    if (store) emit_check_smc(e, ea, size);
+    if (store && !s_skip_smc) emit_check_smc(e, ea, size);
 }
 
 /* The checks of an access at ea: RFLAGS is freed first (the live guest

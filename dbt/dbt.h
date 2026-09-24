@@ -251,6 +251,8 @@ typedef struct {
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
     uint64_t fallback_by_op[OP__COUNT];  /* which op the interpreter actually ran (dynamic) */
     uint64_t fallback_by_class[6];       /* ...and where: real, V86, PM flat, PM paged not flat, PM other, inhibited */
+    struct { uint64_t key, n; } fb_site[4096];   /* X86_FALLBACK_SITES: where (mode:CS:EIP), open-addressed */
+    int      fb_sites;
     uint64_t helper_by_op[OP__COUNT];    /* which op helper calls ran (dynamic) — the promotion list */
     /* X86_PMPROF=1: what protected-mode code actually executes, to decide
      * what the backend learns first. Indexed [op][opsize==4][adsize==4]. */

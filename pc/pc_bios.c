@@ -140,6 +140,18 @@ static void hle_dispatch(x86_cpu *c, int vector) {
     }
     int mode = fn ? pc.ret_mode[vector] : HLE_RET_IRET;
     pc.returned = 0;
+    {   /* X86_SVCTRACE=<vector>: the first callers of that service (return CS:IP from the frame) */
+        static int trace_vec = -2, traced;
+        if (trace_vec == -2) trace_vec = getenv("X86_SVCTRACE") ? (int)strtol(getenv("X86_SVCTRACE"), NULL, 16) : -1;
+        static uint64_t after; if (!after) after = getenv("X86_SVCTRACE_AFTER") ? strtoull(getenv("X86_SVCTRACE_AFTER"), NULL, 0) : 1;
+        if (vector == trace_vec && traced < 12 && c->insn_count >= after) {
+            uint32_t sp = c->seg[S_SS].big ? c->r[R_SP] : (c->r[R_SP] & 0xFFFF);
+            fprintf(stderr, "[svc] INT %02X AH=%02X from %04X:%04X (pmode %d vm %d) at insn %llu\n", vector, x86_get_r8(c, R_AH),
+                    x86_rd(c, c->seg[S_SS].base, sp + 2, 0xFFFFFFFFu, 2), x86_rd(c, c->seg[S_SS].base, sp, 0xFFFFFFFFu, 2),
+                    c->pmode, (c->eflags & X86_VM) != 0, (unsigned long long)c->insn_count);
+            traced++;
+        }
+    }
     if (svc_prof_on < 0) svc_prof_on = getenv("X86_SVCPROF") != NULL;
     if (svc_prof_on) {
         int ah = x86_get_r8(c, R_AH);

@@ -50,6 +50,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->cpu = cpu;
     dbt->quantum = 1u << 20;
     dbt->verify_mem_every = 256;
+    dbt->fb_sites = getenv("X86_FALLBACK_SITES") != NULL;
     if (getenv("X86_PMPROF")) {
         dbt->pmprof = 1;
         dbt->pmprof_after = strtoull(getenv("X86_PMPROF"), NULL, 0);
@@ -564,6 +565,12 @@ int dbt_run(x86_dbt *dbt) {
             if (lin < cpu->mem_size) dbt->pm_hits[lin >> 4]++;
         }
         int hle_step = at_hle(cpu);
+        if (dbt->fb_sites) {
+            uint64_t k = ((uint64_t)(cpu->pmode ? ((cpu->eflags & X86_VM) ? 2 : 1) : 0) << 48) | ((uint64_t)cpu->seg[S_CS].sel << 32) | cpu->eip;
+            uint32_t h = (uint32_t)((k ^ (k >> 29)) * 2654435761u) & 4095, tries = 0;
+            while (dbt->fb_site[h].n && dbt->fb_site[h].key != k && tries++ < 4096) h = (h + 1) & 4095;
+            if (tries < 4096) { dbt->fb_site[h].key = k; dbt->fb_site[h].n++; }
+        }
         if (!hle_step) {
             /* dynamic histogram: what did we hand to the interpreter? */
             uint8_t fb[16];
@@ -762,6 +769,28 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             }
             fprintf(out, "\n");
         }
+    }
+    if (dbt->fb_sites) {
+        static const char *modes[3] = { "real", "pm", "v86" };
+        fprintf(out, "  interp fallback sites (mode CS:EIP):");
+        for (int n = 0; n < 16; n++) {
+            int best = -1;
+            for (int i = 0; i < 4096; i++) if (dbt->fb_site[i].n && (best < 0 || dbt->fb_site[i].n > dbt->fb_site[best].n)) best = i;
+            if (best < 0) break;
+            uint64_t k = dbt->fb_site[best].key;
+            char buf[64] = "?";
+            if (((k >> 48) & 3) != 1) {                          /* real / V86: the bytes as they are now */
+                x86_cpu *c = dbt->cpu;
+                uint32_t lin = ((((uint32_t)(k >> 32) & 0xFFFF) << 4) + (uint32_t)(k & 0xFFFF)) & c->a20_mask;
+                uint8_t fb[16];
+                for (int j = 0; j < 16; j++) fb[j] = lin + j < c->mem_size ? c->mem[lin + j] : 0;
+                x86_dec_ctx dc = { fb, c->model, 0 }; x86_insn di;
+                if (x86_decode(&dc, &di)) x86_disasm(&di, buf, sizeof buf);
+            }
+            fprintf(out, "\n    %s %04X:%X=%llu  %s", modes[(k >> 48) & 3], (unsigned)(k >> 32) & 0xFFFF, (unsigned)k, (unsigned long long)dbt->fb_site[best].n, buf);
+            dbt->fb_site[best].n = 0;
+        }
+        fprintf(out, "\n");
     }
     fprintf(out, "  interp fallbacks by op (dynamic):");
     for (int n = 0; n < 12; n++) {
