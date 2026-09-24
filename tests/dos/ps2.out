@@ -1,0 +1,13 @@
+aux interface test: 00
+reset: FA* AA* 00*
+identify: FA* 00*
+status request: FA* 00* 02* 64*
+rate 40: FA* FA*
+status request: FA* 00* 02* 28*
+wrap 55h, leave: FA* 55* FA*
+loopback 5Ah: 5A*
+INT 15h C2h: enabled, AH=00
+packet 09 X=00 Y=00
+packet 2B X=50 Y=DA
+packet 09 X=00 Y=00
+packet 08 X=00 Y=00

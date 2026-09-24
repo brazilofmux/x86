@@ -264,6 +264,7 @@ static void a20_set(x86_cpu *c, int on);
 static void bios_int15(x86_cpu *c, int vector) {
     (void)vector;
     if (pc_int15_memory(c)) return;              /* 87h, 88h, E801h, E820h: pc_cmos.c */
+    if (pc_int15_ps2(c)) return;                 /* C2h, the pointing device: pc_ps2.c */
     switch (x86_get_r8(c, R_AH)) {
     case 0x4F:                                   /* keyboard intercept: keep the key */
         c->eflags |= X86_CF;
@@ -334,6 +335,21 @@ static void pic2_summary(void) {
     if (pic2.irr & ~pic2.mask) pc.irq_pending |= 1 << 10; else pc.irq_pending &= ~(1 << 10);
 }
 static void pic2_unmask(int n) { pic2.mask &= (uint8_t)~(1 << n); pic2_summary(); }
+void pc_irq_unmask(int irq) {
+    if (irq >= 8) { pic2_unmask(irq - 8); pic.mask &= (uint8_t)~4; }
+    else pic.mask &= (uint8_t)~(1 << irq);
+}
+
+/* The 8042's output buffer holds one byte: a controller reply, a
+ * keyboard code, or one from the auxiliary device. The mouse's next byte
+ * goes in once the buffer is empty and the aux clock is on (command byte
+ * bit 5 clear), with IRQ 12 if bit 1 says so. */
+static void aux_latch(void) {
+    if (pc.aux_full || pc.kbc_out_full || pc.irq9_busy || (pc.kbc_cmdbyte & 0x20) || !pc_ps2_pending()) return;
+    pc.aux_out = pc_ps2_take();
+    pc.aux_full = 1;
+    if (pc.kbc_cmdbyte & 0x02) pc_irq_raise(12);
+}
 
 /* PC_TRAP_RTC, from INT 70h's native stub with register C in AL: the
  * wait of INT 15h AH=83h, counted down on the periodic flag in the AT
@@ -419,7 +435,9 @@ int pc_poll(x86_cpu *c) {
      * the first — one key lost, the next one twice ("HHlo"). The EOI, or
      * our INT 9, says the code has been used. */
     static uint64_t last_code_ns;
-    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !(pc.irq_in_service & 2) && !pc.kbd_disabled
+    pc_ps2_poll(now);
+    aux_latch();
+    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2) && !pc.kbd_disabled
         && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
         uint8_t code;
         pc_kbd_raw_next(&code);
@@ -568,8 +586,9 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     case 0xA0: return pic2.read_isr ? pic2.isr : pic2.irr;
     case 0xA1: return pic2.mask;
     case 0x60:
-        if (pc.kbc_out_full) { pc.kbc_out_full = 0; return pc.kbc_out; }
-        pc.irq9_busy = 0; return pc.last_scancode;
+        if (pc.kbc_out_full) { pc.kbc_out_full = 0; aux_latch(); return pc.kbc_out; }
+        if (pc.aux_full) { uint8_t b = pc.aux_out; pc.aux_full = 0; aux_latch(); return b; }
+        pc.irq9_busy = 0; aux_latch(); return pc.last_scancode;
     case 0x61:
         /* bit 4 toggles with the DRAM refresh, every 15.085 us — the
          * AT's own timing reference (IO.SYS counts its toggles while it
@@ -578,7 +597,8 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     /* 8042 status: not busy, system flag; bit 0 = output buffer full — a
      * controller reply, or a scancode latched for IRQ 1 and not yet read
      * (WIN386's keyboard VxD looks here before it reads port 60h) */
-    case 0x64: return (uint32_t)(0x14 | (pc.kbc_out_full || pc.irq9_busy ? 1 : 0));
+    case 0x64: return (uint32_t)(0x14 | (pc.kbc_out_full || pc.irq9_busy || pc.aux_full ? 1 : 0)
+                                      | (pc.aux_full && !pc.kbc_out_full ? 0x20 : 0));   /* bit 5: the byte is the mouse's */
     case 0x92: return (uint32_t)(c->a20_mask != 0xFFFFFu ? 2 : 0);
     case 0x3DA: {                                /* CGA status: toggle retrace bits */
         static uint8_t t; t ^= 0x09;
@@ -656,7 +676,8 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         case 0x20: pc.kbc_out = pc.kbc_cmdbyte; pc.kbc_out_full = 1; break;    /* read command byte */
         case 0x60: case 0xD1: case 0xD2: case 0xD3: case 0xD4:
             pc.kbc_cmd = (uint8_t)val; break;                                  /* data follows on 60h */
-        case 0xA7: case 0xA8: break;                                           /* auxiliary port off/on: none */
+        case 0xA7: pc.kbc_cmdbyte |= 0x20; break;                              /* auxiliary port off (its clock) */
+        case 0xA8: pc.kbc_cmdbyte &= (uint8_t)~0x20; aux_latch(); break;       /* ... on */
         case 0xA9: pc.kbc_out = 0x00; pc.kbc_out_full = 1; break;              /* aux interface test: ok */
         case 0xAA: pc.kbc_out = 0x55; pc.kbc_out_full = 1; break;              /* self test: passed */
         case 0xAB: pc.kbc_out = 0x00; pc.kbc_out_full = 1; break;              /* keyboard interface test: ok */
@@ -674,13 +695,14 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     case 0x60: {
         uint8_t v = (uint8_t)val;
         switch (pc.kbc_cmd) {
-        case 0x60: pc.kbc_cmdbyte = v; break;                                  /* write command byte */
+        case 0x60: pc.kbc_cmdbyte = v; aux_latch(); break;                     /* write command byte */
         case 0xD1:
             if (!(v & 1)) pc_request_reset(c, "8042 output port reset bit");
             a20_set(c, (v >> 1) & 1);
             break;
         case 0xD2: pc_kbd_raw_reply(v); break;                                 /* as if the keyboard sent it */
-        case 0xD3: case 0xD4: break;                                           /* to the auxiliary port: none */
+        case 0xD3: pc_ps2_inject(v); aux_latch(); break;                       /* as if the mouse sent it */
+        case 0xD4: pc_ps2_write(v); aux_latch(); break;                        /* to the mouse */
         default:
             /* a byte for the keyboard itself. Replies go in front of any
              * queued keys, last first (pc_kbd_raw_reply inserts at the head). */
@@ -778,6 +800,8 @@ static void post(x86_cpu *cpu) {
     pic2.mask = cpu->has_fpu ? 0xDE : 0xFE; pic2.base = 0x70; pic2.icw_step = 0; pic2.read_isr = 0;
     pic2.irr = pic2.isr = 0;
     cpu->ferr_hook = ferr_irq13;
+    pc.aux_full = 0;
+    pc_ps2_post(cpu);
     pc_vga_rom(cpu);                             /* INT 10h's mode set, programmed by OUTs */
     /* FFFF:0000, the reset vector: JMP F000:FFF0, which traps (TRAP_RESET) */
     static const uint8_t jmp[5] = { 0xEA, 0xF0, 0xFF, 0x00, 0xF0 };
@@ -788,7 +812,7 @@ static void post(x86_cpu *cpu) {
 
     /* BIOS data area */
     for (int i = 0; i < 0x100; i++) pc_wr8(cpu, PC_BDA_SEG, (uint16_t)i, 0);
-    pc_wr16(cpu, PC_BDA_SEG, 0x10, (uint16_t)(0x0021 | (cpu->has_fpu ? 0x0002 : 0)));   /* equipment: 80x25 colour, 1 floppy, the coprocessor */
+    pc_wr16(cpu, PC_BDA_SEG, 0x10, (uint16_t)(0x0025 | (cpu->has_fpu ? 0x0002 : 0)));   /* equipment: 80x25 colour, 1 floppy, a PS/2 mouse, the coprocessor */
     if (cpu->has_fpu) x86_fpu_finit(cpu);        /* POST leaves it initialised */
     pc_wr16(cpu, PC_BDA_SEG, 0x13, PC_CONV_KB);
     pc_wr8 (cpu, PC_BDA_SEG, 0x17, 0x00);        /* shift flags */

@@ -114,6 +114,7 @@ static void enqueue(int mask) {
 /* The pointer at (fx, fy) of a 640x480 frame. */
 void pc_mouse_motion(int fx, int fy) {
     x86_cpu *c = pc.cpu;
+    pc_ps2_motion(fx, fy);                           /* the PS/2 mouse sees the same hand */
     if (!m.installed || !c) return;
     int nx = fx * virt_w(c) / 640, ny = fy * virt_h(c) / 480;
     if (nx == m.x && ny == m.y) return;
@@ -123,6 +124,7 @@ void pc_mouse_motion(int fx, int fy) {
 }
 
 void pc_mouse_button(int button, int down) {
+    pc_ps2_button(button, down);
     if (!m.installed || button < 0 || button > 2) return;
     int bit = 1 << button;
     if (down) {

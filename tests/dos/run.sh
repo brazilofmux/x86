@@ -57,6 +57,9 @@ for mode in -j -V; do
     if [ "$got" = "$(cat tests/dos/kbd.out)" ]; then echo "ok   kbd codes $mode"; else echo "FAIL kbd codes $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
     got=$( (sleep 1; printf '\033[<35;11;2M'; sleep 0.5; printf '\033[<0;11;2M'; sleep 0.5; printf '\033[<2;21;4M'; sleep 0.5; printf '\033[<2;21;4m'; sleep 0.5; printf '\033[<0;21;4m'; sleep 0.5; printf '\033') | X86_MOUSE=1 $DM -W $mode -L 400000000 tests/dos/mouse.com 2>/dev/null | tr -d '\r')
     if [ "$got" = "$(cat tests/dos/mouse.out)" ]; then echo "ok   mouse events $mode"; else echo "FAIL mouse events $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
+    # the PS/2 mouse: the 8042's aux port, then INT 15h C2h and INT 74h, fed the same reports
+    got=$( (sleep 1; printf '\033[<35;11;2M'; sleep 0.5; printf '\033[<0;11;2M'; sleep 0.5; printf '\033[<2;21;4M'; sleep 0.5; printf '\033[<2;21;4m'; sleep 0.5; printf '\033[<0;21;4m'; sleep 0.5; printf '\033') | $DM -W -m 386 $mode -L 400000000 tests/dos/ps2.com 2>/dev/null | tr -d '\r')
+    if [ "$got" = "$(cat tests/dos/ps2.out)" ]; then echo "ok   ps/2 mouse $mode"; else echo "FAIL ps/2 mouse $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
 done
 rm -f tmp/text.png
 # The DPMI clients only make sense on a 386: one source, assembled as a

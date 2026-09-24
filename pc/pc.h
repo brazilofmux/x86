@@ -91,6 +91,7 @@ typedef struct pc_state {
     int      irq_pending;            /* bitmask: 1<<8 timer, 1<<9 keyboard */
     int      irq_in_service;         /* 8259 ISR: bits set from delivery until EOI */
     uint64_t irq_service_ns;         /* when the in-service IRQ was delivered (stuck-handler guard) */
+    uint8_t  aux_full, aux_out;      /* 8042: a byte from the auxiliary device (the PS/2 mouse) in the output buffer */
     uint64_t rtc_next_ns;            /* when the RTC next has an interrupt to raise (pc_rtc_poll); ~0 for never */
 
     /* Services by vector; NULL = plain IRET stub. */
@@ -118,6 +119,18 @@ void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted mac
 void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
 void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads as an empty bus */
 void pc_irq_raise(int irq);          /* IRQ 8-15: a request to the slave 8259 */
+void pc_irq_unmask(int irq);         /* as the BIOS opens a line it has a handler for */
+
+/* pc_ps2.c: the PS/2 mouse on the 8042's auxiliary port */
+void pc_ps2_post(x86_cpu *c);
+void pc_ps2_write(uint8_t v);            /* 8042 D4h: a byte to the device */
+int  pc_ps2_pending(void);               /* bytes from the device waiting for the output buffer */
+uint8_t pc_ps2_take(void);
+void pc_ps2_inject(uint8_t v);           /* 8042 D3h: a byte as if the device sent it */
+void pc_ps2_motion(int fx, int fy);      /* the host's pointer, 640x480 frame */
+void pc_ps2_button(int button, int down);
+void pc_ps2_poll(uint64_t now);
+int  pc_int15_ps2(x86_cpu *c);           /* INT 15h AH=C2h; 0 if not that */
 void pc_native_irq_vectors(x86_cpu *c);  /* booted machines: INT 9 through the native stub */
 void pc_kbd_trap(x86_cpu *c, int vector);   /* PC_TRAP_KBD: translate the scancode in AL */
 void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);
@@ -134,6 +147,9 @@ void pc_rtc_set_date(int year, int mon, int mday);
 void pc_rtc_pie(int on);                  /* the periodic interrupt (INT 15h AH=83h) */
 void pc_rtc_alarm(int on, uint8_t h, uint8_t m, uint8_t sec);   /* INT 1Ah AH=06h/07h, BCD */
 int  pc_rtc_alarm_on(void);
+#define PC_TRAP_PS2     0xF3       /* F000:00F3: INT 74h's packet assembly, the byte from port 60h in AL */
+#define PC_STUB_INT74   0x0050     /* IRQ 12: IN 60h, the host's assembly, the program's routine with the packet, EOIs */
+#define PC_PS2_VARS     0x00C0     /*   its data: the routine (offset, segment), then status, X, Y as words */
 #define PC_TRAP_RTC     0xF4       /* F000:00F4: INT 70h's bookkeeping (INT 15h AH=83h's wait), register C in AL */
 #define PC_STUB_INT70   0x0030     /* IRQ 8: read register C, the host's bookkeeping, EOIs, INT 4Ah on an alarm */
 

@@ -21,6 +21,13 @@ if [ -f disks/freedos/c.img ]; then
     printf 'C:.>$\tver\\r\nFreeCom version\t\n' > tmp/boot-c.exp
     if python3 tools/expect.py -t 90 tmp/boot-c.exp -- $DM -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
     then echo "ok   freedos hard disk boot"; else echo "FAIL freedos hard disk boot"; fail=1; fi
+    # the PS/2 mouse under a real driver: CuteMouse finds it through INT 15h
+    # C2h, and a click (SGR reports on stdin) reaches mouse.com's INT 33h
+    # event handler through IRQ 12, INT 74h and the driver
+    mcopy -o -i tmp/boot-c.img@@32256 tests/dos/mouse.com ::/MOUSE.COM
+    printf 'C:.>$\tctmouse\\r\nPS/2 port\tmouse\\r\nFFFF$\t\\x1b[<35;11;2M\ndelay 0.5\nsend \\x1b[<0;11;2M\ndelay 0.5\nsend \\x1b[<0;11;2m\n*E=0004 B=0000\t\\x1b\nC:.>$\t\n' > tmp/boot-c.exp
+    if python3 tools/expect.py -t 90 tmp/boot-c.exp -- $DM -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+    then echo "ok   ps/2 mouse under freedos + ctmouse"; else echo "FAIL ps/2 mouse under freedos + ctmouse"; fail=1; fi
     if mdir -i tmp/boot-c.img@@32256 ::/WP51/WP.EXE >/dev/null 2>&1; then
         printf 'C:.>$\tcd \\\\wp51\\rwp\\r\nDoc 1 Pg 1\tThe quick brown fox, under FreeDOS.\nFreeDOS\\.\t\n' > tmp/boot-wp.exp
         if python3 tools/expect.py -t 120 tmp/boot-wp.exp -- $DM -m 386 -W -T 110 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
