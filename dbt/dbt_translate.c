@@ -24,6 +24,7 @@
  * Rules paid for in blood (see CLAUDE.md): fmask is the LIVE-OUT mask,
  * not live∩write; block exits mark all flags live so -V stays exact.
  */
+#include <unistd.h>
 #include "dbt.h"
 #include <stdlib.h>
 #include <string.h>
@@ -507,8 +508,50 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
 /* ----------------------------------------------------------------------
  * Entry: a key to host code (or NULL: the run loop steps the interpreter)
  * ---------------------------------------------------------------------- */
+/* X86_PERF_MAP=1: every block as it is emitted goes into /tmp/perf-<pid>.map
+ * ("start size name", perf's JIT symbol format), so `perf report` names
+ * translated code by guest key even after flushes reuse the buffer
+ * (a later block at the same host address is simply a later line). */
+static void perf_map_note(x86_dbt *dbt, const dbt_block *b, uint64_t key, const uint8_t *entry) {
+    static FILE *f, *g, *h;
+    static long hoff;
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("X86_PERF_MAP") != NULL;
+        if (on) {
+            char path[64];
+            snprintf(path, sizeof path, "/tmp/perf-%d.map", (int)getpid());
+            f = fopen(path, "w");
+            snprintf(path, sizeof path, "/tmp/perf-%d.blocks", (int)getpid());
+            g = fopen(path, "w");                    /* each block's guest code, by the same name */
+            snprintf(path, sizeof path, "/tmp/perf-%d.code", (int)getpid());
+            h = fopen(path, "wb");                   /* ...and its host bytes, at the offset the .blocks line gives */
+            if (!f) on = 0;
+        }
+    }
+    if (!on) return;
+    size_t size = (size_t)(dbt->code_buf + dbt->code_used - entry);
+    fprintf(f, "%lx %zx x86_%04X_%04X:%08X\n", (unsigned long)(uintptr_t)entry, size,
+            (unsigned)(key >> 48), (unsigned)(key >> 32) & 0xFFFF, (unsigned)key);
+    fflush(f);
+    if (g) {
+        fprintf(g, "x86_%04X_%04X:%08X (%zu host bytes) code@%ld\n", (unsigned)(key >> 48), (unsigned)(key >> 32) & 0xFFFF, (unsigned)key, size, hoff);
+        if (h) { fwrite(entry, 1, size, h); fflush(h); hoff += (long)size; }
+        uint32_t ip = b->start_ip;
+        for (uint32_t i = 0; i < b->n_ops; i++) {
+            char buf[80];
+            x86_disasm(&b->decs[i], buf, sizeof buf);
+            static const char cls[] = "RIH";
+            fprintf(g, "    %04X  %c  %s\n", ip, b->cls[i] < 3 ? cls[b->cls[i]] : '?', buf);
+            ip = b->ip_afters[i];
+        }
+        fflush(g);
+    }
+}
+
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     x86_cpu *cpu = dbt->cpu;
+
     if (dbt->flush_pending || dbt->code_used + 65536 > CODE_BUF_SIZE || dbt->insn_used + MAX_BLOCK_INSNS > INSN_POOL_SIZE) {
         /* Out of JIT space (or A20 flipped): wipe and restart. Already
          * inside the W^X bracket (the run loop wraps us) — do not nest
@@ -536,6 +579,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         if (!plan_pm(dbt, b)) return NULL;
         uint8_t *entry = dbt_arch_emit_block(dbt, b);
         if (!entry) return NULL;
+        perf_map_note(dbt, b, key, entry);
         uint32_t lin = dbt_key_lin(key);
         dbt_mark_block_bytes(dbt, lin, lin + (b->end_ip - b->start_ip));
         dbt_watch_cs_desc(dbt);
@@ -544,6 +588,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     if (!plan_block(dbt, b)) return NULL;
     uint8_t *entry = dbt_arch_emit_block(dbt, b);
     if (!entry) return NULL;
+    perf_map_note(dbt, b, key, entry);
 
     uint32_t lin = dbt_key_lin(key);
     uint32_t skip[2 * MAX_BLOCK_INSNS], nskip = 0;
