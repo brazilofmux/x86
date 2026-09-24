@@ -357,18 +357,26 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
  * out; with no paging (CLAUDE.md) linear == physical, so a client's flat
  * selector is just an offset into this buffer. X86_MEM_SLACK is readable
  * slack past the end so a decode or a straddling access at the top never
- * faults. */
+ * faults.
+ *
+ * The size is the run's (cpu->mem_size, -mem N: N MB in all): at least
+ * X86_MEM_SIZE — 16 MB of extended memory, what the translators' flat
+ * fast paths assume is always there — and at most X86_MEM_MAX, which
+ * the bitmap's fixed distance and the translator's tables are built for.
+ * x86_set_mem_size before x86_init chooses. */
 #define X86_LOW_SIZE  0x110000u
-#define X86_EXT_SIZE  0x1000000u                     /* 16 MB, enough for DOS/4GW-era clients */
+#define X86_EXT_SIZE  0x1000000u                     /* the default and least: 16 MB */
 #define X86_MEM_SIZE  (X86_LOW_SIZE + X86_EXT_SIZE)
+#define X86_MEM_MAX   (0x10000000u + 0x100000u)      /* 257 MB: 256 MB of extended memory, and the first 1 MB */
 #define X86_MEM_SLACK 0x10000u
 /* The code bitmap sits at this fixed distance above guest memory when the
  * mirrored layout is in use (x86_mem.c: one reservation holds both), so
  * translated code reaches a store's bitmap byte as [host_addr + delta]
  * with no register. Disp32-reachable, and past the memory's own span. */
-#define X86_BM_DELTA  0x2000000u
-_Static_assert(X86_BM_DELTA >= X86_MEM_SIZE + X86_MEM_SLACK, "the bitmap must lie above guest memory");
+#define X86_BM_DELTA  0x20000000u
+_Static_assert(X86_BM_DELTA >= X86_MEM_MAX + X86_MEM_SLACK, "the bitmap must lie above guest memory");
 
+void x86_set_mem_size(uint32_t bytes);          /* the next x86_init's memory, X86_MEM_SIZE..X86_MEM_MAX */
 int  x86_mem_alloc(x86_cpu *c);
 void x86_mem_free(x86_cpu *c);
 int  x86_set_a20(x86_cpu *c, int on);

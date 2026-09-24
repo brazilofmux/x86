@@ -54,7 +54,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     if (getenv("X86_PMPROF")) {
         dbt->pmprof = 1;
         dbt->pmprof_after = strtoull(getenv("X86_PMPROF"), NULL, 0);
-        dbt->pm_hits = calloc(X86_MEM_SIZE >> 4, sizeof(uint32_t));
+        dbt->pm_hits = calloc(cpu->mem_size >> 4, sizeof(uint32_t));
     }
 
     if (getenv("X86_NO_SEG16")) dbt_seg16_enabled = 0;
@@ -66,8 +66,8 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->insn_hits = calloc(INSN_POOL_SIZE, sizeof(uint32_t));
     dbt->insn_tag  = calloc(INSN_POOL_SIZE, 1);
     dbt->insn_lin  = calloc(INSN_POOL_SIZE, sizeof(uint32_t));
-    dbt->smc_heat  = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);     /* touched only where SMC happens */
-    dbt->smc_win   = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);
+    dbt->smc_heat  = calloc((size_t)cpu->mem_size + X86_MEM_SLACK, 1);     /* touched only where SMC happens */
+    dbt->smc_win   = calloc((size_t)cpu->mem_size + X86_MEM_SLACK, 1);
     if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool || !dbt->smc_heat || !dbt->smc_win) {
         fprintf(stderr, "dbt_init: out of memory\n");
         return -1;
@@ -680,7 +680,7 @@ static void print_pmprof(x86_dbt *dbt, FILE *out) {
     }
     fprintf(out, "\n");
     /* How concentrated: the share of execution in the hottest 16-byte lines. */
-    size_t lines = X86_MEM_SIZE >> 4, used = 0;
+    size_t lines = dbt->cpu->mem_size >> 4, used = 0;
     uint64_t *v = malloc(lines * sizeof *v);
     for (size_t i = 0; i < lines; i++) if (dbt->pm_hits[i]) v[used++] = dbt->pm_hits[i];
     qsort(v, used, sizeof *v, cmp_u64_desc);

@@ -21,6 +21,14 @@ if [ -f disks/freedos/c.img ]; then
     printf 'C:.>$\tver\\r\nFreeCom version\t\n' > tmp/boot-c.exp
     if python3 tools/expect.py -t 90 tmp/boot-c.exp -- $DM -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
     then echo "ok   freedos hard disk boot"; else echo "FAIL freedos hard disk boot"; fail=1; fi
+    # 257 MB (-mem): HIMEMX finds all 256 MB above the first through INT
+    # 15h E820h/E801h, and MEM says so
+    cp disks/freedos/c.img tmp/boot-mem.img
+    printf 'C:.>$\tmem > c:\\\\mem.txt\\r\nC:.>$\t\n' > tmp/boot-mem.exp
+    python3 tools/expect.py -t 90 tmp/boot-mem.exp -- $DM -m 386 -W -T 80 -mem 257 -hda tmp/boot-mem.img -boot c >/dev/null 2>&1
+    if mtype -i tmp/boot-mem.img@@32256 ::/MEM.TXT 2>/dev/null | grep -q "Extended (XMS)    262,144K"
+    then echo "ok   freedos with 257 MB (himemx)"; else echo "FAIL freedos with 257 MB"; fail=1; fi
+    rm -f tmp/boot-mem.img tmp/boot-mem.exp
     # the PS/2 mouse under a real driver: CuteMouse finds it through INT 15h
     # C2h, and a click (SGR reports on stdin) reaches mouse.com's INT 33h
     # event handler through IRQ 12, INT 74h and the driver

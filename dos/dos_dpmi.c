@@ -65,7 +65,7 @@ static int client_is32(void) { return dpmi.is32; }
  * fail here the same way it would on CWSDPMI.
  */
 #define EXT_BASE   X86_LOW_SIZE
-#define EXT_TOP    X86_MEM_SIZE
+#define EXT_TOP    (pc.cpu->mem_size)                  /* -mem: the run's size */
 #define EXT_PAGE   0x1000u
 #define EXT_BLOCKS 64
 

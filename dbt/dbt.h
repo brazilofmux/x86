@@ -241,7 +241,7 @@ typedef struct {
      * physical. phys_alias[physical page] is the linear page + 1 whose
      * blocks a store there must also sweep. One alias per physical page;
      * a second linear page onto the same one is not translated. */
-    uint32_t phys_alias[X86_MEM_SIZE >> 12];
+    uint32_t phys_alias[X86_MEM_MAX >> 12];
     uint64_t smc_hot_refusals;      /* blocks ended before a patched instruction */
     uint64_t tlb_flushes;           /* TLB flushes seen (CR3, PG, A20)... */
     uint64_t tlb_page_drops;        /* ...and code pages whose blocks went because the page moved */

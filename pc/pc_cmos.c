@@ -2,7 +2,7 @@
  * memory above 1 MB (INT 15h AH=87h, 88h, E801h, E820h)
  *
  * Extended memory is the part of the guest buffer above 1 MB: the HMA and
- * then X86_EXT_SIZE, contiguous, so a physical address above 1 MB is an
+ * then the rest of the run's memory (-mem), contiguous, so a physical address above 1 MB is an
  * offset into cpu->mem like any other. A booted machine reports it all
  * (a 286 only what its 24 address lines reach) and HIMEM owns it from
  * there. Under the HLE DOS it stays unreported, as before: our own DPMI

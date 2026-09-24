@@ -1,7 +1,8 @@
 /* x86_mem.c — guest memory with an A20-aware mirror above 1 MB
  *
  * Guest physical memory is 1 MB plus the 64 KB HMA (X86_LOW_SIZE), and
- * then X86_EXT_SIZE of extended memory above that for the DPMI host. The
+ * then extended memory above that (cpu->mem_size in all: X86_MEM_SIZE
+ * unless x86_set_mem_size asked for more). The
  * interpreter masks every address with a20_mask, so with A20 gated off
  * FFFF:0010 reads byte 0. Translated code cannot afford that mask on
  * every access, so the 64 KB window at 0x100000 is a second MAPPING of
@@ -41,16 +42,23 @@ static uint8_t *reserve(size_t len) {
     return p == MAP_FAILED ? NULL : p;
 }
 
+static uint32_t next_size = X86_MEM_SIZE;
+void x86_set_mem_size(uint32_t bytes) {
+    if (bytes < X86_MEM_SIZE) bytes = X86_MEM_SIZE;
+    if (bytes > X86_MEM_MAX) bytes = X86_MEM_MAX;
+    next_size = bytes & ~0xFFFu;
+}
+
 /* Region layout in the backing object: guest memory at 0, bitmap at
- * X86_MEM_SIZE. Each mapped region is X86_MEM_SIZE + X86_MEM_SLACK. */
+ * mem_size. Each mapped region is mem_size + X86_MEM_SLACK. */
 static int map_region(x86_cpu *c, uint8_t *base, off_t obj_off, int a20_on) {
     if (map_fixed(c->mem_fd, base, HMA_OFF, obj_off) < 0) return -1;
     if (map_fixed(c->mem_fd, base + HMA_OFF, HMA_SIZE, obj_off + (a20_on ? HMA_OFF : 0)) < 0) return -1;
     /* Extended memory is never aliased — only the HMA window moves with A20. */
-    if (map_fixed(c->mem_fd, base + X86_LOW_SIZE, X86_MEM_SIZE - X86_LOW_SIZE, obj_off + X86_LOW_SIZE) < 0) return -1;
-    void *s = mmap(base + X86_MEM_SIZE, X86_MEM_SLACK, PROT_READ | PROT_WRITE,
+    if (map_fixed(c->mem_fd, base + X86_LOW_SIZE, c->mem_size - X86_LOW_SIZE, obj_off + X86_LOW_SIZE) < 0) return -1;
+    void *s = mmap(base + c->mem_size, X86_MEM_SLACK, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    return s == (void *)(base + X86_MEM_SIZE) ? 0 : -1;
+    return s == (void *)(base + c->mem_size) ? 0 : -1;
 }
 
 static int alloc_mirrored(x86_cpu *c) {
@@ -64,22 +72,22 @@ static int alloc_mirrored(x86_cpu *c) {
     if (fd >= 0) shm_unlink(name);
 #endif
     if (fd < 0) return -1;
-    if (ftruncate(fd, (off_t)X86_MEM_SIZE * 2) != 0) { close(fd); return -1; }
+    if (ftruncate(fd, (off_t)c->mem_size * 2) != 0) { close(fd); return -1; }
     c->mem_fd = fd;
 
     /* one reservation: memory at 0, the bitmap at X86_BM_DELTA */
-    size_t region = X86_MEM_SIZE + X86_MEM_SLACK;
+    size_t region = (size_t)c->mem_size + X86_MEM_SLACK;
     c->mem = reserve(X86_BM_DELTA + region);
     if (!c->mem) return -1;
     c->code_bitmap = c->mem + X86_BM_DELTA;
     if (map_region(c, c->mem, 0, 0) < 0) return -1;
-    if (map_region(c, c->code_bitmap, X86_MEM_SIZE, 0) < 0) return -1;
+    if (map_region(c, c->code_bitmap, (off_t)c->mem_size, 0) < 0) return -1;
     c->mem_mirrored = 1;
     return 0;
 }
 
 int x86_mem_alloc(x86_cpu *c) {
-    c->mem_size = X86_MEM_SIZE;
+    c->mem_size = next_size;
     c->mem_fd = -1;
     c->a20_mask = 0xFFFFF;
     if (alloc_mirrored(c) == 0) return 0;
@@ -87,14 +95,14 @@ int x86_mem_alloc(x86_cpu *c) {
     /* Plain fallback: the interpreter still works (it masks), the JIT
      * refuses to start (dbt_jit_available checks mem_mirrored). */
     x86_mem_free(c);
-    c->mem = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);
-    c->code_bitmap = calloc(X86_MEM_SIZE + X86_MEM_SLACK, 1);
+    c->mem = calloc((size_t)c->mem_size + X86_MEM_SLACK, 1);
+    c->code_bitmap = calloc((size_t)c->mem_size + X86_MEM_SLACK, 1);
     c->mem_mirrored = 0;
     return (c->mem && c->code_bitmap) ? 0 : -1;
 }
 
 void x86_mem_free(x86_cpu *c) {
-    size_t region = X86_MEM_SIZE + X86_MEM_SLACK;
+    size_t region = (size_t)c->mem_size + X86_MEM_SLACK;
     if (c->mem_mirrored || c->mem_fd >= 0) {
         if (c->mem) munmap(c->mem, X86_BM_DELTA + region);   /* the bitmap lives inside the same reservation */
         if (c->mem_fd >= 0) close(c->mem_fd);
@@ -117,7 +125,7 @@ int x86_set_a20(x86_cpu *c, int on) {
     if (c->mem_mirrored) {
         if (map_fixed(c->mem_fd, c->mem + HMA_OFF, HMA_SIZE, on ? HMA_OFF : 0) < 0) return -1;
         if (map_fixed(c->mem_fd, c->code_bitmap + HMA_OFF, HMA_SIZE,
-                      X86_MEM_SIZE + (on ? HMA_OFF : 0)) < 0) return -1;
+                      (off_t)c->mem_size + (on ? HMA_OFF : 0)) < 0) return -1;
     }
     c->a20_mask = mask;
     x86_tlb_flush(c);                         /* cached translations hold A20-masked addresses */

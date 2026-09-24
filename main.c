@@ -24,6 +24,7 @@ static void usage(const char *prog) {
     printf("  -M N        with -V: compare guest memory every N block runs (default 1)\n");
     printf("  -m MODEL    cpu model: 86, 186, 286, 386, 486 (default 286; DPMI clients need 386)\n");
     printf("  -fpu, -nofpu  a 387 beside a 386, or a 486SX (default: a 486 has its FPU, nothing else has one)\n");
+    printf("  -mem N      N MB of memory, 17 to 257 (default 17: the first 1 MB and 16 MB above it)\n");
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
     printf("  -fda IMG    diskette image as drive 00h (also -fdb); -hda IMG fixed disk 80h (also -hdb)\n");
@@ -292,6 +293,11 @@ int main(int argc, char **argv) {
             int m = atoi(argv[++i]);
             model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 286 ? X86_MODEL_286
                   : m == 486 ? X86_MODEL_486 : X86_MODEL_386;
+        }
+        else if (!strcmp(argv[i], "-mem") && i + 1 < argc) {
+            long mb = atol(argv[++i]);
+            if (mb < 17 || mb > 257) { fprintf(stderr, "-mem: 17 to 257 (MB)\n"); return 1; }
+            x86_set_mem_size((uint32_t)mb << 20);
         }
         else if (!strcmp(argv[i], "-fpu")) fpu = 1;
         else if (!strcmp(argv[i], "-nofpu")) fpu = 0;
