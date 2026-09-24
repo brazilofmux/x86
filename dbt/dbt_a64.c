@@ -83,6 +83,17 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 
 #define ARITH  X86_ARITH_FLAGS   /* 0x8D5 — not a logical immediate, load it */
 
+/* The backend runs only on its own architecture (a cross build translates
+ * for the golden set, X86_GOLDEN, and never runs a block). */
+int dbt_jit_available(const x86_cpu *cpu) {
+#if defined(__aarch64__)
+    return cpu->mem_mirrored;
+#else
+    (void)cpu;
+    return 0;
+#endif
+}
+
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
 static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_port_thunk_off, s_fault_stub_off, s_fault_exit_off, s_exit_eip_off;
 

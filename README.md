@@ -117,11 +117,15 @@ instructions — runs clean that way.
 
 ## Building
 
-Developed on macOS on Apple Silicon. The translator emits AArch64 only
-so far; on other hosts the interpreter runs (Linux x86-64 builds and
-passes the DOS test suite that way — an x86-64 backend is next).
+Developed on macOS on Apple Silicon; the AArch64 backend is the mature
+one. The x86-64 backend (`dbt/dbt_x64.c`, Linux) runs real-mode code
+inline and everything else through the interpreter's helpers so far —
+correct under `-V`, not yet fast. The backend is chosen by the host
+(`BACKEND=a64|x64` overrides it, for the golden set).
 
     make                 # dos-monster, tools/sst, tools/jittest
+    make ARCH=a64        # cross-compile the AArch64 build on x86-64 Linux into build-a64/
+                         # (runs under qemu-user-static's binfmt)
 
 Needs a C11 compiler and zlib; SDL2 (via `pkg-config`) adds a window for
 graphics modes and is optional — without it the machine is headless.

@@ -30,7 +30,11 @@ endif
 CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c
 CORE_OBJS = $(addprefix $(O)/,$(CORE_SRCS:.c=.o))
 
-DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_translate.c dbt/dbt_a64.c
+# The backend: the host's, unless BACKEND=a64|x64 says otherwise (a cross
+# check: the other backend's translator runs under X86_GOLDEN, never a block).
+HOST_ARCH := $(if $(filter a64,$(ARCH)),aarch64,$(shell uname -m))
+BACKEND ?= $(if $(filter aarch64 arm64,$(HOST_ARCH)),a64,x64)
+DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_translate.c dbt/dbt_$(BACKEND).c
 DBT_OBJS  = $(addprefix $(O)/,$(DBT_SRCS:.c=.o))
 PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c
 PC_OBJS   = $(addprefix $(O)/,$(PC_SRCS:.c=.o))
@@ -42,7 +46,7 @@ SST    = $(O)/tools/sst
 JITTEST = $(O)/tools/jittest
 MAIN_O = $(O)/main.o
 
-.PHONY: test-pm all clean test-sst test-jit test-dos
+.PHONY: test-pm all clean test-sst test-jit test-dos test-x64enc test-hwflags
 
 all: $(TARGET) $(SST) $(JITTEST)
 
@@ -63,7 +67,7 @@ $(O)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
--include $(CORE_OBJS:.o=.d) $(DBT_OBJS:.o=.d) $(PC_OBJS:.o=.d) $(DOS_OBJS:.o=.d) $(MAIN_O:.o=.d) $(SST:=.d) $(JITTEST:=.d)
+-include $(CORE_OBJS:.o=.d) $(DBT_OBJS:.o=.d) $(PC_OBJS:.o=.d) $(DOS_OBJS:.o=.d) $(MAIN_O:.o=.d) $(SST:=.d) $(JITTEST:=.d) $(HWFLAGS:=.d)
 
 # SingleStepTests suites (tests/sst*/, not committed — see tests/sst8088/fetch.sh, tests/sst386/fetch.sh)
 test-sst: $(SST)
@@ -86,6 +90,18 @@ test-dos: $(TARGET)
 
 test-boot: $(TARGET)
 	DM=$(TARGET) tests/boot/run.sh
+
+# dbt/emit_x64.h against objdump (tools/x64enc.c: one line per encoding)
+test-x64enc:
+	tools/x64enc.sh
+
+# The host's flags against the interpreter's for the ops Intel leaves
+# undefined: what the x86-64 backend has to fix up (x86-64 hosts only)
+HWFLAGS = $(O)/tools/hwflags
+$(HWFLAGS): $(O)/tools/hwflags.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+test-hwflags: $(HWFLAGS)
+	$(HWFLAGS) -m 386 -n 2000
 
 test-pm:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 pmrun.py

@@ -399,7 +399,7 @@ static inline int dbt_loads_segment(const x86_insn *in) {
  * backend emit it; NULL when the run loop should step the interpreter. */
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key);
 
-/* Backend hooks (dbt_a64.c) */
+/* Backend hooks (dbt_a64.c, dbt_x64.c: one of them is built, BACKEND in the Makefile) */
 uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b);   /* host code for a plan (never NULL) */
 void     dbt_emit_trampoline(x86_dbt *dbt);
 void     dbt_arch_patch_link(x86_dbt *dbt, uint32_t site_off, uint8_t *target);

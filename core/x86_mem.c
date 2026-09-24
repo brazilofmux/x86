@@ -13,7 +13,8 @@
  * The code bitmap (one byte per guest byte, nonzero while a translated
  * block covers it) is laid out identically, so the JIT's post-store
  * check `bitmap[host_addr - mem]` sees the same aliasing as the memory
- * it guards.
+ * it guards — and it sits X86_BM_DELTA above the memory in the same
+ * reservation, so the check is also `[host_addr + X86_BM_DELTA]`.
  *
  * Both regions carry X86_MEM_SLACK readable bytes past the end so a
  * decode or a straddling access at 0x10FFEF never faults.
@@ -66,10 +67,11 @@ static int alloc_mirrored(x86_cpu *c) {
     if (ftruncate(fd, (off_t)X86_MEM_SIZE * 2) != 0) { close(fd); return -1; }
     c->mem_fd = fd;
 
+    /* one reservation: memory at 0, the bitmap at X86_BM_DELTA */
     size_t region = X86_MEM_SIZE + X86_MEM_SLACK;
-    c->mem = reserve(region);
-    c->code_bitmap = reserve(region);
-    if (!c->mem || !c->code_bitmap) return -1;
+    c->mem = reserve(X86_BM_DELTA + region);
+    if (!c->mem) return -1;
+    c->code_bitmap = c->mem + X86_BM_DELTA;
     if (map_region(c, c->mem, 0, 0) < 0) return -1;
     if (map_region(c, c->code_bitmap, X86_MEM_SIZE, 0) < 0) return -1;
     c->mem_mirrored = 1;
@@ -94,8 +96,7 @@ int x86_mem_alloc(x86_cpu *c) {
 void x86_mem_free(x86_cpu *c) {
     size_t region = X86_MEM_SIZE + X86_MEM_SLACK;
     if (c->mem_mirrored || c->mem_fd >= 0) {
-        if (c->mem) munmap(c->mem, region);
-        if (c->code_bitmap) munmap(c->code_bitmap, region);
+        if (c->mem) munmap(c->mem, X86_BM_DELTA + region);   /* the bitmap lives inside the same reservation */
         if (c->mem_fd >= 0) close(c->mem_fd);
     } else {
         free(c->mem);

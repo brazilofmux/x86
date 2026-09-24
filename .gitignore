@@ -37,6 +37,7 @@ tests/sst*/README.md
 tools/sst
 tools/sst8088
 tools/jittest
+tools/hwflags
 .venv/
 tools/pmoracle/pmtest.img
 tools/pmoracle/*.img

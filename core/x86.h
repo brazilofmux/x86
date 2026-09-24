@@ -134,6 +134,7 @@ typedef struct x86_cpu {
     uint8_t  pg_space;      /* DBT: id of the address space CR3 names (paged block keys carry it) */
     uint32_t jit_cur_lin;   /* linear address of the block making a helper call... */
     uint32_t jit_cur_hit;   /* ...set by the SMC sweep if that block got invalidated */
+    uint64_t jit_flags;     /* x86-64 backend: the guest's arithmetic flags between blocks (an RFLAGS image; 64 bits: it is POPped into) */
 
     /* Descriptor tables. In real mode these sit unused; CR0.PE turns them on.
      * ldtr/tr keep the cached descriptor the same way the segment registers
@@ -341,6 +342,12 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
 #define X86_EXT_SIZE  0x1000000u                     /* 16 MB, enough for DOS/4GW-era clients */
 #define X86_MEM_SIZE  (X86_LOW_SIZE + X86_EXT_SIZE)
 #define X86_MEM_SLACK 0x10000u
+/* The code bitmap sits at this fixed distance above guest memory when the
+ * mirrored layout is in use (x86_mem.c: one reservation holds both), so
+ * translated code reaches a store's bitmap byte as [host_addr + delta]
+ * with no register. Disp32-reachable, and past the memory's own span. */
+#define X86_BM_DELTA  0x2000000u
+_Static_assert(X86_BM_DELTA >= X86_MEM_SIZE + X86_MEM_SLACK, "the bitmap must lie above guest memory");
 
 int  x86_mem_alloc(x86_cpu *c);
 void x86_mem_free(x86_cpu *c);

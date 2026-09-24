@@ -43,15 +43,6 @@ static void build_tables(x86_jit_aux *aux) {
         aux->parity[b] = (__builtin_popcount(b) & 1) ? 0 : X86_PF;
 }
 
-int dbt_jit_available(const x86_cpu *cpu) {
-#if defined(__aarch64__)
-    return cpu->mem_mirrored;
-#else
-    (void)cpu;
-    return 0;
-#endif
-}
-
 int dbt_seg16_enabled = 1;
 
 int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
