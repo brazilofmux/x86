@@ -245,9 +245,11 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
             }
         }
         /* Every 4096 instructions, or at once after the keyboard idle wait
-         * (1 ms a poll: 4096 instructions of a polling loop are seconds). */
-        if ((n++ & 4095) == 0 || c->halted || pc.blocked_calls != waits) {
+         * (1 ms a poll: 4096 instructions of a polling loop are seconds), or
+         * when the machine asked for the next boundary (FERR#: IRQ 13). */
+        if ((n++ & 4095) == 0 || c->halted || pc.blocked_calls != waits || c->jit_cur_hit) {
             waits = pc.blocked_calls;
+            c->jit_cur_hit = 0;
             host_poll(c); if (c->halted) return 0;
         }
         if (limit && c->insn_count >= limit) { pmring_dump(c); return 0; }

@@ -20,7 +20,7 @@ typedef struct x86_fpu {
     uint16_t sexp[8];     /* sign and 15-bit biased exponent */
     uint16_t cw, sw;      /* SW carries TOP in bits 11-13 */
     uint8_t  empty;       /* bit n: Rn is empty (the tag word's 11); other tags follow the contents */
-    uint8_t  ferr;        /* FERR#: an unmasked exception with CR0.NE clear (IRQ 13, once there is a slave PIC) */
+    uint8_t  ferr;        /* FERR#: raised when ES does with CR0.NE clear (IRQ 13); port F0h, FNCLEX, FNINIT drop it */
     uint16_t fop;         /* last non-control instruction: opcode bits 10-8, ModRM 7-0 */
     uint16_t fcs, fds;    /* its CS and its operand's segment */
     uint32_t fip, fdp;    /* its offset and its operand's */

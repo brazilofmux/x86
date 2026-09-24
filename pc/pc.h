@@ -30,6 +30,7 @@ enum { HLE_RET_FLAGS, HLE_RET_IRET };
 #define PC_STUB_SEG     0xF100     /* native BIOS stubs: in the ROM area, but not the trap segment's base */
 #define PC_STUB_INT1C   0x0000     /* INT 1Ch; EOI; IRET — INT 8's tail */
 #define PC_STUB_INT9    0x0010     /* a booted machine's INT 9: IN 60h, translate (PC_TRAP_KBD), EOI */
+#define PC_STUB_INT75   0x0020     /* IRQ 13, the coprocessor's: clear FERR# (port F0h), EOI both PICs, INT 2 */
 #define PC_TRAP_KBD     0xF5       /* F000:00F5: the host's scancode translation, code in AL */
 #define PC_STUB_VGAVARS 0x00F0     /* INT 10h AH=00's native half: its ROM variables (table, DAC, DAC length) */
 #define PC_STUB_VGAPROG 0x0100     /*   the code (tools/vgabios.asm) */
@@ -115,6 +116,7 @@ void pc_set_service(int vector, pc_service_fn fn, int ret_mode);
 void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted machine reboots */
 void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
 void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads as an empty bus */
+void pc_irq_raise(int irq);          /* IRQ 8-15: a request to the slave 8259 */
 void pc_native_irq_vectors(x86_cpu *c);  /* booted machines: INT 9 through the native stub */
 void pc_kbd_trap(x86_cpu *c, int vector);   /* PC_TRAP_KBD: translate the scancode in AL */
 void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);

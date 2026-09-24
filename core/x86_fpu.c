@@ -106,10 +106,27 @@ static inline void push(x86_cpu *c, fx v) { set_top(c, top(c) - 1); set_st(c, 0,
 static inline void set_cc(x86_cpu *c, uint16_t cc) { F.c1_kind = 0; F.sw = (uint16_t)((F.sw & ~SW_CC) | cc); }
 static inline void set_c1(x86_cpu *c, int on) { F.c1_kind = 0; F.sw = (uint16_t)(on ? F.sw | SW_C1 : F.sw & ~SW_C1); }
 
+/* ES and B follow the sticky flags that are unmasked. ES rising with
+ * CR0.NE clear is FERR#, which a PC/AT wires to IRQ 13 (with NE set, the
+ * next waiting instruction's #MF instead). */
+static void es_update(x86_cpu *c) {
+    if (F.sw & ~F.cw & 0x3F) {
+        int rose = !(F.sw & SW_ES);
+        F.sw |= SW_ES | SW_B;
+        if (rose && !(c->cr0 & X86_CR0_NE) && !F.ferr) {
+            F.ferr = 1;
+            if (c->ferr_hook) c->ferr_hook(c);
+        }
+    } else {
+        F.sw &= (uint16_t)~(SW_ES | SW_B);
+        F.ferr = 0;
+    }
+}
+
 /* Sticky flags, and ES/B while any of them is unmasked. */
 static void flag(x86_cpu *c, uint16_t ex) {
     F.sw |= (uint16_t)(ex & 0x7F);
-    if (F.sw & ~F.cw & 0x3F) F.sw |= SW_ES | SW_B;
+    if (F.sw & ~F.cw & 0x3F) es_update(c);
 }
 static inline int unmasked(const x86_cpu *c, uint16_t ex) { return (ex & ~F.cw & 0x3F) != 0; }
 
@@ -1114,7 +1131,8 @@ static void env_load(x86_cpu *c, int os32, const uint8_t *b) {
     F.cw = (uint16_t)((F.cw & ~0xE0C0) | 0x0040);
     F.empty = 0;
     for (int p = 0; p < 8; p++) if (((tw >> (2 * p)) & 3) == 3) F.empty |= (uint8_t)(1u << p);
-    if (F.sw & ~F.cw & 0x3F) F.sw |= SW_ES | SW_B; else F.sw &= (uint16_t)~(SW_ES | SW_B);
+    F.sw &= (uint16_t)~(SW_ES | SW_B);                 /* (so a loaded ES counts as rising) */
+    es_update(c);
 }
 
 /* ---- BCD ---------------------------------------------------------------- */
@@ -1172,10 +1190,14 @@ static int fbstp(x86_cpu *c, const x86_insn *in, uint32_t ea) {
 
 /* ---- dispatch ----------------------------------------------------------- */
 
+/* A waiting instruction with an exception pending: #MF under CR0.NE.
+ * Without it the exception went out as FERR# (IRQ 13) when it happened,
+ * and silicon would hold this instruction until IGNNE# — the PC's port
+ * F0h, which the IRQ 13 handler writes. With interrupts on, that handler
+ * runs at the next instruction boundary, before anything waits, so the
+ * instruction simply goes on here; with them off a real 486 would hang. */
 static void pending(x86_cpu *c) {
-    if (!(F.sw & SW_ES)) return;
-    if (c->cr0 & X86_CR0_NE) x86_fault(c, X86_EXC_MF, 0);
-    F.ferr = 1;                                  /* no IRQ 13 yet: the instruction goes on, as with IGNNE# */
+    if ((F.sw & SW_ES) && (c->cr0 & X86_CR0_NE)) x86_fault(c, X86_EXC_MF, 0);
 }
 
 void x86_fpu_wait(x86_cpu *c) { pending(c); }
@@ -1216,7 +1238,7 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
                 pending(c);
                 uint16_t cw = (uint16_t)rd_n(c, in, ea, 2, 2);
                 F.cw = (uint16_t)((cw & ~0xE0C0) | 0x0040);
-                if (F.sw & ~F.cw & 0x3F) F.sw |= SW_ES | SW_B; else F.sw &= (uint16_t)~(SW_ES | SW_B);
+                es_update(c);
                 return;
             }
             case 6: {                                          /* FNSTENV */
@@ -1257,7 +1279,7 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
         if (esc == 3 && reg == 4) {
             switch (rm) {
             case 0: case 1: case 4: return;                    /* FENI, FDISI, FSETPM: the 8087's and 287's, nothing on a 387 */
-            case 2: F.sw &= (uint16_t)~(0x7F | SW_ES | SW_B); F.ferr = 0; return;   /* FNCLEX */
+            case 2: F.sw &= (uint16_t)~0x7F; es_update(c); return;   /* FNCLEX */
             case 3: finit(c); return;                          /* FNINIT */
             default: ud(c); return;
             }

@@ -282,6 +282,35 @@ static void bios_int15(x86_cpu *c, int vector) {
  * a VCPI server tells IRQ 0 from a double fault, both vector 8, by
  * reading the ISR; a port that read 0 made every tick a double fault. */
 static struct { uint8_t mask, base, icw_step, need_icw4, single, read_isr; } pic = { 0xB8, 8, 0, 0, 0, 0 };
+
+/* The slave 8259, cascaded into the master's IRQ 2 (ports A0h/A1h,
+ * vectors from 70h): IRQs 8-15. It keeps its own request and in-service
+ * registers; while one of its IRQs is in service, so is the master's
+ * IRQ 2, and both want an EOI. Fixed priority, fully nested: IRQ 8
+ * highest, and all eight rank between the master's IRQ 1 and IRQ 3.
+ * pc.irq_pending bit 10 says the slave has something to offer. Its one
+ * source so far is IRQ 13, the coprocessor's FERR#. */
+static struct { uint8_t mask, base, icw_step, need_icw4, read_isr, irr, isr; } pic2 = { 0xFF, 0x70, 0, 0, 0, 0, 0 };
+
+static void pic2_summary(void) {
+    if (pic2.irr) pc.irq_pending |= 1 << 10; else pc.irq_pending &= ~(1 << 10);
+}
+void pc_irq_raise(int irq) {
+    if (irq < 8 || irq > 15) return;
+    pic2.irr |= (uint8_t)(1 << (irq - 8));
+    pic2_summary();
+}
+/* FERR# (core/x86_fpu.c): IRQ 13 */
+static void ferr_irq13(x86_cpu *c) {
+    (void)c;
+    if (pc.debug > 1) fprintf(stderr, "[irq] FERR#: IRQ 13 @%llu\n", (unsigned long long)c->insn_count);
+    pc_irq_raise(13);
+    /* Taken at the next instruction boundary, as on the AT: translated code
+     * running the FPU op as a helper leaves for the run loop after it
+     * (jit_cur_hit: the thunks' "go back now") instead of running on
+     * until its budget is spent. */
+    c->jit_cur_hit = 1;
+}
 static void deliver(x86_cpu *c, int irq) {
     int vector = pic.base + irq;
     pc.irq_in_service |= 1 << irq;
@@ -372,7 +401,7 @@ int pc_poll(x86_cpu *c) {
     /* 8259 priority: nothing while an equal-or-higher IRQ is in service
      * (until its EOI). A handler that never EOIs would hang a real PC;
      * we forgive it after 200 ms of wall clock. */
-    if (pc.irq_in_service && now - pc.irq_service_ns > 200000000ull) pc.irq_in_service = 0;
+    if (pc.irq_in_service && now - pc.irq_service_ns > 200000000ull) { pc.irq_in_service = 0; pic2.isr = 0; }
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) {
         pc.irq_pending &= ~(1 << 8);
         pc.ticks_delivered++;
@@ -384,6 +413,24 @@ int pc_poll(x86_cpu *c) {
         pc.irq_pending &= ~(1 << 9);
         deliver(c, 1);
         return 1;
+    }
+    /* the slave, through IRQ 2: its highest request that nothing of equal
+     * or higher priority on the slave is in service for */
+    uint8_t req = pic2.irr & (uint8_t)~pic2.mask;
+    if (req && !(pc.irq_in_service & 7) && !(pic.mask & 4)) {
+        int n = __builtin_ctz(req);
+        if (!(pic2.isr & ((2u << n) - 1))) {
+            pic2.irr &= (uint8_t)~(1 << n);
+            pic2.isr |= (uint8_t)(1 << n);
+            pic2_summary();
+            pc.irq_in_service |= 1 << 2;
+            pc.irq_service_ns = now;
+            int vector = pic2.base + n;
+            if (pc.debug > 1) fprintf(stderr, "[irq] INT %02X (IRQ %d) @%llu\n", vector, 8 + n, (unsigned long long)c->insn_count);
+            x86_interrupt(c, vector, 0);
+            c->halted = 0;
+            return 1;
+        }
     }
     return 0;
 }
@@ -450,8 +497,11 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
         return b;
     }
     case 0x43: return 0xFF;
-    case 0x20: return pic.read_isr ? (uint32_t)(pc.irq_in_service & 0xFF) : (uint32_t)((pc.irq_pending >> 8) & 3);
+    case 0x20: return pic.read_isr ? (uint32_t)(pc.irq_in_service & 0xFF)
+                                   : (uint32_t)(((pc.irq_pending >> 8) & 3) | (pic2.irr ? 4 : 0));
     case 0x21: return pic.mask;
+    case 0xA0: return pic2.read_isr ? pic2.isr : pic2.irr;
+    case 0xA1: return pic2.mask;
     case 0x60:
         if (pc.kbc_out_full) { pc.kbc_out_full = 0; return pc.kbc_out; }
         pc.irq9_busy = 0; return pc.last_scancode;
@@ -514,6 +564,22 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         else if ((val & 0xE0) == 0x60) pc.irq_in_service &= ~(1 << (val & 7));
         else if (val == 0x20) for (int i = 0; i < 8; i++) if (pc.irq_in_service & (1 << i)) { pc.irq_in_service &= ~(1 << i); break; }
         break;
+    case 0xA1:
+        if (pic2.icw_step == 2) { pic2.base = (uint8_t)(val & 0xF8); pic2.icw_step = 3; }   /* ICW2; a slave is always cascaded */
+        else if (pic2.icw_step == 3) pic2.icw_step = pic2.need_icw4 ? 4 : 0;               /* ICW3: its ID */
+        else if (pic2.icw_step == 4) pic2.icw_step = 0;                                     /* ICW4 */
+        else pic2.mask = (uint8_t)val;
+        break;
+    case 0xA0:
+        if (val & 0x10) { pic2.icw_step = 2; pic2.need_icw4 = val & 1; pic2.mask = 0; pic2.read_isr = 0; pic2.isr = 0; }
+        else if ((val & 0x18) == 0x08) { if (val & 2) pic2.read_isr = val & 1; }           /* OCW3 */
+        else if ((val & 0xE0) == 0x60) pic2.isr &= (uint8_t)~(1 << (val & 7));             /* specific EOI */
+        else if (val == 0x20 && pic2.isr) pic2.isr &= (uint8_t)(pic2.isr - 1);              /* non-specific: the highest in service */
+        break;
+    /* The AT's coprocessor ports: F0h clears the busy/FERR# latch (and so
+     * asserts IGNNE#), F1h resets the coprocessor. */
+    case 0xF0: c->fpu.ferr = 0; break;
+    case 0xF1: if (c->has_fpu) x86_fpu_finit(c); break;
     case 0x61: pit_speaker = (uint8_t)(val & 0x0F); break;
     case 0x64:
         /* The 8042's commands. Only 60h and D1h-D4h take a data byte
@@ -622,6 +688,18 @@ static void post(x86_cpu *cpu) {
     static const uint8_t int9[] = { 0x50, 0xE4, 0x60, 0x9C, 0x9A, PC_TRAP_KBD, 0x00, 0x00, 0xF0,
                                     0xFA, 0xB0, 0x20, 0xE6, 0x20, 0x58, 0xCF };
     for (size_t i = 0; i < sizeof int9; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT9 + i), int9[i]);
+    /* INT 75h, IRQ 13, as the AT BIOS has it: push ax; xor al,al; out F0h,al
+     * (FERR# off); mov al,20h; out A0h,al; out 20h,al (both EOIs); pop ax;
+     * int 2 (where DOS programs hook floating-point errors); iret */
+    static const uint8_t int75[] = { 0x50, 0x32, 0xC0, 0xE6, 0xF0, 0xB0, 0x20, 0xE6, 0xA0, 0xE6, 0x20, 0x58,
+                                     0xCD, 0x02, 0xCF };
+    for (size_t i = 0; i < sizeof int75; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT75 + i), int75[i]);
+    pc_wr16(cpu, 0, 0x75 * 4, PC_STUB_INT75);
+    pc_wr16(cpu, 0, 0x75 * 4 + 2, PC_STUB_SEG);
+    /* the slave at 70h, everything masked but the coprocessor's IRQ 13 */
+    pic2.mask = cpu->has_fpu ? 0xDF : 0xFF; pic2.base = 0x70; pic2.icw_step = 0; pic2.read_isr = 0;
+    pic2.irr = pic2.isr = 0;
+    cpu->ferr_hook = ferr_irq13;
     pc_vga_rom(cpu);                             /* INT 10h's mode set, programmed by OUTs */
     /* FFFF:0000, the reset vector: JMP F000:FFF0, which traps (TRAP_RESET) */
     static const uint8_t jmp[5] = { 0xEA, 0xF0, 0xFF, 0x00, 0xF0 };

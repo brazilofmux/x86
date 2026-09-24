@@ -27,6 +27,12 @@ done
 for mode in -i -j -V; do
     check "unreal $mode"    tests/dos/unreal.out  $DM -m 386 $mode -L 1000000 tests/dos/unreal.com
 done
+# IRQ 13: an unmasked x87 exception through FERR#, the slave 8259 and the
+# BIOS's INT 75h to the program's INT 2
+for mode in -i -j -V; do
+    check "irq13 -m 486 $mode" tests/dos/irq13.out $DM -m 486 $mode -L 3000000 tests/dos/irq13.com
+done
+check "irq13 -m 386 -fpu -V" tests/dos/irq13.out $DM -m 386 -fpu -V -L 3000000 tests/dos/irq13.com
 # the 486 against the 386: EFLAGS.AC, BSWAP/XADD/CMPXCHG/INVD or #UD
 for mode in -i -j -V; do
     for m in 386 486; do

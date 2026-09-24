@@ -399,6 +399,7 @@ static void shadow_copy_regs(x86_dbt *dbt) {
     sh->mem = mem; sh->code_bitmap = bm; sh->mem_fd = fd; sh->mem_mirrored = mirrored;
     sh->dbt = NULL; sh->jit_aux = NULL;
     sh->smc_hook = shadow_smc_none;
+    sh->ferr_hook = NULL;                /* IRQ 13 is the real machine's */
     /* Devices belong to the real machine: the shadow sees their memory as
      * plain bytes and never reaches back into their state. */
     sh->device_store = NULL;

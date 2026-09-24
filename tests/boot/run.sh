@@ -60,6 +60,13 @@ if [ -f disks/msdos622/c.img ]; then
     printf 'C:.>$\tmem /c\\r\n*Free Expanded \\(EMS\\)\t\n' > tmp/boot-c.exp
     if python3 tools/expect.py -t 90 tmp/boot-c.exp -- $DM -m 386 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
     then echo "ok   ms-dos under emm386 (v86)"; else echo "FAIL ms-dos under emm386 (v86)"; fail=1; fi
+    # IRQ 13 on a 486 under EMM386: FERR# to the slave 8259, the BIOS's
+    # INT 75h run in V86 mode (its OUTs to F0h, A0h and 20h through the
+    # monitor), the program's INT 2
+    mcopy -o -i tmp/boot-c.img@@32256 tests/dos/irq13.com ::/IRQ13.COM
+    printf 'C:.>$\tirq13\\r\nafter 02\t\n' > tmp/boot-c.exp
+    if python3 tools/expect.py -t 90 tmp/boot-c.exp -- $DM -m 486 -W -T 80 -hda tmp/boot-c.img -boot c >/dev/null 2>&1
+    then echo "ok   irq 13 on a 486 under emm386"; else echo "FAIL irq 13 on a 486 under emm386"; fail=1; fi
     if [ -d disks/WP51 ]; then
         mcopy -s -i tmp/boot-c.img@@32256 disks/WP51 ::/
         printf 'C:.>$\tcd \\\\wp51\\rwp\\r\nDoc 1 Pg 1\tHello from MS-DOS.\nMS-DOS\\.\t\n' > tmp/boot-c.exp

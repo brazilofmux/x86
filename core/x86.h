@@ -212,6 +212,9 @@ typedef struct x86_cpu {
      * own. Without one, ESC opcodes only perform their bus cycle. */
     uint8_t  has_fpu;
     x86_fpu  fpu;
+    /* FERR#: an unmasked x87 exception with CR0.NE clear; the machine
+     * turns it into IRQ 13 (pc/pc_bios.c). NULL on the -V shadow. */
+    void   (*ferr_hook)(struct x86_cpu *);
 } x86_cpu;
 
 /* 8-bit register access: AL..BL are the low bytes of r[0..3], AH..BH are
