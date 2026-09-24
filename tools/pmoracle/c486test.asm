@@ -61,6 +61,9 @@ stage1:
 stage2:
         mov eax, cr0                ; ET as the machine came up
         mov [cr0_boot], eax
+        mov al, 0xFF                ; every IRQ masked at the PIC: ring 3 runs with IF
+        out 0x21, al                ; set, and a timer tick there reads as vector 8 (a
+        out 0xA1, al                ; slow -V run on the host clock took one in T23)
         in al, 0x92                 ; A20 on
         or al, 2
         out 0x92, al
