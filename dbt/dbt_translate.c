@@ -558,8 +558,13 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
          * another. */
         dbt_cache_invalidate_all(dbt);
         dbt->flush_pending = 0;
-        dbt->code_used = 0;
-        dbt_emit_trampoline(dbt);
+        /* Under X86_PERF_MAP a flush that is not for space keeps appending
+         * (the trampoline stays where it is), so no host address is ever
+         * reused and perf cannot pin a later block on an earlier name. */
+        if (!(getenv("X86_PERF_MAP") && dbt->code_used + 65536 <= CODE_BUF_SIZE)) {
+            dbt->code_used = 0;
+            dbt_emit_trampoline(dbt);
+        }
     }
 
     /* HLE stub segment: the interpreter step dispatches the host service. */
