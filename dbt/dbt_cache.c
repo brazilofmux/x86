@@ -259,14 +259,15 @@ void dbt_dev_changed(x86_cpu *cpu) {
 /* Drop code page I's paged blocks (those of its address space) and the
  * entry's alias. The caller compacts the list. A page's blocks sit in
  * 4096 consecutive slots per key mode (its linear address XOR the folded
- * mode bits): V86, and flat 32-bit PM. */
+ * mode bits): V86, flat 32-bit PM, and segmented 16-bit PM. */
 static void drop_code_page(x86_dbt *dbt, uint32_t i) {
-    static const uint32_t modes[2] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
-                                       (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT) };
+    static const uint32_t modes[3] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
+                                       (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT),
+                                       (uint32_t)((KEY_PMODE | KEY_SEG16) >> KEY_MODE_SHIFT) };
     uint32_t lin = dbt->pcode[i].lin_page << 12, was = dbt->pcode[i].phys_page << 12;
     uint64_t space = (uint64_t)dbt->pcode[i].space << KEY_SPACE_SHIFT;
     if (dbt->phys_alias[was >> 12] == dbt->pcode[i].lin_page + 1) dbt->phys_alias[was >> 12] = 0;
-    for (int m = 0; m < 2; m++)
+    for (int m = 0; m < 3; m++)
         for (uint32_t k = 0; k < 4096; k++) {
             uint32_t slot = dbt_slot_mode(lin + k, modes[m]);
             x86_block_entry *e = &dbt->aux->cache[slot];

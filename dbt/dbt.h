@@ -96,6 +96,7 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_ESNULL         (1ull << 55)   /* flat, but ES is null (a monitor entered from V86): ES accesses are the interpreter's */
 #define KEY_SPACE_SHIFT    58             /* paged keys: which address space (CR3) the block was translated in, */
 #define KEY_SPACE_MASK     (0xFull << KEY_SPACE_SHIFT)   /* 16 at a time (dbt_tlb_flushed); outside the slot hash */
+#define KEY_SS32           (1ull << 62)   /* segmented 16-bit code on a 32-bit stack (SS.B): push/pop move all of ESP */
 #define KEY_A20OFF         (1ull << 57)   /* translated with the A20 gate off: far targets and wraps bake the 1 MB mask
                                              * (outside the slot hash: both states' blocks share a slot, and the SMC
                                              * sweep and code-page drops find either by address) */
@@ -366,8 +367,12 @@ static inline int dbt_seg16_data_ok(const x86_seg *g) {
 static inline int dbt_seg16_ok(const x86_cpu *c) {
     const x86_seg *cs = &c->seg[S_CS], *ss = &c->seg[S_SS];
     if (!cs->usable || cs->big || !X86_AR_S(cs->attr) || !(cs->attr & X86_TYPE_CODE)) return 0;
-    if (!ss->usable || ss->big || !X86_AR_S(ss->attr) || (ss->attr & X86_TYPE_CODE)
+    if (!ss->usable || !X86_AR_S(ss->attr) || (ss->attr & X86_TYPE_CODE)
         || !(ss->attr & X86_TYPE_WRITABLE) || (ss->attr & X86_TYPE_EXPDOWN)) return 0;
+    /* A 32-bit stack (DOS/4GW's 16-bit code on its client's flat stack):
+     * under paging every access goes through the TLB; without it the block
+     * addresses mem + base + ESP, so the segment must lie in memory. */
+    if (ss->big && !(c->cr0 & X86_CR0_PG) && (uint64_t)ss->base + ss->limit >= c->mem_size) return 0;
     return dbt_seg16_data_ok(&c->seg[S_DS]) && dbt_seg16_data_ok(&c->seg[S_ES]);
 }
 
@@ -388,8 +393,10 @@ static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
         b |= KEY_FLAT | (c->seg[S_ES].usable ? 0 : KEY_ESNULL) | (c->seg[S_DS].usable ? 0 : KEY_DSNULL);
         if (c->cr0 & X86_CR0_PG) b |= KEY_PAGED | (uint64_t)c->pg_space << KEY_SPACE_SHIFT;
     }
-    else if (dbt_seg16_enabled && dbt_seg16_ok(c))
-        b |= KEY_SEG16;
+    else if (dbt_seg16_enabled && dbt_seg16_ok(c)) {
+        b |= KEY_SEG16 | (c->seg[S_SS].big ? KEY_SS32 : 0);
+        if (c->cr0 & X86_CR0_PG) b |= KEY_PAGED | (uint64_t)c->pg_space << KEY_SPACE_SHIFT;
+    }
     return b;
 }
 

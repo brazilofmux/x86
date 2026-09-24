@@ -158,6 +158,10 @@ typedef struct x86_cpu {
     /* Pending exception raised during a step (X86_EXC_*), -1 if none */
     int      exc;
     uint32_t exc_err;
+    /* Exceptions delivered, by vector, and the hottest sites (-s): what a
+     * V86 monitor or DPMI host spends its time trapping. */
+    uint64_t exc_count[32];
+    struct { uint64_t key, n; } exc_site[1024];   /* key: vector << 48 | CS << 32 | EIP */
     /* Faults abort the instruction: x86_fault() longjmps here when armed
      * (x86_step, x86_exec_decoded) so no further state is committed. */
     jmp_buf  fault_jb;       /* _setjmp/_longjmp: plain setjmp saves the signal mask, a syscall per instruction on macOS */

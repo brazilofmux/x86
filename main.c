@@ -104,9 +104,30 @@ static void pm_trace_exc(x86_cpu *c, int vec, uint32_t err) {
 
 /* X86_EXC_TRACE=1: every exception the CPU raises, with the code around
  * it (EIP is past the faulting instruction here; faults restart at its
- * start after this hook). The first 50, then quiet. */
+ * start after this hook). The first 50, then quiet. X86_EXC_TRACE=0c,0e
+ * (hex vectors, comma-separated) shows only those, and a "pm" among them
+ * none raised in V86 mode — WIN386's V86 traps (#UD on ARPL, #GP on INT
+ * n and I/O) otherwise use up the 50 at once. */
 static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
-    static int n;
+    static int n, parsed, pm_only;
+    static uint8_t want[32];
+    if (!parsed) {
+        parsed = 1;
+        const char *e = getenv("X86_EXC_TRACE");
+        int any = 0;
+        if (e && strcmp(e, "1") != 0) {
+            for (const char *p = e; *p; ) {
+                if (!strncmp(p, "pm", 2)) { pm_only = 1; p += 2; if (*p) p++; continue; }   /* not from V86 mode */
+                char *end; long v = strtol(p, &end, 16);
+                if (end == p) break;
+                if (v >= 0 && v < 32) { want[v] = 1; any = 1; }
+                p = *end ? end + 1 : end;
+            }
+        }
+        if (!any) memset(want, 1, sizeof want);
+    }
+    if (vec < 32 && !want[vec]) return;
+    if (pm_only && (c->eflags & X86_VM)) return;
     if (n++ >= 50) return;
     uint32_t lin = c->seg[S_CS].base + c->eip;
     fprintf(stderr, "[exc] v=%02X err=%04X at %04X:%04X (%s) bytes before/after:", vec, err,

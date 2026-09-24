@@ -120,6 +120,19 @@ static int s_dsnull;        /* KEY_DSNULL: the same for DS */
 /* Segmented 16-bit protected mode (a KEY_SEG16 block, see dbt_seg16_ok):
  * the real-mode shape with a limit check on every access. */
 static int s_seg16;
+static int s_ss32;          /* a KEY_SEG16 block on a 32-bit stack: ESP whole, no 16-bit wrap */
+
+/* The new stack pointer SP - size (or + size), masked to 16 bits unless
+ * the stack is 32-bit, into DST; and back into ESP/SP. */
+static void emit_sp_adj(emit_t *e, a64_reg_t dst, a64_reg_t sp, int32_t delta) {
+    if (delta < 0) emit_sub_w32_imm(e, dst, sp, (uint32_t)-delta); else emit_add_w32_imm(e, dst, sp, (uint32_t)delta);
+    if (!s_ss32) (void)emit_and_w32_imm(e, dst, dst, 0xFFFF);
+}
+static void emit_set16(emit_t *e, int reg, a64_reg_t src);
+static void emit_set_sp(emit_t *e, a64_reg_t src) {
+    if (s_ss32) { if (src != R_GPR(R_SP)) emit_mov_w32_w32(e, R_GPR(R_SP), src); }
+    else emit_set16(e, R_SP, src);
+}
 
 /* -V strict mode: every block returns to dbt_run (no links, no probe). */
 static int s_strict_exit = -1;
@@ -408,6 +421,7 @@ static a64_reg_t seg_ptr_reg(int s) {
 static void emit_flat_check(emit_t *e, a64_reg_t off);
 static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only);
 static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea);
+static void emit_ea_seg16_paged(emit_t *e, const x86_insn *in, ea_t *ea);
 static void flat_slow_site(emit_t *e);
 static int s_devread;
 static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write);
@@ -456,7 +470,10 @@ static void emit_ea(emit_t *e, const x86_insn *in, ea_t *ea) {
     ea->seg = in->seg;
     if (s_flat) { emit_ea_flat(e, in, ea); return; }
     emit_ea_real(e, in, ea);
-    if (s_paged && in->op != OP_LEA) { emit_ea_paged(e, in, ea); return; }
+    if (s_paged && in->op != OP_LEA) {
+        if (s_seg16) emit_ea_seg16_paged(e, in, ea); else emit_ea_paged(e, in, ea);
+        return;
+    }
     if (s_devread && in->op != OP_LEA && !(in->op == OP_MOV && in->ops[0].kind == OPK_MEM)) {
         /* host address - mem, bits 31:16 == 0xA: the window */
         emit_add_x64_w32_uxtw(e, W_T3, ea->segp, ea->off);
@@ -889,8 +906,43 @@ static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea) {
     ea->off = W_OFF;
 }
 
+/* A segmented 16-bit block under paging (Win16 in 386 enhanced mode,
+ * DOS/4GW's 16-bit segments under a VCPI server): the segment's limit
+ * first — #GP/#SS come before any #PF — then the linear address, base +
+ * offset, through the interpreter's TLB as a paged flat block does
+ * (emit_pgflat). The pinned segment pointers are mem + base, so the base
+ * is theirs minus R_MEM. Leaves the linear address in W_OFF and the page's
+ * host base in X_SEGP. Clobbers W_T1-W_T3, X0-X2. */
+static void emit_ea_seg16_paged(emit_t *e, const x86_insn *in, ea_t *ea) {
+    int size = in->opsize;
+    for (int i = 0; i < 3; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
+    switch (in->op) {
+    case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_JMPF: case OP_CALLF:
+        size = in->opsize + 2; break;
+    default: break;
+    }
+    emit_limit_check(e, ea->seg, ea->off, size);
+    s_ea_checked = 1;
+    emit_sub_x64(e, W_T2, ea->segp, R_MEM);
+    emit_add_w32(e, W_OFF, W_T2, ea->off);
+    int store_only = in->op == OP_MOV && in->ops[0].kind == OPK_MEM;
+    emit_pgflat(e, W_OFF, size, !writes_mem_operand(in) ? PG_READ : store_only ? PG_STORE : PG_RMW);
+    ea->segp = X_SEGP;
+    ea->off = W_OFF;
+}
+
+/* The stack slot at SS:OFF (16-bit SP) of a paged segmented block: limit
+ * check, then through the TLB; X_SEGP + W_OFF addresses it after. OFF may
+ * be W_OFF itself. */
+static void emit_stk_seg16_paged(emit_t *e, a64_reg_t off, int size, int mode) {
+    emit_limit_check(e, S_SS, off, size);
+    emit_sub_x64(e, W_T2, R_SSP, R_MEM);
+    emit_add_w32(e, W_OFF, W_T2, off);
+    emit_pgflat(e, W_OFF, size, mode);
+}
+
 static void emit_read_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t dst) {
-    if (s_seg16) {
+    if (s_seg16 && !s_ea_checked) {             /* (under paging emit_ea checked it, and OFF is linear now) */
         emit_limit_check(e, ea->seg, ea->off, size);
         s_ea_checked = 1;                       /* 286+: a straddling store after this is unreachable */
     }
@@ -1722,6 +1774,16 @@ static void emit_popa_flat(emit_t *e) {
  * the 386 in a segmented block, a dword. */
 static void emit_push_stk(emit_t *e, a64_reg_t val, int size) {
     if (s_flat) { emit_push32_flat(e, val); return; }
+    if (s_paged && s_seg16) {
+        emit_sp_adj(e, W_OFF, R_GPR(R_SP), -size);
+        emit_stk_seg16_paged(e, W_OFF, size, PG_STORE);
+        if (size == 4) emit_str_w32_reg_uxtw(e, val, X_SEGP, W_OFF); else emit_strh_reg_uxtw(e, val, X_SEGP, W_OFF);
+        emit_add_x64_w32_uxtw(e, W_T3, X_SEGP, W_OFF);
+        emit_smc_check_x3(e, size);
+        emit_sp_adj(e, W_T2, R_GPR(R_SP), -size);
+        emit_set_sp(e, W_T2);
+        return;
+    }
     if (s_paged) {
         /* one checked slot, then the store through its translation */
         emit_sub_w32_imm(e, W_OFF, R_GPR(R_SP), (uint32_t)size);
@@ -1736,8 +1798,7 @@ static void emit_push_stk(emit_t *e, a64_reg_t val, int size) {
         return;
     }
     /* new SP in a temp until the store is known to succeed (fault: SP intact) */
-    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), (uint32_t)size);
-    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);   /* also strips ESP[31:16] for the address */
+    emit_sp_adj(e, W_T2, R_GPR(R_SP), -size);        /* (16-bit: also strips ESP[31:16] for the address) */
     if (s_seg16) emit_limit_check(e, S_SS, W_T2, size);
     else emit_wrap_check(e, R_SSP, W_T2, val, 1, 1);
     if (size == 4) emit_str_w32_reg_uxtw(e, val, R_SSP, W_T2);
@@ -1745,12 +1806,20 @@ static void emit_push_stk(emit_t *e, a64_reg_t val, int size) {
     emit_add_x64_w32_uxtw(e, W_T3, R_SSP, W_T2);
     emit_smc_check_x3(e, size);
     if (!s_seg16) emit_wrap_back(e);
-    emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), (uint32_t)size);
-    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
-    emit_set16(e, R_SP, W_T2);
+    emit_sp_adj(e, W_T2, R_GPR(R_SP), -size);
+    emit_set_sp(e, W_T2);
 }
 static void emit_pop_stk(emit_t *e, a64_reg_t dst, int size) {
     if (s_flat) { emit_pop32_flat(e, dst); return; }
+    if (s_paged && s_seg16) {
+        a64_reg_t sp0 = s_ss32 ? R_GPR(R_SP) : emit_reg16(e, R_SP, W_OFF);
+        if (sp0 != W_OFF) emit_mov_w32_w32(e, W_OFF, sp0);
+        emit_stk_seg16_paged(e, W_OFF, size, PG_READ);
+        if (size == 4) emit_ldr_w32_reg_uxtw(e, dst, X_SEGP, W_OFF); else emit_ldrh_reg_uxtw(e, dst, X_SEGP, W_OFF);
+        emit_sp_adj(e, W_T2, R_GPR(R_SP), size);
+        emit_set_sp(e, W_T2);
+        return;
+    }
     if (s_paged) {
         a64_reg_t sp0 = emit_reg16(e, R_SP, W_OFF);
         if (sp0 != W_OFF) emit_mov_w32_w32(e, W_OFF, sp0);
@@ -1761,15 +1830,14 @@ static void emit_pop_stk(emit_t *e, a64_reg_t dst, int size) {
         emit_set16(e, R_SP, W_T2);
         return;
     }
-    a64_reg_t sp = emit_reg16(e, R_SP, W_T2);
+    a64_reg_t sp = s_ss32 ? R_GPR(R_SP) : emit_reg16(e, R_SP, W_T2);
     if (s_seg16) emit_limit_check(e, S_SS, sp, size);
     else emit_wrap_check(e, R_SSP, sp, dst, 0, 0);
     if (size == 4) emit_ldr_w32_reg_uxtw(e, dst, R_SSP, sp);
     else emit_ldrh_reg_uxtw(e, dst, R_SSP, sp);
     if (!s_seg16) emit_wrap_back(e);
-    emit_add_w32_imm(e, W_T2, sp, (uint32_t)size);
-    (void)emit_and_w32_imm(e, W_T2, W_T2, 0xFFFF);
-    emit_set16(e, R_SP, W_T2);
+    emit_sp_adj(e, W_T2, sp, size);
+    emit_set_sp(e, W_T2);
 }
 static void emit_push16(emit_t *e, a64_reg_t val) { emit_push_stk(e, val, 2); }
 static void emit_pop16(emit_t *e, a64_reg_t dst) { emit_pop_stk(e, dst, 2); }
@@ -2662,7 +2730,7 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
     }
     case OP_RET:
         emit_pop16(e, W_VAL);
-        if (in->ops[0].kind == OPK_IMM && s_flat) {
+        if (in->ops[0].kind == OPK_IMM && (s_flat || s_ss32)) {
             emit_add_w32_imm_any(e, R_GPR(R_SP), R_GPR(R_SP), (int32_t)(in->ops[0].imm & 0xFFFF), W_T1);
         } else if (in->ops[0].kind == OPK_IMM) {
             emit_add_w32_imm_any(e, W_T2, R_GPR(R_SP), (int32_t)(in->ops[0].imm & 0xFFFF), W_T1);
@@ -2727,7 +2795,7 @@ static void emit_v86_dynamic_key(emit_t *e, uint64_t mode_bits) {
 static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
     x86_cpu *cpu = dbt->cpu;
     s_flat = 0;
-    s_seg16 = 0;
+    s_seg16 = 0; s_ss32 = 0;
     const x86_seg *cs = &cpu->seg[S_CS];
     /* A20 off in protected mode would fold linear addresses under the
      * block's feet; nothing we run does it, so do not translate it. */
@@ -2856,11 +2924,12 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     if (cpu->pmode && !s_v86 && (!(key & (KEY_FLAT | KEY_SEG16)) || cpu->a20_mask != 0xFFFFFFFFu)) return translate_pm(dbt, key);
     s_flat = cpu->pmode && !s_v86 && (key & KEY_FLAT) != 0;    /* from here on: real mode or V86, a flat block, or a segmented 16-bit one */
     s_seg16 = cpu->pmode && !s_v86 && !s_flat;
+    s_ss32 = s_seg16 && (key & KEY_SS32) != 0;
     s_mode_bits = key & 0x7FFF000000000000ull;
     s_esnull = (key & KEY_ESNULL) != 0;
     s_devread = cpu->device_read != NULL;
     s_dsnull = (key & KEY_DSNULL) != 0;
-    s_pg_user = s_flat && s_paged && (cpu->seg[S_CS].sel & 3) == 3;
+    s_pg_user = (s_flat || s_seg16) && s_paged && (cpu->seg[S_CS].sel & 3) == 3;
     uint32_t code_page = 0, code_delta = 0;     /* physical - linear, mod 2^32: add it before indexing mem */
     if (s_paged) {
         /* A paged block (V86, or flat protected mode) stays on one code
@@ -2936,6 +3005,18 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         if (s_seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
         int c = s_flat ? classify_flat(in) : s_seg16 ? classify_seg16(in) : classify(in);
         if (s_v86) c = classify_v86(in, c);
+        if (s_seg16 && s_paged && c == C_INLINE) {
+            /* one checked access an instruction (emit_ea_seg16_paged); a
+             * string op, or a stack op through memory, has two */
+            switch (in->op) {
+            case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
+                c = C_HELPER; break;
+            case OP_PUSH: case OP_POP: case OP_CALL: case OP_JMP:
+                if (in->ops[0].kind == OPK_MEM) c = C_HELPER;
+                break;
+            default: break;
+            }
+        }
         if (s_devread && !s_flat && c == C_INLINE
             && (in->op == OP_MOVS || in->op == OP_LODS || in->op == OP_CMPS || in->op == OP_SCAS))
             c = C_HELPER;                              /* a read through SI/DI may be the window's */

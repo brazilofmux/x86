@@ -544,6 +544,17 @@ static void far_transfer_pm(x86_cpu *c, uint16_t sel, uint32_t off, int is_call,
     c->eip = gate32 ? tip : (tip & 0xFFFF);
 }
 
+/* -s: count an exception about to be delivered, by vector and by site. */
+static void count_exc(x86_cpu *c, int vec) {
+    c->exc_count[vec & 31]++;
+    uint64_t key = (uint64_t)(vec & 31) << 48 | (uint64_t)c->seg[S_CS].sel << 32 | c->eip;
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 54);
+    for (int k = 0; k < 8; k++) {
+        uint32_t i = (h + (uint32_t)k) & 1023;
+        if (c->exc_site[i].key == key || c->exc_site[i].n == 0) { c->exc_site[i].key = key; c->exc_site[i].n++; return; }
+    }
+}
+
 void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
     if (c->pmode) {
         if (c->fault_armed) { deliver_pm(c, vector, is_sw, c->exc_err); return; }
@@ -568,6 +579,7 @@ void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
             c->exc = -1;
             is_sw = 0;
             c->exc_delivered = 1;
+            count_exc(c, vector);
         }
     }
     (void)is_sw;
@@ -1681,6 +1693,7 @@ void x86_deliver_exception(x86_cpu *c) {
     c->exc = -1;
     if (c->trace_exc) c->trace_exc(c, vec, c->exc_err);
     c->exc_delivered = 1;
+    count_exc(c, vec);
     x86_interrupt(c, vec, 0);
 }
 
@@ -1753,6 +1766,7 @@ int x86_step(x86_cpu *c) {
         if (!trap_semantics) c->eip = start_ip;
         if (vec == X86_EXC_UD && c->model == X86_MODEL_8086) return -1;   /* cannot happen; be loud */
         c->exc_delivered = 1;
+        count_exc(c, vec);
         x86_interrupt(c, vec, 0);
     }
     return 0;

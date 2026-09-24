@@ -416,7 +416,7 @@ int dbt_run(x86_dbt *dbt) {
          * which the interpreter runs and clears. */
         int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF)
                      || ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM)
-                         && !(dbt_cpu_mode_bits(cpu) & KEY_FLAT));        /* paged PM that is not flat: the interpreter's */
+                         && !(dbt_cpu_mode_bits(cpu) & (KEY_FLAT | KEY_SEG16)));   /* paged PM neither flat nor segmented 16-bit: the interpreter's */
         x86_block_entry *be = inhibited ? NULL : dbt_cache_lookup(dbt, key);
         uint8_t *code = be ? be->code : NULL;
         if (!be && !inhibited) {
@@ -692,6 +692,25 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
                 (unsigned long long)dbt->fallback_by_class[0], (unsigned long long)dbt->fallback_by_class[1],
                 (unsigned long long)dbt->fallback_by_class[2], (unsigned long long)dbt->fallback_by_class[3],
                 (unsigned long long)dbt->fallback_by_class[4], (unsigned long long)dbt->fallback_by_class[5]);
+    {
+        x86_cpu *c = dbt->cpu;
+        uint64_t tot = 0;
+        for (int v = 0; v < 32; v++) tot += c->exc_count[v];
+        if (tot) {
+            fprintf(out, "  exceptions: %llu —", (unsigned long long)tot);
+            for (int v = 0; v < 32; v++) if (c->exc_count[v]) fprintf(out, " #%02X:%llu", v, (unsigned long long)c->exc_count[v]);
+            fprintf(out, "\n    hottest sites:");
+            for (int k = 0; k < 8; k++) {
+                int best = -1;
+                for (int i = 0; i < 1024; i++) if (c->exc_site[i].n && (best < 0 || c->exc_site[i].n > c->exc_site[best].n)) best = i;
+                if (best < 0) break;
+                uint64_t key = c->exc_site[best].key;
+                fprintf(out, " #%02X@%04X:%X=%llu", (int)(key >> 48), (unsigned)(key >> 32) & 0xFFFF, (unsigned)key, (unsigned long long)c->exc_site[best].n);
+                c->exc_site[best].n = 0;
+            }
+            fprintf(out, "\n");
+        }
+    }
     fprintf(out, "  interp fallbacks by op (dynamic):");
     for (int n = 0; n < 12; n++) {
         int best = -1;
@@ -724,7 +743,8 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
 }
 
 /* ----------------------------------------------------------------------
- * X86_SAMPLE: a PC sampler for runs too short for an outside profiler
+ * X86_SAMPLE=US[@SECONDS]: a PC sampler for runs too short for an outside
+ * profiler, every US microseconds (from SECONDS in, if given)
  * ---------------------------------------------------------------------- */
 #define SAMPLE_MAX (1u << 20)
 static uintptr_t *s_samples;
@@ -740,8 +760,10 @@ static void on_sample(int sig, siginfo_t *si, void *ctx) {
 void dbt_sample_start(void) {
     const char *e = getenv("X86_SAMPLE");
     if (!e) return;
-    long us = strtol(e, NULL, 0);
+    char *at;
+    long us = strtol(e, &at, 0);
     if (us <= 0) us = 100;
+    double after = *at == '@' ? atof(at + 1) : 0;     /* X86_SAMPLE=US@SECONDS: start later (skip a boot) */
     s_samples = calloc(SAMPLE_MAX, sizeof(uintptr_t));
     if (!s_samples) return;
     struct sigaction sa = { 0 };
@@ -750,7 +772,7 @@ void dbt_sample_start(void) {
     /* The wall-clock timer: macOS delivers ITIMER_PROF's SIGPROF on the
      * way out of the kernel, which piles the samples onto system calls. */
     sigaction(SIGALRM, &sa, NULL);
-    struct itimerval it = { { 0, (int)us }, { 0, (int)us } };
+    struct itimerval it = { { 0, (int)us }, { (time_t)after, (int)((after - (double)(long)after) * 1e6) + (after > 0 ? 0 : (int)us) } };
     setitimer(ITIMER_REAL, &it, NULL);
 }
 
