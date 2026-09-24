@@ -167,7 +167,7 @@ start:
         call crlf
 
         ; ---- past the end: IDNF; a command it does not have: ABRT
-        mov eax, 2048
+        mov eax, 4096                   ; (past the diagnostic cylinder too)
         mov cl, 1
         call lba_regs
         mov al, 0x20

@@ -31,6 +31,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "pc_diskbios.h"
 
 #define DPT_OFF   0xEFC7                     /* diskette parameter table, as on the AT */
 #define FDPT_OFF0 0xE3C0                     /* fixed-disk parameter tables (INT 41h, 46h) */
@@ -310,13 +311,18 @@ static void int13(x86_cpu *c, int vector) {
     }
 }
 
+/* The fixed-disk parameter table, as the AT's: its cylinders are the
+ * drive's, one more than INT 13h AH=08h lets DOS use — the AT kept the
+ * last as the diagnostic cylinder, AH=08h reporting the table's count
+ * less two as the highest, and Windows' WDCTRL insists on that relation
+ * (pc_ide.c gives the drive the cylinder, beyond the image if need be). */
 static void fdpt(x86_cpu *c, uint16_t off, const disk *d) {
     for (int k = 0; k < 16; k++) pc_wr8(c, PC_HLE_SEG, (uint16_t)(off + k), 0);
-    pc_wr16(c, PC_HLE_SEG, off, (uint16_t)d->cyls);
+    pc_wr16(c, PC_HLE_SEG, off, (uint16_t)(d->cyls + 1));
     pc_wr8(c, PC_HLE_SEG, (uint16_t)(off + 2), (uint8_t)d->heads);
     pc_wr16(c, PC_HLE_SEG, (uint16_t)(off + 5), 0xFFFF);          /* no write precompensation */
     pc_wr8(c, PC_HLE_SEG, (uint16_t)(off + 8), d->heads > 8 ? 0x08 : 0);
-    pc_wr16(c, PC_HLE_SEG, (uint16_t)(off + 12), (uint16_t)d->cyls);  /* landing zone */
+    pc_wr16(c, PC_HLE_SEG, (uint16_t)(off + 12), (uint16_t)(d->cyls + 1));   /* landing zone */
     pc_wr8(c, PC_HLE_SEG, (uint16_t)(off + 14), (uint8_t)d->spt);
 }
 
@@ -338,4 +344,13 @@ void pc_disk_install(x86_cpu *c) {
     pc_wr8(c, PC_BDA_SEG, 0x74, 0);
     pc_set_service(0x13, int13, HLE_RET_FLAGS);
     pc_ide_post(c);                              /* the same disks, at the controller */
+    /* An AT with a hard disk: INT 13h is the native fixed-disk BIOS
+     * (tools/diskbios.asm), which drives the controller and passes the
+     * rest — diskettes, the parameter queries — on to the host's at
+     * F000:0013. An XT keeps the host's for everything. */
+    if (nhd && c->model >= X86_MODEL_286) {
+        for (size_t i = 0; i < sizeof diskbios; i++) pc_wr8(c, PC_STUB_SEG, (uint16_t)(PC_STUB_DISKBIOS + i), diskbios[i]);
+        pc_wr16(c, 0, 0x13 * 4, PC_STUB_DISKBIOS);
+        pc_wr16(c, 0, 0x13 * 4 + 2, PC_STUB_SEG);
+    }
 }

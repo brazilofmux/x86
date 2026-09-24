@@ -49,3 +49,4 @@ __pycache__/
 
 # Cross build (make ARCH=a64) and its sysroot
 build-*/
+tools/diskbios.bin

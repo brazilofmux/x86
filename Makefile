@@ -59,6 +59,13 @@ all: $(TARGET) $(SST) $(JITTEST)
 $(TARGET): $(MAIN_O) $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz $(SDL_LIBS)
 
+# The fixed-disk BIOS in real instructions (tools/diskbios.asm), assembled
+# into a header that is checked in: a build needs NASM only after an edit
+pc/pc_diskbios.h: tools/diskbios.asm
+	nasm -f bin -o $(O)/tools/diskbios.bin $< && \
+	python3 -c "import sys; b=open(sys.argv[1],'rb').read(); print('/* tools/diskbios.asm, assembled (make pc/pc_diskbios.h) */'); print('static const unsigned char diskbios[%d] = {' % len(b)); [print('    ' + ', '.join('0x%02X' % x for x in b[i:i+16]) + ',') for i in range(0, len(b), 16)]; print('};')" $(O)/tools/diskbios.bin > $@
+$(O)/pc/pc_disk.o: pc/pc_diskbios.h
+
 $(O)/pc/pc_sdl.o: pc/pc_sdl.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -MMD -MP -c -o $@ $<

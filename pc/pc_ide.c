@@ -27,6 +27,7 @@
  */
 #include "pc.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum { ST_ERR = 0x01, ST_DRQ = 0x08, ST_DSC = 0x10, ST_DF = 0x20, ST_DRDY = 0x40, ST_BSY = 0x80 };
@@ -35,6 +36,8 @@ enum { ER_AMNF = 0x01, ER_ABRT = 0x04, ER_IDNF = 0x10, ER_UNC = 0x40 };
 typedef struct {
     uint8_t *data;
     size_t size;
+    uint8_t *extra;                  /* the diagnostic cylinder where the image ends first: RAM, not kept */
+    uint32_t image_sectors;
     uint32_t sectors;                /* capacity, LBA */
     int cyls, heads, spt;            /* default translation (IDENTIFY words 1, 3, 6) */
     int ccyls, cheads, cspt;         /* current translation (INITIALIZE DEVICE PARAMETERS) */
@@ -64,7 +67,11 @@ static drive *cur(void) { return ide.present[sel()] ? &ide.d[sel()] : NULL; }
 
 static void irq(void) {
     if (ide.control & 0x02) return;              /* nIEN */
-    if (!ide.intrq) { ide.intrq = 1; pc_irq_raise(14); }
+    if (!ide.intrq) {
+        ide.intrq = 1;
+        pc_irq_raise(14);
+        if (pc.cpu) pc.cpu->jit_cur_hit = 1;     /* taken at the next boundary: translated code goes back to the run loop */
+    }
 }
 
 /* the sector the task file names: LBA (device/head bit 6) or CHS through
@@ -97,6 +104,12 @@ static void done(uint8_t status, uint8_t error) {
     irq();
 }
 static void abort_cmd(void) { done(ST_DRDY | ST_DSC | ST_ERR, ER_ABRT); }
+
+/* sector LBA of D: the image's, or past its end the diagnostic cylinder's */
+static uint8_t *sector_at(drive *d, uint32_t lba) {
+    if (lba < d->image_sectors) return d->data + (size_t)lba * 512;
+    return d->extra + (size_t)(lba - d->image_sectors) * 512;
+}
 
 /* ---- IDENTIFY DEVICE ---------------------------------------------------- */
 
@@ -148,7 +161,7 @@ static void read_block(void) {
         done(ST_DRDY | ST_DSC | ST_ERR, ER_IDNF);
         return;
     }
-    memcpy(ide.buf, d->data + (size_t)ide.lba * 512, (size_t)n * 512);
+    for (int k = 0; k < n; k++) memcpy(ide.buf + 512 * k, sector_at(d, ide.lba + (uint32_t)k), 512);
     ide.pos = 0; ide.len = n * 512;
     ide.status = ST_DRDY | ST_DSC | ST_DRQ;
     ide.error = 0;
@@ -158,7 +171,7 @@ static void read_block(void) {
 static void write_block(void) {
     drive *d = &ide.d[ide.target];
     int n = ide.len / 512;
-    memcpy(d->data + (size_t)ide.lba * 512, ide.buf, (size_t)n * 512);
+    for (int k = 0; k < n; k++) memcpy(sector_at(d, ide.lba + (uint32_t)k), ide.buf + 512 * k, 512);
     ide.lba += (uint32_t)n; ide.left -= n;
     taskfile_set(d, ide.lba - 1);
     if (ide.left <= 0) { ide.count = 0; done(ST_DRDY | ST_DSC, 0); return; }
@@ -334,6 +347,7 @@ int pc_ide_port_write(uint16_t port, uint32_t val, int size) {
 
 /* POST: the drives the images give, reset; INT 76h (IRQ 14) as the AT's */
 void pc_ide_post(x86_cpu *c) {
+    for (int u = 0; u < 2; u++) free(ide.d[u].extra);
     memset(&ide, 0, sizeof ide);
     for (int u = 0; u < 2; u++) {
         drive *d = &ide.d[u];
@@ -342,21 +356,31 @@ void pc_ide_post(x86_cpu *c) {
         if (!d->data) continue;
         ide.present[u] = 1;
         uint64_t n = d->size / 512;
-        d->sectors = n > 0x0FFFFFFF ? 0x0FFFFFFF : (uint32_t)n;
+        d->image_sectors = n > 0x0FFFFFFF ? 0x0FFFFFFF : (uint32_t)n;
+        /* The drive: the image, and at least the BIOS's cylinders and the
+         * diagnostic one after them (pc_disk.c's parameter table counts
+         * it); what of that the image does not cover is RAM. */
+        uint64_t want = (uint64_t)(cyls + 1) * (uint64_t)heads * (uint64_t)spt;
+        d->sectors = d->image_sectors;
+        if (want > d->sectors && want <= 0x0FFFFFFF) {
+            d->extra = calloc((size_t)(want - d->sectors), 512);
+            if (d->extra) d->sectors = (uint32_t)want;
+        }
         /* the default translation: the BIOS's heads and sectors, cylinders
-         * for the whole disk (to 16383, as ATA caps word 1) */
+         * for the whole drive (to 16383, as ATA caps word 1) */
         d->heads = heads; d->spt = spt;
         uint32_t cc = d->sectors / ((uint32_t)heads * (uint32_t)spt);
         d->cyls = cc > 16383 ? 16383 : (int)cc;
-        (void)cyls;
         d->ccyls = d->cyls; d->cheads = d->heads; d->cspt = d->spt;
     }
     reset_signature();
     /* push ax; push ds; mov ax,40h; mov ds,ax; mov byte [8Eh],0FFh (the
      * hard-disk interrupt flag INT 13h waits on); mov al,20h; out A0h,al;
-     * out 20h,al; pop ds; pop ax; iret */
+     * out 20h,al; pop ds; mov ax,9100h; int 15h (the interrupt is
+     * complete); pop ax; iret */
     static const uint8_t int76[] = { 0x50, 0x1E, 0xB8, 0x40, 0x00, 0x8E, 0xD8, 0xC6, 0x06, 0x8E, 0x00, 0xFF,
-                                     0xB0, 0x20, 0xE6, 0xA0, 0xE6, 0x20, 0x1F, 0x58, 0xCF };
+                                     0xB0, 0x20, 0xE6, 0xA0, 0xE6, 0x20, 0x1F, 0xB8, 0x00, 0x91, 0xCD, 0x15,
+                                     0x58, 0xCF };
     for (size_t i = 0; i < sizeof int76; i++) pc_wr8(c, PC_STUB_SEG, (uint16_t)(PC_STUB_INT76 + i), int76[i]);
     pc_wr16(c, 0, 0x76 * 4, PC_STUB_INT76);
     pc_wr16(c, 0, 0x76 * 4 + 2, PC_STUB_SEG);

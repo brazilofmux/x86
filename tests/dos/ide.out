@@ -1,5 +1,5 @@
 model: DOS-MONSTER HARDDISK                    
-cylinders heads sectors: 0002 0010 003F, LBA sectors 00000800, multiple up to 10
+cylinders heads sectors: 0003 0010 003F, LBA sectors 00000BD0, multiple up to 10
 READ SECTORS at 3, two: 00000003 00000004  status 50 error 00
 WRITE SECTORS at 10, INT 13h reads: the same
 INT 13h writes 11, the controller reads: the same

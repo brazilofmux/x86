@@ -119,6 +119,15 @@ if [ -f disks/win311/c.img ] && mdir -i disks/win311/c.img@@32256 ::/WINDOWS/WIN
     python3 tools/expect.py -t 200 tmp/boot-c.exp -- $DM -m 386 -W -T 190 -hda tmp/boot-c.img -boot c >/dev/null 2>&1 && ok=1 || ok=0
     if [ $ok = 1 ] && [ "$(python3 tools/pngpix.py tmp/boot-win.png 150,61 2>/dev/null)" = "150,61 0 0 170" ]
     then echo "ok   windows 3.11 enhanced mode, ms-dos prompt vm"; else echo "FAIL windows 3.11 enhanced mode"; fail=1; fi
-    rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-win.png
+    # ... and with 32-bit disk access: WDCTRL validates the BIOS driving the
+    # IDE controller (the AT's sequence, the diagnostic cylinder), then
+    # drives it itself
+    cp disks/win311/c.img tmp/boot-c.img
+    mtype -i tmp/boot-c.img@@32256 ::/WINDOWS/SYSTEM.INI | python3 -c "import sys; s=sys.stdin.buffer.read().decode('latin-1'); sys.stdout.buffer.write(s.replace('[386Enh]\r\n','[386Enh]\r\n32BitDiskAccess=on\r\ndevice=*int13\r\ndevice=*wdctrl\r\n',1).encode('latin-1'))" > tmp/boot-system.ini
+    mcopy -o -i tmp/boot-c.img@@32256 tmp/boot-system.ini ::/WINDOWS/SYSTEM.INI
+    python3 tools/expect.py -t 200 tmp/boot-c.exp -- $DM -m 386 -W -T 190 -hda tmp/boot-c.img -boot c >/dev/null 2>&1 && ok=1 || ok=0
+    if [ $ok = 1 ] && [ "$(python3 tools/pngpix.py tmp/boot-win.png 150,61 2>/dev/null)" = "150,61 0 0 170" ]
+    then echo "ok   windows 3.11 enhanced mode, 32-bit disk access (wdctrl)"; else echo "FAIL windows 3.11 32-bit disk access"; fail=1; fi
+    rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-win.png tmp/boot-system.ini
 fi
 exit $fail

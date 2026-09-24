@@ -224,6 +224,7 @@ static void pmring_exc(x86_cpu *c, int vec, uint32_t err) {
 static int run_interp(x86_cpu *c, uint64_t limit) {
     uint32_t n = 0;
     uint64_t waits = pc.blocked_calls;
+    int shadow_ended = 0;
     for (;;) {
         if (g_pmring) {
             int k = (int)(pmring_n++ % PMRING);
@@ -247,7 +248,7 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
         /* Every 4096 instructions, or at once after the keyboard idle wait
          * (1 ms a poll: 4096 instructions of a polling loop are seconds), or
          * when the machine asked for the next boundary (FERR#: IRQ 13). */
-        if ((n++ & 4095) == 0 || c->halted || pc.blocked_calls != waits || c->jit_cur_hit) {
+        if ((n++ & 4095) == 0 || c->halted || pc.blocked_calls != waits || c->jit_cur_hit || shadow_ended) {
             waits = pc.blocked_calls;
             c->jit_cur_hit = 0;
             host_poll(c); if (c->halted) return 0;
@@ -258,6 +259,7 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
             if (lin >= g_pmtrace_lo && lin <= g_pmtrace_hi) pm_trace(c);
         }
         if (g_golden) dbt_golden_step(&g_dbt);
+        shadow_ended = c->int_inhibit != 0;      /* the next boundary may take an IRQ: poll there */
         int rc = x86_step(c);
         if (rc < 0) {
             fprintf(stderr, "interp: stopped at %04X:%04X\n", c->seg[S_CS].sel, c->eip);

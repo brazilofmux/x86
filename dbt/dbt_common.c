@@ -600,6 +600,7 @@ int dbt_run(x86_dbt *dbt) {
         int timed = (dbt->interp_fallback_insns & 15) == 0;
         struct timespec t0, t1;
         if (timed) clock_gettime(CLOCK_MONOTONIC, &t0);
+        int shadowed = cpu->int_inhibit != 0;
         int rc = x86_step(cpu);
         if (timed) {
             clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -635,6 +636,13 @@ int dbt_run(x86_dbt *dbt) {
          * not translate, every instruction is a fallback, and a clock read
          * each was a fifth of DOOM's time. There the countdown runs on. */
         if (!cpu->pmode) poll_countdown = 0;
+        /* The step that ends an interrupt shadow (after STI, MOV SS) is the
+         * first boundary where a pending IRQ can be taken: poll there, in
+         * any mode. A wait loop that re-enables interrupts every pass
+         * (Windows' WDCTRL waiting on IRQ 14) otherwise had every later
+         * poll land in the next shadow, and starved every IRQ, the timer's
+         * with them. */
+        if (shadowed) poll_countdown = 0;
     }
 }
 

@@ -149,6 +149,7 @@ void pc_rtc_alarm(int on, uint8_t h, uint8_t m, uint8_t sec);   /* INT 1Ah AH=06
 int  pc_rtc_alarm_on(void);
 #define PC_TRAP_PS2     0xF3       /* F000:00F3: INT 74h's packet assembly, the byte from port 60h in AL */
 #define PC_STUB_INT74   0x0050     /* IRQ 12: IN 60h, the host's assembly, the program's routine with the packet, EOIs */
+#define PC_STUB_DISKBIOS 0x1000    /* INT 13h for the fixed disks, in real instructions (tools/diskbios.asm) */
 #define PC_STUB_INT76   0x0098     /* IRQ 14: the hard-disk interrupt flag at 40:8Eh, EOIs */
 #define PC_PS2_VARS     0x00C0     /*   its data: the routine (offset, segment), then status, X, Y as words */
 #define PC_TRAP_RTC     0xF4       /* F000:00F4: INT 70h's bookkeeping (INT 15h AH=83h's wait), register C in AL */
