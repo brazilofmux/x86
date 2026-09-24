@@ -34,10 +34,9 @@ static void usage(const char *prog) {
     printf("  -L N        stop after N instructions\n");
     printf("  -T SECS     stop after SECS seconds of wall-clock time\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
-    printf("  -G FILE     write the screen (text mode, or mode 13h) to FILE as a PNG on exit\n");
+    printf("  -G FILE     write the screen (text, mode 13h or a 16-colour mode) to FILE as a PNG on exit\n");
     printf("  -w          the window is the display: text modes and graphics, from the start\n");
     printf("  -W          no window at all (default: one opens for graphics modes if stdout is a terminal)\n");
-    printf("  -boot IMG   boot a disk image instead (sector 1 at 7C00; INT 13h serves the rest)\n");
     printf("  -pmtrace LO:HI  -i: dump state before each instruction in [LO,HI], QEMU -d cpu format\n");
     printf("  -pmring     -i: on the first exception, or a fetch outside memory, print the\n");
     printf("              last 400 CS:EIP and stop\n");

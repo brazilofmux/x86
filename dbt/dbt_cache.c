@@ -1,7 +1,7 @@
 /* dbt_cache.c — direct-mapped translated-block cache, direct-link
  * registry, and span-gated SMC invalidation.
  *
- * Lifted from ~/z80/dbt/block_cache.c. The cache is indexed on the guest
+ * Lifted from z80's dbt/block_cache.c (github.com/brazilofmux/z80). The cache is indexed on the guest
  * linear address modulo BLOCK_CACHE_SIZE: 1:1 over low memory, folded
  * over extended memory. The SMC sweep relies on the slot for linear p
  * holding, if anything of p's, the block starting at p, so its span says

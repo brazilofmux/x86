@@ -1,8 +1,8 @@
 #!/bin/sh
 # Install Windows 3.11 onto a copy of the MS-DOS 6.22 disk:
 #   tests/boot/wininstall.sh [out.img]      (default disks/win311/c.img)
-# From the six OEM 3.5" diskettes (disks/win311/oem/DISK1-6.IMG, the
-# user's download, git-ignored), flattened into C:\WININST — the machine
+# From the six OEM 3.5" diskettes (disks/win311/oem/DISK1-6.IMG, your
+# own copy, git-ignored), flattened into C:\WININST — the machine
 # has no CD-ROM, and Setup finds every disk's files in one directory by
 # the DISKn marker files. Setup's DOS half is driven by its text; its
 # Windows half (standard mode, VGA mode 12h) blind, by keys and delays:

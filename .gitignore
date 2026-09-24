@@ -35,6 +35,7 @@ tests/sst*/urls.txt
 tests/sst*/80386.csv
 tests/sst*/README.md
 tools/sst
+tools/sst8088
 tools/jittest
 .venv/
 tools/pmoracle/pmtest.img

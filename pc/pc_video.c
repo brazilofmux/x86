@@ -10,7 +10,7 @@
  *                 JIT stores straight into guest memory, nothing traps)
  *                 cost the painter nothing until the next flush.
  *
- * Lifted in spirit from ~/z80/kaypro/kaypro_video.c + kaypro_render_tty.c.
+ * Lifted in spirit from z80's kaypro/kaypro_video.c + kaypro_render_tty.c.
  */
 #include "pc.h"
 #include <stdio.h>

@@ -1,6 +1,6 @@
 /* dbt.h — x86 Dynamic Binary Translator public interface.
  *
- * Lifted from ~/z80/dbt/dbt.h. The translator runs alongside the
+ * Lifted from z80's dbt/dbt.h (github.com/brazilofmux/z80). The translator runs alongside the
  * interpreter (core/x86_interp.c, the oracle): blocks the backend can
  * translate run as native code; anything that changes CS, raises, or
  * talks to the host (INT, far transfers, IRET, DIV, I/O, HLT) ends the

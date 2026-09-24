@@ -57,7 +57,7 @@ if [ -f disks/tp55/TPC.EXE ]; then
     done
 fi
 if [ -f disks/cobol50/COBOL.EXE ]; then
-    # MS COBOL 5.0 (Micro Focus underneath), from the user's diskettes expanded
+    # MS COBOL 5.0 (Micro Focus underneath), from your own diskettes, expanded
     # into disks/cobol50: compile, link and run a sample, all under -V. The
     # compiler is a large real-mode program; its run-time rearranges the PSP's
     # job file table, which is what gave the DOS layer a real one.

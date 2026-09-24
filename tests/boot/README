@@ -53,7 +53,7 @@ WordPerfect was added with mtools:
 (the partition starts at sector 63). run.sh boots scratch copies, so the
 image never changes under a test.
 
-MS-DOS 6.22 (disks/msdos622/, git-ignored: the user's own diskettes,
+MS-DOS 6.22 (disks/msdos622/, git-ignored: your own diskettes,
 msdos622-1..3.img, and c.img installed from them by msinstall.sh)
 -----------------------------------------------------------------
 
@@ -95,7 +95,7 @@ it switches itself over XMS memory. Both needed:
   physical-minus-linear delta to the host pointer unwrapped, 4 GB past
   guest memory. pgtest's T0E runs code on such a page.
 
-Windows 3.11 (disks/win311/, git-ignored: the user's OEM 3.5" diskettes
+Windows 3.11 (disks/win311/, git-ignored: your OEM 3.5" diskettes
 in oem/DISK1-6.IMG, and c.img installed from them)
 --------------------------------------------------------------------
 

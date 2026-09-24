@@ -8,7 +8,7 @@
  * goes into the BIOS ring buffer directly; INT 9 is raised for guests
  * that hook it, with the scancode readable at port 60h.
  *
- * Lifted in spirit from ~/z80/kaypro/kaypro_kbd.c.
+ * Lifted in spirit from z80's kaypro/kaypro_kbd.c.
  */
 #include "pc.h"
 #include <stdlib.h>

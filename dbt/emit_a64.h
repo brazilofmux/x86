@@ -9,7 +9,7 @@
 /*
  * Lightweight AArch64 code emitter for JIT compilation.
  *
- * Lifted from ~/z80/dbt/emit_a64.h (itself from ~/riscv) — same
+ * Lifted from z80's dbt/emit_a64.h (itself from riscv; github.com/brazilofmux) — same
  * single-header static-inline style. The x86 additions (flag-setting
  * shifted arithmetic, MRS NZCV, BFXIL, TBZ/TBNZ, 32-bit pairs, X-offset
  * loads) are grouped at the end. Unused encoders cost nothing.

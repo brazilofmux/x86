@@ -1,7 +1,7 @@
 /* dbt_common.c — architecture-neutral DBT machinery: init/run/cleanup,
  * the run loop, -V lockstep verification, helpers, stats.
  *
- * Lifted from ~/z80/dbt/dbt_common.c.
+ * Lifted from z80's dbt/dbt_common.c (github.com/brazilofmux/z80).
  *
  * Run-loop policy, per guest CS:IP:
  *   1. Cache lookup. Hit → trampoline into the native block (which

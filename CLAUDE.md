@@ -7,8 +7,9 @@ code running **DOS** (and DPMI clients) on modern AArch64 and x86-64
 hosts, with the explicit goal of **multiple billions of guest
 instructions per second**.
 
-It is the third in the line: `~/riscv/dbt` (RV32IMFD), `~/slow-32`, and
-`~/z80` (Z80 + CP/M, 4.3 BIPS on Apple Silicon). Every technique that
+It is the third in the line: [riscv](https://github.com/brazilofmux/riscv)'s
+`dbt/` (RV32IMFD), [slow-32](https://github.com/brazilofmux/slow32-public), and [z80](https://github.com/brazilofmux/z80)
+(Z80 + CP/M, 4.3 BIPS on Apple Silicon). Every technique that
 worked there — pinned guest registers, two-phase translate with static
 dead-flag elimination, block chaining, RAS-backed CALL/RET, span-gated
 SMC bitmap, lockstep `-V` verification — applies here. The low byte of
@@ -42,16 +43,19 @@ SF=7), so even the flag tables carry over.
   and FreeDOS's HIMEMX. So **unreal mode** is in (added 2026-09-23):
   real-mode segment loads keep a cached limit above 64K, and
   32-bit-addressed real-mode code runs in the interpreter.
+- **V86 mode and paging** (2026-09-23): every 386 memory manager (EMM386,
+  JEMM, QEMM) runs DOS in V86 mode with paging for UMBs and EMS, and so
+  does Windows' 386 enhanced mode. The interpreter implements both
+  (checked against QEMU, `tools/pmoracle`); the JIT translates V86 code
+  and paged flat and segmented 16-bit protected mode.
+- **Windows 3.x**, standard and 386 enhanced mode, booted from a disk
+  image under real DOS: 16-bit protected mode, and a BIOS whose I/O is
+  real instructions where a V86 monitor has to see it (the VGA mode set,
+  the timer's and keyboard's EOI).
 
 **Out (do not build toward these):**
 
 - 64-bit long mode. Never.
-- V86 mode and paging — **not never, later** (2026-09-23): every 386
-  memory manager (EMM386, JEMM, QEMM) runs DOS in V86 mode with paging for
-  UMBs and EMS, and Windows enhanced mode needs the same. Until that
-  campaign, booted images use HIMEMX without an EMM, and under the HLE the
-  DPMI host owns memory and guests never see a page table.
-- 16-bit PM (Windows standard mode) — maybe later.
 - **Cycle counting.** No per-instruction cycle accounting, ever. The
   pinned pending-instruction counter (already needed for interrupt
   delivery) is the one pacing knob; if a 1988 game needs throttling,
@@ -79,7 +83,8 @@ Two layers, same journey as z80's shim → real DRI CP/M:
 1. **HLE DOS** (`dos/`): INT 21h implemented in the host, host directory
    mapped as C:, INT 10h/16h/1Ah BIOS services, PSP/MCB/FCB emulation.
    MZ loader. This is where we start.
-2. **Real DOS behind our BIOS** (later): boot FreeDOS (GPL) or the
+2. **Real DOS behind our BIOS** (done: FreeDOS 1.3, MS-DOS 6.22 and
+   Windows 3.11 install and boot from images — `tests/boot/`): boot FreeDOS (GPL) or the
    MIT-licensed MS-DOS 4.0 from a disk image.
 3. **DPMI host** (`dos/dos_dpmi.c`): INT 31h services, LDT management,
    real-mode callbacks, INT 21h translation from PM.
@@ -127,12 +132,16 @@ and native flags are free.
 
 - **Phase A**: 8086/286 real mode, HLE DOS, text mode, AArch64 backend.
   Done when: WP51 runs, `-V` clean, HUD says N BIPS. Own campaign; clean
-  stopping point.
-- **Phase B**: 386 32-bit PM, DPMI host, mode 13h, DOOM.
+  stopping point. *(Done.)*
+- **Phase B**: 386 32-bit PM, DPMI host, mode 13h, DOOM. *(Done: DOOM
+  under our DPMI host, and under DOS/4GW with HIMEM, EMM386/VCPI and a
+  Windows DOS box.)*
 - **Phase C**: x64 backend, real DOS from a disk image, 387, whatever
-  is fun.
+  is fun. *(Real DOS from images done — FreeDOS, MS-DOS 6.22, then V86,
+  paging and Windows 3.11 in 386 enhanced mode. No x64 backend or 387
+  yet.)*
 
-## Where the Bodies Are Buried (borrow from `~/z80`, don't reinvent)
+## Where the Bodies Are Buried (borrow from [z80](https://github.com/brazilofmux/z80), don't reinvent)
 
 The z80 tree is the template. Lift these, rename, adapt; the design is
 already debugged:

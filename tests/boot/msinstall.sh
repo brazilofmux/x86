@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install MS-DOS 6.22 from its three diskettes onto a blank 128 MB disk:
 #   tests/boot/msinstall.sh [out.img]      (default disks/msdos622/c.img)
-# The diskette images are the user's own (disks/msdos622/, git-ignored).
+# The diskette images are your own (disks/msdos622/, git-ignored).
 # Setup won't partition a blank disk ("upgrade" edition), so the script
 # leaves Setup, runs FDISK (which reboots through the reset vector), runs
 # FORMAT C: /S, and then lets Setup finish over the fresh system.
