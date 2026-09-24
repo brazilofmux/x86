@@ -136,6 +136,16 @@ int pc_disk_swap(void) {
 
 int pc_disk_floppy_type(int drive) { return fd[drive & 1].data ? fd[drive & 1].type : 0; }
 
+/* A fixed disk as the IDE controller sees it (pc_ide.c): the same mapped
+ * image INT 13h uses, so the two paths never disagree about a sector.
+ * NULL if there is no such disk. */
+uint8_t *pc_disk_hd(int unit, size_t *size, int *cyls, int *heads, int *spt) {
+    disk *d = &hd[unit & 1];
+    if (!d->data) return NULL;
+    *size = d->size; *cyls = d->cyls; *heads = d->heads; *spt = d->spt;
+    return d->data;
+}
+
 int pc_disk_present(int drive) {
     disk *d = drive & 0x80 ? &hd[drive & 1] : &fd[drive & 1];
     return (drive & 0x7E) == 0 && d->data != NULL;
@@ -327,4 +337,5 @@ void pc_disk_install(x86_cpu *c) {
     pc_wr8(c, PC_BDA_SEG, 0x41, 0);
     pc_wr8(c, PC_BDA_SEG, 0x74, 0);
     pc_set_service(0x13, int13, HLE_RET_FLAGS);
+    pc_ide_post(c);                              /* the same disks, at the controller */
 }

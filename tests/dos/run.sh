@@ -27,6 +27,19 @@ done
 for mode in -i -j -V; do
     check "unreal $mode"    tests/dos/unreal.out  $DM -m 386 $mode -L 1000000 tests/dos/unreal.com
 done
+# the IDE controller, driven directly, on a 1 MB image whose every sector
+# starts with its own LBA (and INT 13h on the same disk)
+mkdir -p tmp
+python3 -c "
+import struct
+with open('tmp/ide.img','wb') as f:
+    for lba in range(2048): f.write(struct.pack('<I', lba) + bytes(((lba*7 + i) & 0xFF) for i in range(4, 512)))
+"
+for mode in -i -j -V; do
+    cp tmp/ide.img tmp/ide-run.img
+    check "ide $mode" tests/dos/ide.out $DM -m 386 $mode -hda tmp/ide-run.img tests/dos/ide.com
+done
+rm -f tmp/ide.img tmp/ide-run.img
 # the real-time clock: registers, UIP, the periodic, update and alarm
 # interrupts on IRQ 8, INT 15h AH=83h, setting the time
 for mode in -i -j -V; do

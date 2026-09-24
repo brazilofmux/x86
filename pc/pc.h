@@ -149,6 +149,7 @@ void pc_rtc_alarm(int on, uint8_t h, uint8_t m, uint8_t sec);   /* INT 1Ah AH=06
 int  pc_rtc_alarm_on(void);
 #define PC_TRAP_PS2     0xF3       /* F000:00F3: INT 74h's packet assembly, the byte from port 60h in AL */
 #define PC_STUB_INT74   0x0050     /* IRQ 12: IN 60h, the host's assembly, the program's routine with the packet, EOIs */
+#define PC_STUB_INT76   0x0098     /* IRQ 14: the hard-disk interrupt flag at 40:8Eh, EOIs */
 #define PC_PS2_VARS     0x00C0     /*   its data: the routine (offset, segment), then status, X, Y as words */
 #define PC_TRAP_RTC     0xF4       /* F000:00F4: INT 70h's bookkeeping (INT 15h AH=83h's wait), register C in AL */
 #define PC_STUB_INT70   0x0030     /* IRQ 8: read register C, the host's bookkeeping, EOIs, INT 4Ah on an alarm */
@@ -215,6 +216,11 @@ int  pc_disk_swap(void);                                          /* ESC-+: next
 int  pc_disk_boot(x86_cpu *c, int drive);                          /* sector 0 to 0000:7C00 */
 void pc_disk_install(x86_cpu *c);
 void pc_mouse_reboot(x86_cpu *c);
+uint8_t *pc_disk_hd(int unit, size_t *size, int *cyls, int *heads, int *spt);   /* pc_ide.c's view */
+/* pc_ide.c: the primary IDE channel */
+void pc_ide_post(x86_cpu *c);
+int  pc_ide_port_read(uint16_t port, int size, uint32_t *val);
+int  pc_ide_port_write(uint16_t port, uint32_t val, int size);
 int  pc_disk_floppy_type(int drive);                              /* CMOS type 1-5, 0 none */
 /* pc_cmos.c */
 void pc_cmos_init(x86_cpu *c);                                    /* after the disks: POST's configuration */

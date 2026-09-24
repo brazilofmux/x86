@@ -28,6 +28,7 @@
  * checksum over 10h-2Dh.
  */
 #include "pc.h"
+#include <stddef.h>
 #include <string.h>
 #include <time.h>
 
@@ -219,6 +220,13 @@ void pc_cmos_init(x86_cpu *c) {
     rtc_schedule();
     nvram[0x10] = (uint8_t)(pc_disk_floppy_type(0) << 4 | pc_disk_floppy_type(1));
     nvram[0x14] = (uint8_t)pc_rd16(c, PC_BDA_SEG, 0x10);
+    /* fixed disks: type 15 in 12h, "see 19h/1Ah", there type 47 (user
+     * defined) — what an AT BIOS reports for IDE drives */
+    size_t sz; int cy, hh, ss;
+    int d0 = pc_disk_hd(0, &sz, &cy, &hh, &ss) != NULL, d1 = pc_disk_hd(1, &sz, &cy, &hh, &ss) != NULL;
+    nvram[0x12] = (uint8_t)((d0 ? 0xF0 : 0) | (d1 ? 0x0F : 0));
+    nvram[0x19] = d0 ? 47 : 0;
+    nvram[0x1A] = d1 ? 47 : 0;
     nvram[0x15] = PC_CONV_KB & 0xFF; nvram[0x16] = PC_CONV_KB >> 8;
     uint32_t ext = pc_ext_kb(c);
     uint16_t ext16 = ext > 0xFFFF ? 0xFFFF : (uint16_t)ext;

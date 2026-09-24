@@ -1,0 +1,11 @@
+model: DOS-MONSTER HARDDISK                    
+cylinders heads sectors: 0002 0010 003F, LBA sectors 00000800, multiple up to 10
+READ SECTORS at 3, two: 00000003 00000004  status 50 error 00
+WRITE SECTORS at 10, INT 13h reads: the same
+INT 13h writes 11, the controller reads: the same
+CHS 1/2/5 under 4x17: 0000006A
+past the end: status 51 error 10
+IDENTIFY PACKET: status 51 error 04
+no slave: status 00
+READ MULTIPLE 8 at 20, blocks of 4: 00000014 00000017 00000018 0000001B IRQs 02
+after soft reset, error count sector cyl cyl, status: 01 01 01 00 00 50

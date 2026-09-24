@@ -563,6 +563,7 @@ static uint8_t a20_out_port(const x86_cpu *c) { return (uint8_t)(0xCD | (c->a20_
 static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     (void)size;
     uint32_t vv;
+    if (pc_ide_port_read(port, size, &vv)) return vv;
     if (pc_vga_port_read(port, &vv)) return vv;
     if (pc_cmos_port_read(port, &vv)) return vv;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
@@ -609,7 +610,7 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     }
 }
 static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
-    (void)size;
+    if (pc_ide_port_write(port, val, size)) return;
     if (pc_vga_port_write(port, val, size)) return;
     if (pc_cmos_port_write(port, val)) return;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61 || port == 0x20))
