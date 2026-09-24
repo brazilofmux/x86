@@ -3,7 +3,11 @@
 follow it) under QEMU and under dos-monster and diff what each wrote to
 port E9.
 
-    python3 pgrun.py [image.asm] [--ours-only] [--m486] [--expect FILE] [-- extra dos-monster args]
+    python3 pgrun.py [image.asm] [--ours-only] [--m486] [--expect FILE | --bochs | --bochs-only] [-- extra dos-monster args]
+
+--bochs runs Bochs as the reference instead of QEMU (bochscfg.py fits the
+checked-in bochsrc to the host); --bochs-only prints its transcript, which
+is how c486test.bochs is made:  python3 pgrun.py c486test.asm --bochs-only > c486test.bochs
 
 --expect compares against a stored transcript instead of running QEMU:
 c486test.bochs is Bochs's, since QEMU has no #AC and lets ring 3 run
@@ -35,6 +39,27 @@ def qemu(img):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return open(out, encoding="latin-1").read()
 
+def bochs(img):
+    """Bochs's port-E9 transcript: the debugger is told to continue, and the
+    run is stopped once the image has written its closing "done" (Bochs has
+    no isa-debug-exit). Lines between the image's name and "done"."""
+    import bochscfg
+    rc = bochscfg.write(os.path.abspath(img), ["port_e9_hack: enabled=1"])
+    name = os.path.splitext(os.path.basename(img))[0]
+    lines, on = [], False
+    p = subprocess.Popen(["bochs", "-q", "-f", rc], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, encoding="latin-1", cwd=HERE)
+    try:
+        p.stdin.write("c\n"); p.stdin.flush()
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            if line.endswith(name): on = True; line = name   # (the debugger prompt may share its line)
+            if on: lines.append(line)
+            if on and line == "done": break
+    finally:
+        p.kill(); p.wait(); os.unlink(rc)
+    return "\n".join(lines) + "\n"
+
 def ours(img, extra, model="386"):
     # stdin stays an open, empty pipe: end of input would feed the guest a
     # Ctrl-Z, and its keyboard interrupt would land in a slow -V run
@@ -59,13 +84,16 @@ def main():
     expect = None
     if "--expect" in args:
         i = args.index("--expect"); expect = args[i + 1]; del args[i:i + 2]
-    args = [a for a in args if a not in ("--ours-only", "--m486")]
+    use_bochs = "--bochs" in args or "--bochs-only" in args
+    args = [a for a in args if a not in ("--ours-only", "--m486", "--bochs", "--bochs-only")]
     asm = args[0] if args else os.path.join(HERE, "pgtest.asm")
     img = build(asm)
+    if "--bochs-only" in sys.argv:
+        sys.stdout.write(bochs(img)); return 0
     o = ours(img, extra, model)
     if only:
         sys.stdout.write(o); return 0
-    q = open(os.path.join(HERE, expect), encoding="latin-1").read() if expect else qemu(img)
+    q = open(os.path.join(HERE, expect), encoding="latin-1").read() if expect else bochs(img) if use_bochs else qemu(img)
     ql, ol = q.splitlines(), o.splitlines()
     bad = 0
     for k in range(max(len(ql), len(ol))):
@@ -73,7 +101,7 @@ def main():
         b = ol[k] if k < len(ol) else "(missing)"
         mark = "  " if a == b else "!!"
         if a != b: bad += 1
-        print("%s %s: %-44s ours: %s" % (mark, "want" if expect else "qemu", a, b))
+        print("%s %s: %-44s ours: %s" % (mark, "want" if expect else "bochs" if use_bochs else "qemu", a, b))
     print("%d of %d lines differ" % (bad, max(len(ql), len(ol))))
     return 1 if bad else 0
 

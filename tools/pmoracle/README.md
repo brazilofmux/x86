@@ -61,11 +61,17 @@ QEMU's `-d cpu` uses, so one parser reads all three. The trace is
 budgeted: a kernel that faults in a loop would otherwise write gigabytes
 before anyone noticed it was stuck.
 
-Bochs needs `brew install bochs`; the build Homebrew ships has the
-internal debugger, which is what `pmbochs.py` drives (a physical
-breakpoint on the instruction under test, then `r`/`s`/`r`/`sreg` per
-case, fed on stdin). `bochsrc` here is a floppy-only machine with no
-display.
+Bochs needs `brew install bochs` on macOS or `apt install bochs
+bochsbios vgabios` on Ubuntu; both builds have the internal debugger,
+which is what `pmbochs.py` drives (a physical breakpoint on the
+instruction under test, then `r`/`s`/`r`/`sreg` per case, fed on stdin).
+`bochsrc` here is a floppy-only machine with no display, written for
+Homebrew; `bochscfg.py` fits it to the host (Ubuntu's 2.7 needs
+BIOS-bochs-legacy, which boots this machine where its BIOS-bochs-latest
+does not, an rfb display in place of the missing nogui, and no
+`-debugger` flag). `pgrun.py --bochs` compares a transcript image against
+Bochs instead of QEMU, and `--bochs-only` prints Bochs's transcript:
+`c486test.bochs` is `python3 pgrun.py c486test.asm --bochs-only`.
 
 ## What it covers so far
 

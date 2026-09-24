@@ -19,9 +19,14 @@ def run(img, under, fault, ncases, spec=None):
     for _ in range(ncases + 2):        # a couple spare: the kernel wraps, so extra is safe
         cmds += ["c", "r", "s", "r", "sreg"]
     cmds.append("q")
-    out = subprocess.run(["bochs", "-q", "-f", os.path.join(HERE, "bochsrc"), "-debugger"],
-                         input="\n".join(cmds) + "\n", capture_output=True, text=True,
-                         timeout=300, cwd=HERE).stdout
+    import bochscfg
+    rc = bochscfg.write(os.path.abspath(img))
+    try:
+        out = subprocess.run(["bochs", "-q", "-f", rc, *bochscfg.debugger_args()],
+                             input="\n".join(cmds) + "\n", capture_output=True, text=True,
+                             timeout=300, cwd=HERE).stdout
+    finally:
+        os.unlink(rc)
 
     # Each case emits: r (pre), s, r (post), sreg. Both r blocks print rax
     # and rip, so the two have to be told apart explicitly.
