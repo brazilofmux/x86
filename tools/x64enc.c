@@ -79,6 +79,10 @@ int main(int argc, char **argv) {
     CASE("lea r8d,[rbx+rsi*1+0x1234]", emit_lea(e, 4, X64_R8, &m));
     m = x64_mi(X64_R14, X64_R8, 0, 0);
     CASE("lea r9,[r14+r8*1]",        emit_lea(e, 8, X64_R9, &m));
+    m = x64_mi(X64_NOREG, X64_RSI, 2, 0x1234);
+    CASE("lea r8d,[rsi*4+0x1234]",   emit_lea(e, 4, X64_R8, &m));
+    m = x64_mi(X64_NOREG, X64_R9, 3, -8);
+    CASE("mov eax,DWORD PTR [r9*8-0x8]", emit_mov_rm(e, 4, X64_RAX, &m));
     CASE("xchg al,ah",               emit_xchg_rr(e, 1, X64_AH, X64_AL));
     CASE("xchg ebx,eax",             emit_xchg_rr(e, 4, X64_RAX, X64_RBX));
     m = x64_m(X64_R15, 4);

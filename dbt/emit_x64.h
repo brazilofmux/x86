@@ -18,7 +18,8 @@
  * R8..R15 in any operand; the encoders assert it (X64_ASSERT), and the
  * translator picks a different sequence for those cases.
  *
- * Memory operands take x64_mem_t; X64_NOREG for no index. The encoder
+ * Memory operands take x64_mem_t; X64_NOREG for no index, and for no
+ * base when there is an index ([index * 2^scale + disp32]). The encoder
  * handles the two ModRM special cases: a base whose low three bits are
  * 100 (RSP/R12) needs a SIB byte, and a base whose low bits are 101
  * (RBP/R13) cannot use mod=00, so a zero displacement is encoded as
@@ -164,8 +165,15 @@ static inline void x64_op(emit_t *e, int size, int op) {
 
 static inline void x64_modrm_mem(emit_t *e, int reg, const x64_mem_t *m) {
     int base = m->base, index = m->index;
-    X64_ASSERT(base != X64_NOREG);                 /* absolute [disp32] would be RIP-relative here */
     X64_ASSERT(index != X64_RSP);                  /* RSP cannot be an index */
+    if (base == X64_NOREG) {
+        /* [index * 2^scale + disp32]: mod 00, SIB with base 101 and no base */
+        X64_ASSERT(index != X64_NOREG);            /* absolute [disp32] would be RIP-relative here */
+        emit_byte(e, (uint8_t)((reg & 7) << 3 | 4));
+        emit_byte(e, (uint8_t)((m->scale << 6) | ((index & 7) << 3) | 5));
+        emit_u32(e, (uint32_t)m->disp);
+        return;
+    }
     int need_sib = (index != X64_NOREG) || ((base & 7) == 4);
     int mod;
     if (m->disp == 0 && (base & 7) != 5) mod = 0;
