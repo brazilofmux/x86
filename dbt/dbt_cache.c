@@ -12,6 +12,7 @@
  * the eviction unlinks.
  */
 #include "dbt.h"
+#include <stdlib.h>
 #include <string.h>
 
 x86_block_entry *dbt_cache_lookup(x86_dbt *dbt, uint64_t key) {
@@ -213,6 +214,11 @@ void dbt_watch_cs_desc(x86_dbt *dbt) {
  * services) whenever the bitmap byte is set. */
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    /* X86_SMC_TRACE=N: the first N stores that hit translated code, with
+     * where the guest was — what a retranslation storm is made of */
+    static int trace = -1;
+    if (trace < 0) { const char *t = getenv("X86_SMC_TRACE"); trace = t ? atoi(t) : 0; }
+    if (trace > 0) { trace--; fprintf(stderr, "[smc] store %06X from %04X:%08X\n", phys, cpu->seg[S_CS].sel, cpu->eip); }
     if (cpu->code_bitmap[phys] & X86_BM_DESC) {
         flush_under_running_code(dbt);     /* clears every CODE and DESC bit */
         dbt->desc_flushes++;

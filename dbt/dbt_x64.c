@@ -515,6 +515,7 @@ static void slow_back(emit_t *e, uint32_t rf_after) {
 static void emit_slow_chunks(x86_dbt *dbt, emit_t *e) {
     for (uint32_t k = 0; k < s_nslow; ) {
         slow_site_t *s = &s_slow[k];
+        if (!s->back_off) { fprintf(stderr, "dbt: slow site without a rejoin (op %u)\n", s->op_i); abort(); }
         uint32_t chunk = emit_pos(e), j = k;
         for (; j < s_nslow && s_slow[j].op_i == s->op_i; j++) emit_patch_rel32(e, s_slow[j].patch_off, chunk);
         s_cur_ip_after = s->ip_after;
@@ -673,12 +674,21 @@ static const int sh_of_op[OP__COUNT] = {
     [OP_SHL] = X64_SH_SHL, [OP_SHR] = X64_SH_SHR, [OP_SAL] = X64_SH_SHL, [OP_SAR] = X64_SH_SAR,
 };
 
+static void emit_string1(emit_t *e, const x86_insn *in, uint32_t live_in);
+static void emit_rep_string(emit_t *e, const x86_insn *in, uint32_t live_in);
+static void emit_mul16(emit_t *e, const x86_insn *in, const ea_t *ea, uint32_t live_in, uint32_t live_out);
+static void emit_div16(emit_t *e, const x86_insn *in, const ea_t *ea, uint32_t live_in);
+static void emit_shift_cl(emit_t *e, const x86_insn *in, const ea_t *ea, uint32_t live_in, uint32_t live_out);
+static void emit_pushf16(emit_t *e, uint32_t live_in);
+static void emit_popf16(emit_t *e, uint32_t live_in);
+
 /* Can this instruction be emitted inline by the code below? (The plan's
  * class says the interpreter is not required; this says the emitter is
  * ready for it.) */
-static int inline_ok(const x86_insn *in) {
+static int inline_ok(const dbt_block *b, const x86_insn *in) {
     if (in->opsize != 2 || in->adsize != 2) return 0;
-    for (int i = 0; i < 2; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size > 2) return 0;
+    int farptr = in->op == OP_CALLF || in->op == OP_JMPF || in->op == OP_LDS || in->op == OP_LES;
+    for (int i = 0; i < 2; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size > 2 && !farptr) return 0;
     switch (in->op) {
     case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
     case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
@@ -689,17 +699,42 @@ static int inline_ok(const x86_insn *in) {
         return 1;
     case OP_PUSH:   /* (the 8086's FE /6, a byte push, is the interpreter's) */
         return in->ops[0].kind == OPK_SREG || in->ops[0].kind == OPK_IMM || in->ops[0].size == 2;
-    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR: case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR:
-        return in->ops[1].kind == OPK_IMM && (in->ops[1].imm & 0xFF) < (uint32_t)in->ops[0].size * 8;
     case OP_POP:
         if (in->ops[0].kind == OPK_SREG) return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES;
         return in->ops[0].size == 2;
     case OP_MOVSEG:
         if (in->ops[0].kind == OPK_SREG) return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES;
         return 1;
+    case OP_CALLF: case OP_JMPF: case OP_RETF: case OP_INT: case OP_INT3:
+        return 1;
+    case OP_MOVS: case OP_STOS: case OP_CMPS: case OP_SCAS: case OP_LODS:
+        if (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return 0;
+        if (!in->rep) return 1;
+        return in->op != OP_LODS && !b->regs32;      /* REP on a 386: the upper halves (later) */
+    case OP_MUL: case OP_IMUL:
+        return in->opcode2 != 0xAF;                  /* one-operand forms */
+    case OP_DIV: case OP_IDIV:
+        return b->model >= X86_MODEL_286;
+    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR: case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR:
+        if (in->ops[1].kind == OPK_IMM) return (in->ops[1].imm & 0xFF) < (uint32_t)in->ops[0].size * 8;
+        if (b->model == X86_MODEL_8086) return 0;    /* counts are not masked there */
+        if (in->ops[0].size == 1 && b->model >= X86_MODEL_386) return 0;   /* the byte-by-16/24 quirk */
+        return 1;
+    case OP_PUSHF: case OP_POPF:
+        return 1;
+    case OP_LDS: case OP_LES: case OP_XLAT: case OP_LAHF: case OP_SAHF:
+        return 1;
+    case OP_MOVZX: case OP_MOVSX:
+        return 1;
     default:
         return 0;
     }
+}
+
+/* The front end asks: real-mode-shaped blocks without paging so far. */
+int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
+    if (b->flat || b->seg16 || b->v86 || b->paged || getenv("X86_X64_HELPERS")) return 0;
+    return inline_ok(b, in);
 }
 
 /* The checks of an access at ea: RFLAGS is freed first (the live guest
@@ -798,6 +833,10 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
     }
 
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR: case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR: {
+        if (s->kind == OPK_REG) {                                /* by CL */
+            emit_shift_cl(e, in, &ea, live_in, live_out);
+            return;
+        }
         uint32_t cnt = s->imm & 0xFF;
         int sh = sh_of_op[in->op];
         int rot = in->op == OP_ROL || in->op == OP_ROR || in->op == OP_RCL || in->op == OP_RCR;
@@ -807,8 +846,8 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
          * 8086 and undefined (and different) on the host: two steps then */
         int two = cnt > 1 && (live_out & X86_OF) && in->op != OP_SAR;
         if (d->kind == OPK_MEM) {
-            emit_checks(e, &ea, size, 1, live_in & (in->op == OP_RCL || in->op == OP_RCR ? ~X86_CF : ~0u));
-            if (in->op == OP_RCL || in->op == OP_RCR) fl_need_cf(e);   /* (the checks may have moved it out) */
+            emit_checks(e, &ea, size, 1, live_in);
+            if (in->op == OP_RCL || in->op == OP_RCR) fl_need_cf(e);   /* (the checks moved it to the slot) */
             m = ea_mem(&ea);
             if (two) { emit_shift_mi(e, size, sh, &m, (uint8_t)(cnt - 1)); emit_shift_mi(e, size, sh, &m, 1); }
             else emit_shift_mi(e, size, sh, &m, (uint8_t)cnt);
@@ -975,11 +1014,595 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         return;
     }
 
+    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
+        if (in->rep) emit_rep_string(e, in, live_in);
+        else emit_string1(e, in, live_in);
+        slow_back(e, s_rf);
+        return;
+
+    case OP_MUL: case OP_IMUL:
+        emit_mul16(e, in, &ea, live_in, live_out);
+        return;
+
+    case OP_DIV: case OP_IDIV:
+        emit_div16(e, in, &ea, live_in);
+        return;
+
+    case OP_PUSHF: emit_pushf16(e, live_in); slow_back(e, 0); return;
+    case OP_POPF:  emit_popf16(e, live_in); slow_back(e, 0); return;
+
+    case OP_LDS: case OP_LES: {
+        /* the far pointer as one dword (at FFFD..FFFF it straddles: the
+         * interpreter's), then the register, then the segment */
+        fl_save(e, live_in);
+        emit_alu_ri(e, 2, X64_ALU_CMP, ea.off, 0xFFFC);
+        slow_site(e, X64_CC_A);
+        m = ea_mem(&ea); emit_mov_rm(e, 4, W_T2, &m);
+        emit_mov_rr(e, 2, host_reg(d), W_T2);
+        emit_shift_ri(e, 4, X64_SH_SHR, W_T2, 16);
+        emit_load_seg_real(e, in->op == OP_LDS ? S_DS : S_ES, W_T2);
+        slow_back(e, 0);
+        return;
+    }
+
+    case OP_XLAT: {
+        /* AL = [seg: (BX + AL) & FFFF] */
+        emit_movzx_rr(e, 4, W_T2, 1, X64_AL);
+        m = x64_mi(X64_RBX, W_T2, 0, 0); emit_lea(e, 4, W_T2, &m);
+        emit_movzx_rr(e, 4, W_T2, 2, W_T2);
+        int segp = emit_seg_ptr(e, in->seg, W_T1);
+        m = x64_mi(segp, W_T2, 0, 0); emit_mov_rm(e, 1, X64_AL, &m);
+        return;
+    }
+
+    case OP_LAHF:
+        if ((s_rf & (X86_SF | X86_ZF | X86_AF | X86_PF | X86_CF)) == (X86_SF | X86_ZF | X86_AF | X86_PF | X86_CF)) {
+            emit_lahf(e);                                       /* bit 1 set, 3 and 5 clear: the host's too */
+        } else {
+            fl_save(e, live_in);
+            m = M(R_CPU, OFF_JIT_FLAGS); emit_movzx_rm(e, 4, W_T2, 1, &m);
+            emit_alu_ri(e, 4, X64_ALU_AND, W_T2, 0xD5);
+            emit_alu_ri(e, 4, X64_ALU_OR, W_T2, 0x02);
+            emit_high8_open(e, X64_AH);
+            emit_mov_rr(e, 1, X64_AL, W_T2);
+            emit_high8_close(e, X64_AH);
+        }
+        return;
+    case OP_SAHF:
+        emit_sahf(e);
+        fl_produce(X86_SF | X86_ZF | X86_AF | X86_PF | X86_CF);
+        return;
+
+    case OP_MOVZX: case OP_MOVSX: {
+        int ssize = s->size, zx = in->op == OP_MOVZX;
+        if (s->kind == OPK_MEM) {
+            emit_checks(e, &ea, ssize, 0, live_in);
+            m = ea_mem(&ea);
+            if (zx) emit_movzx_rm(e, size, host_reg(d), ssize, &m); else emit_movsx_rm(e, size, host_reg(d), ssize, &m);
+            slow_back(e, s_rf);
+        } else if (is_high8(s)) {
+            /* movzx ax, bh: no REX needed, the encoder does it natively */
+            if (zx) emit_movzx_rr(e, size, host_reg(d), 1, s->reg); else emit_movsx_rr(e, size, host_reg(d), 1, s->reg);
+        } else {
+            if (zx) emit_movzx_rr(e, size, host_reg(d), ssize, host_reg(s)); else emit_movsx_rr(e, size, host_reg(d), ssize, host_reg(s));
+        }
+        return;
+    }
+
     default:
         break;
     }
     /* not inline after all: the interpreter */
     emit_helper_op(dbt, e, in, live_in);
+}
+
+/* ----------------------------------------------------------------------
+ * Multi-slot stack frames (far CALL, INT): every slot checked before the
+ * first store, so a slow path replays the whole instruction from an
+ * untouched state. W_T3 = SS pointer, W_T2 = a slot's offset.
+ * ---------------------------------------------------------------------- */
+static void emit_frame_slot(emit_t *e, int32_t below) {           /* W_T2 = (SP - below) & FFFF */
+    x64_mem_t m = M(X64_R12, -below);
+    emit_lea(e, 4, W_T2, &m);
+    emit_movzx_rr(e, 4, W_T2, 2, W_T2);
+}
+static void emit_frame_checks(emit_t *e, int nslots) {
+    emit_seg_ptr(e, S_SS, W_T3);
+    for (int k = 1; k <= nslots; k++) {
+        emit_frame_slot(e, 2 * k);
+        ea_t ea = { W_T3, W_T2 };
+        emit_check_wrap(e, &ea, 2);
+        emit_check_smc(e, &ea, 2);
+    }
+}
+/* store a 16-bit register or immediate into slot k (1 = the first pushed) */
+static void emit_frame_store_r(emit_t *e, int k, int reg) {
+    emit_frame_slot(e, 2 * k);
+    x64_mem_t m = x64_mi(W_T3, W_T2, 0, 0);
+    emit_mov_mr(e, 2, &m, reg);
+}
+static void emit_frame_store_i(emit_t *e, int k, uint16_t imm) {
+    emit_frame_slot(e, 2 * k);
+    x64_mem_t m = x64_mi(W_T3, W_T2, 0, 0);
+    emit_mov_mi(e, 2, &m, imm);
+}
+static void emit_frame_done(emit_t *e, int nslots) {              /* SP -= 2 * nslots */
+    emit_frame_slot(e, 2 * nslots);
+    emit_mov_rr(e, 2, X64_R12, W_T2);
+}
+
+/* CS := selector in `sel` (16 bits, any register but W_T0); real mode:
+ * base = sel << 4. Limit, usable and D bit are already real mode's for
+ * CS (never unreal). Leaves the base in W_T0. */
+static void emit_load_cs(emit_t *e, int sel) {
+    x64_mem_t m;
+    emit_movzx_rr(e, 4, W_T0, 2, sel);
+    m = M(R_CPU, OFF_SEG_SEL(S_CS)); emit_mov_mr(e, 4, &m, W_T0);            /* sel, attr = 0 */
+    emit_shift_ri(e, 4, X64_SH_SHL, W_T0, 4);
+    m = M(R_CPU, OFF_SEG_BASE(S_CS)); emit_mov_mr(e, 4, &m, W_T0);
+}
+/* R_KEY = key of base (W_T0, from emit_load_cs) + ip (`ip`, 16 bits) with
+ * selector `sel`; A20 masked when off. sel and ip: any registers but W_T0/W_T1. */
+static void emit_far_key(emit_t *e, int sel, int ip) {
+    emit_movzx_rr(e, 4, W_T1, 2, ip);
+    x64_mem_t m = x64_mi(W_T0, W_T1, 0, 0);
+    emit_lea(e, 4, R_KEY, &m);
+    if (!s_blk->v86 && s_cpu->a20_mask == 0xFFFFF) emit_alu_ri(e, 4, X64_ALU_AND, R_KEY, 0xFFFFF);
+    emit_movzx_rr(e, 8, W_T1, 2, sel);
+    emit_shift_ri(e, 8, X64_SH_SHL, W_T1, 32);
+    emit_alu_rr(e, 8, X64_ALU_OR, R_KEY, W_T1);
+    if (s_mode_bits) { emit_mov_ri(e, 8, W_T1, s_mode_bits); emit_alu_rr(e, 8, X64_ALU_OR, R_KEY, W_T1); }
+}
+
+/* Far transfers (real mode). The frame is pushed with every slot checked
+ * first; a ptr16:16 in memory is read as one dword (a far pointer at
+ * offset FFFD..FFFF straddles: the interpreter's). Flags are saved and
+ * the block charged by the caller. */
+static void emit_far_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t ip_after) {
+    const x86_cpu *cpu = s_cpu;
+    x64_mem_t m;
+    if (in->op == OP_RETF) {
+        /* both slots fetched before SP moves (a 286 limit fault on either leaves SP intact) */
+        emit_seg_ptr(e, S_SS, W_T3);
+        int sp = X64_R12;
+        if (s_regs32) { emit_movzx_rr(e, 4, W_T2, 2, X64_R12); sp = W_T2; }
+        ea_t lo = { W_T3, sp };
+        emit_check_wrap(e, &lo, 2);
+        m = M(sp, 2); emit_lea(e, 4, W_T1, &m); emit_movzx_rr(e, 4, W_T1, 2, W_T1);
+        ea_t hi = { W_T3, W_T1 };
+        emit_check_wrap(e, &hi, 2);
+        m = ea_mem(&hi); emit_movzx_rm(e, 4, W_T0, 2, &m);                     /* selector */
+        m = ea_mem(&lo); emit_movzx_rm(e, 4, W_T1, 2, &m);                     /* ip */
+        int32_t adj = 4 + (in->ops[0].kind == OPK_IMM ? (int32_t)(in->ops[0].imm & 0xFFFF) : 0);
+        m = M(X64_R12, adj); emit_lea(e, 4, W_T2, &m); emit_mov_rr(e, 2, X64_R12, W_T2);
+        emit_mov_rr(e, 4, W_T3, W_T0);                                          /* sel out of W_T0's way */
+        emit_load_cs(e, W_T3);
+        emit_far_key(e, W_T3, W_T1);
+        emit_dynamic_tail(dbt, e);
+        return;
+    }
+    int is_imm = in->ops[0].kind == OPK_IMM;
+    if (!is_imm) {
+        /* ptr16:16 in memory: one dword read, W_T1 = sel:off; W_T0/W_T1 are the EA's */
+        ea_t ea; emit_ea(e, in, &ea);
+        emit_alu_ri(e, 2, X64_ALU_CMP, ea.off, 0xFFFC);
+        slow_site(e, X64_CC_A);
+        m = ea_mem(&ea); emit_mov_rm(e, 4, W_T1, &m);
+        emit_mov_mr(e, 4, &(x64_mem_t){ R_CPU, X64_NOREG, 0, OFF_JIT_CUR_HIT }, W_T1);   /* parked: the frame needs every scratch */
+    }
+    if (in->op == OP_CALLF) {
+        emit_frame_checks(e, 2);
+        m = M(R_CPU, OFF_SEG_SEL(S_CS)); emit_movzx_rm(e, 4, W_T1, 2, &m);
+        emit_frame_store_r(e, 1, W_T1);
+        emit_frame_store_i(e, 2, (uint16_t)ip_after);
+        emit_frame_done(e, 2);
+    }
+    if (is_imm) {
+        uint16_t sel = (uint16_t)in->imm2, off = (uint16_t)in->ops[0].imm;
+        emit_mov_ri(e, 4, W_T3, sel);
+        emit_load_cs(e, W_T3);
+        uint32_t lin = ((uint32_t)sel << 4) + off;
+        if (!s_blk->v86) lin &= cpu->a20_mask;
+        emit_edge(dbt, e, dbt_key(sel, lin) | s_mode_bits);
+    } else {
+        m = M(R_CPU, OFF_JIT_CUR_HIT); emit_mov_rm(e, 4, W_T1, &m);
+        emit_mov_rr(e, 4, W_T3, W_T1);
+        emit_shift_ri(e, 4, X64_SH_SHR, W_T3, 16);                              /* sel */
+        emit_load_cs(e, W_T3);
+        emit_far_key(e, W_T3, W_T1);
+        emit_dynamic_tail(dbt, e);
+    }
+}
+
+/* reg = FLAGS as the guest sees them: cpu->eflags with the arithmetic
+ * bits from the slot (saved already) and DF from the host's RFLAGS.
+ * Clobbers W_T0 and RFLAGS. */
+static void emit_flags_image(emit_t *e, int reg) {
+    x64_mem_t m;
+    m = M(R_CPU, OFF_EFLAGS); emit_mov_rm(e, 4, reg, &m);
+    emit_alu_ri(e, 4, X64_ALU_AND, reg, ~(uint32_t)(ARITH | X86_DF));
+    m = M(R_CPU, OFF_JIT_FLAGS); emit_mov_rm(e, 4, W_T0, &m);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T0, ARITH);
+    emit_alu_rr(e, 4, X64_ALU_OR, reg, W_T0);
+    emit_pushfq(e); emit_pop_r(e, W_T0);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T0, X86_DF);
+    emit_alu_rr(e, 4, X64_ALU_OR, reg, W_T0);
+}
+
+/* INT n / INT3 (real mode). The IVT entry is read before the frame is
+ * pushed (measured), the pushed FLAGS are the pre-clear value with the
+ * arithmetic bits from the slot, IF and TF are cleared, and the frame's
+ * three slots are checked before any store. Landing on the HLE stub
+ * segment is a refused key, so the run loop steps the service. */
+static void emit_int_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
+    uint32_t vec = in->op == OP_INT3 ? 3 : (in->ops[0].imm & 0xFF);
+    x64_mem_t m;
+    m = M(R_MEM, (int32_t)(vec * 4)); emit_mov_rm(e, 4, W_T0, &m);              /* sel:off */
+    m = M(R_CPU, OFF_JIT_CUR_HIT); emit_mov_mr(e, 4, &m, W_T0);                 /* parked across the frame */
+    emit_frame_checks(e, 3);
+    emit_flags_image(e, W_T1);
+    emit_frame_store_r(e, 1, W_T1);                                              /* FLAGS as the guest sees it */
+    m = M(R_CPU, OFF_SEG_SEL(S_CS)); emit_movzx_rm(e, 4, W_T1, 2, &m);
+    emit_frame_store_r(e, 2, W_T1);
+    emit_frame_store_i(e, 3, (uint16_t)s_cur_ip_after);
+    emit_frame_done(e, 3);
+    m = M(R_CPU, OFF_EFLAGS); emit_alu_mi(e, 4, X64_ALU_AND, &m, ~(uint32_t)(X86_IF | X86_TF));
+    m = M(R_CPU, (int32_t)offsetof(x86_cpu, int_inhibit)); emit_mov_mi(e, 1, &m, 0);
+    m = M(R_CPU, OFF_JIT_CUR_HIT); emit_mov_rm(e, 4, W_T1, &m);
+    emit_mov_rr(e, 4, W_T3, W_T1);
+    emit_shift_ri(e, 4, X64_SH_SHR, W_T3, 16);                                  /* sel */
+    emit_load_cs(e, W_T3);
+    emit_far_key(e, W_T3, W_T1);
+    emit_dynamic_tail(dbt, e);
+}
+
+/* ----------------------------------------------------------------------
+ * String instructions (16-bit addressing, byte and word), on the host's
+ * own: SI/DI become host pointers for the duration and are turned back
+ * into offsets after. DF is the host's already. The checks come first —
+ * a word at FFFFh, a store's bitmap byte, and for REP the whole range:
+ * no wrap around the segment, no code bitmap bit under any store — and
+ * a miss runs the instruction through the interpreter from the state
+ * as it stands. Below the 386 the pointer registers are canonical; on
+ * a 386 REP forms stay with the interpreter for now.
+ * ---------------------------------------------------------------------- */
+
+/* W_T1 = pointer of the source segment, W_T2 = of ES (registers the
+ * string op needs kept: this is called first). */
+static void emit_str_segs(emit_t *e, const x86_insn *in, int need_src) {
+    if (need_src) { if (in->seg == S_DS) emit_mov_rr(e, 8, W_T1, R_DSP); else emit_seg_ptr(e, in->seg, W_T1); }
+    emit_seg_ptr(e, S_ES, W_T2);
+}
+/* On a 386 the upper halves of ESI/EDI must survive a 16-bit string op:
+ * kept in the cpu's own register slots (stale during a block anyway),
+ * and the registers themselves are only truncated once every check has
+ * passed (a slow path must see them whole). */
+static void emit_str_save_hi(emit_t *e) {
+    if (!s_regs32) return;
+    x64_mem_t m;
+    m = M(R_CPU, OFF_R(R_SI)); emit_mov_mr(e, 4, &m, X64_RSI);
+    m = M(R_CPU, OFF_R(R_DI)); emit_mov_mr(e, 4, &m, X64_RDI);
+}
+static void emit_str_trunc(emit_t *e, int si, int di) {
+    if (!s_regs32) return;
+    if (si) emit_movzx_rr(e, 4, X64_RSI, 2, X64_RSI);
+    if (di) emit_movzx_rr(e, 4, X64_RDI, 2, X64_RDI);
+}
+/* reg (SI/DI) back to a 16-bit offset: host pointer minus base (in
+ * `negbase`, negated), then the 386's upper half restored. Flag-free. */
+static void emit_str_unptr(emit_t *e, int reg, int negbase) {
+    x64_mem_t m = x64_mi(reg, negbase, 0, 0);
+    emit_lea(e, 8, reg, &m);
+    emit_movzx_rr(e, 4, reg, 2, reg);
+    if (s_regs32) {
+        m = M(R_CPU, OFF_R(reg == X64_RSI ? R_SI : R_DI));
+        emit_mov_rm(e, 4, W_T0, &m);
+        emit_mov_rr(e, 2, W_T0, reg);
+        emit_mov_rr(e, 4, reg, W_T0);
+    }
+}
+
+static void emit_string1(emit_t *e, const x86_insn *in, uint32_t live_in) {
+    int size = in->ops[0].size;
+    int rd_si = in->op == OP_MOVS || in->op == OP_LODS || in->op == OP_CMPS;
+    int wr_di = in->op == OP_MOVS || in->op == OP_STOS;
+    int use_di = in->op != OP_LODS;
+    x64_mem_t m;
+    fl_save(e, live_in);
+    emit_str_segs(e, in, rd_si);
+    emit_str_save_hi(e);
+    int si16 = X64_RSI, di16 = X64_RDI;
+    if (s_regs32) { emit_movzx_rr(e, 4, W_T0, 2, X64_RSI); emit_movzx_rr(e, 4, W_T3, 2, X64_RDI); si16 = W_T0; di16 = W_T3; }
+    if (rd_si) { ea_t ea = { W_T1, si16 }; emit_check_wrap(e, &ea, size); }
+    if (use_di) { ea_t ea = { W_T2, di16 }; emit_check_wrap(e, &ea, size); if (wr_di) emit_check_smc(e, &ea, size); }
+    emit_str_trunc(e, rd_si, use_di);
+    /* negated bases for the flag-free way back (CMPS/SCAS leave flags) */
+    if (rd_si) { emit_mov_rr(e, 8, W_T0, W_T1); emit_g3_r(e, 8, X64_G3_NEG, W_T0); emit_mov_rr(e, 8, W_T1, W_T0); }
+    if (use_di) { emit_mov_rr(e, 8, W_T0, W_T2); emit_g3_r(e, 8, X64_G3_NEG, W_T0); emit_mov_rr(e, 8, W_T2, W_T0); }
+    /* W_T1 = -src base, W_T2 = -ES base: the pointers are reg - (-base) */
+    if (rd_si) { emit_mov_rr(e, 8, W_T0, X64_RSI); emit_alu_rr(e, 8, X64_ALU_SUB, W_T0, W_T1); emit_mov_rr(e, 8, X64_RSI, W_T0); }
+    if (use_di) { emit_mov_rr(e, 8, W_T0, X64_RDI); emit_alu_rr(e, 8, X64_ALU_SUB, W_T0, W_T2); emit_mov_rr(e, 8, X64_RDI, W_T0); }
+    switch (in->op) {
+    case OP_MOVS: emit_movs(e, size, 0); break;
+    case OP_STOS: emit_stos(e, size, 0); break;
+    case OP_LODS: emit_lods(e, size, 0); break;
+    case OP_CMPS: emit_cmps(e, size, 0); break;
+    default:      emit_scas(e, size, 0); break;
+    }
+    if (rd_si) emit_str_unptr(e, X64_RSI, W_T1);
+    if (use_di) emit_str_unptr(e, X64_RDI, W_T2);
+    (void)m;
+    if (in->op == OP_CMPS || in->op == OP_SCAS) fl_produce(ARITH);
+}
+
+/* REP MOVS/STOS and REPE/REPNE CMPS/SCAS, canonical registers only. The
+ * range is CX elements in DF's direction; W_T0 = its byte count. */
+static void emit_rep_string(emit_t *e, const x86_insn *in, uint32_t live_in) {
+    int size = in->ops[0].size;
+    int rd_si = in->op == OP_MOVS || in->op == OP_CMPS;
+    int wr_di = in->op == OP_MOVS || in->op == OP_STOS;
+    int cmp = in->op == OP_CMPS || in->op == OP_SCAS;
+    x64_mem_t m;
+    fl_save(e, live_in);
+    emit_test_rr(e, 2, X64_RCX, X64_RCX);
+    uint32_t none = emit_jcc_rel32(e, X64_CC_E);
+    emit_str_segs(e, in, rd_si);
+    /* byte count */
+    if (size == 1) emit_mov_rr(e, 4, W_T0, X64_RCX);
+    else { m = x64_mi(X64_RCX, X64_RCX, 0, 0); emit_lea(e, 4, W_T0, &m); }
+    /* direction */
+    emit_pushfq(e); emit_pop_r(e, W_T3);
+    emit_test_ri(e, 4, W_T3, X86_DF);
+    uint32_t down = emit_jcc_rel32(e, X64_CC_NE);
+    /* up: offset + count <= 64K for each pointer; the bitmap under [ES:DI, +count) */
+    if (rd_si) { m = x64_mi(X64_RSI, W_T0, 0, 0); emit_lea(e, 4, W_T3, &m); emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, 0x10000); slow_site(e, X64_CC_A); }
+    m = x64_mi(X64_RDI, W_T0, 0, 0); emit_lea(e, 4, W_T3, &m); emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, 0x10000); slow_site(e, X64_CC_A);
+    if (wr_di) { m = x64_mi(W_T2, X64_RDI, 0, (int32_t)X86_BM_DELTA); emit_lea(e, 8, W_T3, &m); }
+    uint32_t to_scan = emit_jmp_rel32(e);
+    /* down: offset + size >= count for each pointer; the bitmap under [ES:DI + size - count, +count) */
+    emit_patch_rel32(e, down, emit_pos(e));
+    if (rd_si) { m = M(X64_RSI, size); emit_lea(e, 4, W_T3, &m); emit_alu_rr(e, 4, X64_ALU_CMP, W_T3, W_T0); slow_site(e, X64_CC_B); }
+    m = M(X64_RDI, size); emit_lea(e, 4, W_T3, &m); emit_alu_rr(e, 4, X64_ALU_CMP, W_T3, W_T0); slow_site(e, X64_CC_B);
+    if (wr_di) {
+        emit_alu_rr(e, 4, X64_ALU_SUB, W_T3, W_T0);                              /* DI + size - count */
+        m = x64_mi(W_T2, W_T3, 0, (int32_t)X86_BM_DELTA); emit_lea(e, 8, W_T3, &m);
+    }
+    emit_patch_rel32(e, to_scan, emit_pos(e));
+    if (wr_di) {
+        /* the bitmap scan: W_T3 = first byte, W_T0 = count (recomputed after) */
+        uint32_t top = emit_pos(e);
+        emit_alu_ri(e, 4, X64_ALU_CMP, W_T0, 8);
+        uint32_t tail = emit_jcc_rel8(e, X64_CC_B);
+        m = M(W_T3, 0); emit_alu_mi(e, 8, X64_ALU_CMP, &m, 0);
+        slow_site(e, X64_CC_NE);
+        emit_alu_ri(e, 8, X64_ALU_ADD, W_T3, 8);
+        emit_alu_ri(e, 4, X64_ALU_SUB, W_T0, 8);
+        emit_patch_rel32(e, emit_jmp_rel32(e), top);
+        emit_patch_rel8(e, tail, emit_pos(e));
+        uint32_t tail_top = emit_pos(e);
+        emit_test_rr(e, 4, W_T0, W_T0);
+        uint32_t scanned = emit_jcc_rel8(e, X64_CC_E);
+        m = M(W_T3, 0); emit_alu_mi(e, 1, X64_ALU_CMP, &m, 0);
+        slow_site(e, X64_CC_NE);
+        emit_alu_ri(e, 8, X64_ALU_ADD, W_T3, 1);
+        emit_alu_ri(e, 4, X64_ALU_SUB, W_T0, 1);
+        emit_patch_rel32(e, emit_jmp_rel32(e), tail_top);
+        emit_patch_rel8(e, scanned, emit_pos(e));
+    }
+    /* pointers in, the op, pointers out (negated bases: no flags on the way back) */
+    if (rd_si) { m = x64_mi(W_T1, X64_RSI, 0, 0); emit_lea(e, 8, X64_RSI, &m); emit_g3_r(e, 8, X64_G3_NEG, W_T1); }
+    m = x64_mi(W_T2, X64_RDI, 0, 0); emit_lea(e, 8, X64_RDI, &m); emit_g3_r(e, 8, X64_G3_NEG, W_T2);
+    switch (in->op) {
+    case OP_MOVS: emit_movs(e, size, 0xF3); break;
+    case OP_STOS: emit_stos(e, size, 0xF3); break;
+    case OP_CMPS: emit_cmps(e, size, in->rep); break;
+    default:      emit_scas(e, size, in->rep); break;
+    }
+    if (rd_si) emit_str_unptr(e, X64_RSI, W_T1);
+    emit_str_unptr(e, X64_RDI, W_T2);
+    if (cmp) {                         /* the last comparison's flags, to the slot: the CX = 0 path left them there too */
+        m = M(R_CPU, OFF_JIT_FLAGS);
+        emit_pushfq(e); emit_pop_m(e, &m);
+    }
+    emit_patch_rel32(e, none, emit_pos(e));
+}
+
+/* ----------------------------------------------------------------------
+ * MUL, IMUL, DIV, IDIV, shifts by CL, PUSHF/POPF, LDS/LES, XLAT, LAHF/SAHF
+ * ---------------------------------------------------------------------- */
+
+/* The slot's ZF := (reg == 0). Whatever RFLAGS held is in the slot
+ * already; RFLAGS is free after. */
+static void emit_slot_zf_from(emit_t *e, int size, int reg) {
+    x64_mem_t m = M(R_CPU, OFF_JIT_FLAGS);
+    emit_test_rr(e, size, reg, reg);
+    emit_setcc_r(e, X64_CC_E, W_T0);
+    emit_movzx_rr(e, 4, W_T0, 1, W_T0);
+    emit_shift_ri(e, 4, X64_SH_SHL, W_T0, 6);
+    emit_alu_mi(e, 4, X64_ALU_AND, &m, ~(uint32_t)X86_ZF);
+    emit_alu_mr(e, 4, X64_ALU_OR, &m, W_T0);
+}
+
+/* One-operand MUL/IMUL r/m8, r/m16: the host's, whose CF/OF, SF and PF
+ * are the interpreter's; its ZF is not (the interpreter's is the low
+ * half's), so when ZF is live it is fixed in the slot. */
+static void emit_mul16(emit_t *e, const x86_insn *in, const ea_t *ea, uint32_t live_in, uint32_t live_out) {
+    int size = in->ops[0].size, g3 = in->op == OP_MUL ? X64_G3_MUL : X64_G3_IMUL;
+    const x86_operand *s = &in->ops[0];
+    x64_mem_t m;
+    if (s->kind == OPK_MEM) {
+        emit_checks(e, ea, size, 0, live_in);
+        m = ea_mem(ea); emit_g3_m(e, size, g3, &m);
+    } else {
+        int hi = is_high8(s);
+        if (hi) {
+            /* mul ah: the register is rotated into AL's place... but AL is
+             * the other operand: copy to a scratch instead */
+            emit_mov_rr(e, 4, W_T2, X64_RAX + (s->reg & 3));
+            emit_shift_ri(e, 4, X64_SH_SHR, W_T2, 8);
+            emit_g3_r(e, 1, g3, W_T2);
+        } else {
+            emit_g3_r(e, size, g3, host_reg(s));
+        }
+    }
+    fl_produce(ARITH);
+    if (live_out & X86_ZF) {
+        fl_save(e, ARITH);
+        emit_slot_zf_from(e, size, X64_RAX);
+    }
+    if (s->kind == OPK_MEM) slow_back(e, s_rf);
+}
+
+/* DIV/IDIV r/m8, r/m16 on the 286 and later: the host's, after checks
+ * that keep it from faulting — a #DE (zero divisor, quotient too large)
+ * is the interpreter's. Unsigned: exact (the high part below the
+ * divisor). Signed: the fast path takes a dividend that is the sign
+ * extension of its low half (what CBW/CWD leave) and not the one
+ * overflowing pair. Flags are unchanged (CONTRACT, 186+); the checks
+ * clobber RFLAGS, so they go to the slot first. */
+static void emit_div16(emit_t *e, const x86_insn *in, const ea_t *ea, uint32_t live_in) {
+    int size = in->ops[0].size, sgn = in->op == OP_IDIV;
+    const x86_operand *s = &in->ops[0];
+    x64_mem_t m;
+    int src;
+    fl_save(e, live_in);
+    if (s->kind == OPK_MEM) { emit_check_wrap(e, ea, size); m = ea_mem(ea); emit_movzx_rm(e, 4, W_T2, size, &m); src = W_T2; }
+    else if (is_high8(s)) { emit_mov_rr(e, 4, W_T2, X64_RAX + (s->reg & 3)); emit_shift_ri(e, 4, X64_SH_SHR, W_T2, 8); src = W_T2; }
+    else src = host_reg(s);
+    int hi = size == 1 ? X64_AH : X64_RDX;      /* the high half of the dividend */
+    if (!sgn) {
+        if (size == 1) { emit_mov_rr(e, 4, W_T3, X64_RAX); emit_shift_ri(e, 4, X64_SH_SHR, W_T3, 8); emit_alu_rr(e, 1, X64_ALU_CMP, W_T3, src); }
+        else emit_alu_rr(e, 2, X64_ALU_CMP, X64_RDX, src);
+        slow_site(e, X64_CC_AE);                                   /* high >= divisor: #DE (0 included) */
+    } else {
+        emit_test_rr(e, size, src, src);
+        slow_site(e, X64_CC_E);                                    /* divisor 0 */
+        /* high half must be the sign extension of the low half */
+        if (size == 1) {
+            emit_movsx_rr(e, 4, W_T3, 1, X64_AL);
+            emit_alu_rr(e, 2, X64_ALU_CMP, W_T3, X64_RAX);
+        } else {
+            emit_movsx_rr(e, 4, W_T3, 2, X64_RAX);
+            emit_shift_ri(e, 4, X64_SH_SAR, W_T3, 16);
+            emit_alu_rr(e, 2, X64_ALU_CMP, W_T3, X64_RDX);
+        }
+        slow_site(e, X64_CC_NE);
+        /* the one overflowing pair: MIN / -1 */
+        emit_alu_ri(e, size, X64_ALU_CMP, src, size == 1 ? 0xFF : 0xFFFF);
+        uint32_t ok = emit_jcc_rel8(e, X64_CC_NE);
+        emit_alu_ri(e, size, X64_ALU_CMP, X64_RAX, size == 1 ? 0x80 : 0x8000);
+        slow_site(e, X64_CC_E);
+        emit_patch_rel8(e, ok, emit_pos(e));
+    }
+    (void)hi;
+    emit_g3_r(e, size, sgn ? X64_G3_IDIV : X64_G3_DIV, src);
+    s_rf = 0;                                                      /* undefined on the host; the slot is the truth */
+    slow_back(e, 0);                                               /* (the #DE checks are sites whatever the operand) */
+}
+
+/* Shifts and rotates by CL (186+: the count masked to 5 bits, as the
+ * host does). A zero count changes nothing, flags included, so the flags
+ * are in the slot on both paths out. OF after more than one step is
+ * the last step's on the guest: for SHL/ROL/RCL that is SF ^ CF of the
+ * result, fixed in the slot when OF is live; SAR's is 0 on both. */
+static void emit_shift_cl(emit_t *e, const x86_insn *in, const ea_t *ea, uint32_t live_in, uint32_t live_out) {
+    int size = in->ops[0].size, sh = sh_of_op[in->op];
+    const x86_operand *d = &in->ops[0];
+    x64_mem_t m, slot = M(R_CPU, OFF_JIT_FLAGS);
+    int rcx = in->op == OP_RCL || in->op == OP_RCR;
+    if (d->kind == OPK_MEM) emit_checks(e, ea, size, 1, live_in); else fl_save(e, live_in);
+    emit_test_ri(e, 1, X64_CL, 0x1F);
+    uint32_t zero = emit_jcc_rel32(e, X64_CC_E);
+    int fix_of = (live_out & X86_OF) != 0 && in->op != OP_SAR;
+    if (fix_of && in->op == OP_SHR) {                            /* the original's sign, for a count of one */
+        if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_movzx_rm(e, 4, W_T3, size, &m); emit_shift_ri(e, 4, X64_SH_SHR, W_T3, size * 8 - 1); }
+        else { emit_mov_rr(e, 4, W_T3, is_high8(d) ? (d->reg & 3) : host_reg(d)); emit_shift_ri(e, 4, X64_SH_SHR, W_T3, is_high8(d) ? 15 : size * 8 - 1); }
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T3, 1);
+    }
+    if (rcx) fl_need_cf(e);
+    if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_shift_mcl(e, size, sh, &m); }
+    else emit_shift_rcl(e, size, sh, host_reg(d));               /* a high byte and CL: no REX, native */
+    int rot = in->op == OP_ROL || in->op == OP_ROR || rcx;
+    if (!rot) { emit_pushfq(e); emit_pop_m(e, &slot); }
+    else {                                                       /* a rotate writes CF and OF only: merge */
+        emit_pushfq(e); emit_pop_r(e, W_T3);
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T3, X86_CF | X86_OF);
+        emit_alu_mi(e, 4, X64_ALU_AND, &slot, ~(uint32_t)(X86_CF | X86_OF));
+        emit_alu_mr(e, 4, X64_ALU_OR, &slot, W_T3);
+    }
+    if (fix_of) {
+        /* OF, the last step's on the guest (the rotates leave SF alone,
+         * so signs come from the value itself):
+         *   SHL/SAL/ROL/RCL  MSB(result) ^ CF
+         *   ROR/RCR          MSB(result) ^ the bit below it
+         *   SHR              MSB(original) for a count of one, else 0 */
+        int msb = is_high8(d) ? 15 : size * 8 - 1;
+        if (in->op == OP_SHR) {
+            emit_mov_rr(e, 4, W_T2, X64_RCX);
+            emit_alu_ri(e, 4, X64_ALU_AND, W_T2, 0x1F);
+            emit_alu_ri(e, 4, X64_ALU_CMP, W_T2, 1);
+            uint32_t one = emit_jcc_rel8(e, X64_CC_E);
+            emit_mov_ri(e, 4, W_T3, 0);
+            emit_patch_rel8(e, one, emit_pos(e));
+        } else {
+            if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_movzx_rm(e, 4, W_T3, size, &m); }
+            else emit_mov_rr(e, 4, W_T3, is_high8(d) ? (d->reg & 3) : host_reg(d));
+            if (in->op == OP_ROR || in->op == OP_RCR) {
+                emit_mov_rr(e, 4, W_T2, W_T3);
+                emit_shift_ri(e, 4, X64_SH_SHR, W_T3, msb);
+                emit_shift_ri(e, 4, X64_SH_SHR, W_T2, msb - 1);
+                emit_alu_rr(e, 4, X64_ALU_XOR, W_T3, W_T2);
+            } else {
+                emit_shift_ri(e, 4, X64_SH_SHR, W_T3, msb);
+                emit_mov_rm(e, 4, W_T2, &slot);
+                emit_alu_rr(e, 4, X64_ALU_XOR, W_T3, W_T2);           /* CF is bit 0 */
+            }
+        }
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T3, 1);
+        emit_shift_ri(e, 4, X64_SH_SHL, W_T3, 11);
+        emit_alu_mi(e, 4, X64_ALU_AND, &slot, ~(uint32_t)X86_OF);
+        emit_alu_mr(e, 4, X64_ALU_OR, &slot, W_T3);
+    }
+    emit_patch_rel32(e, zero, emit_pos(e));
+    s_rf = 0;
+    slow_back(e, 0);
+}
+
+/* PUSHF with a 16-bit operand: FLAGS as the guest sees them, low word. */
+static void emit_pushf16(emit_t *e, uint32_t live_in) {
+    x64_mem_t m;
+    fl_save(e, live_in | ARITH);                                   /* the value pushed: everything */
+    emit_flags_image(e, W_T2);
+    emit_push16(e, W_T2);
+    (void)m;
+}
+/* POPF with a 16-bit operand, real mode: the low word of EFLAGS replaced
+ * whole, then x86_flags_fixup's per-model masks (bit 1 set, 3 and 5
+ * clear; 12-15 ones on the 8086/186, zeros on the 286, the 386 clears bit
+ * 15 and VM). DF goes to the host's DF, the arithmetic bits to the slot. */
+static void emit_popf16(emit_t *e, uint32_t live_in) {
+    x64_mem_t m;
+    fl_save(e, live_in);
+    emit_pop16(e, W_T2);
+    emit_movzx_rr(e, 4, W_T2, 2, W_T2);
+    if (s_model >= X86_MODEL_386) {
+        m = M(R_CPU, OFF_EFLAGS); emit_mov_rm(e, 4, W_T0, &m);
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T0, 0xFFFF0000u & ~(uint32_t)X86_VM);
+        emit_alu_rr(e, 4, X64_ALU_OR, W_T2, W_T0);
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T2, ~0x8028u);
+        emit_alu_ri(e, 4, X64_ALU_OR, W_T2, 0x2);
+    } else if (s_model == X86_MODEL_286) {
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T2, 0x0FD7);
+        emit_alu_ri(e, 4, X64_ALU_OR, W_T2, 0x2);
+    } else {
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T2, 0xFFD7);
+        emit_alu_ri(e, 4, X64_ALU_OR, W_T2, 0xF002);
+    }
+    m = M(R_CPU, OFF_EFLAGS); emit_mov_mr(e, 4, &m, W_T2);
+    m = M(R_CPU, OFF_JIT_FLAGS); emit_mov_mr(e, 4, &m, W_T2);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T2, X86_DF);
+    emit_push_r(e, W_T2); emit_popfq(e);
+    s_rf = 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -1063,6 +1686,12 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
     fl_save(e, ARITH);
     emit_tail_prologue(e, n_ops);
     switch (in->op) {
+    case OP_INT: case OP_INT3:
+        emit_int_ender(dbt, e, in);
+        break;
+    case OP_CALLF: case OP_JMPF: case OP_RETF:
+        emit_far_ender(dbt, e, in, ip_after);
+        break;
     case OP_JMP:
         if (in->ops[0].kind == OPK_IMM) { emit_edge(dbt, e, target_key(ip_after + in->ops[0].imm)); return; }
         if (in->ops[0].kind == OPK_MEM) {
@@ -1155,7 +1784,7 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
         n = i + 1;
         ip = b->ip_afters[i];
         uint32_t live_out = b->fmask[i], live_in = b->live_in[i];
-        int is_inline = inl && b->cls[i] == C_INLINE && inline_ok(in);
+        int is_inline = inl && b->cls[i] == C_INLINE;
         if (is_inline && (b->role[i] == ROLE_UNCOND || (b->role[i] == ROLE_COND && i == b->n_ops - 1))) {
             s_cur_n_done = 0;                                    /* the whole block is charged by the tail */
             emit_branch_ender(dbt, &e, in, b->ip_afters[i], b->n_ops);

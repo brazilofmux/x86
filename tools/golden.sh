@@ -70,6 +70,7 @@ run)
     wait
     rm -rf tmp/golden-cob 'disks/WP51/WP}WP{'*
     fi
+    [ -n "$GOLDEN_NO_BOOT" ] && exit 0          # GOLDEN_NO_BOOT=1: the exact workloads only
     # booted machines: real DOS, V86 and paging under memory managers, Windows
     if [ -f disks/freedos/c.img ]; then
         cp disks/freedos/c.img tmp/golden-fd.img

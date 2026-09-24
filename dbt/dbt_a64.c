@@ -2531,6 +2531,119 @@ static void emit_flat_slow_chunks(x86_dbt *dbt, emit_t *e) {
     s_nfslow = 0;
 }
 
+
+/* ----------------------------------------------------------------------
+ * What this backend inlines, by block shape (dbt_arch_can_inline).
+ * The lists the classifier used to hold: the front end now asks.
+ * ---------------------------------------------------------------------- */
+static int a64_shift_inline(const x86_insn *in) {
+    if (in->ops[1].kind != OPK_IMM) return 0;
+    uint32_t cnt = in->ops[1].imm & 0xFF;
+    return cnt < (uint32_t)in->ops[0].size * 8;   /* 0 included: static no-op */
+}
+
+/* Real mode and V86: the 16-bit emitters. */
+static int a64_real_inline(const x86_insn *in) {
+    switch (in->op) {
+    case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
+    case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
+    case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
+    case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD: case OP_CLI: case OP_STI:
+    case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
+    case OP_RET: case OP_CALLF: case OP_JMPF: case OP_RETF:
+    case OP_INT: case OP_INT3:
+    case OP_OUT:
+    case OP_MOVZX: case OP_MOVSX: case OP_SETCC:
+    case OP_PUSH: case OP_POP: case OP_LES: case OP_LDS: case OP_MOVSEG:
+    case OP_DIV: case OP_IDIV: case OP_MUL: case OP_PUSHF: case OP_POPF:
+        return 1;
+    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
+        /* through DS/ES/SS only; REP LODS stays a helper */
+        if (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return 0;
+        return !(in->rep && in->op == OP_LODS);
+    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
+        return a64_shift_inline(in);
+    case OP_IMUL:
+        return in->opcode2 != 0xAF;   /* one-operand form only */
+    default:
+        return 0;
+    }
+}
+
+/* Flat protected mode: the real-mode emitters, widened to 32 bits, take
+ * what they cover with 32-bit addressing through DS/ES/SS. Near
+ * transfers need a 32-bit operand size (a 16-bit one truncates EIP) and
+ * the LOOP family a 32-bit address size (ECX). */
+static int a64_flat_inline(const x86_insn *in) {
+    if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS))) return 0;
+    switch (in->op) {
+    case OP_ADD: case OP_OR: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP: case OP_TEST:
+    case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
+    case OP_NOP: case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
+    case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
+    case OP_ADC: case OP_SBB:
+    case OP_SETCC: case OP_OUT:
+        return 1;
+    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
+        if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4;   /* by CL */
+        return a64_shift_inline(in);
+    case OP_DIV: case OP_IDIV:
+        return in->ops[0].size == 4;
+    case OP_PUSHA: case OP_POPA:
+        return in->opsize == 4;
+    case OP_SHLD: case OP_SHRD:
+        /* 32-bit, immediate count 1..31: one EXTR. CL counts, zero counts
+         * and 16-bit forms (the 386's count > 16 quirk) stay helpers. */
+        return in->ops[0].size == 4 && in->imm2 != 0xFFFFFFFFu && (in->imm2 & 31);
+    case OP_IMUL: case OP_MUL: case OP_IMUL3:
+        return in->ops[0].size == 4;   /* IMUL r32, r/m32; EDX:EAX = EAX * r/m32 */
+    case OP_PUSH:
+        return in->opsize == 4 && in->ops[0].kind != OPK_SREG;
+    case OP_POP:
+        return in->opsize == 4 && in->ops[0].kind == OPK_REG;
+    case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC:
+        return in->opsize == 4;
+    case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
+        return in->opsize == 4 && in->adsize == 4;
+    default:
+        return 0;
+    }
+}
+
+/* Segmented 16-bit protected mode: the real-mode set with 16-bit
+ * addressing through DS, ES or SS, plus the 32-bit-operand forms of the
+ * straight-line ops the emitters handle at any width (DOS/4GW's
+ * dispatcher moves dwords through 16-bit segments). */
+static int a64_seg16_inline(const x86_insn *in) {
+    if (in->adsize != 2) return 0;
+    if (in->ea_valid && in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return 0;
+    if (in->opsize == 4) {
+        switch (in->op) {
+        case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
+        case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
+        case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
+            return 1;
+        case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
+            /* by CL only at 32 bits (emit_shift_cl); a byte op under a 66 prefix is not */
+            if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4;
+            return a64_shift_inline(in);
+        case OP_PUSH:
+            return in->ops[0].kind != OPK_SREG;
+        case OP_POP:
+            return in->ops[0].kind != OPK_SREG;
+        default:
+            return 0;          /* 32-bit near transfers included: EIP would need to stay whole */
+        }
+    }
+    return a64_real_inline(in);
+}
+
+int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
+    if (b->flat) return a64_flat_inline(in);
+    if (b->seg16) return a64_seg16_inline(in);
+    return a64_real_inline(in);
+}
+
 /* ----------------------------------------------------------------------
  * Block emission: a plan (dbt_translate.c) to AArch64
  * ---------------------------------------------------------------------- */

@@ -38,14 +38,14 @@ static int s_cls_model = X86_MODEL_286;
 /* ----------------------------------------------------------------------
  * Classification
  * ---------------------------------------------------------------------- */
-static int is_shift_inline(const x86_insn *in) {
-    if (in->op != OP_SHL && in->op != OP_SAL && in->op != OP_SHR && in->op != OP_SAR) return 0;
-    if (in->ops[1].kind != OPK_IMM) return 0;
-    uint32_t cnt = in->ops[1].imm & 0xFF;
-    return cnt < (uint32_t)in->ops[0].size * 8;   /* 0 included: static no-op */
-}
-
-static int classify_op(const x86_insn *in) {
+/* What the interpreter demands of an instruction, before any backend
+ * is asked: C_REFUSE ends the block (the run loop steps it: a CS load in
+ * disguise, an undecodable form), C_HELPER keeps it in the block but
+ * exact by construction (an interrupt shadow, a model's microcode
+ * quirk), and C_INLINE is permission — granted only if the backend says
+ * it can (dbt_arch_can_inline, for the block's shape). Every op the
+ * interpreter has and a backend might emit is listed as C_INLINE. */
+static int classify_sem(const x86_insn *in) {
     switch (in->op) {
     case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
     case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
@@ -56,39 +56,24 @@ static int classify_op(const x86_insn *in) {
     case OP_INT: case OP_INT3:
     case OP_OUT:
     case OP_MOVZX: case OP_MOVSX: case OP_SETCC:
-        return C_INLINE;
-    case OP_PUSH:
-        return C_INLINE;
-    case OP_POP:
-        if (in->ops[0].kind != OPK_SREG) return C_INLINE;
-        if (in->ops[0].reg == S_CS) return C_REFUSE;           /* POP CS: 8086 control transfer */
-        return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES ? C_INLINE : C_HELPER;   /* SS: interrupt shadow */
-    case OP_LES: case OP_LDS:
-        return C_INLINE;
+    case OP_PUSH: case OP_LES: case OP_LDS:
     case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
-        /* through DS/ES/SS only; REP MOVS/STOS/LODS stay helpers: an
-         * SMC exit inside a storing loop has no exact place to land */
-        if (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return C_HELPER;
-        if (in->rep && in->op == OP_LODS) return C_HELPER;
-        return C_INLINE;
-    case OP_DIV: case OP_IDIV:
-        return s_cls_model >= X86_MODEL_286 ? C_INLINE : C_HELPER;  /* 8086 microcode quirks; 186 #DE is a trap */
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-        return is_shift_inline(in) ? C_INLINE : C_HELPER;
-    case OP_MUL:
-        return C_INLINE;
-    case OP_IMUL:
-        return in->opcode2 == 0xAF ? C_HELPER : C_INLINE;   /* one-operand form inline */
-    case OP_PUSHF: case OP_POPF:
-        return C_INLINE;                                     /* 16-bit (classify); POPF real mode only (classify_seg16) */
     case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR: case OP_SETMO:
-    case OP_IMUL3:
+    case OP_MUL: case OP_IMUL: case OP_IMUL3:
+    case OP_PUSHF: case OP_POPF:
     case OP_AAD: case OP_AAA: case OP_AAS: case OP_DAA: case OP_DAS: case OP_SALC:
     case OP_XLAT: case OP_SAHF: case OP_LAHF:
     case OP_PUSHA: case OP_POPA: case OP_ENTER: case OP_LEAVE:
     case OP_BT: case OP_BTS: case OP_BTR: case OP_BTC: case OP_BSF: case OP_BSR:
     case OP_SHLD: case OP_SHRD: case OP_CMPXCHG: case OP_XADD: case OP_BSWAP:
-        return C_HELPER;
+        return C_INLINE;
+    case OP_POP:
+        if (in->ops[0].kind != OPK_SREG) return C_INLINE;
+        if (in->ops[0].reg == S_CS) return C_REFUSE;           /* POP CS: 8086 control transfer */
+        return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES ? C_INLINE : C_HELPER;   /* SS: interrupt shadow */
+    case OP_DIV: case OP_IDIV:
+        return s_cls_model >= X86_MODEL_286 ? C_INLINE : C_HELPER;  /* 8086 microcode quirks; 186 #DE is a trap */
     case OP_AAM:
         return in->ops[0].imm ? C_HELPER : C_REFUSE;
     case OP_MOVSEG:
@@ -102,9 +87,13 @@ static int classify_op(const x86_insn *in) {
     }
 }
 
-static int classify(const x86_insn *in) {
+/* Real mode (and V86, below): 16-bit forms only — the 386's 32-bit
+ * operand and address sizes in real mode are the interpreter's. */
+static int classify(const dbt_block *b, const x86_insn *in) {
     if (in->opsize != 2 || in->adsize != 2) return C_REFUSE;   /* 386 forms: Phase B */
-    return classify_op(in);
+    int c = classify_sem(in);
+    if (c == C_INLINE && !dbt_arch_can_inline(b, in)) c = C_HELPER;
+    return c;
 }
 
 /* Virtual-8086 mode on top of the real-mode classes. What V86 does
@@ -153,105 +142,49 @@ static int classify_pm(const x86_insn *in) {
     case OP_OUT:
         return C_INLINE;          /* the port thunk (emit_out), in every kind of block */
     default:
-        return classify_op(in) == C_REFUSE ? C_REFUSE : C_HELPER;
+        return classify_sem(in) == C_REFUSE ? C_REFUSE : C_HELPER;
     }
 }
 
 
-/* Flat protected mode: the real-mode emitters, widened to 32 bits, take
- * what they cover with 32-bit addressing through DS/ES/SS; everything
- * else is a helper, as in any protected-mode block. Near transfers need
- * a 32-bit operand size (a 16-bit one truncates EIP) and the LOOP family
- * a 32-bit address size (ECX). */
-static int classify_flat(const x86_insn *in) {
+/* Flat protected mode: what a backend inlines here is 32-bit code
+ * addressing through DS/ES/SS; everything else is a helper, as in any
+ * protected-mode block. */
+static int classify_flat(const dbt_block *b, const x86_insn *in) {
     if (classify_pm(in) == C_REFUSE) return C_REFUSE;
-    if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS)))
-        return C_HELPER;
-    switch (in->op) {
-    case OP_ADD: case OP_OR: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP: case OP_TEST:
-    case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
-    case OP_NOP: case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
-    case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
-        return C_INLINE;
-    case OP_ADC: case OP_SBB:
-        return C_INLINE;
-    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-        if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* by CL */
-        return is_shift_inline(in) ? C_INLINE : C_HELPER;
-    case OP_DIV: case OP_IDIV:
-        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
-    case OP_SETCC:
-        return C_INLINE;
-    case OP_PUSHA: case OP_POPA:
-        return in->opsize == 4 ? C_INLINE : C_HELPER;
-    case OP_SHLD: case OP_SHRD:
-        /* 32-bit, immediate count 1..31: one EXTR. CL counts, zero counts
-         * and 16-bit forms (the 386's count > 16 quirk) stay helpers. */
-        return in->ops[0].size == 4 && in->imm2 != 0xFFFFFFFFu && (in->imm2 & 31) ? C_INLINE : C_HELPER;
-    case OP_IMUL: case OP_MUL:
-        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* IMUL r32, r/m32; EDX:EAX = EAX * r/m32 */
-    case OP_IMUL3:
-        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
-    case OP_PUSH:
-        return in->opsize == 4 && in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
-    case OP_POP:
-        return in->opsize == 4 && in->ops[0].kind == OPK_REG ? C_INLINE : C_HELPER;
-    case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC:
-        return in->opsize == 4 ? C_INLINE : C_HELPER;
-    case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
-        return in->opsize == 4 && in->adsize == 4 ? C_INLINE : C_HELPER;
-    case OP_OUT:
-        return C_INLINE;
-    default:
-        return C_HELPER;
-    }
+    if (classify_sem(in) == C_HELPER) return C_HELPER;
+    return dbt_arch_can_inline(b, in) ? C_INLINE : C_HELPER;
 }
 
-/* Segmented 16-bit protected mode: the real-mode set with 16-bit
- * addressing through DS, ES or SS (limit-checked at run time), plus the
- * 32-bit-operand forms of the straight-line ops the emitters handle at
- * any width (DOS/4GW's dispatcher moves dwords through 16-bit
- * segments). What touches IOPL (CLI/STI), a segment register, a far
- * target or an interrupt frame stays with the interpreter — a helper,
- * ending the block when it loads a segment (loads_segment), or refused. */
-static int classify_seg16(const x86_insn *in) {
+/* Segmented 16-bit protected mode: the real-mode shape with limit checks
+ * at run time. What touches IOPL (CLI/STI, POPF), a segment register, a
+ * far target or an interrupt frame stays with the interpreter — a
+ * helper, ending the block when it loads a segment (dbt_loads_segment),
+ * or refused. OUT goes through the port thunk in every kind of block. */
+static int classify_seg16(const dbt_block *b, const x86_insn *in) {
     if (classify_pm(in) == C_REFUSE) return C_REFUSE;
     if (dbt_loads_segment(in)) return C_HELPER;                  /* descriptor loads: the interpreter's */
-    if (in->op == OP_POPF) return C_HELPER;                  /* IOPL and IF under privilege rules */
-    if (in->adsize != 2) return C_HELPER;
-    if (in->ea_valid && in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return C_HELPER;
-    switch (in->op) {
-    case OP_CLI: case OP_STI:
-        return C_HELPER;              /* #GP above IOPL */
-    case OP_OUT:
-        return C_INLINE;
-    default: break;
-    }
-    if (in->opsize == 4) {
-        switch (in->op) {
-        case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
-        case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
-        case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
-            return C_INLINE;
-        case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-            /* by CL only at 32 bits (emit_shift_cl); a byte op under a 66 prefix is not */
-            if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
-            return is_shift_inline(in) ? C_INLINE : C_HELPER;
-        case OP_PUSH:
-            return in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
-        case OP_POP:
-            return in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
-        default:
-            return C_HELPER;          /* 32-bit near transfers included: EIP would need to stay whole */
-        }
-    }
-    return classify_op(in);
+    if (in->op == OP_POPF) return C_HELPER;                      /* IOPL and IF under privilege rules */
+    if (in->op == OP_CLI || in->op == OP_STI) return C_HELPER;   /* #GP above IOPL */
+    if (in->op == OP_OUT) return C_INLINE;
+    if (classify_sem(in) == C_HELPER) return C_HELPER;
+    return dbt_arch_can_inline(b, in) ? C_INLINE : C_HELPER;
 }
 
-/* Exposed for tools/jittest's fuzzer: 0 refuse, 1 inline, 2 helper. */
-int dbt_classify_op(const x86_insn *in) { return classify(in); }
+/* Exposed for tools/jittest's fuzzer: 0 refuse, 1 inline, 2 helper,
+ * for a block of the plain shape of each kind. */
+static dbt_block *shape_block(int flat, int seg16) {
+    static dbt_block b;
+    memset(&b, 0, offsetof(dbt_block, decs));
+    b.model = s_cls_model;
+    b.regs32 = s_cls_model >= X86_MODEL_386;
+    b.wrap_exact = s_cls_model < X86_MODEL_286;
+    b.flat = (uint8_t)flat; b.seg16 = (uint8_t)seg16;
+    return &b;
+}
+int dbt_classify_op(const x86_insn *in) { return classify(shape_block(0, 0), in); }
 int dbt_classify_op_pm(const x86_insn *in) { return classify_pm(in); }
-int dbt_classify_op_seg16(const x86_insn *in) { return classify_seg16(in); }
+int dbt_classify_op_seg16(const x86_insn *in) { return classify_seg16(shape_block(0, 1), in); }
 
 /* Inline ops with a word-sized memory or stack access: the 286+ limit
  * check in front of it can raise #GP. Byte accesses cannot straddle. */
@@ -311,6 +244,13 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
          * live-out set when it does shift. */
         if (in->ops[1].kind == OPK_IMM && (in->ops[1].imm & 0xFF)) *wr = ARITH;
         break;
+    case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR:
+        /* CF (and OF) written by a nonzero count; through-carry forms read CF */
+        if (in->op == OP_RCL || in->op == OP_RCR) *rd = X86_CF;
+        if (in->ops[1].kind == OPK_IMM && (in->ops[1].imm & 0xFF)) *wr = X86_CF | X86_OF;
+        break;
+    case OP_LAHF: *rd = X86_SF | X86_ZF | X86_AF | X86_PF | X86_CF; break;
+    case OP_SAHF: *wr = X86_SF | X86_ZF | X86_AF | X86_PF | X86_CF; break;
     case OP_DIV: case OP_IDIV: case OP_OUT:
         *rd = ARITH; break;
     case OP_CMPS: case OP_SCAS:
@@ -492,7 +432,7 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
             if (hot) { dbt->smc_hot_refusals++; break; }
         }
         if (b->seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
-        int c = b->flat ? classify_flat(in) : b->seg16 ? classify_seg16(in) : classify(in);
+        int c = b->flat ? classify_flat(b, in) : b->seg16 ? classify_seg16(b, in) : classify(b, in);
         if (b->v86) c = classify_v86(b, in, c);
         if (b->seg16 && b->paged && c == C_INLINE) {
             /* one checked access an instruction (emit_ea_seg16_paged); a

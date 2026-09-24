@@ -401,6 +401,11 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key);
 
 /* Backend hooks (dbt_a64.c, dbt_x64.c: one of them is built, BACKEND in the Makefile) */
 uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b);   /* host code for a plan (never NULL) */
+/* Can the backend emit this instruction inline in a block of b's shape
+ * (flat, seg16, v86/real, paged; b->model)? Asked by the front end for
+ * every instruction the interpreter does not claim; a no makes it a
+ * helper. b->decs is not filled in yet when this is called. */
+int      dbt_arch_can_inline(const dbt_block *b, const x86_insn *in);
 void     dbt_emit_trampoline(x86_dbt *dbt);
 void     dbt_arch_patch_link(x86_dbt *dbt, uint32_t site_off, uint8_t *target);
 
