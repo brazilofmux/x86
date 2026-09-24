@@ -43,14 +43,24 @@ def ours(img, extra):
     return lines(p.stdout.decode("latin-1"))
 
 def bochs(img):
-    with tempfile.TemporaryDirectory() as d:
-        rc = os.path.join(d, "bochsrc")
-        src = open(os.path.join(HERE, "bochsrc")).read()
-        src = re.sub(r"1_44=\S+,", "1_44=%s," % img, src).replace("/tmp/bochs.log", os.path.join(d, "bochs.log"))
-        open(rc, "w").write(src + "port_e9_hack: enabled=1\n")
-        p = subprocess.run(["bochs", "-q", "-f", rc], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=300)
-        return lines(p.stdout.decode("latin-1"))
+    """Bochs's transcript, as pgrun.py gets it: bochscfg.py fits the bochsrc
+    to the host, the debugger (always on in some builds) is told to
+    continue, and the run is stopped at "done"."""
+    import bochscfg
+    rc = bochscfg.write(os.path.abspath(img), ["port_e9_hack: enabled=1"])
+    out = []
+    p = subprocess.Popen(["bochs", "-q", "-f", rc], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, encoding="latin-1", cwd=HERE)
+    try:
+        p.stdin.write("c\n"); p.stdin.flush()
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            if line.endswith("fputest"): line = "fputest"      # (the debugger prompt may share its line)
+            out.append(line)
+            if line == "done": break
+    finally:
+        p.kill(); p.wait()
+    return lines("\n".join(out))
 
 def qemu(img):
     with tempfile.TemporaryDirectory() as d:
