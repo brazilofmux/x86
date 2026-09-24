@@ -110,6 +110,8 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 #define OFF_PGD_R       ((int32_t)offsetof(x86_cpu, pgd_r))
 #define OFF_PGD_W       ((int32_t)offsetof(x86_cpu, pgd_w))
 #define OFF_TLB         ((int32_t)offsetof(x86_cpu, tlb))
+#define OFF_CR0         ((int32_t)offsetof(x86_cpu, cr0))
+#define OFF_FPU_SW      ((int32_t)(offsetof(x86_cpu, fpu) + offsetof(x86_fpu, sw)))
 
 #define ARITH  X86_ARITH_FLAGS
 
@@ -1158,7 +1160,7 @@ static int inline_ok(const dbt_block *b, const x86_insn *in) {
     case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
     case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
     case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD: case OP_CLI: case OP_STI:
-    case OP_SETCC: case OP_OUT:
+    case OP_SETCC: case OP_OUT: case OP_WAIT:
     case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE: case OP_RET:
         return 1;
     case OP_PUSH:   /* (the 8086's FE /6, a byte push, is the interpreter's) */
@@ -1278,7 +1280,7 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
     case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
     case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
     case OP_MOVZX: case OP_MOVSX: case OP_SETCC: case OP_LAHF: case OP_SAHF:
-    case OP_MUL: case OP_IMUL: case OP_IMUL3: case OP_OUT:
+    case OP_MUL: case OP_IMUL: case OP_IMUL3: case OP_OUT: case OP_WAIT:
         return 1;
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR: case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR:
         if (in->ops[1].kind == OPK_IMM) return (in->ops[1].imm & 0xFF) < (uint32_t)in->ops[0].size * 8;
@@ -1531,6 +1533,22 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         if (s->kind == OPK_IMM && s_dyn_imm_lin) emit_mov_rr(e, size, host_reg(d), emit_dyn_imm(e, s));
         else if (s->kind == OPK_IMM) emit_mov_ri(e, size, host_reg(d), s->imm);
         else emit_mov_rr(e, size, host_reg(d), host_reg(s));
+        return;
+
+    case OP_WAIT:
+        /* Nothing to do unless CR0 has both TS and MP (#NM) or the x87 has
+         * an unmasked exception pending (SW.ES: #MF, or FERR#); then the
+         * whole WAIT is the interpreter's, out of line. Without a
+         * coprocessor WAIT does nothing at all. */
+        if (!s_cpu->has_fpu) return;
+        fl_save(e, live_in);
+        m = M(R_CPU, OFF_CR0); emit_mov_rm(e, 4, W_T0, &m);
+        emit_alu_ri(e, 4, X64_ALU_AND, W_T0, X86_CR0_TS | X86_CR0_MP);
+        emit_alu_ri(e, 4, X64_ALU_CMP, W_T0, X86_CR0_TS | X86_CR0_MP);
+        slow_site(e, X64_CC_E);
+        m = M(R_CPU, OFF_FPU_SW); emit_test_mi(e, 2, &m, 0x80);   /* SW.ES */
+        slow_site(e, X64_CC_NE);
+        slow_back(e, 0);
         return;
 
     case OP_OUT: {
