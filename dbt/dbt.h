@@ -7,8 +7,14 @@
  * block and the run loop steps the interpreter for that one instruction.
  * Instructions that are exact but rare go through a generic helper
  * that calls the interpreter's execute() on the pooled decoded form —
- * still inside the block, no exit. Protected-mode blocks are, for now,
- * nothing but such helpers (translate_pm in dbt_a64.c).
+ * still inside the block, no exit. Protected-mode code the emitters do
+ * not shape (16-bit PM outside KEY_SEG16, anything with A20 off) is
+ * translated as nothing but such helpers.
+ *
+ * Two halves: dbt_translate.c plans a block (decode, classify, roles,
+ * flag liveness — x86 semantics, host-independent) and a backend emits
+ * it (dbt_arch_emit_block: dbt_a64.c, dbt_x64.c). The plan is dbt_block,
+ * below.
  *
  * Block ABI (AArch64, dbt_a64.c). Guest state is PINNED in host
  * registers across blocks and chains:
@@ -341,13 +347,67 @@ int  dbt_golden_open(x86_dbt *dbt, const char *path);
 void dbt_golden_step(x86_dbt *dbt);
 void dbt_golden_close(x86_dbt *dbt, FILE *out);
 
-/* Backend hooks (dbt_a64.c) */
+/* ---- A block plan: the front end's decisions, the backend's input ----
+ * dbt_translate.c decodes the block at a key, classifies each instruction,
+ * gives it a role, runs the backward flag-liveness pass and finds patched
+ * immediates; dbt_arch_emit_block turns the plan into host code. Nothing
+ * in the plan depends on the host. */
+enum { C_REFUSE = 0, C_INLINE, C_HELPER };                 /* an instruction's class */
+enum { ROLE_PLAIN = 0, ROLE_UNCOND, ROLE_COND, ROLE_HELPER_END };   /* and its role in the block */
+
+/* Superblocks keep translating through conditionals (side exits) only
+ * while the block is shorter than this many guest bytes. */
+#define SUPERBLOCK_BYTE_CAP 48
+
+typedef struct {
+    uint64_t key;
+    uint64_t mode_bits;         /* the key's mode bits: every static edge carries them */
+    int      model;             /* cpu->model */
+    /* The block's shape, from the key and the cpu. */
+    uint8_t  flat, seg16, ss32, v86, paged, iopl3, pg_user, esnull, dsnull;
+    uint8_t  devread;           /* a device answers reads in the VGA window (planar VGA) */
+    uint8_t  regs32;            /* 386: the pinned registers hold all 32 bits */
+    uint8_t  wrap_exact;        /* < 286: word accesses at offset FFFF wrap in-segment */
+    uint8_t  all_helper;        /* a protected-mode block of nothing but helpers (plan_pm) */
+    uint8_t  ends_dynamic;      /* all_helper: ends after a near transfer; the helper set EIP */
+    uint32_t code_delta;        /* paged: physical - linear of the code page, mod 2^32 */
+    uint32_t start_ip, end_ip;  /* guest bytes covered: [start_ip, end_ip) within CS */
+    uint32_t n_ops;
+    uint32_t ip_afters[MAX_BLOCK_INSNS];
+    uint8_t  cls[MAX_BLOCK_INSNS];        /* C_INLINE or C_HELPER (refusals end the block) */
+    uint8_t  role[MAX_BLOCK_INSNS];       /* ROLE_* */
+    uint32_t fmask[MAX_BLOCK_INSNS];      /* arithmetic flags live AFTER op i (live-out) */
+    uint32_t live_in[MAX_BLOCK_INSNS];    /* and BEFORE it: what bookkeeping emitted ahead of op i must not clobber */
+    uint32_t dyn_lin[MAX_BLOCK_INSNS];    /* nonzero: read op i's immediate from this physical address */
+    x86_insn decs[MAX_BLOCK_INSNS];       /* last: everything before it is cleared per block */
+} dbt_block;
+
+/* Predicates both halves need. */
+static inline int dbt_near_transfer(int op) {
+    return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JCC || op == OP_JCXZ
+        || op == OP_LOOP || op == OP_LOOPE || op == OP_LOOPNE;
+}
+static inline int dbt_loads_segment(const x86_insn *in) {
+    switch (in->op) {
+    case OP_MOVSEG: case OP_POP: return in->ops[0].kind == OPK_SREG;
+    case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: return 1;
+    default: return 0;
+    }
+}
+
+/* Front end (dbt_translate.c): plan the block at key and have the
+ * backend emit it; NULL when the run loop should step the interpreter. */
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key);
+
+/* Backend hooks (dbt_a64.c) */
+uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b);   /* host code for a plan (never NULL) */
 void     dbt_emit_trampoline(x86_dbt *dbt);
 void     dbt_arch_patch_link(x86_dbt *dbt, uint32_t site_off, uint8_t *target);
 
-int      dbt_classify_op(const x86_insn *in);   /* 0 refuse, 1 inline, 2 helper */
-int      dbt_classify_op_pm(const x86_insn *in);   /* same, for a flat protected-mode block */
+/* Classes for tools/jittest's fuzzer (dbt_translate.c): 0 refuse, 1 inline, 2 helper. */
+int      dbt_classify_op(const x86_insn *in);
+int      dbt_classify_op_pm(const x86_insn *in);
+int      dbt_classify_op_seg16(const x86_insn *in);
 
 /* Helpers called from translated code (dbt_common.c) */
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index);

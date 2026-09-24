@@ -30,7 +30,7 @@ endif
 CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c
 CORE_OBJS = $(addprefix $(O)/,$(CORE_SRCS:.c=.o))
 
-DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_a64.c
+DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_translate.c dbt/dbt_a64.c
 DBT_OBJS  = $(addprefix $(O)/,$(DBT_SRCS:.c=.o))
 PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c
 PC_OBJS   = $(addprefix $(O)/,$(PC_SRCS:.c=.o))

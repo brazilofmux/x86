@@ -483,7 +483,7 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
  * gate onto a HLT, ending the run on both machines. */
 #define CODE16 0x120000u
 #define HLT16  0x1000u                     /* offset of the fault landing in CS */
-extern int dbt_classify_op_seg16(const x86_insn *in);
+/* dbt_classify_op_seg16: dbt.h */
 
 static int fuzz_accept_seg16(const x86_insn *in) {
     if (in->seg_override == S_CS || in->seg_override == S_FS || in->seg_override == S_GS) return 0;

@@ -1,4 +1,9 @@
-/* dbt_a64.c — AArch64 backend for the x86 DBT.
+/* dbt_a64.c — AArch64 backend for the x86 DBT: host code for a block plan.
+ *
+ * The plan comes from dbt_translate.c (decode, classes, roles, flag
+ * liveness); dbt_arch_emit_block at the bottom of this file turns it into
+ * AArch64. Everything else here is emission: operands, flags, the ALU,
+ * string ops, control flow, the slow-path chunks, the trampoline.
  *
  * Register convention (see dbt.h for the full ABI):
  *   X19 cpu  X20 mem  X21..X28 AX CX DX BX SP BP SI DI (canonical 16-bit)
@@ -16,7 +21,7 @@
  * before conditional side exits. That is the first thing to optimize
  * once -V is clean (defer the materialization into the side chunk).
  *
- * Three instruction classes (classify()):
+ * Three instruction classes (dbt_translate.c):
  *   INLINE  — emitted directly.
  *   HELPER  — synced call into the interpreter's execute() via the
  *             exec thunk. Exact by construction; slow. The stats print
@@ -32,10 +37,6 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Superblocks keep translating through conditionals (side exits) only
- * while the block is shorter than this many guest bytes. */
-#define SUPERBLOCK_BYTE_CAP 48
 
 #define R_CPU  A64_W19
 #define R_MEM  A64_W20
@@ -90,8 +91,6 @@ static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_port_thunk_off, s_fault_stu
  * 16-bit register as an address, a count or a branch target has to mask
  * it first. Below 386 they are canonical 16-bit and none of that applies. */
 static int s_regs32;
-/* cpu model of the block being classified (real-mode DIV is inline from the 286 on) */
-static int s_cls_model = X86_MODEL_286;
 
 static a64_reg_t emit_reg16(emit_t *e, int reg, a64_reg_t tmp);
 static void emit_set16(emit_t *e, int reg, a64_reg_t src);
@@ -110,7 +109,7 @@ static inline uint32_t topshift(int size) { return size == 1 ? 24 : size == 2 ? 
 static int s_flat;
 static uint64_t s_mode_bits;
 /* Virtual-8086 blocks (KEY_V86) are real-mode blocks at CPL 3: what V86
- * does differently goes to the interpreter (classify_v86), and under
+ * does differently goes to the interpreter (classify_v86, dbt_translate.c), and under
  * paging (KEY_PAGED) every memory access goes through cpu->pgd_r/pgd_w
  * (emit_paged). s_iopl3: CLI/STI/PUSHF behave as in real mode. */
 static int s_v86, s_paged, s_iopl3;
@@ -1845,319 +1844,6 @@ static void emit_push16(emit_t *e, a64_reg_t val) { emit_push_stk(e, val, 2); }
 static void emit_pop16(emit_t *e, a64_reg_t dst) { emit_pop_stk(e, dst, 2); }
 
 /* ----------------------------------------------------------------------
- * Classification
- * ---------------------------------------------------------------------- */
-enum { C_REFUSE = 0, C_INLINE, C_HELPER };
-
-static int is_shift_inline(const x86_insn *in) {
-    if (in->op != OP_SHL && in->op != OP_SAL && in->op != OP_SHR && in->op != OP_SAR) return 0;
-    if (in->ops[1].kind != OPK_IMM) return 0;
-    uint32_t cnt = in->ops[1].imm & 0xFF;
-    return cnt < (uint32_t)in->ops[0].size * 8;   /* 0 included: static no-op */
-}
-
-static int classify_op(const x86_insn *in) {
-    switch (in->op) {
-    case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
-    case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
-    case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
-    case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD: case OP_CLI: case OP_STI:
-    case OP_CALL: case OP_JMP: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
-    case OP_RET: case OP_CALLF: case OP_JMPF: case OP_RETF:
-    case OP_INT: case OP_INT3:
-    case OP_OUT:
-    case OP_MOVZX: case OP_MOVSX: case OP_SETCC:
-        return C_INLINE;
-    case OP_PUSH:
-        return C_INLINE;
-    case OP_POP:
-        if (in->ops[0].kind != OPK_SREG) return C_INLINE;
-        if (in->ops[0].reg == S_CS) return C_REFUSE;           /* POP CS: 8086 control transfer */
-        return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES ? C_INLINE : C_HELPER;   /* SS: interrupt shadow */
-    case OP_LES: case OP_LDS:
-        return C_INLINE;
-    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
-        /* through DS/ES/SS only; REP MOVS/STOS/LODS stay helpers: an
-         * SMC exit inside a storing loop has no exact place to land */
-        if (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return C_HELPER;
-        if (in->rep && in->op == OP_LODS) return C_HELPER;
-        return C_INLINE;
-    case OP_DIV: case OP_IDIV:
-        return s_cls_model >= X86_MODEL_286 ? C_INLINE : C_HELPER;  /* 8086 microcode quirks; 186 #DE is a trap */
-    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-        return is_shift_inline(in) ? C_INLINE : C_HELPER;
-    case OP_MUL:
-        return C_INLINE;
-    case OP_IMUL:
-        return in->opcode2 == 0xAF ? C_HELPER : C_INLINE;   /* one-operand form inline */
-    case OP_PUSHF: case OP_POPF:
-        return C_INLINE;                                     /* 16-bit (classify); POPF real mode only (classify_seg16) */
-    case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR: case OP_SETMO:
-    case OP_IMUL3:
-    case OP_AAD: case OP_AAA: case OP_AAS: case OP_DAA: case OP_DAS: case OP_SALC:
-    case OP_XLAT: case OP_SAHF: case OP_LAHF:
-    case OP_PUSHA: case OP_POPA: case OP_ENTER: case OP_LEAVE:
-    case OP_BT: case OP_BTS: case OP_BTR: case OP_BTC: case OP_BSF: case OP_BSR:
-    case OP_SHLD: case OP_SHRD: case OP_CMPXCHG: case OP_XADD: case OP_BSWAP:
-        return C_HELPER;
-    case OP_AAM:
-        return in->ops[0].imm ? C_HELPER : C_REFUSE;
-    case OP_MOVSEG:
-        /* Loading CS (8086 only) is a control transfer in disguise; SS
-         * opens an interrupt shadow, FS/GS are the 386's own. */
-        if (in->ops[0].kind != OPK_SREG) return C_INLINE;
-        if (in->ops[0].reg == S_CS) return C_REFUSE;
-        return in->ops[0].reg == S_DS || in->ops[0].reg == S_ES ? C_INLINE : C_HELPER;
-    default:
-        return C_REFUSE;
-    }
-}
-
-static int classify(const x86_insn *in) {
-    if (in->opsize != 2 || in->adsize != 2) return C_REFUSE;   /* 386 forms: Phase B */
-    return classify_op(in);
-}
-
-/* Virtual-8086 mode on top of the real-mode classes. What V86 does
- * differently is the interpreter's: INT n (through the IDT, IOPL-
- * sensitive), IRET and POPF (IOPL-sensitive, and they keep IOPL and VM),
- * HLT (#GP); I/O is a helper (the interpreter asks the TSS bitmap). CLI, STI and PUSHF are real mode's at
- * IOPL 3 only. Under paging an inline instruction gets one checked access
- * (emit_paged), so those that touch memory twice — a string op, a far
- * CALL or RET, PUSH/POP/CALL through memory — become helpers. */
-static int classify_v86(const x86_insn *in, int c) {
-    switch (in->op) {
-    case OP_INT: case OP_INT3: case OP_INTO: case OP_INT1: case OP_IRET: case OP_POPF: case OP_HLT:
-        return C_REFUSE;
-    case OP_IN: case OP_OUT: case OP_INS: case OP_OUTS:
-        return C_HELPER;           /* the interpreter asks the I/O bitmap and faults to the monitor */
-    case OP_CLI: case OP_STI: case OP_PUSHF:
-        if (!s_iopl3) return C_REFUSE;
-        break;
-    default: break;
-    }
-    if (!s_paged || c != C_INLINE) return c;
-    switch (in->op) {
-    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
-    case OP_CALLF: case OP_RETF:
-        return C_HELPER;
-    case OP_JMPF:
-        return in->ops[0].kind == OPK_IMM ? C_INLINE : C_HELPER;
-    case OP_PUSH: case OP_POP: case OP_CALL:
-        return in->ops[0].kind == OPK_MEM ? C_HELPER : C_INLINE;
-    default:
-        return c;
-    }
-}
-
-/* Protected mode, for now: everything the real-mode backend handles
- * becomes a helper call — the interpreter's own execute() on the
- * pre-decoded instruction, so exact by construction, faults included —
- * except what moves CS or goes through a gate, which the interpreter
- * steps. Near control transfers end the block (see translate). */
-static int classify_pm(const x86_insn *in) {
-    switch (in->op) {
-    case OP_INT: case OP_INT3: case OP_CALLF: case OP_JMPF: case OP_RETF:
-        return C_REFUSE;
-    case OP_DIV: case OP_IDIV:
-        return C_HELPER;          /* #DE is a fault: the thunk's fault exit delivers it */
-    case OP_OUT:
-        return C_INLINE;          /* the port thunk (emit_out), in every kind of block */
-    default:
-        return classify_op(in) == C_REFUSE ? C_REFUSE : C_HELPER;
-    }
-}
-
-static int is_near_transfer(int op) {
-    return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JCC || op == OP_JCXZ
-        || op == OP_LOOP || op == OP_LOOPE || op == OP_LOOPNE;
-}
-
-static int loads_segment(const x86_insn *in) {
-    switch (in->op) {
-    case OP_MOVSEG: case OP_POP: return in->ops[0].kind == OPK_SREG;
-    case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: return 1;
-    default: return 0;
-    }
-}
-
-/* Flat protected mode: the real-mode emitters, widened to 32 bits, take
- * what they cover with 32-bit addressing through DS/ES/SS; everything
- * else is a helper, as in any protected-mode block. Near transfers need
- * a 32-bit operand size (a 16-bit one truncates EIP) and the LOOP family
- * a 32-bit address size (ECX). */
-static int classify_flat(const x86_insn *in) {
-    if (classify_pm(in) == C_REFUSE) return C_REFUSE;
-    if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS)))
-        return C_HELPER;
-    switch (in->op) {
-    case OP_ADD: case OP_OR: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP: case OP_TEST:
-    case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
-    case OP_NOP: case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
-    case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
-        return C_INLINE;
-    case OP_ADC: case OP_SBB:
-        return C_INLINE;
-    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-        if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* by CL */
-        return is_shift_inline(in) ? C_INLINE : C_HELPER;
-    case OP_DIV: case OP_IDIV:
-        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
-    case OP_SETCC:
-        return C_INLINE;
-    case OP_PUSHA: case OP_POPA:
-        return in->opsize == 4 ? C_INLINE : C_HELPER;
-    case OP_SHLD: case OP_SHRD:
-        /* 32-bit, immediate count 1..31: one EXTR. CL counts, zero counts
-         * and 16-bit forms (the 386's count > 16 quirk) stay helpers. */
-        return in->ops[0].size == 4 && in->imm2 != 0xFFFFFFFFu && (in->imm2 & 31) ? C_INLINE : C_HELPER;
-    case OP_IMUL: case OP_MUL:
-        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;   /* IMUL r32, r/m32; EDX:EAX = EAX * r/m32 */
-    case OP_IMUL3:
-        return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
-    case OP_PUSH:
-        return in->opsize == 4 && in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
-    case OP_POP:
-        return in->opsize == 4 && in->ops[0].kind == OPK_REG ? C_INLINE : C_HELPER;
-    case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC:
-        return in->opsize == 4 ? C_INLINE : C_HELPER;
-    case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
-        return in->opsize == 4 && in->adsize == 4 ? C_INLINE : C_HELPER;
-    case OP_OUT:
-        return C_INLINE;
-    default:
-        return C_HELPER;
-    }
-}
-
-/* Segmented 16-bit protected mode: the real-mode set with 16-bit
- * addressing through DS, ES or SS (limit-checked at run time), plus the
- * 32-bit-operand forms of the straight-line ops the emitters handle at
- * any width (DOS/4GW's dispatcher moves dwords through 16-bit
- * segments). What touches IOPL (CLI/STI), a segment register, a far
- * target or an interrupt frame stays with the interpreter — a helper,
- * ending the block when it loads a segment (loads_segment), or refused. */
-static int classify_seg16(const x86_insn *in) {
-    if (classify_pm(in) == C_REFUSE) return C_REFUSE;
-    if (loads_segment(in)) return C_HELPER;                  /* descriptor loads: the interpreter's */
-    if (in->op == OP_POPF) return C_HELPER;                  /* IOPL and IF under privilege rules */
-    if (in->adsize != 2) return C_HELPER;
-    if (in->ea_valid && in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return C_HELPER;
-    switch (in->op) {
-    case OP_CLI: case OP_STI:
-        return C_HELPER;              /* #GP above IOPL */
-    case OP_OUT:
-        return C_INLINE;
-    default: break;
-    }
-    if (in->opsize == 4) {
-        switch (in->op) {
-        case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
-        case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
-        case OP_MOVZX: case OP_MOVSX: case OP_CBW: case OP_CWD:
-            return C_INLINE;
-        case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-            /* by CL only at 32 bits (emit_shift_cl); a byte op under a 66 prefix is not */
-            if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4 ? C_INLINE : C_HELPER;
-            return is_shift_inline(in) ? C_INLINE : C_HELPER;
-        case OP_PUSH:
-            return in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
-        case OP_POP:
-            return in->ops[0].kind != OPK_SREG ? C_INLINE : C_HELPER;
-        default:
-            return C_HELPER;          /* 32-bit near transfers included: EIP would need to stay whole */
-        }
-    }
-    return classify_op(in);
-}
-
-/* Exposed for tools/jittest's fuzzer: 0 refuse, 1 inline, 2 helper. */
-int dbt_classify_op(const x86_insn *in) { return classify(in); }
-int dbt_classify_op_pm(const x86_insn *in) { return classify_pm(in); }
-int dbt_classify_op_seg16(const x86_insn *in) { return classify_seg16(in); }
-
-/* Inline ops with a word-sized memory or stack access: the 286+ limit
- * check in front of it can raise #GP. Byte accesses cannot straddle. */
-static int op_may_fault(const x86_insn *in) {
-    switch (in->op) {
-    case OP_PUSH: case OP_POP: case OP_CALL: case OP_RET: case OP_CALLF: case OP_RETF: case OP_JMPF:
-        return 1;
-    case OP_INT: case OP_INT3:
-        return 1;                     /* the frame carries FLAGS: all of them must be materialized */
-    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
-        return in->ops[0].size >= 2 || s_seg16;    /* the slow path's helper can fault, frame and all */
-    default: break;
-    }
-    for (int i = 0; i < 2; i++)
-        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || s_seg16)) return 1;   /* seg16: a limit is any size's problem */
-    return 0;
-}
-
-/* Inline ops that store to guest memory. The store's SMC check can find
- * that it patched the running block and leave it right there — an
- * unplanned exit after the op, whose flags the next block (or the run
- * loop) sees in full. */
-static int op_stores(const x86_insn *in) {
-    switch (in->op) {
-    case OP_PUSH: case OP_PUSHA: case OP_CALL: case OP_CALLF: case OP_INT: case OP_INT3: case OP_OUT: return 1;
-    case OP_STOS: case OP_MOVS: return 1;
-    case OP_LODS: case OP_CMPS: case OP_SCAS: return 0;
-    case OP_CMP: case OP_TEST: case OP_LEA: return 0;
-    case OP_XCHG: return in->ea_valid;
-    default: return in->ops[0].kind == OPK_MEM;
-    }
-}
-
-static int is_uncond_ender(int op) {
-    return op == OP_JMP || op == OP_CALL || op == OP_RET || op == OP_JMPF || op == OP_CALLF || op == OP_RETF
-        || op == OP_INT || op == OP_INT3;
-}
-static int is_cond_ender(int op) {
-    return op == OP_JCC || op == OP_JCXZ || op == OP_LOOP || op == OP_LOOPE || op == OP_LOOPNE;
-}
-
-/* Flag data-flow of one op over the arithmetic bits: rd = bits read,
- * wr = bits written. Helper-class ops sync the whole F both ways. */
-static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t *wr) {
-    *rd = 0; *wr = 0;
-    if (cls == C_HELPER) { *rd = ARITH; *wr = ARITH; return; }
-    switch (in->op) {
-    case OP_ADD: case OP_SUB: case OP_CMP: case OP_AND: case OP_OR: case OP_XOR: case OP_TEST: case OP_NEG:
-        *wr = ARITH; break;
-    case OP_ADC: case OP_SBB:
-        *wr = ARITH; *rd = X86_CF; break;
-    case OP_INC: case OP_DEC:
-        *wr = ARITH & ~X86_CF; break;
-    case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
-        /* A CL count writes every flag or, when zero, none: the union
-         * over both is a pass-through (rd = wr = 0) that computes the
-         * live-out set when it does shift. */
-        if (in->ops[1].kind == OPK_IMM && (in->ops[1].imm & 0xFF)) *wr = ARITH;
-        break;
-    case OP_DIV: case OP_IDIV: case OP_OUT:
-        *rd = ARITH; break;
-    case OP_CMPS: case OP_SCAS:
-        if (!in->rep) *wr = ARITH;   /* repeated: none when CX = 0, so a pass-through */
-        break;
-    case OP_PUSHF: *rd = ARITH; break;
-    case OP_POPF:  *wr = ARITH; break;          /* #DE / #GP: an unplanned exit whose frame holds the flags */
-    case OP_SETCC: {
-        static const uint16_t need[8] = { X86_OF, X86_CF, X86_ZF, X86_CF | X86_ZF, X86_SF, X86_PF, X86_SF | X86_OF, X86_SF | X86_OF | X86_ZF };
-        *rd = need[in->cond >> 1]; break;
-    }
-    case OP_SHLD: case OP_SHRD:
-        *wr = ARITH; break;          /* inline only with a nonzero immediate count */
-    case OP_IMUL: case OP_IMUL3: case OP_MUL:
-        *wr = ARITH; break;
-    case OP_CLC: case OP_STC: *wr = X86_CF; break;
-    case OP_CMC: *wr = X86_CF; *rd = X86_CF; break;
-    case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
-        *rd = ARITH; break;   /* side exit: every bit observable */
-    default: break;
-    }
-}
-
-/* ----------------------------------------------------------------------
  * Per-op emission (straight-line ops)
  * ---------------------------------------------------------------------- */
 static void emit_helper_op(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
@@ -2753,24 +2439,7 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
 }
 
 /* ----------------------------------------------------------------------
- * Block translation
- * ---------------------------------------------------------------------- */
-static void fetch_at(const x86_cpu *c, uint32_t ip, uint8_t *buf) {
-    uint32_t base = c->seg[S_CS].base;
-    for (int i = 0; i < 16; i++) buf[i] = x86_phys_rd8((x86_cpu *)c, base + ((ip + i) & 0xFFFF));
-}
-
-/* ----------------------------------------------------------------------
- * Protected-mode blocks (milestone 1: every instruction a helper).
- *
- * Everything the real-mode backend inlines for control transfers — the
- * interrupt frame, the IVT read, a far target's base from its selector —
- * is real-mode reasoning, so none of it is used here. A block is a run of
- * helper calls on pre-decoded instructions; what the translation saves is
- * the interpreter's fetch and decode. It ends after a near control
- * transfer (the helper has set EIP; the tail probes for the block there),
- * before anything classify_pm refuses (the run loop steps it), or at the
- * end of what the code segment's limit allows.
+ * Protected-mode blocks of nothing but helpers (plan_pm, dbt_translate.c)
  * ---------------------------------------------------------------------- */
 
 /* X0 = key for cpu->eip after a helper moved it. */
@@ -2794,90 +2463,38 @@ static void emit_v86_dynamic_key(emit_t *e, uint64_t mode_bits) {
     emit_movk_x64(e, A64_W0, (uint16_t)(mode_bits >> 48), 48);
 }
 
-static uint8_t *translate_pm(x86_dbt *dbt, uint64_t key) {
+/* A protected-mode block of nothing but helpers (plan_pm): the exec
+ * thunk per instruction, then a probe for wherever the last helper left
+ * EIP, or an edge to the fall-through. */
+static uint8_t *emit_pm_block(x86_dbt *dbt, const dbt_block *b) {
     x86_cpu *cpu = dbt->cpu;
-    s_flat = 0;
-    s_seg16 = 0; s_ss32 = 0;
     const x86_seg *cs = &cpu->seg[S_CS];
-    /* A20 off in protected mode would fold linear addresses under the
-     * block's feet; nothing we run does it, so do not translate it. */
-    if (cpu->a20_mask != 0xFFFFFFFFu) return NULL;
-    uint64_t mode_bits = dbt_cpu_mode_bits(cpu);
-    uint32_t ipmask = cs->big ? 0xFFFFFFFFu : 0xFFFFu;
-
-    x86_insn decs[MAX_BLOCK_INSNS];
-    uint32_t ip_afters[MAX_BLOCK_INSNS];
-    uint32_t ip = cpu->eip, start_ip = ip, n_ops = 0;
-    int ends_dynamic = 0;
-    uint8_t buf[16];
-    x86_dec_ctx ctx = { buf, cpu->model, cs->big };
-    while (n_ops < MAX_BLOCK_INSNS) {
-        x86_insn *in = &decs[n_ops];
-        if (ip > cs->limit) break;
-        uint32_t lin = cs->base + ip;
-        if (lin >= cpu->mem_size || cpu->mem_size - lin < 16) break;   /* the interpreter's open bus */
-        for (int i = 0; i < 16; i++) buf[i] = cpu->mem[lin + (uint32_t)i];
-        if (!x86_decode(&ctx, in)) break;
-        if (ip + in->len - 1 > cs->limit || ip + in->len - 1 < ip) break;   /* straddles the limit: #GP is the interpreter's */
-        if (((ip + in->len) & ipmask) != ip + in->len) break;              /* 16-bit IP wrap */
-        if (classify_pm(in) == C_REFUSE) { dbt->refused_by_op[in->op]++; break; }
-        ip += in->len;
-        ip_afters[n_ops++] = ip;
-        if (is_near_transfer(in->op)) { ends_dynamic = 1; break; }
-    }
-    if (n_ops == 0) return NULL;
-
+    uint64_t mode_bits = b->mode_bits;
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;
-    s_cur_lin = dbt_key_lin(key);
     uint32_t budget_patch = emit_pos(&e);
     emit_tbnz_x64(&e, R_CNT, 63, 0);
-    for (uint32_t i = 0; i < n_ops; i++) {
-        s_cur_ip_after = ip_afters[i];
-        s_cur_ip_start = ip_afters[i] - decs[i].len;
+    for (uint32_t i = 0; i < b->n_ops; i++) {
+        s_cur_ip_after = b->ip_afters[i];
+        s_cur_ip_start = b->ip_afters[i] - b->decs[i].len;
         s_cur_n_done = i + 1;
-        if (decs[i].op == OP_OUT) emit_out(&e, &decs[i]);
-        else emit_helper_op(dbt, &e, &decs[i]);
+        if (b->decs[i].op == OP_OUT) emit_out(&e, &b->decs[i]);
+        else emit_helper_op(dbt, &e, &b->decs[i]);
     }
-    emit_tail_prologue(&e, n_ops);
-    if (ends_dynamic) {
+    emit_tail_prologue(&e, b->n_ops);
+    if (b->ends_dynamic) {
         emit_pm_dynamic_key(&e, cpu, mode_bits);
         emit_dynamic_tail(&e, dbt->exit_stub_off);
     } else {
-        emit_edge(dbt, &e, dbt_key(cs->sel, cs->base + ip) | mode_bits);
+        emit_edge(dbt, &e, dbt_key(cs->sel, cs->base + b->end_ip) | mode_bits);
     }
     emit_patch_tb14(&e, budget_patch, emit_pos(&e));
-    emit_mov_x64_imm64(&e, A64_W0, key);
+    emit_mov_x64_imm64(&e, A64_W0, b->key);
     emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
 
     dbt->code_used = e.offset;
     __builtin___clear_cache((char *)entry, (char *)(dbt->code_buf + e.offset));
-    uint32_t lin = dbt_key_lin(key);
-    dbt_mark_block_bytes(dbt, lin, lin + (ip - start_ip));
-    dbt_watch_cs_desc(dbt);
     return entry;
-}
-
-/* An inline op whose immediate keeps being patched (every byte of it at
- * SMC_VOLATILE heat) reads it from memory at run time: returns the
- * immediate's physical address (INSN_AT is the instruction's; a flat
- * block's code is where its page maps), or 0 to bake it in as usual. Only ops that
- * read the immediate as a value through emit_read_operand, and only with
- * no memory operand — a flat memory operand has a slow path that replays
- * the pooled decode, immediate and all. */
-static uint32_t dyn_imm_at(const x86_dbt *dbt, const x86_insn *in, uint32_t insn_at) {
-    switch (in->op) {
-    case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
-    case OP_TEST: case OP_MOV:
-        break;
-    default:
-        return 0;
-    }
-    if (in->ea_valid || in->ops[1].kind != OPK_IMM || !in->ops[1].imm_enc) return 0;
-    uint32_t at = insn_at + X86_IMM_AT(in->ops[1].imm_enc), n = X86_IMM_LEN(in->ops[1].imm_enc);
-    for (uint32_t k = 0; k < n; k++)
-        if (!dbt_smc_hot(dbt->smc_heat, dbt->smc_win, at + k, dbt_smc_window(dbt->cpu))) return 0;
-    return at;
 }
 
 /* Out-of-range paths of a flat block: the whole instruction through the
@@ -2903,178 +2520,32 @@ static void emit_flat_slow_chunks(x86_dbt *dbt, emit_t *e) {
     s_nfslow = 0;
 }
 
-uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
+/* ----------------------------------------------------------------------
+ * Block emission: a plan (dbt_translate.c) to AArch64
+ * ---------------------------------------------------------------------- */
+uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
     x86_cpu *cpu = dbt->cpu;
     if (s_strict_exit < 0)
         s_strict_exit = dbt->verify && getenv("X86_VERIFY_STRICT") != NULL;
-    if (dbt->flush_pending || dbt->code_used + 65536 > CODE_BUF_SIZE || dbt->insn_used + MAX_BLOCK_INSNS > INSN_POOL_SIZE) {
-        /* Out of JIT space (or A20 flipped): wipe and restart. Already
-         * inside the W^X bracket (the run loop wraps us) — do not nest
-         * another. */
-        dbt_cache_invalidate_all(dbt);
-        dbt->flush_pending = 0;
-        dbt->code_used = 0;
-        dbt_emit_trampoline(dbt);
-    }
+    /* the block's shape, for every emitter below */
+    s_v86 = b->v86; s_paged = b->paged; s_iopl3 = b->iopl3;
+    s_flat = b->flat; s_seg16 = b->seg16; s_ss32 = b->ss32;
+    s_mode_bits = b->mode_bits;
+    s_esnull = b->esnull; s_dsnull = b->dsnull; s_devread = b->devread; s_pg_user = b->pg_user;
+    s_cur_lin = dbt_key_lin(b->key);
+    if (b->all_helper) return emit_pm_block(dbt, b);
 
-    /* HLE stub segment: the interpreter step dispatches the host service. */
-    if (cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4)) return NULL;
-
-    s_v86 = (key & KEY_V86) != 0;
-    s_paged = (key & KEY_PAGED) != 0;
-    s_iopl3 = (key & KEY_IOPL3) != 0;
-    if (cpu->pmode && !s_v86 && (!(key & (KEY_FLAT | KEY_SEG16)) || cpu->a20_mask != 0xFFFFFFFFu)) return translate_pm(dbt, key);
-    s_flat = cpu->pmode && !s_v86 && (key & KEY_FLAT) != 0;    /* from here on: real mode or V86, a flat block, or a segmented 16-bit one */
-    s_seg16 = cpu->pmode && !s_v86 && !s_flat;
-    s_ss32 = s_seg16 && (key & KEY_SS32) != 0;
-    s_mode_bits = key & 0x7FFF000000000000ull;
-    s_esnull = (key & KEY_ESNULL) != 0;
-    s_devread = cpu->device_read != NULL;
-    s_dsnull = (key & KEY_DSNULL) != 0;
-    s_pg_user = (s_flat || s_seg16) && s_paged && (cpu->seg[S_CS].sel & 3) == 3;
-    uint32_t code_page = 0, code_delta = 0;     /* physical - linear, mod 2^32: add it before indexing mem */
-    if (s_paged) {
-        /* A paged block (V86, or flat protected mode) stays on one code
-         * page. Its key is linear; its bytes, and their code-bitmap
-         * marks, are wherever the page maps — one-to-one, or remapped
-         * (UMB code, a memory manager mapped high), which phys_alias lets
-         * the SMC sweep find. dbt_tlb_flushed re-peeks it. */
-        int user = s_v86 || s_pg_user;
-        code_page = (cpu->seg[S_CS].base + (s_flat ? cpu->eip : (cpu->eip & 0xFFFF))) & 0xFFFFF000u;
-        uint32_t phys = x86_page_peek(cpu, code_page, user);
-        if (phys == X86_PG_BAD || phys + 0xFFFu >= cpu->mem_size) return NULL;
-        if (!dbt_note_code_page(dbt, code_page >> 12, phys >> 12, user)) return NULL;
-        if (phys != (code_page & cpu->a20_mask)) {
-            uint32_t *alias = &dbt->phys_alias[phys >> 12];
-            if (*alias && *alias != (code_page >> 12) + 1) return NULL;   /* one alias per physical page */
-            *alias = (code_page >> 12) + 1;
-            code_delta = phys - code_page;
-        }
-        (void)x86_phys_rd8(cpu, code_page | ((cpu->seg[S_CS].base + cpu->eip) & 0xFFF));   /* the fetch's walk: accessed bits */
-    }
-
+    const x86_insn *decs = b->decs;
+    const uint32_t *ip_afters = b->ip_afters, *dyn_lin = b->dyn_lin, *fmask = b->fmask;
+    const uint8_t *role = b->role, *cls = b->cls;
+    uint32_t n_ops = b->n_ops, ip = b->end_ip;
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;
 
-    /* ---- Phase 1: decode ---- */
-    x86_insn decs[MAX_BLOCK_INSNS];
-    uint32_t ip_afters[MAX_BLOCK_INSNS];
-    uint8_t  cls[MAX_BLOCK_INSNS];
-    uint8_t  role[MAX_BLOCK_INSNS];
-    uint32_t dyn_lin[MAX_BLOCK_INSNS];
-    enum { R_PLAIN, R_UNCOND, R_COND, R_HELPER_END };
-    uint32_t ip = s_flat ? cpu->eip : cpu->eip & 0xFFFF;
-    uint32_t start_ip = ip;
-    uint32_t n_ops = 0;
-    uint8_t buf[16];
-    x86_dec_ctx ctx = { buf, cpu->model, (uint8_t)s_flat };
-    s_cls_model = cpu->model;
-
-    while (n_ops < MAX_BLOCK_INSNS) {
-        x86_insn *in = &decs[n_ops];
-        if (s_flat && s_paged) {
-            uint32_t lin = cpu->seg[S_CS].base + ip;
-            if ((lin & 0xFFFFF000u) != code_page) break;
-            memcpy(buf, cpu->mem + (uint32_t)(lin + code_delta), 16);
-        } else if (s_flat) {
-            /* flat CS: no limit to hit short of 4 GB; stay inside memory */
-            uint32_t lin = cpu->seg[S_CS].base + ip;
-            if (lin >= cpu->mem_size || cpu->mem_size - lin < 16) break;
-            memcpy(buf, cpu->mem + lin, 16);
-        } else if (s_paged) {
-            uint32_t lin = cpu->seg[S_CS].base + ip;
-            if ((lin & 0xFFFFF000u) != code_page) break;
-            memcpy(buf, cpu->mem + (uint32_t)(lin + code_delta), 16);          /* identity: the mirror applies A20 */
-        } else {
-            fetch_at(cpu, ip, buf);
-        }
-        if (!x86_decode(&ctx, in)) break;
-        if (!s_flat && ip + in->len > 0x10000) break;  /* IP wrap: leave it to the interp */
-        if (s_paged && ((cpu->seg[S_CS].base + ip + in->len - 1) & 0xFFFFF000u) != code_page) break;   /* runs off the page */
-        if (!s_flat) {
-            /* An instruction whose bytes keep being patched (FreeCOM
-             * rewrites its INT n's number before every call) stays out of
-             * blocks: the interpreter runs it from memory as it is, and
-             * the patches no longer invalidate the code around it. */
-            uint32_t at = cpu->seg[S_CS].base + ip + code_delta;
-            if (!s_v86 && !s_seg16) at &= cpu->a20_mask;
-            uint8_t now = dbt_smc_window(cpu);
-            int hot = 0;
-            for (uint32_t k = 0; k < in->len && at + k < cpu->mem_size; k++)
-                if (dbt_smc_hot(dbt->smc_heat, dbt->smc_win, at + k, now)) { hot = 1; break; }
-            if (hot) { dbt->smc_hot_refusals++; break; }
-        }
-        if (s_seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
-        int c = s_flat ? classify_flat(in) : s_seg16 ? classify_seg16(in) : classify(in);
-        if (s_v86) c = classify_v86(in, c);
-        if (s_seg16 && s_paged && c == C_INLINE) {
-            /* one checked access an instruction (emit_ea_seg16_paged); a
-             * string op, or a stack op through memory, has two */
-            switch (in->op) {
-            case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
-                c = C_HELPER; break;
-            case OP_PUSH: case OP_POP: case OP_CALL: case OP_JMP:
-                if (in->ops[0].kind == OPK_MEM) c = C_HELPER;
-                break;
-            default: break;
-            }
-        }
-        if (s_devread && !s_flat && c == C_INLINE
-            && (in->op == OP_MOVS || in->op == OP_LODS || in->op == OP_CMPS || in->op == OP_SCAS))
-            c = C_HELPER;                              /* a read through SI/DI may be the window's */
-        if (s_flat && c == C_INLINE) {
-            if (s_esnull && in->ea_valid && in->seg == S_ES) c = C_HELPER;          /* #GP: the interpreter's */
-            if (s_dsnull && in->ea_valid && in->seg == S_DS) c = C_HELPER;
-            if (s_paged && (in->op == OP_PUSHA || in->op == OP_POPA)) c = C_HELPER;  /* two accesses */
-        }
-        if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
-        if (c == C_REFUSE) {
-            dbt->refused_by_op[in->op]++;
-            break;
-        }
-        int r = R_PLAIN;
-        if (c == C_INLINE && is_uncond_ender(in->op)) r = R_UNCOND;
-        else if (c == C_INLINE && is_cond_ender(in->op)) r = R_COND;
-        else if ((s_flat || s_seg16) && c == C_HELPER && (is_near_transfer(in->op) || loads_segment(in))) r = R_HELPER_END;
-        else if (s_v86 && c == C_HELPER && (is_near_transfer(in->op) || in->op == OP_CALLF || in->op == OP_RETF || in->op == OP_JMPF))
-            r = R_HELPER_END;                          /* paged V86: a transfer run by the interpreter */
-        cls[n_ops] = (uint8_t)c;
-        role[n_ops] = (uint8_t)r;
-        /* physical, so under paging too (a paged block's page, and with it
-         * code_delta, holds for the block's life): DOOM's renderer patches
-         * its own immediates, and under EMM386 each patch was an SMC
-         * invalidation — ten million of them, 24x slower than bare DOS */
-        dyn_lin[n_ops] = s_flat && c == C_INLINE ? dyn_imm_at(dbt, in, cpu->seg[S_CS].base + ip + code_delta) : 0;
-        ip_afters[n_ops] = ip + in->len;
-        n_ops++;
-        ip += in->len;
-        if (r == R_UNCOND || r == R_HELPER_END) break;
-        if (r == R_COND && ip - start_ip >= SUPERBLOCK_BYTE_CAP) break;
-    }
-    if (n_ops == 0) return NULL;
-
-    /* ---- Phase 2: backward flag liveness. fmask[i] = bits live after
-     * op i (LIVE-OUT, not live∩write). Block exits observe everything. */
-    uint32_t fmask[MAX_BLOCK_INSNS];
-    {
-        uint32_t live = ARITH;
-        for (int i = (int)n_ops - 1; i >= 0; i--) {
-            uint32_t rd, wr;
-            op_flag_effects(&decs[i], cls[i], &rd, &wr);
-            /* 286+: a limit fault is an unplanned exit whose frame holds
-             * the flags, so an op that can fault observes all of them. */
-            if (cpu->model >= X86_MODEL_286 && !s_flat && op_may_fault(&decs[i])) rd |= ARITH;
-            /* A store can leave the block after the op (SMC): all live out. */
-            fmask[i] = live | (cls[i] == C_INLINE && op_stores(&decs[i]) ? ARITH : 0);
-            live = (fmask[i] & ~wr) | rd;
-        }
-    }
-
-    /* ---- Phase 3: emit ----
+    /* ---- Emit ----
      * Entry: budget check. Exhausted → out-of-line exit with our own key. */
-    s_cur_lin = dbt_key_lin(key);
-    s_wrap_exact = cpu->model < X86_MODEL_286;
-    s_regs32 = cpu->model >= X86_MODEL_386;
+    s_wrap_exact = b->wrap_exact;
+    s_regs32 = b->regs32;
     s_nwrap = 0;
     s_nfault = 0;
     s_nzcv.valid = 0;                 /* nothing carries into a block: its first op may be a Jcc */
@@ -3094,7 +2565,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         s_cur_insn = in;
         s_cur_ender = 0;
         s_ea_checked = 0;                 /* per instruction: never leaks to the next */
-        if (role[i] == R_UNCOND || (role[i] == R_COND && i == n_ops - 1)) {
+        if (role[i] == ROLE_UNCOND || (role[i] == ROLE_COND && i == n_ops - 1)) {
             emit_tail_prologue(&e, n_ops);
             /* The whole block is charged now: a thunk, fault or slow-path
              * exit inside the ender must not charge it again. */
@@ -3104,14 +2575,14 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             final_by_branch = 1;
             break;
         }
-        if (role[i] == R_COND) {
+        if (role[i] == ROLE_COND) {
             sides[n_sides].patch_off = emit_cond_side_branch(&e, in);
             sides[n_sides].insns = i + 1;
             sides[n_sides].op = i;
             n_sides++;
             continue;
         }
-        if (role[i] == R_HELPER_END) {
+        if (role[i] == ROLE_HELPER_END) {
             /* A helper that moved EIP (a 16-bit near transfer) or loaded a
              * segment: leave from where it left EIP. After a segment load
              * the flat assumption is off, so go back to the run loop,
@@ -3120,7 +2591,7 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
             emit_tail_prologue(&e, n_ops);
             if (s_v86) emit_v86_dynamic_key(&e, s_mode_bits);
             else emit_pm_dynamic_key(&e, cpu, s_mode_bits);
-            if (loads_segment(in)) emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
+            if (dbt_loads_segment(in)) emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
             else emit_dynamic_tail(&e, dbt->exit_stub_off);
             final_by_branch = 1;
             break;
@@ -3153,22 +2624,10 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
 
     /* Budget-exhausted exit: nothing executed, next = this block. */
     emit_patch_tb14(&e, budget_patch, emit_pos(&e));
-    emit_mov_x64_imm64(&e, A64_W0, key);
+    emit_mov_x64_imm64(&e, A64_W0, b->key);
     emit_b(&e, (int32_t)dbt->exit_stub_off - (int32_t)emit_pos(&e));
 
     dbt->code_used = e.offset;
     __builtin___clear_cache((char *)entry, (char *)(dbt->code_buf + e.offset));
-
-    uint32_t lin = dbt_key_lin(key);
-    uint32_t skip[2 * MAX_BLOCK_INSNS], nskip = 0;
-    for (uint32_t i = 0; i < n_ops; i++)
-        if (dyn_lin[i]) {
-            skip[2 * nskip] = dyn_lin[i];
-            skip[2 * nskip + 1] = dyn_lin[i] + X86_IMM_LEN(decs[i].ops[1].imm_enc);
-            nskip++;
-        }
-    lin += code_delta;                               /* the bitmap is physical */
-    dbt_mark_block_bytes_except(dbt, lin, lin + (ip - start_ip), skip, nskip);
-    if (s_flat || s_seg16) dbt_watch_cs_desc(dbt);
     return entry;
 }
