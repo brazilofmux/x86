@@ -878,7 +878,7 @@ static int writes_mem_operand(const x86_insn *in) {
  * six for LES/LDS and indirect far transfers). */
 static int flat_access_size(const x86_insn *in) {
     int size = in->opsize;
-    for (int i = 0; i < 3; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
+    for (int i = 0; i < 2; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
     switch (in->op) {
     case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_JMPF: case OP_CALLF:
         size = in->opsize + 2; break;
@@ -892,7 +892,7 @@ static int flat_access_size(const x86_insn *in) {
  * bytes for LES/LDS and indirect far transfers). */
 static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea) {
     int size = in->opsize;
-    for (int i = 0; i < 3; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
+    for (int i = 0; i < 2; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
     switch (in->op) {
     case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_JMPF: case OP_CALLF:
         size = in->opsize + 2; break;
@@ -915,7 +915,7 @@ static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea) {
  * host base in X_SEGP. Clobbers W_T1-W_T3, X0-X2. */
 static void emit_ea_seg16_paged(emit_t *e, const x86_insn *in, ea_t *ea) {
     int size = in->opsize;
-    for (int i = 0; i < 3; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
+    for (int i = 0; i < 2; i++) if (in->ops[i].kind == OPK_MEM && in->ops[i].size) size = in->ops[i].size;
     switch (in->op) {
     case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_JMPF: case OP_CALLF:
         size = in->opsize + 2; break;
@@ -2384,7 +2384,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
             emit_mov_w32_w32(e, R_GPR(R_AX), W_T0);
             break;
         }
-        /* fall through: IMUL r32, r/m32 */
+        /* fall through - IMUL r32, r/m32 */
     case OP_IMUL3: {
         /* 32-bit two- and three-operand IMUL. CONTRACT (interp, 386):
          * SZP from the HIGH half of the product, AF clear, CF = OF = the

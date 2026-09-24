@@ -57,10 +57,69 @@ Power-on to `C:\>` is 2.5 s (2 of them MS-DOS's own F5/F8 pause), and
 `win` to a drawn Program Manager 0.8 s. `tests/boot/bench.sh` measures
 these.
 
+The same timedemo, same machine, bare MS-DOS in each:
+
+| | realtics | |
+|---|---|---|
+| **dos-monster** | **93** | |
+| DOSBox-X 2026.08, `core=dynamic` (dynrec), `cycles=max` | 494 | 5.3× |
+| Bochs 3.1 (`clock: sync=realtime`) | 1,347 | 14.5× |
+| DOSBox-X, `core=normal` | 1,270 | 13.7× |
+
+QEMU 11 (TCG, `qemu-system-i386`) was still in the middle of the demo
+after 90 seconds, and none of three runs lived to print a result, so it
+has no number here. One workload, one machine: take it as a data point.
+
+### Why it is fast
+
+A translator is fast when the code it emits does only the guest's work.
+What dos-monster does to get there:
+
+- **Guest registers live in host registers.** AX–DI, the DS/ES/SS
+  segment bases, FLAGS, the guest-memory base and the instruction
+  counter are pinned to AArch64 registers for the life of translated
+  code. A guest `ADD AX,BX` is a host `ADD`, not a load, an add and a
+  store through a CPU-state structure.
+- **Flags are dead until proven live — decided at translation time.**
+  Each block is decoded whole, then scanned backwards for which flags
+  anything reads before they are overwritten; only those are computed.
+  Most arithmetic's flags die immediately, and a compare followed by a
+  jump becomes a host compare and branch on the host's own condition
+  codes. That is static dead-flag elimination, not lazy flags: there is
+  no deferred-flag state to save and replay at run time.
+- **Blocks jump straight to blocks.** An exit to a known target is
+  patched into a direct branch once the target is translated; indirect
+  jumps and returns probe the block cache inline. Near and far CALL and
+  RET, INT n and OUT stay inside translated code.
+- **Guest memory is one host buffer.** A real-mode address is a pinned
+  segment base plus an offset. The 1 MB wrap is not masked on every
+  access: the 64 KB above 1 MB is a second mapping of the first 64 KB
+  while A20 is off, and of the real memory once it is on. The A20 state is
+  part of each block's key, so flipping the gate (HIMEM does it thousands
+  of times while it tests memory) costs nothing.
+- **Self-modifying code costs one byte-load per store.** A bitmap marks
+  every byte translated code covers; a store checks its byte and moves on.
+  Code that keeps patching itself — DOOM's renderer rewrites immediates in
+  its inner loops — gets those immediates read at run time instead of
+  being retranslated after every patch.
+- **No cycle counting.** Nothing is paced per instruction. Interrupts are
+  taken when a pinned counter runs out at a block boundary, so the hot
+  path carries no event checks.
+- **Paging stays in translated code.** Under a memory manager or Windows,
+  a guest access goes through a software TLB inline, blocks are keyed by
+  address space so switching page tables (a VCPI client does it on every
+  DOS call) keeps them, and stores to video memory under paging take the
+  same fast path as without it.
+
+And it is checked: `-V` runs every translated block in lockstep with the
+interpreter, and the full DOOM timedemo under EMM386 — 5.5 billion
+instructions — runs clean that way.
+
 ## Building
 
-Developed and tested on macOS on Apple Silicon. The translator emits
-AArch64; elsewhere `-i` (the interpreter) is what runs.
+Developed on macOS on Apple Silicon. The translator emits AArch64 only
+so far; on other hosts the interpreter runs (Linux x86-64 builds and
+passes the DOS test suite that way — an x86-64 backend is next).
 
     make                 # dos-monster, tools/sst, tools/jittest
 

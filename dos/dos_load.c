@@ -159,8 +159,11 @@ int dos_mount(int drive, const char *dirs) {
     char *list = strdup(dirs);
     for (char *tok = strtok(list, ":"); tok; tok = strtok(NULL, ":")) {
         d->disks = realloc(d->disks, sizeof(char *) * (size_t)(d->ndisks + 1));
-        char *abs = realloc(NULL, DOS_MAX_PATH);
-        if (!realpath(tok, abs)) { fprintf(stderr, "dos: %s: no such directory\n", tok); free(list); return -1; }
+        /* realpath's own buffer: a caller's must be PATH_MAX, and glibc's
+         * fortified realpath aborts on anything smaller however short the
+         * path (DOS_MAX_PATH did, on Linux) */
+        char *abs = realpath(tok, NULL);
+        if (!abs) { fprintf(stderr, "dos: %s: no such directory\n", tok); free(list); return -1; }
         d->disks[d->ndisks++] = abs;
     }
     free(list);

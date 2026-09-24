@@ -563,23 +563,25 @@ void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
          * x86_fault would return into a half-built frame. Arm here: a
          * fault delivers that exception instead, a fault in that is #DF,
          * and a third shuts the processor down. */
-        uint32_t err = c->exc_err;
-        for (int depth = 0; ; depth++) {
+        /* volatile: they change between the _setjmp and a later longjmp */
+        volatile uint32_t err = c->exc_err;
+        volatile int vec = vector, sw = is_sw;
+        for (volatile int depth = 0; ; depth++) {
             c->fault_armed = 1;
             if (_setjmp(c->fault_jb) == 0) {
-                deliver_pm(c, vector, is_sw, err);
+                deliver_pm(c, vec, sw, err);
                 c->fault_armed = 0;
                 return;
             }
             c->fault_armed = 0;
             c->pg_super = 0;
             if (depth == 2) { c->exc = -1; c->halted = 1; return; }   /* triple fault */
-            vector = depth == 1 ? X86_EXC_DF : c->exc;
+            vec = depth == 1 ? X86_EXC_DF : c->exc;
             err = depth == 1 ? 0 : c->exc_err;
             c->exc = -1;
-            is_sw = 0;
+            sw = 0;
             c->exc_delivered = 1;
-            count_exc(c, vector);
+            count_exc(c, vec);
         }
     }
     (void)is_sw;

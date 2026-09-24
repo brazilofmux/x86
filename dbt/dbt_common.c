@@ -754,7 +754,19 @@ static void on_sample(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)si;
     ucontext_t *uc = (ucontext_t *)ctx;
     uint32_t n = s_nsamples;
-    if (n < SAMPLE_MAX) { s_samples[n] = (uintptr_t)uc->uc_mcontext->__ss.__pc; s_nsamples = n + 1; }
+    uintptr_t pc = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+#elif defined(__APPLE__) && defined(__x86_64__)
+    pc = (uintptr_t)uc->uc_mcontext->__ss.__rip;
+#elif defined(__linux__) && defined(__x86_64__)
+    pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__linux__) && defined(__aarch64__)
+    pc = (uintptr_t)uc->uc_mcontext.pc;
+#else
+    (void)uc;
+#endif
+    if (n < SAMPLE_MAX) { s_samples[n] = pc; s_nsamples = n + 1; }
 }
 
 void dbt_sample_start(void) {
