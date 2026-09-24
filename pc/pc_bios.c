@@ -632,7 +632,8 @@ static void post(x86_cpu *cpu) {
 
     /* BIOS data area */
     for (int i = 0; i < 0x100; i++) pc_wr8(cpu, PC_BDA_SEG, (uint16_t)i, 0);
-    pc_wr16(cpu, PC_BDA_SEG, 0x10, 0x0021);      /* equipment: 80x25 colour, 1 floppy */
+    pc_wr16(cpu, PC_BDA_SEG, 0x10, (uint16_t)(0x0021 | (cpu->has_fpu ? 0x0002 : 0)));   /* equipment: 80x25 colour, 1 floppy, the coprocessor */
+    if (cpu->has_fpu) x86_fpu_finit(cpu);        /* POST leaves it initialised */
     pc_wr16(cpu, PC_BDA_SEG, 0x13, PC_CONV_KB);
     pc_wr8 (cpu, PC_BDA_SEG, 0x17, 0x00);        /* shift flags */
     pc_wr16(cpu, PC_BDA_SEG, 0x1A, 0x1E);        /* kbd buffer head */

@@ -971,6 +971,13 @@ void dpmi_int31(x86_cpu *c, int vector) {
         /* Bit 0 present, 1 client-enabled, 2 host emulating, 3 client
          * emulating, 4-7 type. There is no FPU here and we do not pretend
          * to emulate one, so the only bit that can be set is the client's. */
+        if (c->has_fpu) {
+            /* 0 MPv (enabled for the client), 1 EMv (client emulates),
+             * 2 MPr (present), 4-7 the type: 3 a 387, 4 a 486's */
+            x86_set_r16(c, R_AX, (uint16_t)(((c->cr0 & X86_CR0_MP) ? 1 : 0) | ((c->cr0 & X86_CR0_EM) ? 2 : 0) | 4
+                                            | ((c->model >= X86_MODEL_486 ? 4 : 3) << 4)));
+            break;
+        }
         x86_set_r16(c, R_AX, (c->cr0 & 0x4) ? 0x0008 : 0x0000);
         break;
     case 0x0E01: {                                     /* set coprocessor emulation */
@@ -979,6 +986,10 @@ void dpmi_int31(x86_cpu *c, int vector) {
          * emulation. Asking for real hardware we do not have is the one
          * request we refuse; every other state sets CR0.EM, so coprocessor
          * instructions arrive as #NM rather than quietly doing nothing. */
+        if (c->has_fpu) {
+            c->cr0 = (c->cr0 & ~(X86_CR0_MP | X86_CR0_EM)) | ((bits & 1) ? X86_CR0_MP : 0) | ((bits & 2) ? X86_CR0_EM : 0);
+            break;
+        }
         if ((bits & 3) == 1) { x86_set_r16(c, R_AX, 0x8025); c->eflags |= X86_CF; break; }
         c->cr0 |= 0x4;
         break;

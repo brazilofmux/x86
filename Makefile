@@ -27,8 +27,14 @@ ifneq ($(SDL_CFLAGS),)
   SDL_LIBS   += -lSDL2
 endif
 
-CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c
-CORE_OBJS = $(addprefix $(O)/,$(CORE_SRCS:.c=.o))
+CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c core/x86_fpu.c
+# Berkeley SoftFloat 3e (core/softfloat/README): the x87's arithmetic,
+# built with upstream's options and its own warnings left alone
+SF_SRCS   = $(sort $(wildcard core/softfloat/*.c core/softfloat/8086/*.c))
+SF_OBJS   = $(addprefix $(O)/,$(SF_SRCS:.c=.o))
+SF_CFLAGS = -O2 -g -std=c11 -w -Icore/softfloat -Icore/softfloat/include -Icore/softfloat/8086 \
+            -DSOFTFLOAT_FAST_INT64 -DSOFTFLOAT_ROUND_ODD -DINLINE_LEVEL=5 -DSOFTFLOAT_FAST_DIV32TO16 -DSOFTFLOAT_FAST_DIV64TO32
+CORE_OBJS = $(addprefix $(O)/,$(CORE_SRCS:.c=.o)) $(SF_OBJS)
 
 # The backend: the host's, unless BACKEND=a64|x64 says otherwise (a cross
 # check: the other backend's translator runs under X86_GOLDEN, never a block).
@@ -46,7 +52,7 @@ SST    = $(O)/tools/sst
 JITTEST = $(O)/tools/jittest
 MAIN_O = $(O)/main.o
 
-.PHONY: test-pm all clean test-sst test-jit test-dos test-x64enc test-hwflags
+.PHONY: test-pm all clean test-sst test-jit test-dos test-x64enc test-hwflags test-fpu
 
 all: $(TARGET) $(SST) $(JITTEST)
 
@@ -62,6 +68,17 @@ $(SST): $(O)/tools/sst.o $(CORE_OBJS)
 
 $(JITTEST): $(O)/tools/jittest.o $(CORE_OBJS) $(DBT_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+
+$(O)/core/softfloat/%.o: core/softfloat/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(SF_CFLAGS) -MMD -MP -c -o $@ $<
+
+# the x87 uses SoftFloat's internals (its round-and-pack), so it is built
+# with SoftFloat's configuration too
+$(O)/core/x86_fpu.o: core/x86_fpu.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -isystem core/softfloat/include -isystem core/softfloat/8086 -Icore \
+	    -DSOFTFLOAT_FAST_INT64 -DINLINE_LEVEL=5 -MMD -MP -c -o $@ $<
 
 $(O)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -109,8 +126,14 @@ test-pm:
 # Paging and V86 transcript images: QEMU and dos-monster, diffed
 test-pg: $(TARGET)
 	cd tools/pmoracle && python3 pgrun.py pgtest.asm && python3 pgrun.py vmtest.asm && \
-	    python3 pgrun.py c486test.asm --m486 --expect c486test.bochs && \
-	    python3 pgrun.py c486test.asm --m486 --expect c486test.bochs -- -V
+	    python3 pgrun.py c486test.asm --m486 --expect c486test.expected && \
+	    python3 pgrun.py c486test.asm --m486 --expect c486test.expected -- -V
+
+# The x87 against its transcript (tools/pmoracle/fpurun.py): the interpreter,
+# the JIT and -V
+test-fpu: $(TARGET)
+	cd tools/pmoracle && python3 fpurun.py --expect fputest.expected -- -i && \
+	    python3 fpurun.py --expect fputest.expected && python3 fpurun.py --expect fputest.expected -- -V
 
 test-pm-compare:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 compare.py

@@ -1,0 +1,15 @@
+Berkeley SoftFloat Release 3e, by John R. Hauser — the x87's 80-bit
+arithmetic (extF80), the 128-bit format the transcendentals work in
+(f128), and the conversions to and from single, double and integers.
+
+  upstream   https://github.com/ucb-bar/berkeley-softfloat-3
+  revision   a0c6494cdc11865811dec815d5c0049fba9d82a8
+  license    BSD 3-clause, COPYING.txt (applies to every file here but
+             platform.h and this README)
+
+A subset, unmodified: source/*.c without half precision (f16, bf16) and
+without the pointer-passing "M" variants, source/include/*.h, and the
+8086 specialization (source/8086: x87 NaN rules — the 8086-SSE one is
+SSE's). platform.h is ours: upstream keeps one per build directory.
+Built with upstream's options: SOFTFLOAT_FAST_INT64, SOFTFLOAT_ROUND_ODD, INLINE_LEVEL=5,
+SOFTFLOAT_FAST_DIV32TO16, SOFTFLOAT_FAST_DIV64TO32.

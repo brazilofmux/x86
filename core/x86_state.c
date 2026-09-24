@@ -210,6 +210,7 @@ void x86_reset(x86_cpu *c) {
     x86_real_limits(c);
     c->cr0 = 0; c->cr2 = 0; c->cr3 = 0;
     if (c->model >= X86_MODEL_486) c->cr0 = 0x60000010u;   /* 486 reset: CD, NW (caches off), ET */
+    x86_fpu_reset(c);
     c->pg_super = c->pg_probe = 0;
     x86_tlb_flush(c);
     c->halted = 0;

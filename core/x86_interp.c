@@ -122,6 +122,21 @@ static inline void mwr(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, in
     x86_wr(c, c->seg[seg].base, off, wrapmask(c, admask(in)), size, v);
 }
 
+/* The FPU's operands (core/x86_fpu.c): N bytes as one access — limit
+ * and alignment checked for the whole — before any byte moves. */
+void x86_fpu_mrd(x86_cpu *c, const x86_insn *in, uint32_t off, int n, int align, uint8_t *buf) {
+    uint32_t base = c->seg[in->seg].base, m = wrapmask(c, admask(in));
+    limit_check(c, in->seg, off, n);
+    ac_check(c, base, off, align, 0);
+    for (int i = 0; i < n; i++) buf[i] = x86_phys_rd8(c, base + ((off + (uint32_t)i) & m));
+}
+void x86_fpu_mwr(x86_cpu *c, const x86_insn *in, uint32_t off, int n, int align, const uint8_t *buf) {
+    uint32_t base = c->seg[in->seg].base, m = wrapmask(c, admask(in));
+    limit_check(c, in->seg, off, n);
+    ac_check(c, base, off, align, 1);
+    for (int i = 0; i < n; i++) x86_phys_wr8(c, base + ((off + (uint32_t)i) & m), buf[i]);
+}
+
 static uint32_t rd_op(x86_cpu *c, const x86_insn *in, int i, uint32_t ea) {
     const x86_operand *o = &in->ops[i];
     switch (o->kind) {
@@ -1522,13 +1537,25 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     }
 
     /* ---- misc ------------------------------------------------------- */
-    case OP_NOP: case OP_WAIT: case OP_LOCK_ONLY:
+    case OP_NOP: case OP_LOCK_ONLY:
+        break;
+    case OP_WAIT:
+        /* WAIT traps only with both TS and MP (a task switch left the
+         * coprocessor's state behind); then it reports what is pending */
+        if (!c->has_fpu) break;
+        if ((c->cr0 & (X86_CR0_TS | X86_CR0_MP)) == (X86_CR0_TS | X86_CR0_MP)) RAISE(X86_EXC_NM);
+        x86_fpu_wait(c);
         break;
     case OP_ESC:
         /* CR0.EM makes every coprocessor instruction trap instead, so
          * software can emulate one; INT 31h 0E01h is how a DPMI client
          * asks for that, and DJGPP's emu387 then does the arithmetic. */
-        if (c->cr0 & 0x4) RAISE(X86_EXC_NM);
+        if (c->cr0 & X86_CR0_EM) RAISE(X86_EXC_NM);
+        if (c->has_fpu) {
+            if (c->cr0 & X86_CR0_TS) RAISE(X86_EXC_NM);   /* the state belongs to another task */
+            x86_fpu_exec(c, in, ea, start_ip);
+            break;
+        }
         /* No coprocessor: the 8088 still performs the operand bus read;
          * the 286 limit-checks a word (measured). */
         if (in->ops[0].kind == OPK_MEM) (void)mrd(c, in, in->seg, ea, c->model >= X86_MODEL_286 ? 2 : 1);

@@ -248,12 +248,21 @@ void dbt_golden_close(x86_dbt *dbt, FILE *out) {
 /* ----------------------------------------------------------------------
  * -V shadow-verify support
  * ---------------------------------------------------------------------- */
+/* The x87 (translated code steps it in the interpreter, but a divergence
+ * anywhere else shows up here too), field by field: no padding compared. */
+static int fpu_equal(const x86_fpu *a, const x86_fpu *b) {
+    for (int i = 0; i < 8; i++) if (a->sig[i] != b->sig[i] || a->sexp[i] != b->sexp[i]) return 0;
+    return a->cw == b->cw && a->sw == b->sw && a->empty == b->empty && a->fop == b->fop
+        && a->fcs == b->fcs && a->fds == b->fds && a->fip == b->fip && a->fdp == b->fdp;
+}
+
 static int cpu_regs_equal(const x86_cpu *a, const x86_cpu *b) {
     for (int i = 0; i < 8; i++) if (a->r[i] != b->r[i]) return 0;
     if (a->eip != b->eip || a->eflags != b->eflags) return 0;
     for (int i = 0; i < 6; i++)
         if (a->seg[i].sel != b->seg[i].sel || a->seg[i].base != b->seg[i].base) return 0;
     if (a->halted != b->halted) return 0;
+    if (a->has_fpu && !fpu_equal(&a->fpu, &b->fpu)) return 0;
     return 1;
 }
 
@@ -273,6 +282,9 @@ static void verify_first_diff(const x86_cpu *jit, const x86_cpu *interp) {
     if (jit->eflags != interp->eflags)
         fprintf(stderr, "    FLAGS differ: jit=%08X interp=%08X (xor %08X)\n",
                 jit->eflags, interp->eflags, jit->eflags ^ interp->eflags);
+    if (jit->has_fpu && !fpu_equal(&jit->fpu, &interp->fpu))
+        fprintf(stderr, "    FPU differs: jit cw=%04X sw=%04X empty=%02X, interp cw=%04X sw=%04X empty=%02X\n",
+                jit->fpu.cw, jit->fpu.sw, jit->fpu.empty, interp->fpu.cw, interp->fpu.sw, interp->fpu.empty);
     for (int i = 0; i < 6; i++)
         if (jit->seg[i].sel != interp->seg[i].sel)
             fprintf(stderr, "    %s differs: jit=%04X interp=%04X\n", sn[i], jit->seg[i].sel, interp->seg[i].sel);

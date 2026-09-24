@@ -9,9 +9,12 @@ port E9.
 checked-in bochsrc to the host); --bochs-only prints its transcript, which
 is how c486test.bochs is made:  python3 pgrun.py c486test.asm --bochs-only > c486test.bochs
 
---expect compares against a stored transcript instead of running QEMU:
-c486test.bochs is Bochs's, since QEMU has no #AC and lets ring 3 run
-INVD and WBINVD (the SDM, and Bochs, say #GP).
+--expect compares against a stored transcript instead of running QEMU.
+c486test.expected is Bochs's (c486test.bochs, verbatim) but for four
+lines: QEMU has no #AC and lets ring 3 run INVD and WBINVD (the SDM, and
+Bochs, say #GP), and its x87 pops on unmasked exceptions and misses #MF
+on waiting loads; Bochs's default CPU stores FCS and FDS as 0, as Intel's
+since Haswell do, where a 486 stores the selectors (QEMU agrees).
 
 QEMU runs with -cpu 486 (CR0.WP off, as a 386 has none) and exits through
 isa-debug-exit at port F4; dos-monster boots the image with -boot on a

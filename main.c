@@ -23,6 +23,7 @@ static void usage(const char *prog) {
     printf("  -S          with -V: verify after every block (no chaining)\n");
     printf("  -M N        with -V: compare guest memory every N block runs (default 1)\n");
     printf("  -m MODEL    cpu model: 86, 186, 286, 386, 486 (default 286; DPMI clients need 386)\n");
+    printf("  -fpu, -nofpu  a 387 beside a 386, or a 486SX (default: a 486 has its FPU, nothing else has one)\n");
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
     printf("  -fda IMG    diskette image as drive 00h (also -fdb); -hda IMG fixed disk 80h (also -hdb)\n");
@@ -265,7 +266,7 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
 }
 
 int main(int argc, char **argv) {
-    int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0;
+    int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0, fpu = -1;
     uint64_t limit = 0;
     int mem_every = 0;          /* -M N: whole-memory -V compare every N block runs (0: the DBT default) */
     const char *root = NULL, *prog = NULL, *dump = NULL, *gdump = NULL, *drive_a = NULL, *drive_b = NULL;
@@ -288,6 +289,8 @@ int main(int argc, char **argv) {
             model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 286 ? X86_MODEL_286
                   : m == 486 ? X86_MODEL_486 : X86_MODEL_386;
         }
+        else if (!strcmp(argv[i], "-fpu")) fpu = 1;
+        else if (!strcmp(argv[i], "-nofpu")) fpu = 0;
         else if (!strcmp(argv[i], "-C") && i + 1 < argc) root = argv[++i];
         else if (!strcmp(argv[i], "-A") && i + 1 < argc) drive_a = argv[++i];
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) drive_b = argv[++i];
@@ -334,6 +337,7 @@ int main(int argc, char **argv) {
          * it through INT 13h. */
         if (!pc_disk_present(boot_drive)) { fprintf(stderr, "-boot: no image for drive %02Xh\n", boot_drive); return 1; }
         x86_init(&cpu, model);
+        cpu.has_fpu = (uint8_t)(fpu < 0 ? model >= X86_MODEL_486 : fpu && model >= X86_MODEL_386);
         pc_init(&cpu, tty);
         pc.booted = 1;
         pc_empty_upper_memory(&cpu);
@@ -386,6 +390,7 @@ int main(int argc, char **argv) {
         dos_name[n] = 0;
 
         x86_init(&cpu, model);
+        cpu.has_fpu = (uint8_t)(fpu < 0 ? model >= X86_MODEL_486 : fpu && model >= X86_MODEL_386);
         pc_init(&cpu, tty);
         pc_disk_install(&cpu);
         pc_cmos_init(&cpu);

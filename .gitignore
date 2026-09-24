@@ -41,6 +41,7 @@ tools/hwflags
 .venv/
 tools/pmoracle/pmtest.img
 tools/pmoracle/*.img
+tools/pmoracle/fputest.asm
 
 # Python bytecode from the oracle harness
 __pycache__/

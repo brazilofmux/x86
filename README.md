@@ -1,7 +1,8 @@
 # dos-monster
 
-An 8086–80386 PC emulator built around a dynamic binary translator: x86
-real mode, protected mode, virtual-8086 mode and paging, translated to
+An 8086–80486 PC emulator built around a dynamic binary translator: x86
+real mode, protected mode, virtual-8086 mode and paging, and the 387/486
+floating-point unit, translated to
 AArch64 at run time, with the goal of running DOS software at billions of
 instructions per second. It boots FreeDOS, MS-DOS 6.22 and Windows 3.11 in
 386 enhanced mode from disk images, and runs DOOM, WordPerfect 5.1, Turbo
@@ -129,7 +130,9 @@ correct under `-V`, not yet fast. The backend is chosen by the host
 
 Needs a C11 compiler and zlib; SDL2 (via `pkg-config`) adds a window for
 graphics modes and is optional — without it the machine is headless.
-The tests also use `nasm`, `python3`, `mtools` and `qemu-system-i386`.
+The tests also use `nasm`, `python3`, `mtools`, `qemu-system-i386` and
+`bochs`. The x87's arithmetic is Berkeley SoftFloat 3e (BSD licence,
+`core/softfloat/COPYING.txt`).
 
 ## Running
 
@@ -156,15 +159,19 @@ MS-DOS 6.22 and Windows 3.11 from diskette images end to end, unattended.
 - `make test-jit` — the translator against the interpreter, instruction
   sequences fuzzed in real mode, flat and segmented protected mode
 - `make test-pm`, `test-pm-compare`, `test-pg` — protected mode, paging
-  and V86 mode against QEMU (`tools/pmoracle`: boot images that log
-  their observations)
+  and V86 mode against QEMU and Bochs (`tools/pmoracle`: boot images that
+  log their observations)
+- `make test-fpu` — the x87: 6,600 cases (every instruction, the awkward
+  operands, rounding and precision control, masked and unmasked
+  exceptions) against Bochs's transcript, adjudicated where Bochs is the
+  one that is off; the transcendentals against mpmath (`fpuacc.py`)
 - `make test-dos` — DOS programs under the interpreter, the JIT and `-V`
 - `make test-boot` — FreeDOS, MS-DOS and Windows booted from images and
   driven by `tools/expect.py`
 
 ## Layout
 
-    core/   the x86: decoder, interpreter, paging
+    core/   the x86: decoder, interpreter, paging, the x87 (and SoftFloat)
     dbt/    the translator (AArch64)
     pc/     the machine: BIOS, VGA, keyboard, timer, disks, CMOS, mouse
     dos/    the emulated DOS, MZ loader, DPMI host

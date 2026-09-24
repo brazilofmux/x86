@@ -66,8 +66,11 @@ SF=7), so even the flag tables carry over.
 
 ### Guest Environment
 
-- **CPU**: 8086 → 386 (no FPU emulation initially; 387 is a Phase C
-  question — Turbo Pascal's software floating point works without one).
+- **CPU**: 8086 → 486 (`-m 486`: AC, BSWAP/XADD/CMPXCHG, INVLPG, CR0.WP,
+  #AC). The x87 (`core/x86_fpu.c`) is a 486DX's, or a 387 beside a 386
+  with `-fpu`: Berkeley SoftFloat 3e's 80-bit arithmetic (vendored in
+  `core/softfloat/`) inside an x87 of our own, checked against Bochs and
+  QEMU (`make test-fpu`), transcendentals against mpmath.
 - **Memory**: flat host buffer. Real mode `seg<<4 + off` with 20-bit
   wrap and an A20 gate; PM flat selectors are just offsets. Mirror page
   trick from `z80_mem_alloc` for wrap-exact 16-bit stack ops.
@@ -138,8 +141,8 @@ and native flags are free.
   Windows DOS box.)*
 - **Phase C**: x64 backend, real DOS from a disk image, 387, whatever
   is fun. *(Real DOS from images done — FreeDOS, MS-DOS 6.22, then V86,
-  paging and Windows 3.11 in 386 enhanced mode. No x64 backend or 387
-  yet.)*
+  paging and Windows 3.11 in 386 enhanced mode. The x64 backend (on
+  kagura), then the 486 and its x87, 2026-09-24.)*
 
 ## Where the Bodies Are Buried (borrow from [z80](https://github.com/brazilofmux/z80), don't reinvent)
 

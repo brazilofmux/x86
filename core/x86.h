@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <setjmp.h>
+#include "x86_fpu.h"
 
 /* ============================================================================
  * FLAGS
@@ -206,6 +207,11 @@ typedef struct x86_cpu {
      * Filled by the page walk, cleared with the TLB (then tlb_hook). */
     int64_t  pgd_r[X86_PGD_PAGES], pgd_w[X86_PGD_PAGES];
     void   (*tlb_hook)(struct x86_cpu *);   /* DBT: translations flushed (CR3, PG, A20) */
+
+    /* The coprocessor (core/x86_fpu.c): a 387 beside a 386, a 486DX's
+     * own. Without one, ESC opcodes only perform their bus cycle. */
+    uint8_t  has_fpu;
+    x86_fpu  fpu;
 } x86_cpu;
 
 /* 8-bit register access: AL..BL are the low bytes of r[0..3], AH..BH are

@@ -288,6 +288,131 @@ pm32:
         mov ebx, r3_bswap
         call ring3
 
+        ; ---- the coprocessor in protected mode: #MF, the environment, #NM
+        mov eax, cr0
+        or eax, 0x20                        ; NE: #MF, not FERR#
+        and eax, ~0x0E                      ; MP, EM, TS clear
+        mov cr0, eax
+        mov byte [tno], 0x40
+        mov dword [resume], .t41
+        fninit
+        fldcw [cw_ze]                       ; ZE unmasked
+        fld1
+        fldz
+        fdivp st1, st0                      ; 1/0: ZE pending, nothing written
+        fnstsw ax                           ; (no-wait)
+        movzx eax, ax
+        call ok_eax
+        mov byte [tno], 0x41
+        fwait                               ; #MF here
+        call ok_eax
+.t41:   mov byte [tno], 0x42
+        mov dword [resume], .t43
+        fnstsw ax                           ; still pending
+        movzx eax, ax
+        call ok_eax
+        mov byte [tno], 0x43
+        fld1                                ; a waiting instruction: #MF again
+        call ok_eax
+.t43:   mov byte [tno], 0x44
+        mov dword [resume], .t45
+        fnclex
+        fld1
+        fnstsw ax
+        movzx eax, ax
+        call ok_eax
+.t45:   mov byte [tno], 0x45                ; FNSTENV, 32-bit protected-mode layout
+        mov dword [resume], .t46
+        fninit
+        fld dword [f_three]
+        fld1
+        fsubr dword [f_three]               ; the last instruction, and its operand
+        fnstenv [0x30100]
+        mov esi, 0x30100
+        mov ecx, 7
+.env:   lodsd
+        push ecx
+        push esi
+        call ok_eax
+        pop esi
+        pop ecx
+        loop .env
+.t46:   mov byte [tno], 0x46                ; the 16-bit protected-mode layout
+        mov dword [resume], .t47
+        fninit
+        fld1
+        fadd dword [f_three]
+        o16 fnstenv [0x30140]
+        mov esi, 0x30140
+        mov ecx, 7
+.env16: xor eax, eax
+        lodsw
+        push ecx
+        push esi
+        call ok_eax
+        pop esi
+        pop ecx
+        loop .env16
+.t47:   mov byte [tno], 0x47                ; FNSAVE, FRSTOR
+        mov dword [resume], .t4a
+        fninit
+        fldpi
+        fld1
+        fnsave [0x30200]
+        fnstsw ax                           ; FNSAVE leaves it initialised
+        movzx eax, ax
+        call ok_eax
+        mov byte [tno], 0x48
+        frstor [0x30200]
+        fstp dword [0x30300]
+        fstp dword [0x30304]
+        mov eax, [0x30300]
+        call ok_eax
+        mov byte [tno], 0x49
+        mov eax, [0x30304]
+        call ok_eax
+.t4a:   mov byte [tno], 0x4A                ; #NM: TS on the ESC, TS+MP on WAIT, EM
+        mov dword [resume], .t4b
+        mov eax, cr0
+        or eax, 0x08
+        mov cr0, eax
+        fwait                               ; TS alone: WAIT goes on
+        mov eax, 1
+        call ok_eax
+.t4b:   mov byte [tno], 0x4B
+        mov dword [resume], .t4c
+        fld1                                ; TS: #NM
+        call ok_eax
+.t4c:   mov byte [tno], 0x4C
+        mov dword [resume], .t4d
+        mov eax, cr0
+        or eax, 0x02
+        mov cr0, eax
+        fwait                               ; TS and MP: #NM
+        call ok_eax
+.t4d:   mov byte [tno], 0x4D
+        mov dword [resume], .t4e
+        clts
+        mov eax, cr0
+        or eax, 0x04
+        and eax, ~0x02
+        mov cr0, eax
+        fld1                                ; EM: #NM
+        call ok_eax
+.t4e:   mov byte [tno], 0x4E
+        mov dword [resume], .t4f
+        fwait                               ; EM alone: WAIT goes on
+        mov eax, 2
+        call ok_eax
+.t4f:   mov eax, cr0
+        and eax, ~0x04                      ; EM off
+        mov cr0, eax
+        ; (With NE clear, a waiting instruction after an unmasked exception
+        ; freezes until IGNNE# — the PC's IRQ 13 handler writes port F0h — so
+        ; with interrupts off a 486 would hang there, as Bochs does. We go on
+        ; as if IGNNE# were up until there is a slave 8259 for IRQ 13.)
+.t50:   fninit
+
         mov esi, msg_done
         call puts
         mov al, 0
@@ -469,6 +594,9 @@ resume    dd 0
 saved_esp dd 0
 cr0_boot  dd 0
 r3flags   dd 0x202
+cw_ze     dw 0x037B
+          align 4
+f_three   dd 3.0
 
 gdt:    dq 0
         dq 0x00CF9A000000FFFF       ; 08 code, ring 0
