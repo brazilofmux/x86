@@ -707,15 +707,37 @@ static void emit_fault_chunks(emit_t *e) {
  * from the cpu at run time: the block runs under whatever the code has
  * loaded since. In 64-bit arithmetic (an SS32 offset near 4G must not
  * wrap the sum). Clobbers RFLAGS and a scratch that is not the ea's. */
+/* A scratch for a check's arithmetic: W_T3, else W_T2, else W_T3 parked
+ * on the host stack (POP [mem] holds the stack's pointer and offset in
+ * both while the destination's are in W_T0/W_T1); the caller pops it
+ * before its branch (flags survive a pop). */
+static int check_scratch(emit_t *e, const ea_t *ea, int *park) {
+    uint32_t busy = s_check_busy | (1u << ea->off) | (1u << ea->segp);
+    int t = W_T3;
+    *park = 0;
+    if (busy & (1u << W_T3)) t = W_T2;
+    if (busy & (1u << t)) { t = W_T3; *park = 1; emit_push_r(e, t); }
+    return t;
+}
+
+/* A read while a device answers the VGA window (planar modes: the
+ * latches load on every read): host address - mem with bits 19:16 == A
+ * is the window's, and the instruction runs through the interpreter. */
+static void emit_check_window(emit_t *e, const ea_t *ea) {
+    int park, t = check_scratch(e, ea, &park);
+    x64_mem_t m = x64_mi(ea->segp, ea->off, 0, 0);
+    emit_lea(e, 8, t, &m);
+    emit_alu_rr(e, 8, X64_ALU_SUB, t, R_MEM);
+    emit_shift_ri(e, 8, X64_SH_SHR, t, 16);
+    emit_alu_ri(e, 4, X64_ALU_CMP, t, 0xA);
+    if (park) emit_pop_r(e, t);
+    slow_site(e, X64_CC_E);
+}
+
 static void emit_limit_check(emit_t *e, int seg, int segp, int off, int size) {
     uint8_t vec = (uint8_t)(seg == S_SS && s_regs32 ? X86_EXC_SS : X86_EXC_GP);
-    /* a scratch for the arithmetic: W_T3, else W_T2, else W_T3 parked on
-     * the host stack (POP [mem] holds the stack's pointer and offset in
-     * both while the destination's are in W_T0/W_T1) */
-    uint32_t busy = s_check_busy | (1u << off) | (1u << segp);
-    int t = W_T3, park = 0;
-    if (busy & (1u << W_T3)) t = W_T2;
-    if (busy & (1u << t)) { t = W_T3; park = 1; emit_push_r(e, t); }
+    ea_t ea = { segp, off, seg };
+    int park, t = check_scratch(e, &ea, &park);
     x64_mem_t m = M(R_CPU, OFF_SEG_LIMIT(seg));
     emit_mov_rm(e, 4, t, &m);                               /* zero-extended */
     emit_alu_rr(e, 8, X64_ALU_SUB, t, off);                 /* limit - off, exact as a signed 64-bit value */
@@ -1117,6 +1139,7 @@ static void emit_checks_rw(emit_t *e, const ea_t *ea, int size, int store, int r
     fl_save(e, live_in);
     if (s_flat) { emit_check_flat(e, ea, size, store, reads); return; }
     emit_check_wrap(e, ea, size);
+    if (reads && s_blk->devread) emit_check_window(e, ea);
     if (store) emit_check_smc(e, ea, size);
 }
 static void emit_checks(emit_t *e, const ea_t *ea, int size, int store, uint32_t live_in) {
@@ -1552,6 +1575,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         fl_save(e, live_in);
         emit_alu_ri(e, 2, X64_ALU_CMP, ea.off, 0xFFFC);
         slow_site(e, X64_CC_A);
+        if (s_blk->devread) emit_check_window(e, &ea);
         m = ea_mem(&ea); emit_mov_rm(e, 4, W_T2, &m);
         emit_mov_rr(e, 2, host_reg(d), W_T2);
         emit_shift_ri(e, 4, X64_SH_SHR, W_T2, 16);
@@ -1566,9 +1590,10 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         m = x64_mi(X64_RBX, W_T2, 0, 0); emit_lea(e, 4, W_T2, &m);
         if (!s_flat) emit_movzx_rr(e, 4, W_T2, 2, W_T2);
         int segp = s_flat ? R_MEM : emit_seg_ptr(e, in->seg, W_T1);
-        if (s_flat || s_seg16) { ea_t xe = { segp, W_T2, in->seg }; emit_checks(e, &xe, 1, 0, live_in); }
+        int chk = s_flat || s_seg16 || s_blk->devread;
+        if (chk) { ea_t xe = { segp, W_T2, in->seg }; emit_checks(e, &xe, 1, 0, live_in); }
         m = x64_mi(segp, W_T2, 0, 0); emit_mov_rm(e, 1, X64_AL, &m);
-        if (s_flat || s_seg16) slow_back(e, s_rf);
+        if (chk) slow_back(e, s_rf);
         return;
     }
 
