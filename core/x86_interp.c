@@ -1665,6 +1665,19 @@ static int fetch_bytes(x86_cpu *c, uint8_t *buf, int *cross_at) {
     uint32_t m = c->seg[S_CS].big ? 0xFFFFFFFFu : 0xFFFF;
     int first_bad = 16;
     *cross_at = 16;
+    /* The common case in one copy: no paging, no IP wrap inside the 16,
+     * no A20 fold between them, all in memory and none in a device's
+     * read window — exactly what the byte loop below would read. */
+    if (!(c->cr0 & X86_CR0_PG) && ip + 15 <= m && ip + 15 >= ip) {
+        uint32_t lin = base + ip, p = lin & c->a20_mask;
+        if (((lin + 15) & c->a20_mask) == p + 15 && p + 16 <= c->mem_size
+            && !(c->device_read && p + 15 >= 0xA0000u && p < 0xB0000u)) {
+            memcpy(buf, c->mem + p, 16);
+            uint32_t to_page = 0x1000u - (lin & 0xFFFu);
+            if (to_page < 16) *cross_at = (int)to_page;
+            return 16;
+        }
+    }
     c->pg_probe = 1;
     for (int i = 0; i < 16; i++) {
         c->pg_miss = 0;
@@ -1723,7 +1736,7 @@ int x86_step(x86_cpu *c) {
         c->exc = X86_EXC_GP;
     } else {
         int cross_at;
-        int first_bad = fetch_bytes(c, buf, &cross_at);
+        volatile int first_bad = fetch_bytes(c, buf, &cross_at);   /* (read only before any longjmp) */
         x86_dec_ctx ctx = { buf, c->model, c->seg[S_CS].big };
         if (!x86_decode(&ctx, &in)) {
             /* > 15 bytes of prefixes: the 8086 just keeps going; 386 #GP.
