@@ -27,6 +27,12 @@ done
 for mode in -i -j -V; do
     check "unreal $mode"    tests/dos/unreal.out  $DM -m 386 $mode -L 1000000 tests/dos/unreal.com
 done
+# the 486 against the 386: EFLAGS.AC, BSWAP/XADD/CMPXCHG/INVD or #UD
+for mode in -i -j -V; do
+    for m in 386 486; do
+        check "cpu486 -m $m $mode" tests/dos/cpu486-$m.out $DM -m $m $mode -L 1000000 tests/dos/cpu486.com
+    done
+done
 # The VGA text renderer (-G on a text screen: attributes, blink off, line
 # drawing, a block cursor), compared as decoded pixels; and the BIOS's
 # INT 9 translation of modified keys fed as xterm sequences; the INT 33h

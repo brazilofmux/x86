@@ -11,8 +11,11 @@
  * The 386's protection rules: a user access (CPL 3, not an implicit
  * supervisor access such as a descriptor-table read) needs U/S set at
  * both levels, and a user write needs R/W at both. The supervisor reads
- * and writes every present page; CR0.WP, which makes it honour R/W, came
- * with the 486. A fault records the linear address in CR2 and raises #PF
+ * and writes every present page — unless CR0.WP is set, on a 486, which
+ * makes a supervisor write honour R/W too. A cached translation says
+ * what a write may skip the walk for only through its D bit, so while WP
+ * is set a read-only page's entry never gets D: the interpreter and
+ * translated code both miss on a write there and come back here. A fault records the linear address in CR2 and raises #PF
  * with an error code: bit 0 a protection violation (else not present),
  * bit 1 a write, bit 2 a user access.
  *
@@ -91,6 +94,12 @@ void x86_tlb_flush(x86_cpu *c) {
     if (c->tlb_hook) c->tlb_hook(c);
 }
 
+/* 486 WP: a read-only page (R/W clear at either level) takes no write
+ * through a cached translation, supervisor or not. */
+static int wp_ro(const x86_cpu *c, uint32_t both) {
+    return (c->cr0 & X86_CR0_WP) && c->model >= X86_MODEL_486 && !(both & 2);
+}
+
 uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
     int user = !c->pg_super && x86_cpl(c) == 3;
     uint32_t err = (write ? 2u : 0u) | (user ? 4u : 0u);
@@ -106,6 +115,8 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
     if (ok && user) {
         uint32_t both = pde & pte;
         if (!(both & 4) || (write && !(both & 2))) { ok = 0; err |= 1; }
+    } else if (ok && write && (c->cr0 & X86_CR0_WP) && c->model >= X86_MODEL_486 && !(pde & pte & 2)) {
+        ok = 0; err |= 1;                                 /* 486 WP: a supervisor write to a read-only page */
     }
     if (!ok) {
         if (c->pg_probe) { c->pg_miss = 1; return X86_PG_BAD; }
@@ -125,7 +136,7 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
     t->tag = (lin & 0xFFFFF000u) | X86_TLB_V
            | ((both & 4) ? X86_TLB_U : 0)
            | ((both & 4) && (both & 2) ? X86_TLB_UW : 0)
-           | ((pte & 0x40) ? X86_TLB_D : 0)
+           | ((pte & 0x40) && !(wp_ro(c, pde & pte)) ? X86_TLB_D : 0)
            | tlb_mem_bits(c, pte & 0xFFFFF000u);
     t->phys = pte & 0xFFFFF000u;
     /* the translator's tables, low linear pages only, user permissions */

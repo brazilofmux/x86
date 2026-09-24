@@ -46,6 +46,7 @@ enum x86_op {
     OP_MOVCR, OP_MOVDR, OP_MOVTR,
     OP_INT1,
     OP_SETMO,                   /* 8086 undocumented D0-D3 /6: operand = -1 (if count != 0) */
+    OP_INVD, OP_WBINVD, OP_INVLPG,   /* 486: cache and TLB maintenance */
     OP__COUNT
 };
 

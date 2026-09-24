@@ -1213,7 +1213,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     }
     case OP_PUSHF:
         if (v86_iopl_trap(c)) break;
-        push(c, in->opsize, in->opsize == 2 ? (c->eflags & 0xFFFF) : (c->eflags & 0x3FFFF & ~(X86_RF | X86_VM)));   /* 386: bits 18-31 push as 0 (measured) */
+        push(c, in->opsize, in->opsize == 2 ? (c->eflags & 0xFFFF) : (c->eflags & (c->model >= X86_MODEL_486 ? 0x7FFFF : 0x3FFFF) & ~(X86_RF | X86_VM)));   /* 386: bits 18-31 push as 0 (measured); 486: AC too */
         break;
     case OP_POPF: {
         if (v86_iopl_trap(c)) break;
@@ -1506,6 +1506,16 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         need_cpl0(c);
         c->cr0 &= ~8u;                          /* CR0.TS */
         break;
+    /* 486: the cache has nothing for INVD or WBINVD to do here, and the
+     * TLB is flushed whole for INVLPG (a superset of the one page: every
+     * later access re-walks, which software cannot tell apart). */
+    case OP_INVD: case OP_WBINVD:
+        need_cpl0(c);
+        break;
+    case OP_INVLPG:
+        need_cpl0(c);
+        x86_tlb_flush(c);
+        break;
     /* ---- descriptor tables and CR0 -------------------------------- */
     case OP_LGDT: case OP_LIDT: {
         need_cpl0(c);
@@ -1568,7 +1578,12 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             if (cr == 0) {
                 /* PG without PE is #GP(0) */
                 if ((v & X86_CR0_PG) && !(v & 1)) x86_fault(c, X86_EXC_GP, 0);
-                if ((v ^ c->cr0) & X86_CR0_PG) x86_tlb_flush(c);
+                if (c->model >= X86_MODEL_486) v |= X86_CR0_ET;   /* hardwired on the 486 */
+                /* WP changes which cached pages a supervisor may write */
+                if ((v ^ c->cr0) & (X86_CR0_PG | (c->model >= X86_MODEL_486 ? X86_CR0_WP : 0))) {
+                    c->cr0 = v;
+                    x86_tlb_flush(c);
+                }
                 c->cr0 = v;
                 if (!c->pmode && (c->cr0 & 1)) x86_pe_set(c);
                 c->pmode = (c->cr0 & 1) != 0;

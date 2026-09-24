@@ -1,0 +1,7 @@
+EFLAGS.AC: toggles (486)
+EFLAGS.ID: fixed (no CPUID)
+bswap 12345678: 78563412
+xadd 5,7 -> eax ebx flags: 0000000C 00000005 004
+cmpxchg eax=5 ebx=5 ecx=9 -> eax ebx flags: 00000005 00000009 044
+cmpxchg eax=4 ebx=9 ecx=1 -> eax ebx flags: 00000009 00000009 091
+invd: ok

@@ -186,10 +186,16 @@ uint32_t x86_flags_fixup(x86_cpu *c, uint32_t f) {
         f |= 0xF000; f &= 0xFFFF; break;          /* 12-15 read as 1 */
     case X86_MODEL_286:
         if (!c->pmode) f &= 0x0FFF; else f &= 0x7FFF; break;
-    default:
+    case X86_MODEL_386:
         /* 386: bit 15 clear, RF/VM allowed; bits 18-31 are reserved and
          * read back as whatever they were (the 386EX shows them set) */
         f &= ~0x8000u;
+        if (!c->pmode) f &= ~X86_VM;
+        break;
+    default:
+        /* 486: AC (bit 18) is real — the bit software toggles to tell a
+         * 486 from a 386 — and bits 19-31 read 0 (no CPUID, so no ID) */
+        f &= ~0x8000u & 0x0007FFFFu;
         if (!c->pmode) f &= ~X86_VM;
         break;
     }
@@ -203,6 +209,7 @@ void x86_reset(x86_cpu *c) {
     c->pe_window = 0;
     x86_real_limits(c);
     c->cr0 = 0; c->cr2 = 0; c->cr3 = 0;
+    if (c->model >= X86_MODEL_486) c->cr0 = 0x60000010u;   /* 486 reset: CD, NW (caches off), ET */
     c->pg_super = c->pg_probe = 0;
     x86_tlb_flush(c);
     c->halted = 0;

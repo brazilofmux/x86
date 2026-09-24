@@ -127,6 +127,8 @@ static const opdesc map0f[256] = {
     [0x02] = E(OP_LAR, F_Gv, F_Ew),
     [0x03] = E(OP_LSL, F_Gv, F_Ew),
     [0x06] = E(OP_CLTS, F_NONE, F_NONE),
+    [0x08] = E(OP_INVD, F_NONE, F_NONE),     /* 486 (gated below) */
+    [0x09] = E(OP_WBINVD, F_NONE, F_NONE),
     [0x20] = E(OP_MOVCR, F_Rd, F_Cd),
     [0x21] = E(OP_MOVDR, F_Rd, F_Dd),
     [0x22] = E(OP_MOVCR, F_Cd, F_Rd),
@@ -185,7 +187,7 @@ static const opdesc map0f[256] = {
 static const uint8_t grp3_ops[8]  = { OP_TEST, OP_TEST, OP_NOT, OP_NEG, OP_MUL, OP_IMUL, OP_DIV, OP_IDIV };
 static const uint8_t grp5_ops[8]  = { OP_INC, OP_DEC, OP_CALL, OP_CALLF, OP_JMP, OP_JMPF, OP_PUSH, OP_PUSH };
 static const uint8_t grp0f00[8]   = { OP_SLDT, OP_STR, OP_LLDT, OP_LTR, OP_VERR, OP_VERW, OP_UD, OP_UD };
-static const uint8_t grp0f01[8]   = { OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_UD, OP_LMSW, OP_UD };
+static const uint8_t grp0f01[8]   = { OP_SGDT, OP_SIDT, OP_LGDT, OP_LIDT, OP_SMSW, OP_UD, OP_LMSW, OP_INVLPG };   /* /7: 486 (gated below) */
 static const uint8_t grp0fba[8]   = { OP_UD, OP_UD, OP_UD, OP_UD, OP_BT, OP_BTS, OP_BTR, OP_BTC };
 
 /* ------------------------------------------------------------------------ */
@@ -318,7 +320,7 @@ static int fill_operand(cursor *c, x86_insn *in, x86_operand *o, int form) {
         if (in->seg_override == S_NONE) in->seg = S_DS;
         break;
     case F_Zb: o->kind = OPK_REG; o->reg = in->opcode & 7; o->size = 1; break;
-    case F_Zv: o->kind = OPK_REG; o->reg = in->opcode & 7; break;
+    case F_Zv: o->kind = OPK_REG; o->reg = (in->opcode2 ? in->opcode2 : in->opcode) & 7; break;   /* 0F C8+r: BSWAP */
     case F_Sop:
         o->kind = OPK_SREG; o->size = 2;
         o->reg = in->opcode2 ? (in->opcode2 & 8 ? S_GS : S_FS) : (in->opcode >> 3) & 3;
@@ -474,6 +476,16 @@ done_prefix:
     /* SETCC / 0F Jcc already have cond; Jcc in the primary map too */
     if (in->op == OP_SETCC) in->cond = in->opcode2 & 15;
 
+    /* The 486's additions are #UD on a 386: CMPXCHG, XADD, BSWAP, INVD,
+     * WBINVD, INVLPG. CPU-detection code probes exactly these. */
+    if (model < X86_MODEL_486) {
+        switch (in->op) {
+        case OP_CMPXCHG: case OP_XADD: case OP_BSWAP: case OP_INVD: case OP_WBINVD: case OP_INVLPG:
+            in->op = OP_UD; break;
+        default: break;
+        }
+    }
+
     /* 386+: LOCK is only legal on the read-modify-write ALU ops with a
      * memory destination (and XCHG with a memory operand); anywhere
      * else it is #UD. Earlier parts treat it as a no-op prefix. */
@@ -522,6 +534,7 @@ static const char *op_names[OP__COUNT] = {
     [OP_LAR]="lar",[OP_LSL]="lsl",[OP_CLTS]="clts",[OP_SGDT]="sgdt",[OP_SIDT]="sidt",[OP_LGDT]="lgdt",[OP_LIDT]="lidt",
     [OP_SLDT]="sldt",[OP_STR]="str",[OP_LLDT]="lldt",[OP_LTR]="ltr",[OP_VERR]="verr",[OP_VERW]="verw",[OP_SMSW]="smsw",[OP_LMSW]="lmsw",
     [OP_MOVCR]="mov",[OP_MOVDR]="mov",[OP_MOVTR]="mov",[OP_INT1]="int1",[OP_SETMO]="setmo",[OP_UD]="(bad)",
+    [OP_INVD]="invd",[OP_WBINVD]="wbinvd",[OP_INVLPG]="invlpg",
 };
 static const char *cc_names[16] = { "o","no","b","ae","e","ne","be","a","s","ns","p","np","l","ge","le","g" };
 static const char *r8n[8]  = { "al","cl","dl","bl","ah","ch","dh","bh" };

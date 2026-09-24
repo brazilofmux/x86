@@ -22,7 +22,7 @@ static void usage(const char *prog) {
     printf("  -V          JIT with lockstep verification against the interpreter\n");
     printf("  -S          with -V: verify after every block (no chaining)\n");
     printf("  -M N        with -V: compare guest memory every N block runs (default 1)\n");
-    printf("  -m MODEL    cpu model: 86, 186, 286, 386 (default 286; DPMI clients need 386)\n");
+    printf("  -m MODEL    cpu model: 86, 186, 286, 386, 486 (default 286; DPMI clients need 386)\n");
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
     printf("  -fda IMG    diskette image as drive 00h (also -fdb); -hda IMG fixed disk 80h (also -hdb)\n");
@@ -285,7 +285,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-d")) debug++;
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) {
             int m = atoi(argv[++i]);
-            model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 286 ? X86_MODEL_286 : X86_MODEL_386;
+            model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 286 ? X86_MODEL_286
+                  : m == 486 ? X86_MODEL_486 : X86_MODEL_386;
         }
         else if (!strcmp(argv[i], "-C") && i + 1 < argc) root = argv[++i];
         else if (!strcmp(argv[i], "-A") && i + 1 < argc) drive_a = argv[++i];

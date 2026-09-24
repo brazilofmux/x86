@@ -1,0 +1,7 @@
+EFLAGS.AC: fixed (386)
+EFLAGS.ID: fixed (no CPUID)
+bswap 12345678: #UD
+xadd 5,7 -> eax ebx flags: #UD
+cmpxchg eax=5 ebx=5 ecx=9 -> eax ebx flags: #UD
+cmpxchg eax=4 ebx=9 ecx=1 -> eax ebx flags: #UD
+invd: #UD

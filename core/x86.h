@@ -33,6 +33,7 @@
 #define X86_NT   0x4000
 #define X86_RF   0x00010000
 #define X86_VM   0x00020000
+#define X86_AC   0x00040000   /* 486: alignment check (writable; how software tells a 486 from a 386) */
 
 #define X86_ARITH_FLAGS (X86_CF|X86_PF|X86_AF|X86_ZF|X86_SF|X86_OF)
 
@@ -42,6 +43,7 @@ enum {
     X86_MODEL_186  = 186,
     X86_MODEL_286  = 286,
     X86_MODEL_386  = 386,
+    X86_MODEL_486  = 486,    /* no FPU (a 486SX's view), no CPUID: EFLAGS.ID stays 0 */
 };
 
 /* Register indexes (encoding order) */
@@ -250,6 +252,9 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
  * and a user write R/W in both; the supervisor writes anywhere, CR0.WP
  * being a 486 thing — and raises #PF. */
 #define X86_CR0_PG  0x80000000u
+#define X86_CR0_ET  0x00000010u   /* 486: reads as 1 */
+#define X86_CR0_WP  0x00010000u   /* 486: supervisor writes honour read-only pages */
+#define X86_CR0_AM  0x00040000u   /* 486: EFLAGS.AC checks alignment at CPL 3 */
 #define X86_TLB_V   0x001u
 #define X86_TLB_U   0x002u
 #define X86_TLB_UW  0x004u
