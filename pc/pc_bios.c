@@ -269,9 +269,11 @@ static void bios_int15(x86_cpu *c, int vector) {
     case 0x4F:                                   /* keyboard intercept: keep the key */
         c->eflags |= X86_CF;
         break;
-    case 0xC0:                                   /* system configuration: none */
-        x86_set_r8(c, R_AH, 0x80);
-        c->eflags |= X86_CF;
+    case 0xC0:                                   /* the system configuration table (POST wrote it) */
+        x86_load_seg(c, S_ES, PC_HLE_SEG);
+        x86_set_r16(c, R_BX, PC_SYSCONF_OFF);
+        x86_set_r8(c, R_AH, 0);
+        c->eflags &= ~X86_CF;
         break;
     case 0x24:                                   /* A20 gate */
         switch (x86_get_r8(c, R_AL)) {
@@ -412,6 +414,7 @@ int pc_poll(x86_cpu *c) {
     uint64_t now = pc_now_ns();
     pc.now_ns = now;
     if (now >= pc.rtc_next_ns) pc_rtc_poll(now);        /* the RTC's next interrupt is due (IRQ 8) */
+    if (c->insn_count >= pc.ide_due) pc_ide_poll(0);     /* the IDE drive has the next block, or is done */
     int deliverable = pc.irq_pending && (c->eflags & X86_IF) && !c->int_inhibit;
     if (!deliverable && !c->halted && now < pc.next_slow_ns) return 0;
 
@@ -466,6 +469,7 @@ int pc_poll(x86_cpu *c) {
         pc.irq_pending |= 1 << 8;
     }
 
+    if (c->halted && pc.ide_due != UINT64_MAX) pc_ide_poll(1);   /* halted waiting for the disk: no instructions will pass */
     while (c->halted && (c->eflags & X86_IF) && !pc.irq_pending) {
         /* HLT with interrupts on: the guest is idling for the next tick —
          * or for the RTC, if its interrupt comes first (and until one of
@@ -560,7 +564,14 @@ static void a20_set(x86_cpu *c, int on) {
 }
 static uint8_t a20_out_port(const x86_cpu *c) { return (uint8_t)(0xCD | (c->a20_mask != 0xFFFFFu ? 2 : 0)); }   /* 8042 output port: A20 in bit 1, bit 0 = no reset */
 
+static uint32_t port_read_(x86_cpu *c, uint16_t port, int size);
 static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
+    uint32_t v = port_read_(c, port, size);
+    if (pc.debug > 1 && (port == 0x20 || port == 0x21 || port == 0xA0 || port == 0xA1))
+        fprintf(stderr, "[pic] in %02X -> %02X (isr %02X/%02X irr2 %02X) @%llu\n", port, v & 0xFF, pc.irq_in_service & 0xFF, pic2.isr, pic2.irr, (unsigned long long)c->insn_count);
+    return v;
+}
+static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
     (void)size;
     uint32_t vv;
     if (pc_ide_port_read(port, size, &vv)) return vv;
@@ -606,10 +617,14 @@ static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
         pc_vga_status_read();
         return t;
     }
-    default: return 0xFF;
+    default:
+        if (pc.debug) fprintf(stderr, "[port] in %03X: nothing there @%04X:%08X\n", port, c->seg[S_CS].sel, c->eip);
+        return 0xFF;
     }
 }
 static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
+    if (pc.debug > 1 && (port == 0x20 || port == 0x21 || port == 0xA0 || port == 0xA1))
+        fprintf(stderr, "[pic] out %02X <- %02X (isr %02X/%02X) @%llu\n", port, val & 0xFF, pc.irq_in_service & 0xFF, pic2.isr, (unsigned long long)c->insn_count);
     if (pc_ide_port_write(port, val, size)) return;
     if (pc_vga_port_write(port, val, size)) return;
     if (pc_cmos_port_write(port, val)) return;
@@ -734,7 +749,9 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         a20_set(c, (val >> 1) & 1);
         if (val & 1) pc_request_reset(c, "port 92h fast reset");
         break;
-    default: break;
+    default:
+        if (pc.debug) fprintf(stderr, "[port] out %03X <- %02X: nothing there @%04X:%08X\n", port, val & 0xFF, c->seg[S_CS].sel, c->eip);
+        break;
     }
 }
 
@@ -810,6 +827,12 @@ static void post(x86_cpu *cpu) {
     static const char date[] = "01/01/92";
     for (int i = 0; i < 8; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(0xFFF5 + i), (uint8_t)date[i]);
     pc_wr8(cpu, PC_HLE_SEG, 0xFFFE, 0xFC);       /* model: AT */
+    /* INT 15h AH=C0h's table, an AT's: 8 bytes follow; model FCh, submodel
+     * 01h, revision 0; feature byte 1: a second 8259 (bit 6), a real-time
+     * clock (5), INT 9 calling INT 15h AH=4Fh (4) — ISA, not Micro
+     * Channel, no extended BIOS data area; the other feature bytes 0 */
+    static const uint8_t sysconf[10] = { 8, 0, 0xFC, 0x01, 0x00, 0x70, 0, 0, 0, 0 };
+    for (int i = 0; i < 10; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(PC_SYSCONF_OFF + i), sysconf[i]);
 
     /* BIOS data area */
     for (int i = 0; i < 0x100; i++) pc_wr8(cpu, PC_BDA_SEG, (uint16_t)i, 0);

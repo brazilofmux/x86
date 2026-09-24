@@ -10,6 +10,7 @@
 
 #include "x86.h"
 #include "x86_decode.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* parity_even[b] = 1 if b has an even number of set bits (PF semantics) */
@@ -417,6 +418,93 @@ static uint16_t tss_stack(x86_cpu *c, int newcpl, uint32_t *sp) {
     return ss;
 }
 
+/* A task switch, the 386's (a 32-bit TSS; a 286 one is #GP), for JMP
+ * or CALL to a TSS or a task gate, an interrupt through a task gate
+ * (NT's double fault and NMI), or IRET with NT set. The outgoing state
+ * goes into the current TSS (EIP, EFLAGS — NT cleared leaving by JMP or
+ * IRET — the eight registers, the six selectors); busy bits as the SDM
+ * has them (the old task's cleared for JMP and IRET, the new one's set
+ * but for IRET); for CALL and interrupts the new TSS's back link and NT;
+ * then TR, CR3 (TLB flushed), the LDT, EFLAGS, EIP, the registers and
+ * the segments — CS first, which says the new CPL, the rest checked
+ * against it, or real-mode style for a V86 task — CR0.TS, and an error
+ * code, if the interrupt has one, on the new task's stack. */
+enum { TS_JMP, TS_CALL, TS_INT, TS_IRET };
+static void task_switch(x86_cpu *c, uint16_t nsel, int reason, int has_err, uint32_t err) {
+    uint32_t lo, hi;
+    int bad_vec = reason == TS_IRET ? X86_EXC_TS : X86_EXC_GP;
+    if ((nsel & 4) || (nsel & 0xFFFC) == 0) x86_fault(c, bad_vec, nsel & 0xFFFC);   /* the GDT only */
+    if (!x86_read_desc(c, nsel, &lo, &hi)) x86_fault(c, bad_vec, nsel & 0xFFFC);
+    uint16_t attr = (uint16_t)(((hi >> 8) & 0xFF) | (((hi >> 20) & 0x0F) << 8));
+    int type = X86_AR_TYPE(attr);
+    if (X86_AR_S(attr) || (reason == TS_IRET ? type != 0x0B : type != 0x09))
+        x86_fault(c, bad_vec, nsel & 0xFFFC);                  /* a 386 TSS, busy only to return to */
+    if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, nsel & 0xFFFC);
+    x86_seg nt;
+    x86_unpack_desc(&nt, nsel, lo, hi);
+    if (nt.limit < 0x67) x86_fault(c, X86_EXC_TS, nsel & 0xFFFC);
+
+    /* the outgoing task */
+    uint32_t ob = c->tr.base;
+    uint32_t oflags = c->eflags;
+    if (reason == TS_JMP || reason == TS_IRET) oflags &= ~(uint32_t)X86_NT;
+    x86_sup_wr(c, ob, 0x20, 4, c->eip);
+    x86_sup_wr(c, ob, 0x24, 4, oflags);
+    for (int i = 0; i < 8; i++) x86_sup_wr(c, ob, 0x28 + 4 * (uint32_t)i, 4, c->r[i]);
+    for (int i = 0; i < 6; i++) x86_sup_wr(c, ob, 0x48 + 4 * (uint32_t)i, 2, c->seg[i].sel);
+    if (reason == TS_JMP || reason == TS_IRET) {
+        uint32_t ohi = x86_sup_rd(c, c->gdtr.base, (c->tr.sel & 0xFFF8) + 4, 4);
+        x86_sup_wr(c, c->gdtr.base, (c->tr.sel & 0xFFF8) + 4, 4, ohi & ~0x0200u);
+    }
+    if (reason != TS_IRET) x86_sup_wr(c, c->gdtr.base, (nsel & 0xFFF8) + 4, 4, hi | 0x0200u);
+    if (reason == TS_CALL || reason == TS_INT) x86_sup_wr(c, nt.base, 0, 2, c->tr.sel);
+
+    /* the incoming one */
+    uint32_t nb = nt.base;
+    uint32_t cr3 = x86_sup_rd(c, nb, 0x1C, 4);
+    uint32_t neip = x86_sup_rd(c, nb, 0x20, 4);
+    uint32_t nfl = x86_sup_rd(c, nb, 0x24, 4);
+    uint32_t nr[8];
+    for (int i = 0; i < 8; i++) nr[i] = x86_sup_rd(c, nb, 0x28 + 4 * (uint32_t)i, 4);
+    uint16_t nseg[6];
+    for (int i = 0; i < 6; i++) nseg[i] = (uint16_t)x86_sup_rd(c, nb, 0x48 + 4 * (uint32_t)i, 2);
+    uint16_t nldt = (uint16_t)x86_sup_rd(c, nb, 0x60, 2);
+    if (c->trace_task) c->trace_task(c, c->tr.sel, nsel, reason);
+
+    nt.attr = (uint16_t)(nt.attr | 0x02);                    /* busy, as the descriptor now says */
+    c->tr = nt;
+    if (c->cr0 & X86_CR0_PG) { c->cr3 = cr3; x86_tlb_flush(c); }
+    if (reason == TS_CALL || reason == TS_INT) nfl |= X86_NT;
+    c->eflags = x86_flags_fixup(c, nfl);
+    c->eip = neip;
+    for (int i = 0; i < 8; i++) c->r[i] = nr[i];
+    c->cr0 |= X86_CR0_TS;
+
+    /* the LDT, then the segments in the new task's own right */
+    if ((nldt & 0xFFFC) == 0) { memset(&c->ldtr, 0, sizeof c->ldtr); }
+    else {
+        uint32_t llo = 0, lhi = 0;
+        if ((nldt & 4) || !x86_read_desc(c, nldt, &llo, &lhi)) x86_fault(c, X86_EXC_TS, nldt & 0xFFFC);
+        uint16_t lattr = (uint16_t)(((lhi >> 8) & 0xFF) | (((lhi >> 20) & 0x0F) << 8));
+        if (X86_AR_S(lattr) || X86_AR_TYPE(lattr) != 0x2) x86_fault(c, X86_EXC_TS, nldt & 0xFFFC);
+        x86_unpack_desc(&c->ldtr, nldt, llo, lhi);
+    }
+    if (c->eflags & X86_VM) {
+        for (int i = 0; i < 6; i++) x86_load_seg(c, i, nseg[i]);
+    } else {
+        uint16_t cs = nseg[S_CS];
+        uint32_t clo = 0, chi = 0;
+        if ((cs & 0xFFFC) == 0 || !x86_read_desc(c, cs, &clo, &chi)) x86_fault(c, X86_EXC_TS, cs & 0xFFFC);
+        uint16_t cattr = (uint16_t)(((chi >> 8) & 0xFF) | (((chi >> 20) & 0x0F) << 8));
+        if (!X86_AR_S(cattr) || !(X86_AR_TYPE(cattr) & X86_TYPE_CODE)) x86_fault(c, X86_EXC_TS, cs & 0xFFFC);
+        if (!X86_AR_P(cattr)) x86_fault(c, X86_EXC_NP, cs & 0xFFFC);
+        x86_unpack_desc(&c->seg[S_CS], cs, clo, chi);
+        static const int order[5] = { S_SS, S_DS, S_ES, S_FS, S_GS };
+        for (int k = 0; k < 5; k++) x86_load_seg(c, order[k], nseg[order[k]]);
+    }
+    if (has_err) push(c, 4, err);
+}
+
 /* Protected-mode interrupt and exception delivery through the IDT. */
 static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     int from_v86 = (c->eflags & X86_VM) != 0;
@@ -427,6 +515,12 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
     uint16_t gattr = (uint16_t)((hi >> 8) & 0xFF);
     int type = gattr & 0x1F;
     int gate32 = (type & 0x08) != 0;
+    if (type == 0x05) {                                   /* a task gate: another task takes it */
+        if (is_sw && ((gattr >> 5) & 3) < x86_cpl(c)) x86_fault(c, X86_EXC_GP, (off | 2));
+        if (!(gattr & 0x80)) x86_fault(c, X86_EXC_NP, (off | 2));
+        task_switch(c, (uint16_t)(lo >> 16), TS_INT, !is_sw && vec_has_err(vector), err);
+        return;
+    }
     /* The 386's order: the gate's type, then a software INT's privilege,
      * and only then the present bit. An all-zero gate is #GP, not #NP —
      * EMM386 leaves some vectors so and reflects the #GP an INT n from V86
@@ -537,7 +631,15 @@ static void far_transfer_pm(x86_cpu *c, uint16_t sel, uint32_t off, int is_call,
         return;
     }
 
-    /* A system descriptor: the only kind we follow is a call gate. */
+    /* A TSS or a task gate: a task switch. The descriptor's DPL must admit
+     * both CPL and the selector's RPL. */
+    if (type == 0x09 || type == 0x05) {
+        if (X86_AR_DPL(attr) < cpl || X86_AR_DPL(attr) < rpl) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
+        if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
+        task_switch(c, type == 0x05 ? (uint16_t)(lo >> 16) : sel, is_call ? TS_CALL : TS_JMP, 0, 0);
+        return;
+    }
+    /* Otherwise the only system descriptor we follow is a call gate. */
     if (type != 0x0C && type != 0x04) x86_fault(c, X86_EXC_GP, sel & 0xFFFC);
     int gate32 = type == 0x0C;
     if (!X86_AR_P(attr)) x86_fault(c, X86_EXC_NP, sel & 0xFFFC);
@@ -629,6 +731,28 @@ void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
             }
             c->fault_armed = 0;
             c->pg_super = 0;
+            {   /* X86_TRACE_DF: every escalation, what was being delivered and what faulted */
+                static int trace = -1;
+                if (trace < 0) trace = getenv("X86_TRACE_DF") != NULL;
+                if (trace)
+                    fprintf(stderr, "[fault] delivering #%02X (err %X): #%02X err %X at %04X:%08X ss:esp %04X:%08X cr2 %08X cr3 %08X%s @%llu\n",
+                            vec, (unsigned)err, c->exc, (unsigned)c->exc_err, c->seg[S_CS].sel, c->eip,
+                            c->seg[S_SS].sel, c->r[R_SP], c->cr2, c->cr3, depth == 2 ? " — triple fault" : "",
+                            (unsigned long long)c->insn_count);
+                if (trace && depth == 0) {       /* the stack above ESP: return addresses tell the story */
+                    uint8_t sp8 = c->pg_probe; c->pg_probe = 1;
+                    for (int row = 0; row < 32; row++) {
+                        fprintf(stderr, "  %08X:", c->r[R_SP] + 64u + 32u * (uint32_t)row);
+                        for (int k = 0; k < 8; k++) {
+                            uint32_t a = c->seg[S_SS].base + c->r[R_SP] + 64u + 32u * (uint32_t)row + 4u * (uint32_t)k, v = 0;
+                            for (int b = 0; b < 4; b++) v |= (uint32_t)x86_phys_rd8(c, a + (uint32_t)b) << (8 * b);
+                            fprintf(stderr, " %08X", v);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    c->pg_probe = sp8;
+                }
+            }
             if (depth == 2) { c->exc = -1; c->halted = 1; return; }   /* triple fault */
             vec = depth == 1 ? X86_EXC_DF : c->exc;
             err = depth == 1 ? 0 : c->exc_err;
@@ -1427,6 +1551,10 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             load_seg(c, S_CS, b);
             set_ip(c, a, in->opsize);
             c->eflags = x86_flags_fixup(c, (c->eflags & ~m) | (f & m));
+            break;
+        }
+        if (c->pmode && (c->eflags & X86_NT)) {       /* a nested task's return: to its back link */
+            task_switch(c, (uint16_t)x86_sup_rd(c, c->tr.base, 0, 2), TS_IRET, 0, 0);
             break;
         }
         if (c->pmode && in->opsize == 4 && x86_cpl(c) == 0 && (peek(c, 8, 4) & X86_VM)) {

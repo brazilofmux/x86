@@ -210,6 +210,11 @@ typedef struct x86_cpu {
 
     /* The coprocessor (core/x86_fpu.c): a 387 beside a 386, a 486DX's
      * own. Without one, ESC opcodes only perform their bus cycle. */
+    void   (*trace_task)(struct x86_cpu *, uint16_t from, uint16_t to, int reason);   /* NULL, or a debugging hook */
+    /* A device's next event is due at this instruction count (the IDE
+     * drive done with a block): translated code runs no further than
+     * that before the run loop polls. 0 or past: no limit. */
+    uint64_t next_event;
     uint8_t  has_fpu;
     x86_fpu  fpu;
     /* FERR#: an unmasked x87 exception with CR0.NE clear; the machine

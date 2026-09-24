@@ -7,11 +7,19 @@
  * block in multiple mode). The disks are the images INT 13h serves
  * (pc_disk.c maps them once), so the two paths never disagree.
  *
- * The drive is an instant one: a command completes before the OUT that
- * issued it returns, so BSY is never seen, DRQ is up when there is data
- * to move, and INTRQ rises as the ATA standard has it — for a read when
- * each sector (or block) is ready, for a write when each has been taken
- * and when the command completes, for non-data commands at completion.
+ * The drive takes its time over the data, as a disk does: after a read
+ * command, and after each block moved either way, it is busy (BSY) for
+ * IDE_BUSY_INSNS guest instructions before the next block is ready or
+ * the command is done — then DRQ, and INTRQ as the ATA standard has it
+ * (for a read when each sector or block is ready, for a write when each
+ * has been taken and when the command completes). An instant drive
+ * raised the next interrupt inside the handler that moved the data, and
+ * NT's HAL, deferring an interrupt at its own level and replaying it as
+ * a nested call when the level drops, stacked one replay per sector
+ * until the kernel stack ran out. Counted in instructions, not time, so
+ * the interpreter, the translator and -V see the same thing; a halted
+ * CPU (waiting for the interrupt) has it at once. Non-data commands
+ * still complete at once.
  * Reading the status register drops INTRQ (the alternate status at 3F6h
  * does not), as does issuing the next command; nIEN in the device
  * control register keeps it off the bus. IRQ 14 is its rising edge.
@@ -60,7 +68,10 @@ static struct {
     int pos, len;                    /* bytes moved / in the block */
     int intrq;
     int target;                      /* the drive the transfer is for */
+    int busy;                        /* 0, or what becomes ready at pc.ide_due: 1 the next block, 2 the command done */
 } ide;
+
+#define IDE_BUSY_INSNS 10000u
 
 static int sel(void) { return (ide.devhead >> 4) & 1; }
 static drive *cur(void) { return ide.present[sel()] ? &ide.d[sel()] : NULL; }
@@ -152,6 +163,25 @@ static void identify(const drive *d, int unit) {
 
 /* ---- data --------------------------------------------------------------- */
 
+/* The drive at work: BSY until IDE_BUSY_INSNS instructions from now, then
+ * (pc_ide_poll) the next block ready — DRQ — or the command done, with
+ * INTRQ either way. */
+static void busy(int what) {
+    ide.busy = what;
+    ide.status = ST_BSY | ST_DSC;
+    pc.ide_due = (pc.cpu ? pc.cpu->insn_count : 0) + IDE_BUSY_INSNS;
+    if (pc.cpu) pc.cpu->next_event = pc.ide_due;
+}
+void pc_ide_poll(int now) {
+    if (!ide.busy) { pc.ide_due = UINT64_MAX; return; }
+    if (!now && pc.cpu && pc.cpu->insn_count < pc.ide_due) return;
+    int what = ide.busy;
+    ide.busy = 0;
+    pc.ide_due = UINT64_MAX;
+    if (what == 1) { ide.status = ST_DRDY | ST_DSC | ST_DRQ; irq(); }
+    else done(ST_DRDY | ST_DSC, 0);
+}
+
 /* the next block of a read into the buffer, DRQ up, INTRQ */
 static void read_block(void) {
     drive *d = &ide.d[ide.target];
@@ -163,9 +193,8 @@ static void read_block(void) {
     }
     for (int k = 0; k < n; k++) memcpy(ide.buf + 512 * k, sector_at(d, ide.lba + (uint32_t)k), 512);
     ide.pos = 0; ide.len = n * 512;
-    ide.status = ST_DRDY | ST_DSC | ST_DRQ;
     ide.error = 0;
-    irq();
+    busy(1);                                     /* ready, and interrupting, once the drive has it */
 }
 /* a block the host has written: to the image; the next block, or done */
 static void write_block(void) {
@@ -174,12 +203,11 @@ static void write_block(void) {
     for (int k = 0; k < n; k++) memcpy(sector_at(d, ide.lba + (uint32_t)k), ide.buf + 512 * k, 512);
     ide.lba += (uint32_t)n; ide.left -= n;
     taskfile_set(d, ide.lba - 1);
-    if (ide.left <= 0) { ide.count = 0; done(ST_DRDY | ST_DSC, 0); return; }
+    if (ide.left <= 0) { ide.count = 0; busy(2); return; }
     ide.count = (uint8_t)ide.left;
     int m = ide.left < ide.block ? ide.left : ide.block;
     ide.pos = 0; ide.len = m * 512;
-    ide.status = ST_DRDY | ST_DSC | ST_DRQ;
-    irq();
+    busy(1);
 }
 static void begin(int write, int multiple) {
     drive *d = cur();
@@ -230,6 +258,7 @@ static void data_write(uint32_t v, int size) {
 /* ---- commands ----------------------------------------------------------- */
 
 static void reset_signature(void) {
+    ide.busy = 0; pc.ide_due = UINT64_MAX;
     ide.error = 0x01;                            /* diagnostics passed */
     ide.count = 1; ide.sector = 1; ide.cyl_lo = 0; ide.cyl_hi = 0;   /* an ATA device */
     ide.devhead &= 0x10;
@@ -239,6 +268,7 @@ static void reset_signature(void) {
 
 static void command(uint8_t c) {
     ide.intrq = 0;
+    ide.busy = 0; pc.ide_due = UINT64_MAX;       /* a new command ends whatever was pending */
     if (pc.debug) fprintf(stderr, "[ide] drive %d command %02X count %02X lba/chs %02X %02X %02X dh %02X\n",
                               sel(), c, ide.count, ide.sector, ide.cyl_lo, ide.cyl_hi, ide.devhead);
     drive *d = cur();

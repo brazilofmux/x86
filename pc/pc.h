@@ -43,6 +43,7 @@ enum { HLE_RET_FLAGS, HLE_RET_IRET };
 #define PC_FONT14_OFF   0xD000
 #define PC_FONT8_OFF    0xE000
 #define PC_FONT8_AT_OFF 0xFA6E
+#define PC_SYSCONF_OFF  0xE820     /* INT 15h AH=C0h's system configuration table */
 extern const uint8_t pc_font8[256 * 8], pc_font14[256 * 14], pc_font16[256 * 16];
 #define PC_HLE_DUMMY_IRET 0xFF53   /* where every unserved vector points, as on an AT (traps as vector 53h) */
 #define PC_HLE_DPMI_ENTRY 0x00FD   /* offset in the HLE segment; the trap vector is eip & FFh */
@@ -92,7 +93,8 @@ typedef struct pc_state {
     int      irq_in_service;         /* 8259 ISR: bits set from delivery until EOI */
     uint64_t irq_service_ns;         /* when the in-service IRQ was delivered (stuck-handler guard) */
     uint8_t  aux_full, aux_out;      /* 8042: a byte from the auxiliary device (the PS/2 mouse) in the output buffer */
-    uint64_t rtc_next_ns;            /* when the RTC next has an interrupt to raise (pc_rtc_poll); ~0 for never */
+    uint64_t rtc_next_ns;
+    uint64_t ide_due;                /* the IDE drive is busy until this instruction count (UINT64_MAX: idle) */            /* when the RTC next has an interrupt to raise (pc_rtc_poll); ~0 for never */
 
     /* Services by vector; NULL = plain IRET stub. */
     pc_service_fn service[256];
@@ -222,6 +224,7 @@ uint8_t *pc_disk_hd(int unit, size_t *size, int *cyls, int *heads, int *spt);   
 void pc_ide_post(x86_cpu *c);
 int  pc_ide_port_read(uint16_t port, int size, uint32_t *val);
 int  pc_ide_port_write(uint16_t port, uint32_t val, int size);
+void pc_ide_poll(int now);               /* the drive's busy time over (NOW: at once, the CPU is waiting) */
 int  pc_disk_floppy_type(int drive);                              /* CMOS type 1-5, 0 none */
 /* pc_cmos.c */
 void pc_cmos_init(x86_cpu *c);                                    /* after the disks: POST's configuration */

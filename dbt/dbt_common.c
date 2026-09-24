@@ -438,6 +438,17 @@ static void shadow_resync(x86_dbt *dbt) {
 
 typedef void (*trampoline_fn)(x86_cpu *cpu, uint8_t *mem, void *block, void *aux, uint64_t budget);
 
+/* The instructions translated code may run before coming back: the
+ * quantum, or less if a device's event (cpu->next_event) comes sooner —
+ * so the drive's interrupt is taken when the drive has it, not a quantum
+ * later. */
+static uint64_t run_budget(const x86_dbt *dbt) {
+    const x86_cpu *c = dbt->cpu;
+    uint64_t q = dbt->quantum;
+    if (c->next_event > c->insn_count && c->next_event - c->insn_count < q) q = c->next_event - c->insn_count;
+    return q;
+}
+
 int dbt_run(x86_dbt *dbt) {
     x86_cpu *cpu = dbt->cpu;
     trampoline_fn trampoline = (trampoline_fn)(void *)dbt->code_buf;
@@ -511,7 +522,7 @@ int dbt_run(x86_dbt *dbt) {
 
                 dbt->jit_block_entries++;
                 dev_log_arm(dbt);
-                trampoline(cpu, cpu->mem, code, dbt->aux, dbt->quantum);
+                trampoline(cpu, cpu->mem, code, dbt->aux, run_budget(dbt));
                 poll_countdown = 0;
                 if (cpu->exc >= 0) x86_deliver_exception(cpu);
                 uint64_t jit_insns = cpu->insn_count - insns_before;
@@ -556,7 +567,7 @@ int dbt_run(x86_dbt *dbt) {
                 continue;
             }
             dbt->jit_block_entries++;
-            trampoline(cpu, cpu->mem, code, dbt->aux, dbt->quantum);
+            trampoline(cpu, cpu->mem, code, dbt->aux, run_budget(dbt));
             poll_countdown = 0;
             if (cpu->exc >= 0) x86_deliver_exception(cpu);
             continue;

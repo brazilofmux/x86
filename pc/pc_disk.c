@@ -34,8 +34,8 @@
 #include "pc_diskbios.h"
 
 #define DPT_OFF   0xEFC7                     /* diskette parameter table, as on the AT */
-#define FDPT_OFF0 0xE3C0                     /* fixed-disk parameter tables (INT 41h, 46h) */
-#define FDPT_OFF1 0xE3D0
+#define FDPT_OFF0 0xE800                     /* fixed-disk parameter tables (INT 41h, 46h), clear of the */
+#define FDPT_OFF1 0xE810                     /* 8x8 font at E000-E7FF (at E3C0 they overwrote its "x" to "z") */
 
 typedef struct {
     uint8_t *data;
