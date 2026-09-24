@@ -6,7 +6,7 @@
 ; instruction, with the exception in the status word; with interrupts
 ; off it waits for STI (and then comes soon: how soon after STI is the
 ; translator's block boundary, so this waits for it); and the slave's
-; mask reads as POST left it.
+; mask reads as POST left it (IRQs 8 and 13 open).
 ;
 ;   nasm -f bin -o irq13.com irq13.asm
         cpu 486
@@ -24,7 +24,7 @@ start:
         mov [es:2*4+2], cs
         sti
 
-        in al, 0xA1                     ; slave mask: everything but IRQ 13
+        in al, 0xA1                     ; slave mask: all but IRQ 8 (the RTC) and IRQ 13
         mov dx, s_mask
         call puts
         call hex8

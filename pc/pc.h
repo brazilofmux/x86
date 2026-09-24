@@ -91,6 +91,7 @@ typedef struct pc_state {
     int      irq_pending;            /* bitmask: 1<<8 timer, 1<<9 keyboard */
     int      irq_in_service;         /* 8259 ISR: bits set from delivery until EOI */
     uint64_t irq_service_ns;         /* when the in-service IRQ was delivered (stuck-handler guard) */
+    uint64_t rtc_next_ns;            /* when the RTC next has an interrupt to raise (pc_rtc_poll); ~0 for never */
 
     /* Services by vector; NULL = plain IRET stub. */
     pc_service_fn service[256];
@@ -124,6 +125,17 @@ void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
 uint64_t pc_now_ns(void);
 uint64_t pc_wall_ns(void);            /* the host's clock, whatever pc_now_ns is */
+
+/* pc_cmos.c: the real-time clock */
+void pc_rtc_poll(uint64_t now);           /* run it to NOW: its flags, and IRQ 8 */
+void pc_rtc_get(int *h, int *m, int *sec, int *year, int *mon, int *mday);
+void pc_rtc_set_time(int h, int m, int sec);
+void pc_rtc_set_date(int year, int mon, int mday);
+void pc_rtc_pie(int on);                  /* the periodic interrupt (INT 15h AH=83h) */
+void pc_rtc_alarm(int on, uint8_t h, uint8_t m, uint8_t sec);   /* INT 1Ah AH=06h/07h, BCD */
+int  pc_rtc_alarm_on(void);
+#define PC_TRAP_RTC     0xF4       /* F000:00F4: INT 70h's bookkeeping (INT 15h AH=83h's wait), register C in AL */
+#define PC_STUB_INT70   0x0030     /* IRQ 8: read register C, the host's bookkeeping, EOIs, INT 4Ah on an alarm */
 
 /* Segment:offset helpers on guest memory (real mode, A20 respected). */
 static inline uint32_t pc_lin(uint16_t seg, uint16_t off) { return ((uint32_t)seg << 4) + off; }

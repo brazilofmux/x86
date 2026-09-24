@@ -27,6 +27,11 @@ done
 for mode in -i -j -V; do
     check "unreal $mode"    tests/dos/unreal.out  $DM -m 386 $mode -L 1000000 tests/dos/unreal.com
 done
+# the real-time clock: registers, UIP, the periodic, update and alarm
+# interrupts on IRQ 8, INT 15h AH=83h, setting the time
+for mode in -i -j -V; do
+    check "rtc $mode" tests/dos/rtc.out $DM -m 386 $mode tests/dos/rtc.com
+done
 # IRQ 13: an unmasked x87 exception through FERR#, the slave 8259 and the
 # BIOS's INT 75h to the program's INT 2
 for mode in -i -j -V; do

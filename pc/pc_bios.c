@@ -196,6 +196,8 @@ static void bios_int8(x86_cpu *c, int vector) {
     pc.returned = 1;
 }
 
+static void pic2_unmask(int n);                  /* (the slave 8259, below) */
+
 static void bios_int1a(x86_cpu *c, int vector) {
     (void)vector;
     switch (x86_get_r8(c, R_AH)) {
@@ -210,21 +212,38 @@ static void bios_int1a(x86_cpu *c, int vector) {
         pc_wr16(c, PC_BDA_SEG, 0x6C, x86_get_r16(c, R_DX));
         pc_wr16(c, PC_BDA_SEG, 0x6E, x86_get_r16(c, R_CX));
         break;
-    case 0x02: case 0x04: {
-        time_t now = time(NULL);
-        struct tm tm; localtime_r(&now, &tm);
+    case 0x02: case 0x04: {                      /* the RTC's time, date (BCD) */
+        int h, m, sec, y, mon, d;
+        pc_rtc_get(&h, &m, &sec, &y, &mon, &d);
         #define BCD(v) ((uint8_t)((((v) / 10) << 4) | ((v) % 10)))
         if (x86_get_r8(c, R_AH) == 0x02) {
-            x86_set_r8(c, R_CH, BCD(tm.tm_hour)); x86_set_r8(c, R_CL, BCD(tm.tm_min));
-            x86_set_r8(c, R_DH, BCD(tm.tm_sec)); x86_set_r8(c, R_DL, 0);
+            x86_set_r8(c, R_CH, BCD(h)); x86_set_r8(c, R_CL, BCD(m));
+            x86_set_r8(c, R_DH, BCD(sec)); x86_set_r8(c, R_DL, 0);
         } else {
-            int y = tm.tm_year + 1900;
             x86_set_r8(c, R_CH, BCD(y / 100)); x86_set_r8(c, R_CL, BCD(y % 100));
-            x86_set_r8(c, R_DH, BCD(tm.tm_mon + 1)); x86_set_r8(c, R_DL, BCD(tm.tm_mday));
+            x86_set_r8(c, R_DH, BCD(mon)); x86_set_r8(c, R_DL, BCD(d));
         }
         c->eflags &= ~X86_CF;
         break;
     }
+    case 0x03: case 0x05: {                      /* set them */
+        #define UNBCD(v) ((((v) >> 4) & 15) * 10 + ((v) & 15))
+        uint8_t ch = x86_get_r8(c, R_CH), cl = x86_get_r8(c, R_CL), dh = x86_get_r8(c, R_DH), dl = x86_get_r8(c, R_DL);
+        if (x86_get_r8(c, R_AH) == 0x03) pc_rtc_set_time(UNBCD(ch), UNBCD(cl), UNBCD(dh));
+        else pc_rtc_set_date(UNBCD(ch) * 100 + UNBCD(cl), UNBCD(dh), UNBCD(dl));
+        c->eflags &= ~X86_CF;
+        break;
+    }
+    case 0x06:                                   /* set the alarm (CH:CL:DH, BCD); one at a time */
+        if (pc_rtc_alarm_on()) { c->eflags |= X86_CF; break; }
+        pc_rtc_alarm(1, x86_get_r8(c, R_CH), x86_get_r8(c, R_CL), x86_get_r8(c, R_DH));
+        pic2_unmask(0);
+        c->eflags &= ~X86_CF;
+        break;
+    case 0x07:                                   /* reset it */
+        pc_rtc_alarm(0, 0, 0, 0);
+        c->eflags &= ~X86_CF;
+        break;
     default:
         c->eflags |= X86_CF;
         break;
@@ -262,6 +281,23 @@ static void bios_int15(x86_cpu *c, int vector) {
         default: x86_set_r8(c, R_AH, 0x86); c->eflags |= X86_CF; break;
         }
         break;
+    case 0x83:                                   /* event wait: set a flag byte after CX:DX us, by the RTC */
+        if (x86_get_r8(c, R_AL) == 0x00) {
+            if (pc_rd8(c, PC_BDA_SEG, 0xA0) & 1) { c->eflags |= X86_CF; break; }   /* one at a time */
+            pc_wr16(c, PC_BDA_SEG, 0x98, x86_get_r16(c, R_BX));
+            pc_wr16(c, PC_BDA_SEG, 0x9A, c->seg[S_ES].sel);
+            pc_wr16(c, PC_BDA_SEG, 0x9C, x86_get_r16(c, R_DX));
+            pc_wr16(c, PC_BDA_SEG, 0x9E, x86_get_r16(c, R_CX));
+            pc_wr8(c, PC_BDA_SEG, 0xA0, 1);
+            pic2_unmask(0);
+            pc_rtc_pie(1);
+            c->eflags &= ~X86_CF;
+        } else if (x86_get_r8(c, R_AL) == 0x01) {
+            pc_wr8(c, PC_BDA_SEG, 0xA0, 0);
+            pc_rtc_pie(0);
+            c->eflags &= ~X86_CF;
+        } else { x86_set_r8(c, R_AH, 0x86); c->eflags |= X86_CF; }
+        break;
     case 0x86: {                                 /* wait CX:DX microseconds */
         uint32_t us = ((uint32_t)x86_get_r16(c, R_CX) << 16) | x86_get_r16(c, R_DX);
         if (us) { uint64_t w0 = pc_wall_ns(); usleep(us); pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++; }
@@ -292,9 +328,32 @@ static struct { uint8_t mask, base, icw_step, need_icw4, single, read_isr; } pic
  * source so far is IRQ 13, the coprocessor's FERR#. */
 static struct { uint8_t mask, base, icw_step, need_icw4, read_isr, irr, isr; } pic2 = { 0xFF, 0x70, 0, 0, 0, 0, 0 };
 
+/* (unmasked requests only: a masked one must not keep a halted machine
+ * from sleeping until something it can take) */
 static void pic2_summary(void) {
-    if (pic2.irr) pc.irq_pending |= 1 << 10; else pc.irq_pending &= ~(1 << 10);
+    if (pic2.irr & ~pic2.mask) pc.irq_pending |= 1 << 10; else pc.irq_pending &= ~(1 << 10);
 }
+static void pic2_unmask(int n) { pic2.mask &= (uint8_t)~(1 << n); pic2_summary(); }
+
+/* PC_TRAP_RTC, from INT 70h's native stub with register C in AL: the
+ * wait of INT 15h AH=83h, counted down on the periodic flag in the AT
+ * BIOS's 976 us steps (its 1024 Hz); run out, it sets bit 7 of the
+ * caller's flag byte and stops the periodic interrupt. */
+static void rtc_trap(x86_cpu *c, int vector) {
+    (void)vector;
+    if (!(x86_get_r8(c, R_AL) & 0x40) || !(pc_rd8(c, PC_BDA_SEG, 0xA0) & 1)) return;
+    int32_t left = (int32_t)(pc_rd16(c, PC_BDA_SEG, 0x9C) | ((uint32_t)pc_rd16(c, PC_BDA_SEG, 0x9E) << 16)) - 976;
+    if (left > 0) {
+        pc_wr16(c, PC_BDA_SEG, 0x9C, (uint16_t)left);
+        pc_wr16(c, PC_BDA_SEG, 0x9E, (uint16_t)((uint32_t)left >> 16));
+        return;
+    }
+    uint16_t off = pc_rd16(c, PC_BDA_SEG, 0x98), seg = pc_rd16(c, PC_BDA_SEG, 0x9A);
+    pc_wr8(c, seg, off, (uint8_t)(pc_rd8(c, seg, off) | 0x80));
+    pc_wr8(c, PC_BDA_SEG, 0xA0, 0x80);            /* posted */
+    pc_rtc_pie(0);
+}
+
 void pc_irq_raise(int irq) {
     if (irq < 8 || irq > 15) return;
     pic2.irr |= (uint8_t)(1 << (irq - 8));
@@ -336,6 +395,7 @@ static uint64_t irq0_period_ns(void);
 int pc_poll(x86_cpu *c) {
     uint64_t now = pc_now_ns();
     pc.now_ns = now;
+    if (now >= pc.rtc_next_ns) pc_rtc_poll(now);        /* the RTC's next interrupt is due (IRQ 8) */
     int deliverable = pc.irq_pending && (c->eflags & X86_IF) && !c->int_inhibit;
     if (!deliverable && !c->halted && now < pc.next_slow_ns) return 0;
 
@@ -388,12 +448,17 @@ int pc_poll(x86_cpu *c) {
         pc.irq_pending |= 1 << 8;
     }
 
-    if (c->halted && (c->eflags & X86_IF) && !pc.irq_pending) {
-        /* HLT with interrupts on: the guest is idling for the next tick. */
+    while (c->halted && (c->eflags & X86_IF) && !pc.irq_pending) {
+        /* HLT with interrupts on: the guest is idling for the next tick —
+         * or for the RTC, if its interrupt comes first (and until one of
+         * them has actually raised something). */
         uint64_t next = pc.next_tick_ns;
+        int rtc_first = pc.rtc_next_ns < next;
+        if (rtc_first) next = pc.rtc_next_ns;
         uint64_t hnow = pc_now_ns();
         if (next > hnow) { uint64_t w0 = pc_wall_ns(); usleep((useconds_t)((next - hnow) / 1000 + 1)); pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++; }
-        pc.irq_pending |= 1 << 8;
+        if (rtc_first) pc_rtc_poll(pc_now_ns());
+        else pc.irq_pending |= 1 << 8;
     }
     }
     if (pc.debug > 2) { static int n; if ((n++ & 1023) == 0) fprintf(stderr, "[poll] pending %X isr %X IF %d inhibit %d @%llu\n", pc.irq_pending, pc.irq_in_service, (c->eflags & X86_IF) != 0, c->int_inhibit, (unsigned long long)c->insn_count); }
@@ -569,6 +634,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         else if (pic2.icw_step == 3) pic2.icw_step = pic2.need_icw4 ? 4 : 0;               /* ICW3: its ID */
         else if (pic2.icw_step == 4) pic2.icw_step = 0;                                     /* ICW4 */
         else pic2.mask = (uint8_t)val;
+        pic2_summary();
         break;
     case 0xA0:
         if (val & 0x10) { pic2.icw_step = 2; pic2.need_icw4 = val & 1; pic2.mask = 0; pic2.read_isr = 0; pic2.isr = 0; }
@@ -696,8 +762,20 @@ static void post(x86_cpu *cpu) {
     for (size_t i = 0; i < sizeof int75; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT75 + i), int75[i]);
     pc_wr16(cpu, 0, 0x75 * 4, PC_STUB_INT75);
     pc_wr16(cpu, 0, 0x75 * 4 + 2, PC_STUB_SEG);
-    /* the slave at 70h, everything masked but the coprocessor's IRQ 13 */
-    pic2.mask = cpu->has_fpu ? 0xDF : 0xFF; pic2.base = 0x70; pic2.icw_step = 0; pic2.read_isr = 0;
+    /* INT 70h, IRQ 8, the RTC's: push ax; mov al,0Ch; out 70h,al; in al,71h
+     * (register C, which clears it); pushf; call far F000:PC_TRAP_RTC (the
+     * wait of INT 15h AH=83h, counted on the periodic flag); cli; push ax;
+     * mov al,20h; out A0h,al; out 20h,al; pop ax; test al,20h (the alarm);
+     * jz +2; int 4Ah; pop ax; iret */
+    static const uint8_t int70[] = { 0x50, 0xB0, 0x0C, 0xE6, 0x70, 0xE4, 0x71, 0x9C, 0x9A, PC_TRAP_RTC, 0x00, 0x00, 0xF0,
+                                     0xFA, 0x50, 0xB0, 0x20, 0xE6, 0xA0, 0xE6, 0x20, 0x58, 0xA8, 0x20, 0x74, 0x02,
+                                     0xCD, 0x4A, 0x58, 0xCF };
+    for (size_t i = 0; i < sizeof int70; i++) pc_wr8(cpu, PC_STUB_SEG, (uint16_t)(PC_STUB_INT70 + i), int70[i]);
+    pc_wr16(cpu, 0, 0x70 * 4, PC_STUB_INT70);
+    pc_wr16(cpu, 0, 0x70 * 4 + 2, PC_STUB_SEG);
+    /* the slave at 70h: the RTC's IRQ 8 open (register B has its interrupts
+     * off until someone wants them), and the coprocessor's IRQ 13 if there is one */
+    pic2.mask = cpu->has_fpu ? 0xDE : 0xFE; pic2.base = 0x70; pic2.icw_step = 0; pic2.read_isr = 0;
     pic2.irr = pic2.isr = 0;
     cpu->ferr_hook = ferr_irq13;
     pc_vga_rom(cpu);                             /* INT 10h's mode set, programmed by OUTs */
@@ -807,6 +885,7 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     pc_set_service(0x16, pc_kbd_int16, HLE_RET_FLAGS);
     pc_set_service(0x09, pc_kbd_int9, HLE_RET_IRET);
     pc_set_trap(PC_TRAP_KBD, pc_kbd_trap, HLE_RET_IRET);
+    pc_set_trap(PC_TRAP_RTC, rtc_trap, HLE_RET_IRET);
 
     pc_video_init(cpu);
     pc_kbd_init();

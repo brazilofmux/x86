@@ -1,0 +1,7 @@
+registers A B D: 26 02 80
+periodic 1024 Hz: about 1000 interrupts a second
+without reading C: interrupts 01
+update-ended interrupt: came
+UIP seen, then the second changed
+INT 15h AH=83h flag: at once, a tick later, in the end: 00 00 80
+set 12:34 through the registers: reads 12:34, INT 1Ah says 12:34
