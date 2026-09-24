@@ -45,6 +45,7 @@ static void usage(const char *prog) {
 }
 
 static x86_dbt g_dbt;
+static int g_golden;              /* X86_GOLDEN: interpreter run, every block translated and hashed */
 static int g_stats;
 static uint64_t g_last_insns, g_last_ns;
 
@@ -253,8 +254,7 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
             uint32_t lin = c->seg[S_CS].base + c->eip;
             if (lin >= g_pmtrace_lo && lin <= g_pmtrace_hi) pm_trace(c);
         }
-        int exc_before = c->exc;
-        (void)exc_before;
+        if (g_golden) dbt_golden_step(&g_dbt);
         int rc = x86_step(c);
         if (rc < 0) {
             fprintf(stderr, "interp: stopped at %04X:%04X\n", c->seg[S_CS].sel, c->eip);
@@ -417,6 +417,15 @@ int main(int argc, char **argv) {
         if (dos_load_program(&cpu, host_prog, dos_path, args) < 0) return 1;
     }
 
+    if (getenv("X86_VCLOCK")) { pc.vclock = 1; pc.t0_ns = pc_now_ns(); }   /* a slow host (qemu-user): timer and idle detection by instruction count */
+    if (getenv("X86_GOLDEN")) {
+        /* translate-only: the interpreter runs, the translator is checked */
+        if (dbt_init(&g_dbt, &cpu) < 0 || dbt_golden_open(&g_dbt, getenv("X86_GOLDEN")) < 0) return 1;
+        g_golden = 1;
+        use_jit = 0;
+        pc.vclock = 1;
+        pc.t0_ns = pc_now_ns();
+    }
     if (use_jit && !dbt_jit_available(&cpu)) {
         fprintf(stderr, "dos-monster: JIT unavailable for this model/host; using the interpreter\n");
         use_jit = 0;
@@ -450,7 +459,7 @@ int main(int argc, char **argv) {
         rc = use_jit ? dbt_run(&g_dbt) : run_interp(&cpu, limit);
         if (rc < 0 || !pc.reboot) break;
         pc_reboot(&cpu);                       /* the booted machine reset itself */
-        if (use_jit) { dbt_cache_invalidate_all(&g_dbt); g_dbt.shadow_stale = 1; }
+        if (use_jit || g_golden) { dbt_cache_invalidate_all(&g_dbt); g_dbt.shadow_stale = 1; }
     }
     uint64_t t1 = pc_now_ns();
 
@@ -496,7 +505,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);
     }
     if (use_jit) dbt_sample_report(&g_dbt, stderr);
-    if (use_jit) dbt_cleanup(&g_dbt);
+    if (g_golden) dbt_golden_close(&g_dbt, stderr);
+    if (use_jit || g_golden) dbt_cleanup(&g_dbt);
     /* X86_MEM_DUMP=<path>: the whole guest memory at exit, for locating
      * hot blocks from a profile (ndisasm -b 32 -o ADDR -e ADDR). */
     if (getenv("X86_MEM_DUMP")) {

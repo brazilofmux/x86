@@ -84,6 +84,7 @@ typedef struct pc_state {
 
     /* Timer */
     uint64_t t0_ns;                  /* wall clock at boot */
+    int      vclock;                 /* the clock is the instruction counter (X86_GOLDEN: repeatable runs) */
     uint64_t ticks_delivered;        /* INT 8s raised so far */
     uint64_t next_tick_ns;           /* when IRQ 0 is next due, at PIT channel 0's rate */
     int      irq_pending;            /* bitmask: 1<<8 timer, 1<<9 keyboard */
@@ -120,6 +121,7 @@ void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);
 void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
 uint64_t pc_now_ns(void);
+uint64_t pc_wall_ns(void);            /* the host's clock, whatever pc_now_ns is */
 
 /* Segment:offset helpers on guest memory (real mode, A20 respected). */
 static inline uint32_t pc_lin(uint16_t seg, uint16_t off) { return ((uint32_t)seg << 4) + off; }

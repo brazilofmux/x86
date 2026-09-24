@@ -382,7 +382,9 @@ static void emit_edge(x86_dbt *dbt, emit_t *e, uint64_t key) {
     }
     uint32_t site = e->offset;
     int linked = 0;
-    if (dbt_link_record(dbt, key, site)) {
+    /* (under X86_GOLDEN the site stays unlinked: a link baked here depends
+     * on translation order, which is not what the golden set compares) */
+    if (dbt_link_record(dbt, key, site) && !dbt->golden) {
         x86_block_entry *be = &dbt->aux->cache[dbt_slot(key)];
         if (be->key == key && be->code) {
             emit_b(e, (int32_t)(be->code - (e->buf + site)));
@@ -2159,7 +2161,7 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
  * Per-op emission (straight-line ops)
  * ---------------------------------------------------------------------- */
 static void emit_helper_op(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
-    uint32_t idx = dbt->insn_used++;
+    uint32_t idx = dbt->golden ? 0 : dbt->insn_used++;    /* (X86_GOLDEN: the index is translation order, not content) */
     dbt->insn_pool[idx] = *in;
     dbt->insn_tag[idx] = (uint8_t)(!s_flat ? 0 : s_in_slow_chunk ? 2 : 1);
     dbt->insn_lin[idx] = dbt->cpu->seg[S_CS].base + s_cur_ip_start;

@@ -198,6 +198,62 @@ uint32_t dbt_h_out(x86_cpu *cpu, uint32_t port_size, uint32_t value) {
 }
 
 /* ----------------------------------------------------------------------
+ * X86_GOLDEN: translate-only mode (see dbt.h)
+ * ---------------------------------------------------------------------- */
+static uint64_t fnv1a(uint64_t h, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+int dbt_golden_open(x86_dbt *dbt, const char *path) {
+    dbt->golden = fopen(path, "w");
+    if (!dbt->golden) { perror(path); return -1; }
+    dbt->golden_hash = 1469598103934665603ull;
+    dbt->golden_n = 0;
+    return 0;
+}
+
+/* Before an interpreter step: what dbt_run would do at this cpu state,
+ * short of running the block. The same keys go untranslated (an
+ * interrupt shadow, RF, paged protected mode that is neither flat nor
+ * segmented 16-bit), the same cache holds the results, and the SMC
+ * bitmap marks and invalidations happen as they would under the JIT. */
+void dbt_golden_step(x86_dbt *dbt) {
+    x86_cpu *cpu = dbt->cpu;
+    if (cpu->int_inhibit != 0 || (cpu->eflags & X86_RF)) return;
+    if ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM)
+        && !(dbt_cpu_mode_bits(cpu) & (KEY_FLAT | KEY_SEG16))) return;
+    uint64_t key = dbt_cpu_key(cpu);
+    if (dbt_cache_lookup(dbt, key)) return;
+    dbt_jit_writable_begin();
+    uint8_t *code = dbt_translate_block(dbt, key);
+    dbt_jit_writable_end();
+    dbt_cache_insert(dbt, key, code);
+    uint32_t len = code ? (uint32_t)(dbt->code_buf + dbt->code_used - code) : 0;
+    uint64_t h = fnv1a(1469598103934665603ull, code, len);
+    /* X86_GOLDEN_KEY=<hex key>: that block's bytes, for disassembling two
+     * builds' translations side by side */
+    static const char *want; static int want_init;
+    if (!want_init) { want = getenv("X86_GOLDEN_KEY"); want_init = 1; }
+    if (want && strtoull(want, NULL, 16) == key) {
+        for (uint32_t i = 0; i < len; i++) fprintf(dbt->golden, "%02X", code[i]);
+        fprintf(dbt->golden, "\n");
+    }
+    fprintf(dbt->golden, "%016llX %u %016llX\n", (unsigned long long)key, len, (unsigned long long)h);
+    dbt->golden_hash = fnv1a(dbt->golden_hash, (const uint8_t *)&h, sizeof h);
+    dbt->golden_n++;
+    if (code) dbt->blocks_translated++;
+}
+
+void dbt_golden_close(x86_dbt *dbt, FILE *out) {
+    if (!dbt->golden) return;
+    fclose(dbt->golden);
+    dbt->golden = NULL;
+    fprintf(out, "golden: %llu translations, hash %016llX\n",
+            (unsigned long long)dbt->golden_n, (unsigned long long)dbt->golden_hash);
+}
+
+/* ----------------------------------------------------------------------
  * -V shadow-verify support
  * ---------------------------------------------------------------------- */
 static int cpu_regs_equal(const x86_cpu *a, const x86_cpu *b) {

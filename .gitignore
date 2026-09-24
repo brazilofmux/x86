@@ -44,3 +44,6 @@ tools/pmoracle/*.img
 # Python bytecode from the oracle harness
 __pycache__/
 /tmp/
+
+# Cross build (make ARCH=a64) and its sysroot
+build-*/

@@ -16,8 +16,17 @@ pc_state pc;
  * which through clock_gettime was 6% of a COBOL program's run; on
  * AArch64 the virtual counter is a register read, scaled here by a
  * 32.32 fixed-point factor (24 MHz on Apple Silicon: 41.7 ns ticks). */
-#if defined(__aarch64__)
+/* pc.vclock: the clock is the instruction counter — a nanosecond per ten
+ * guest instructions (100 MIPS) — plus the host time spent deliberately
+ * blocked (a key wait, a guest delay, HLT until the next tick), which no
+ * instruction counts. Every timer tick then lands at the same instruction
+ * on every run of the same input, and a wait still ends. */
 uint64_t pc_now_ns(void) {
+    if (pc.vclock && pc.cpu) return pc.cpu->insn_count * 10 + pc.blocked_ns;
+    return pc_wall_ns();
+}
+#if defined(__aarch64__)
+uint64_t pc_wall_ns(void) {
     static uint64_t mult;
     uint64_t v;
     if (!mult) {
@@ -29,7 +38,7 @@ uint64_t pc_now_ns(void) {
     return (uint64_t)(((unsigned __int128)v * mult) >> 32);
 }
 #else
-uint64_t pc_now_ns(void) {
+uint64_t pc_wall_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -243,7 +252,7 @@ static void bios_int15(x86_cpu *c, int vector) {
         break;
     case 0x86: {                                 /* wait CX:DX microseconds */
         uint32_t us = ((uint32_t)x86_get_r16(c, R_CX) << 16) | x86_get_r16(c, R_DX);
-        if (us) { uint64_t w0 = pc_now_ns(); usleep(us); pc.blocked_ns += pc_now_ns() - w0; pc.blocked_calls++; }
+        if (us) { uint64_t w0 = pc_wall_ns(); usleep(us); pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++; }
         c->eflags &= ~X86_CF;
         break;
     }
@@ -342,7 +351,7 @@ int pc_poll(x86_cpu *c) {
         /* HLT with interrupts on: the guest is idling for the next tick. */
         uint64_t next = pc.next_tick_ns;
         uint64_t hnow = pc_now_ns();
-        if (next > hnow) { usleep((useconds_t)((next - hnow) / 1000 + 1)); pc.blocked_ns += pc_now_ns() - hnow; pc.blocked_calls++; }
+        if (next > hnow) { uint64_t w0 = pc_wall_ns(); usleep((useconds_t)((next - hnow) / 1000 + 1)); pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++; }
         pc.irq_pending |= 1 << 8;
     }
     }

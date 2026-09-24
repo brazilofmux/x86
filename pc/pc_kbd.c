@@ -448,9 +448,9 @@ int pc_kbd_wait(x86_cpu *c, int can_return) {
         pc.kbd_reads++;
         /* Waiting on the host, not emulating: charged separately so it
           * is not mistaken for the cost of running the service. */
-        uint64_t w0 = pc_now_ns();
+        uint64_t w0 = pc_wall_ns();
         int ready = host_readable(hooked ? 10 : 50);
-        pc.blocked_ns += pc_now_ns() - w0;
+        pc.blocked_ns += pc_wall_ns() - w0;
         pc.blocked_calls++;
         if (ready) pc_kbd_poll(c);
         if (hooked) return 0;                      /* let the timer and anything else run too */
@@ -490,12 +490,12 @@ static void idle_check(x86_cpu *c) {
     if (c->insn_count - idle_last_insn > IDLE_GAP) idle_run = 0;
     idle_last_insn = c->insn_count;
     if (++idle_run < IDLE_RUN) return;
-    uint64_t w0 = pc_now_ns();
+    uint64_t w0 = pc_wall_ns();
     /* a terminal (or a pipe with more to come) can end the wait early;
      * at end of input, or on /dev/null, just sleep */
     if (!pc.eof_seen && isatty(STDIN_FILENO)) (void)host_readable(1);
     else usleep(1000);
-    pc.blocked_ns += pc_now_ns() - w0;
+    pc.blocked_ns += pc_wall_ns() - w0;
     pc.blocked_calls++;
 }
 

@@ -280,6 +280,9 @@ typedef struct {
     uint32_t iolog_n, iolog_cap, iolog_pos;
     int verify_mem_every;          /* compare guest memory every N block runs (0 = each) */
 
+    FILE    *golden;               /* X86_GOLDEN: the translation log */
+    uint64_t golden_hash, golden_n;
+
     x86_cpu shadow;                /* verify only; has its own memory */
     int shadow_live;
 } x86_dbt;
@@ -324,6 +327,19 @@ void dbt_dev_changed(x86_cpu *cpu);
 void             dbt_tlb_flushed(x86_cpu *cpu);
 int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user);
 void             dbt_space_current(x86_dbt *dbt);   /* register CR3's space, set cpu->pg_space */
+
+/* X86_GOLDEN=<path>: translate-only mode (dbt_common.c). The interpreter
+ * runs the program; before every instruction the key it stands at is
+ * translated, once, and the emitted bytes are hashed to the file as one
+ * line per translation: key, length, hash. Two builds of the translator
+ * must agree on every block, byte for byte (tools/golden-diff.py) — the
+ * check a refactor of the translator is held to, and one that needs no
+ * host of the backend's architecture: the emitters only write bytes.
+ * The machine's clock is the instruction counter meanwhile (pc.vclock),
+ * so the timer, and with it the block sequence, repeats run to run. */
+int  dbt_golden_open(x86_dbt *dbt, const char *path);
+void dbt_golden_step(x86_dbt *dbt);
+void dbt_golden_close(x86_dbt *dbt, FILE *out);
 
 /* Backend hooks (dbt_a64.c) */
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key);
