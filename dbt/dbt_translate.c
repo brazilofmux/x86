@@ -458,6 +458,11 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
             if (b->paged && (in->op == OP_PUSHA || in->op == OP_POPA)) c = C_HELPER;  /* two accesses */
         }
         if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
+        /* 486: POPFD can set EFLAGS.AC; ending the block with the run loop
+         * stepping it lets the loop see alignment checking come on (the only
+         * way it can inside translated code: IRET, far transfers and MOV CR0
+         * are already stepped, and a 16-bit POPF cannot reach bit 18) */
+        if (cpu->model >= X86_MODEL_486 && in->op == OP_POPF && in->opsize == 4) c = C_REFUSE;
         if (c == C_REFUSE) {
             dbt->refused_by_op[in->op]++;
             break;

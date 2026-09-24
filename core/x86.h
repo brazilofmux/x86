@@ -268,6 +268,9 @@ void     x86_tlb_flush(struct x86_cpu *c);
 uint32_t x86_page_peek(struct x86_cpu *c, uint32_t lin, int user);   /* LIN's physical page, no side effects */
 uint32_t x86_tlb_from_pgd(struct x86_cpu *c, uint32_t lin);          /* a low page's delta, into the TLB too */
 int      x86_cpl(const struct x86_cpu *c);
+/* 486: alignment checking is on (CR0.AM, EFLAGS.AC, CPL 3). Translated
+ * code does not check, so the run loop gives such code to the interpreter. */
+static inline int x86_ac_live(const struct x86_cpu *c);
 
 static inline uint32_t x86_lin(x86_cpu *c, uint32_t lin, int write) {
     if (!(c->cr0 & X86_CR0_PG)) return lin;
@@ -289,6 +292,9 @@ static inline uint32_t x86_lin(x86_cpu *c, uint32_t lin, int write) {
     return x86_page_walk(c, lin, write);
 }
 
+static inline int x86_ac_live(const x86_cpu *c) {
+    return (c->cr0 & X86_CR0_AM) && (c->eflags & X86_AC) && c->model >= X86_MODEL_486 && x86_cpl(c) == 3;
+}
 static inline uint8_t x86_phys_rd8(x86_cpu *c, uint32_t lin) {
     uint32_t p = x86_lin(c, lin, 0);
     if (p == X86_PG_BAD) return 0xFF;
@@ -363,7 +369,7 @@ enum {
     X86_EXC_DE = 0, X86_EXC_DB = 1, X86_EXC_BP = 3, X86_EXC_OF = 4,
     X86_EXC_BR = 5, X86_EXC_UD = 6, X86_EXC_NM = 7, X86_EXC_DF = 8,
     X86_EXC_TS = 10, X86_EXC_NP = 11, X86_EXC_SS = 12, X86_EXC_GP = 13,
-    X86_EXC_PF = 14,
+    X86_EXC_PF = 14, X86_EXC_AC = 17,
 };
 
 /* ============================================================================

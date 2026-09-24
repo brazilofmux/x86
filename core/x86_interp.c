@@ -99,12 +99,26 @@ static inline void limit_check(x86_cpu *c, int seg, uint32_t off, int size) {
     if (c->model >= X86_MODEL_286 && (off > c->seg[seg].limit || off + size - 1 > c->seg[seg].limit))
         x86_fault(c, (seg == S_SS && c->model >= X86_MODEL_386) ? X86_EXC_SS : X86_EXC_GP, 0);   /* 386: stack-segment faults are #SS (measured) */
 }
+/* 486: with CR0.AM and EFLAGS.AC set, a data access at CPL 3 (V86 too)
+ * that is not aligned to its size is #AC(0) — a fault, after the limit
+ * and after the paging unit has had its say (#PF ranks above #AC), before
+ * anything is written. Implicit supervisor accesses are never checked. */
+static void ac_fault(x86_cpu *c, uint32_t lin, int size, int write) {
+    if (c->pg_super || !x86_ac_live(c)) return;
+    if (c->cr0 & X86_CR0_PG) { (void)x86_lin(c, lin, write); (void)x86_lin(c, lin + (uint32_t)size - 1, write); }
+    x86_fault(c, X86_EXC_AC, 0);
+}
+static inline void ac_check(x86_cpu *c, uint32_t base, uint32_t off, int size, int write) {
+    if (__builtin_expect(((base + off) & (uint32_t)(size - 1)) != 0, 0)) ac_fault(c, base + off, size, write);
+}
 static inline uint32_t mrd(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, int size) {
     limit_check(c, seg, off, size);
+    ac_check(c, c->seg[seg].base, off, size, 0);
     return x86_rd(c, c->seg[seg].base, off, wrapmask(c, admask(in)), size);
 }
 static inline void mwr(x86_cpu *c, const x86_insn *in, int seg, uint32_t off, int size, uint32_t v) {
     limit_check(c, seg, off, size);
+    ac_check(c, c->seg[seg].base, off, size, 1);
     x86_wr(c, c->seg[seg].base, off, wrapmask(c, admask(in)), size, v);
 }
 
@@ -131,6 +145,7 @@ static void push(x86_cpu *c, int size, uint32_t v) {
     uint32_t m = stkmask(c);
     uint32_t sp = (c->r[R_SP] - size) & m;
     limit_check(c, S_SS, sp, size);                 /* before SP moves */
+    ac_check(c, c->seg[S_SS].base, sp, size, 1);
     x86_wr(c, c->seg[S_SS].base, sp, wrapmask(c, m), size, v);
     c->r[R_SP] = m == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
 }
@@ -139,6 +154,7 @@ static uint32_t pop(x86_cpu *c, int size) {
     uint32_t m = stkmask(c);
     uint32_t sp = c->r[R_SP] & m;
     limit_check(c, S_SS, sp, size);
+    ac_check(c, c->seg[S_SS].base, sp, size, 0);
     uint32_t v = x86_rd(c, c->seg[S_SS].base, sp, wrapmask(c, m), size);
     sp = (sp + size) & m;
     c->r[R_SP] = m == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | sp) : sp;
@@ -154,6 +170,7 @@ static uint32_t peek(x86_cpu *c, uint32_t off, int size) {
     uint32_t m = stkmask(c);
     uint32_t sp = (c->r[R_SP] + off) & m;
     limit_check(c, S_SS, sp, size);
+    ac_check(c, c->seg[S_SS].base, sp, size, 0);
     return x86_rd(c, c->seg[S_SS].base, sp, wrapmask(c, m), size);
 }
 /* 386: a 32-bit transfer target past the code limit is #GP before
@@ -1121,17 +1138,32 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         a = rd_op(c, in, 0, ea);
         wr_op(c, in, 0, ea, (a >> 24) | ((a >> 8) & 0xFF00) | ((a << 8) & 0xFF0000) | (a << 24));
         break;
-    case OP_XADD:
+    case OP_XADD: {
+        /* the store first: a fault on it (#PF, #AC) commits nothing */
         a = rd_op(c, in, 0, ea); b = rd_op(c, in, 1, ea);
+        uint32_t f0 = c->eflags;
         r = do_add(c, a, b, 0, size);
-        wr_op(c, in, 1, ea, a); wr_op(c, in, 0, ea, r);
+        uint32_t f1 = c->eflags;
+        c->eflags = f0;
+        wr_op(c, in, 0, ea, r);
+        if (in->ops[0].kind == OPK_MEM || in->ops[0].reg != in->ops[1].reg) wr_op(c, in, 1, ea, a);
+        else wr_op(c, in, 0, ea, r);   /* XADD r, r: the sum wins */
+        c->eflags = f1;
         break;
+    }
     case OP_CMPXCHG: {
+        /* The destination is always written — the old value back when the
+         * compare fails (SDM: a locked read always has its locked write), so
+         * a read-only page faults either way. Flags only once it has landed. */
         a = rd_op(c, in, 0, ea);
         uint32_t acc = x86_get_reg(c, R_AX, size);
+        uint32_t f0 = c->eflags;
         do_sub(c, acc, a, 0, size);
-        if (c->eflags & X86_ZF) wr_op(c, in, 0, ea, rd_op(c, in, 1, ea));
-        else x86_set_reg(c, R_AX, size, a);
+        uint32_t f1 = c->eflags;
+        c->eflags = f0;
+        if (f1 & X86_ZF) wr_op(c, in, 0, ea, rd_op(c, in, 1, ea));
+        else { wr_op(c, in, 0, ea, a); x86_set_reg(c, R_AX, size, a); }
+        c->eflags = f1;
         break;
     }
 
@@ -1180,6 +1212,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
              * one is skipped, and #SS is raised at the end with SP intact */
             uint32_t sp0 = c->r[R_SP];
             int bad = 0;
+            ac_check(c, c->seg[S_SS].base, (c->r[R_SP] - os) & sm, (int)os, 1);   /* 486: one alignment for all eight */
             for (int i = 0; i < 8; i++) {
                 uint32_t p = (c->r[R_SP] - os) & sm;
                 if (p + os - 1 > lim) bad = 1;
@@ -1240,6 +1273,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
 #define ENTER_PUSH(v) do { \
             uint32_t p_ = (c->r[R_SP] - os) & sm; \
             if (chk && p_ + os - 1 > lim) { c->r[R_SP] = sp0; c->r[R_BP] = bp0; x86_fault(c, vec, 0); } \
+            ac_check(c, base, p_, os, 1); \
             x86_wr(c, base, p_, wrapmask(c, sm), os, (v)); \
             c->r[R_SP] = sm == 0xFFFF ? ((c->r[R_SP] & 0xFFFF0000u) | p_) : p_; \
         } while (0)
@@ -1250,6 +1284,12 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
                 uint32_t bp = (x86_get_reg(c, R_BP, os) - os) & sm;
                 x86_set_reg(c, R_BP, os, bp);
                 if (chk && bp + os - 1 > lim) { c->r[R_SP] = sp0; c->r[R_BP] = bp0; x86_fault(c, vec, 0); }
+                if ((base + bp) & (os - 1)) {                /* 486 #AC, with SP and BP restored like the limit faults */
+                    uint32_t s_ = c->r[R_SP], b_ = c->r[R_BP];
+                    c->r[R_SP] = sp0; c->r[R_BP] = bp0;
+                    ac_check(c, base, bp, os, 0);
+                    c->r[R_SP] = s_; c->r[R_BP] = b_;
+                }
                 ENTER_PUSH(x86_rd(c, base, bp, wrapmask(c, sm), os));
             }
             ENTER_PUSH(frame);
@@ -1533,8 +1573,13 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     }
     case OP_SGDT: case OP_SIDT: {
         int is_g = in->op == OP_SGDT;
-        mwr(c, in, in->seg, ea, 2, is_g ? c->gdtr.limit : c->idtr.limit);
-        mwr(c, in, in->seg, (ea + 2) & admask(in), 4, is_g ? c->gdtr.base : c->idtr.base);
+        uint32_t ea2 = (ea + 2) & admask(in);
+        /* 486 #AC: the six bytes are one GDTR/IDTR image, aligned to 4 (SDM) */
+        limit_check(c, in->seg, ea, 2);
+        ac_check(c, c->seg[in->seg].base, ea, 4, 1);
+        x86_wr(c, c->seg[in->seg].base, ea, wrapmask(c, admask(in)), 2, is_g ? c->gdtr.limit : c->idtr.limit);
+        limit_check(c, in->seg, ea2, 4);           /* after the limit word lands, as before */
+        x86_wr(c, c->seg[in->seg].base, ea2, wrapmask(c, admask(in)), 4, is_g ? c->gdtr.base : c->idtr.base);
         break;
     }
     case OP_LLDT: case OP_LTR: {

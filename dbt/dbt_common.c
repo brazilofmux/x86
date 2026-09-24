@@ -463,6 +463,7 @@ int dbt_run(x86_dbt *dbt) {
          * real-mode-shaped blocks (KEY_V86). RF lasts one instruction,
          * which the interpreter runs and clears. */
         int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF)
+                     || x86_ac_live(cpu)                  /* 486 #AC: translated code does not check alignment */
                      || ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM)
                          && !(dbt_cpu_mode_bits(cpu) & (KEY_FLAT | KEY_SEG16)));   /* paged PM neither flat nor segmented 16-bit: the interpreter's */
         x86_block_entry *be = inhibited ? NULL : dbt_cache_lookup(dbt, key);

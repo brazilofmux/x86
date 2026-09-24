@@ -108,7 +108,9 @@ test-pm:
 
 # Paging and V86 transcript images: QEMU and dos-monster, diffed
 test-pg: $(TARGET)
-	cd tools/pmoracle && python3 pgrun.py pgtest.asm && python3 pgrun.py vmtest.asm
+	cd tools/pmoracle && python3 pgrun.py pgtest.asm && python3 pgrun.py vmtest.asm && \
+	    python3 pgrun.py c486test.asm --m486 --expect c486test.bochs && \
+	    python3 pgrun.py c486test.asm --m486 --expect c486test.bochs -- -V
 
 test-pm-compare:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 compare.py
