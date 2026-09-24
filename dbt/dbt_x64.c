@@ -1242,11 +1242,6 @@ int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
     if (getenv("X86_X64_HELPERS")) return 0;
     if (b->paged && getenv("X86_X64_NOPAGED")) return 0;
     if (b->v86) return inline_ok_v86(b, in);
-    /* Paged flat and segmented blocks through the TLB (emit_pgflat,
-     * emit_pgseg16): written, unverified — DOOM under EMM386 (VCPI) page
-     * faults and Windows enhanced mode goes blank with them on. Off until
-     * the lockstep run finds the divergence; X86_X64_PGTLB=1 turns them on. */
-    if (b->paged && !getenv("X86_X64_PGTLB")) return 0;
     if (b->flat) return inline_ok_flat(b, in);
     if (b->seg16) return inline_ok_seg16(b, in);
     return inline_ok(b, in);
@@ -2429,7 +2424,9 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
         if (dyn) s_check_busy |= 1u << W_T3;                     /* the target rides across the push's checks */
         emit_push_stk(e, W_T2);
         s_check_busy &= ~(1u << W_T3);
-        if (dyn && s_paged) emit_movzx_rr(e, 4, W_T3, 2, host_reg(&in->ops[0]));   /* (after: the translation used W_T3; not SP, see inline_ok_v86) */
+        if (dyn && s_paged) {                                    /* (after: the translation used W_T3; not SP, see inline_ok_v86) */
+            if (w == 4) emit_mov_rr(e, 4, W_T3, host_reg(&in->ops[0])); else emit_movzx_rr(e, 4, W_T3, 2, host_reg(&in->ops[0]));
+        }
         if (dyn) { emit_dynamic_key(e, W_T3); emit_dynamic_tail(dbt, e); }
         else emit_edge(dbt, e, target_key(ip_after + in->ops[0].imm));
         break;
