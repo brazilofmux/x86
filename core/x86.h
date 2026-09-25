@@ -16,6 +16,14 @@
 #include <setjmp.h>
 #include "x86_fpu.h"
 
+/* The separator in a list of host paths (a diskette sequence): ':' as in
+ * $PATH, but ';' on Windows, where ':' follows a drive letter. */
+#if defined(_WIN32)
+#define HOST_PATH_LIST_SEP ";"
+#else
+#define HOST_PATH_LIST_SEP ":"
+#endif
+
 /* ============================================================================
  * FLAGS
  * The low byte is the 8080 F register: CF=0 PF=2 AF=4 ZF=6 SF=7.

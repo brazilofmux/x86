@@ -134,6 +134,24 @@ The tests also use `nasm`, `python3`, `mtools`, `qemu-system-i386` and
 `bochs`. The x87's arithmetic is Berkeley SoftFloat 3e (BSD licence,
 `core/softfloat/COPYING.txt`).
 
+### Windows
+
+x86-64 Windows 10 1803 or later, built with MSVC (Visual Studio's C
+compiler) and nmake, from an "x64 Native Tools Command Prompt":
+
+    vcpkg install --triplet x64-windows-static --x-install-root=build-win\vcpkg
+    nmake /f Makefile.win               # build-win\dos-monster.exe, tools\sst.exe, tools\jittest.exe
+    nmake /f Makefile.win test-jit
+
+vcpkg (Visual Studio's own will do) brings SDL2 and zlib as static
+libraries (`vcpkg.json`), so the one .exe is all there is to copy. The
+POSIX the sources use comes from `win/`: `win/posix.h` is force-included
+into every file and maps it onto Win32. The terminal is the Windows
+console with its VT sequences on, so `-t` works in Windows Terminal or a
+console window; under mintty (Git Bash) stdout is a pipe, not a
+terminal, so use `-w` for the window there. A list of diskettes (`-A`,
+`-fda`) is separated by `;` rather than `:`.
+
 ## Running
 
     ./dos-monster -m 386 -C ~/dos WP.EXE              # a program, emulated DOS
@@ -177,6 +195,7 @@ MS-DOS 6.22 and Windows 3.11 from diskette images end to end, unattended.
     dos/    the emulated DOS, MZ loader, DPMI host
     tools/  oracles, fuzzers, expect.py, the native BIOS routine
     tests/  DOS test programs, boot tests, test-suite runners
+    win/    the POSIX subset over Win32, for the MSVC build
 
 `CLAUDE.md` is the design document: scope, architecture, and the rules
 learned the hard way.

@@ -1,0 +1,5 @@
+# LF everywhere, Windows checkouts included: the shell tests compare
+# byte-exact output against the .out files, and bash will not run a CRLF
+# script. MSVC reads LF sources as they are.
+* text=auto eol=lf
+*.bat text eol=crlf

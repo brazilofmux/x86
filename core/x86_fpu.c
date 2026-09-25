@@ -456,6 +456,19 @@ static void parts(fx v, int *exp, uint64_t *sig) {
 
 /* ---- FPREM / FPREM1 ----------------------------------------------------- */
 
+/* (sa << n) / den and its remainder, for 0 <= n <= 63 and den >= 2^63
+ * (a normalized significand), so the quotient fits in 64 bits. */
+static uint64_t shl_divrem(uint64_t sa, int n, uint64_t den, uint64_t *rem) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    uint64_t hi = n ? sa >> (64 - n) : 0, lo = sa << n;
+    return _udiv128(hi, lo, den, rem);
+#else
+    unsigned __int128 num = (unsigned __int128)sa << n;
+    *rem = (uint64_t)(num % den);
+    return (uint64_t)(num / den);
+#endif
+}
+
 static void fprem(x86_cpu *c, int ieee) {
     if (empty(c, 0) || empty(c, 1)) {
         if (underflow(c)) return;
@@ -490,23 +503,21 @@ static void fprem(x86_cpu *c, int ieee) {
     int ea, eb; uint64_t sa, sb;
     parts(a, &ea, &sa); parts(b, &eb, &sb);
     int d = ea - eb, sign = sign_of(a);
-    unsigned __int128 num, den = sb, q, r;
+    uint64_t q, r;                                     /* only q's low three bits are used */
     int rexp;
     if (d >= 64) {                                     /* partial: reduce by 32..63, C2 says more to do */
         int n = (d & 31) | 32;
-        num = (unsigned __int128)sa << n;
-        q = num / den; r = num % den;
+        q = shl_divrem(sa, n, sb, &r);
         rexp = ea - n;
         cc = SW_C2;
     } else if (d >= 0) {
-        num = (unsigned __int128)sa << d;
-        q = num / den; r = num % den;
+        q = shl_divrem(sa, d, sb, &r);
         rexp = eb;
-        if (ieee && (2 * r > den || (2 * r == den && (q & 1)))) { q++; r = den - r; sign ^= 1; }
+        if (ieee && (r > sb - r || (r == sb - r && (q & 1)))) { q++; r = sb - r; sign ^= 1; }
     } else {
         q = 0; r = sa; rexp = ea;
-        if (ieee && d == -1 && (unsigned __int128)sa > den) {  /* |a| > |b|/2: one more b */
-            q = 1; r = 2 * den - sa; rexp = ea; sign ^= 1;
+        if (ieee && d == -1 && sa > sb) {              /* |a| > |b|/2: one more b */
+            q = 1; r = 2 * sb - sa; rexp = ea; sign ^= 1;   /* (mod 2^64: the result is below sb) */
         }
     }
     if (!(cc & SW_C2)) {
@@ -721,9 +732,9 @@ static void q_init(void) {
     /* The x87's pi: 66 bits, the top 64 of pi's significand and the next
      * two (11; the bit after them is 0, so this is also pi rounded to 66).
      * pi/2 = N66 x 2^-65, split 33 + 33 so k x each part is exact. */
-    unsigned __int128 n66 = ((unsigned __int128)UINT64_C(0xC90FDAA22168C234) << 2) | 3;
-    P66_HI = q_mul(q_i((int64_t)(uint64_t)(n66 >> 33)), q_pow2(-32));
-    P66_LO = q_mul(q_i((int64_t)(uint64_t)(n66 & ((UINT64_C(1) << 33) - 1))), q_pow2(-65));
+    const uint64_t pi64 = UINT64_C(0xC90FDAA22168C234);          /* N66 = pi64 << 2 | 3 */
+    P66_HI = q_mul(q_i((int64_t)(pi64 >> 31)), q_pow2(-32));                            /* N66 >> 33 */
+    P66_LO = q_mul(q_i((int64_t)(((pi64 & 0x7FFFFFFFu) << 2) | 3)), q_pow2(-65));       /* its low 33 bits */
     softfloat_roundingMode = rm; softfloat_exceptionFlags = fl;
     q_ready = 1;
 }

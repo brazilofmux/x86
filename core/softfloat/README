@@ -11,5 +11,8 @@ A subset, unmodified: source/*.c without half precision (f16, bf16) and
 without the pointer-passing "M" variants, source/include/*.h, and the
 8086 specialization (source/8086: x87 NaN rules — the 8086-SSE one is
 SSE's). platform.h is ours: upstream keeps one per build directory.
+s_mul128To256M.c is the one "M" file kept: MSVC has no __int128, so
+there f128_mul calls it (with GCC or clang opts-GCC.h inlines it and the
+file compiles to nothing).
 Built with upstream's options: SOFTFLOAT_FAST_INT64, SOFTFLOAT_ROUND_ODD, INLINE_LEVEL=5,
 SOFTFLOAT_FAST_DIV32TO16, SOFTFLOAT_FAST_DIV64TO32.

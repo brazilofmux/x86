@@ -48,6 +48,13 @@ int pc_sdl_window_allowed(void) { return allowed; }
 
 static int open_window(void) {
     SDL_SetMainReady();
+#if defined(_WIN32)
+    /* Windows stretches a DPI-unaware window's bitmap on a scaled display,
+     * pixels blurred; aware, with SDL sizing the window in points so it is
+     * not small either. */
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "sdl: %s; staying headless\n", SDL_GetError());
         allowed = 0;

@@ -1,0 +1,89 @@
+# dos-monster — the Windows build: MSVC and nmake, from a "x64 Native
+# Tools Command Prompt" (or after vcvars64.bat):
+#
+#   nmake /f Makefile.win            dos-monster.exe, tools\sst.exe, tools\jittest.exe
+#   nmake /f Makefile.win test-jit
+#
+# The POSIX the sources use comes from win\ (win\posix.h, force-included).
+# SDL2 and zlib are vcpkg's static libraries (vcpkg.json), installed once:
+#
+#   vcpkg install --triplet x64-windows-static --x-install-root=build-win\vcpkg
+#
+# Objects and the binaries go under build-win\. Windows 10 1803 or later
+# (the JIT's guest memory is built from VirtualAlloc2 placeholders).
+
+O       = build-win
+VCPKG   = build-win\vcpkg\x64-windows-static
+CC      = cl
+CFLAGS  = /nologo /std:c17 /O2 /Zi /Fd$(O)\cl.pdb /FS /W3 /MT /utf-8 /wd4146 /wd4244 /wd4267 /wd4018 /wd4996 \
+          /FI$(MAKEDIR)\win\posix.h /Iwin /I$(VCPKG)\include /I$(VCPKG)\include\SDL2 -DHAVE_SDL
+SF_CFLAGS = /nologo /std:c17 /O2 /Zi /Fd$(O)\cl.pdb /FS /W0 /MT /Icore\softfloat /Icore\softfloat\include /Icore\softfloat\8086 \
+          -DSOFTFLOAT_FAST_INT64 -DSOFTFLOAT_ROUND_ODD -DINLINE_LEVEL=5 -DSOFTFLOAT_FAST_DIV32TO16 -DSOFTFLOAT_FAST_DIV64TO32
+FPU_CFLAGS = /Icore\softfloat\include /Icore\softfloat\8086 /Icore -DSOFTFLOAT_FAST_INT64 -DINLINE_LEVEL=5
+LDFLAGS = /nologo /DEBUG /INCREMENTAL:NO binmode.obj
+SYSLIBS = user32.lib gdi32.lib winmm.lib imm32.lib ole32.lib oleaut32.lib version.lib uuid.lib \
+          advapi32.lib setupapi.lib shell32.lib cfgmgr32.lib
+LIBS    = $(VCPKG)\lib\zs.lib
+
+CORE_OBJS = $(O)\core\x86_decode.obj $(O)\core\x86_interp.obj $(O)\core\x86_state.obj \
+            $(O)\core\x86_mem.obj $(O)\core\x86_paging.obj $(O)\core\x86_fpu.obj $(O)\win\win_posix.obj
+DBT_OBJS  = $(O)\dbt\dbt_common.obj $(O)\dbt\dbt_cache.obj $(O)\dbt\dbt_translate.obj $(O)\dbt\dbt_x64.obj
+PC_OBJS   = $(O)\pc\pc_bios.obj $(O)\pc\pc_video.obj $(O)\pc\pc_vga.obj $(O)\pc\pc_sdl.obj $(O)\pc\pc_kbd.obj \
+            $(O)\pc\pc_font.obj $(O)\pc\pc_mouse.obj $(O)\pc\pc_disk.obj $(O)\pc\pc_cmos.obj $(O)\pc\pc_ps2.obj \
+            $(O)\pc\pc_ide.obj
+DOS_OBJS  = $(O)\dos\dos_load.obj $(O)\dos\dos_host.obj $(O)\dos\dos_int21.obj $(O)\dos\dos_dpmi.obj
+
+TARGET  = $(O)\dos-monster.exe
+SST     = $(O)\tools\sst.exe
+JITTEST = $(O)\tools\jittest.exe
+
+all: dirs $(O)\softfloat.lib $(TARGET) $(SST) $(JITTEST)
+
+dirs:
+	@for %d in (core dbt pc dos win tools softfloat softfloat\8086) do @if not exist $(O)\%d mkdir $(O)\%d
+
+# Berkeley SoftFloat 3e, built with upstream's options, as a library
+$(O)\softfloat.lib: core\softfloat\*.c core\softfloat\8086\*.c
+	$(CC) $(SF_CFLAGS) /c /Fo$(O)\softfloat\ core\softfloat\*.c
+	$(CC) $(SF_CFLAGS) /c /Fo$(O)\softfloat\8086\ core\softfloat\8086\*.c
+	lib /nologo /OUT:$@ $(O)\softfloat\*.obj $(O)\softfloat\8086\*.obj
+
+$(TARGET): $(O)\main.obj $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS) $(O)\softfloat.lib
+	link $(LDFLAGS) /OUT:$@ $** $(LIBS) $(VCPKG)\lib\SDL2-static.lib $(SYSLIBS)
+
+$(SST): $(O)\tools\sst.obj $(CORE_OBJS) $(O)\softfloat.lib
+	link $(LDFLAGS) /OUT:$@ $** $(LIBS)
+
+$(JITTEST): $(O)\tools\jittest.obj $(CORE_OBJS) $(DBT_OBJS) $(O)\softfloat.lib
+	link $(LDFLAGS) /OUT:$@ $** $(LIBS)
+
+# the x87 uses SoftFloat's internals (its round-and-pack), so it is built
+# with SoftFloat's configuration too
+$(O)\core\x86_fpu.obj: core\x86_fpu.c
+	$(CC) $(CFLAGS) $(FPU_CFLAGS) /c /Fo$@ core\x86_fpu.c
+
+$(O)\main.obj: main.c
+	$(CC) $(CFLAGS) /c /Fo$@ main.c
+
+{core}.c{$(O)\core}.obj::
+	$(CC) $(CFLAGS) /c /Fo$(O)\core\ $<
+{dbt}.c{$(O)\dbt}.obj::
+	$(CC) $(CFLAGS) /c /Fo$(O)\dbt\ $<
+{pc}.c{$(O)\pc}.obj::
+	$(CC) $(CFLAGS) /c /Fo$(O)\pc\ $<
+{dos}.c{$(O)\dos}.obj::
+	$(CC) $(CFLAGS) /c /Fo$(O)\dos\ $<
+{win}.c{$(O)\win}.obj::
+	$(CC) $(CFLAGS) /c /Fo$(O)\win\ $<
+{tools}.c{$(O)\tools}.obj::
+	$(CC) $(CFLAGS) /c /Fo$(O)\tools\ $<
+
+test-jit: $(JITTEST)
+	$(JITTEST) -p 0 && $(JITTEST) -p 1 && $(JITTEST) -m 286 -p 0 && \
+	$(JITTEST) -f 2000 && $(JITTEST) -m 286 -f 2000 && $(JITTEST) -m 386 -f 2000 && \
+	$(JITTEST) -P -f 3000 && $(JITTEST) -P -f 1000 -r 100000 -n 40 && \
+	$(JITTEST) -G -f 3000 && $(JITTEST) -G -f 1000 -r 100000 -n 40
+
+clean:
+	@for %d in (core dbt pc dos win tools softfloat\8086 softfloat) do @if exist $(O)\%d rmdir /s /q $(O)\%d
+	@del /q $(O)\*.obj $(O)\*.exe $(O)\*.pdb $(O)\*.lib $(O)\tools\*.exe 2>nul

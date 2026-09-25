@@ -16,10 +16,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
 #include <signal.h>
 #include <sys/time.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
+#endif
 
 static uint32_t io_record(x86_cpu *c, uint16_t port, int size);   /* -V: port reads logged for the shadow */
 
@@ -864,6 +866,7 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
  * profiler, every US microseconds (from SECONDS in, if given)
  * ---------------------------------------------------------------------- */
 #define SAMPLE_MAX (1u << 20)
+#if !defined(_WIN32)
 static uintptr_t *s_samples;
 static volatile uint32_t s_nsamples;
 
@@ -961,3 +964,8 @@ void dbt_sample_report(x86_dbt *dbt, FILE *out) {
     }
     free(h); free(b);
 }
+#else
+/* Windows: no SIGALRM and no ucontext; use an outside profiler (WPR, VTune). */
+void dbt_sample_start(void) { }
+void dbt_sample_report(x86_dbt *dbt, FILE *out) { (void)dbt; (void)out; }
+#endif

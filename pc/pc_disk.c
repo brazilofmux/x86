@@ -105,9 +105,9 @@ static int map_image(disk *d, int drive, const char *path, int readonly) {
 int pc_disk_attach(int drive, const char *path, int readonly) {
     disk *d = drive & 0x80 ? &hd[drive & 1] : &fd[drive & 1];
     memset(d, 0, sizeof *d);
-    if (!(drive & 0x80) && strchr(path, ':')) {
+    if (!(drive & 0x80) && strstr(path, HOST_PATH_LIST_SEP)) {
         char *all = strdup(path);
-        for (char *t = strtok(all, ":"); t; t = strtok(NULL, ":")) {
+        for (char *t = strtok(all, HOST_PATH_LIST_SEP); t; t = strtok(NULL, HOST_PATH_LIST_SEP)) {
             d->seq = realloc(d->seq, (size_t)(d->nseq + 1) * sizeof *d->seq);
             d->seq[d->nseq++] = t;
         }

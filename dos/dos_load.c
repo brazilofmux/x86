@@ -150,14 +150,14 @@ void dos_init(x86_cpu *cpu, const char *root) {
 }
 
 /* Mount host directory/directories on a drive. A colon-separated list
- * is a diskette sequence: the first is in the drive, dos_swap_disk
- * moves to the next. */
+ * (semicolons on Windows: HOST_PATH_LIST_SEP) is a diskette sequence: the
+ * first is in the drive, dos_swap_disk moves to the next. */
 int dos_mount(int drive, const char *dirs) {
     if (drive < 0 || drive >= 26) return -1;
     dos_drive *d = &dos.drives[drive];
     memset(d, 0, sizeof *d);
     char *list = strdup(dirs);
-    for (char *tok = strtok(list, ":"); tok; tok = strtok(NULL, ":")) {
+    for (char *tok = strtok(list, HOST_PATH_LIST_SEP); tok; tok = strtok(NULL, HOST_PATH_LIST_SEP)) {
         d->disks = realloc(d->disks, sizeof(char *) * (size_t)(d->ndisks + 1));
         /* realpath's own buffer: a caller's must be PATH_MAX, and glibc's
          * fortified realpath aborts on anything smaller however short the

@@ -381,6 +381,10 @@ int main(int argc, char **argv) {
         /* Split the program path into host directory (drive root) and name. */
         char progdir[PATH_MAX], progname[256], host_prog[PATH_MAX];
         const char *slash = strrchr(prog, '/');
+#if defined(_WIN32)
+        const char *bslash = strrchr(prog, '\\');
+        if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
         if (slash) { snprintf(progdir, sizeof progdir, "%.*s", (int)(slash - prog), prog); snprintf(progname, sizeof progname, "%s", slash + 1); }
         else { strcpy(progdir, "."); snprintf(progname, sizeof progname, "%s", prog); }
         if (!root) root = progdir;

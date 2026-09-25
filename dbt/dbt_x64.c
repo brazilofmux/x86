@@ -74,8 +74,24 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
+#endif
+
+/* The C calling convention the thunks and the trampoline speak: System V,
+ * or on Windows the Microsoft x64 one � arguments in RCX RDX R8 R9, 32
+ * bytes of the caller's stack for the callee to spill them into, and
+ * RSI RDI callee-saved (the trampoline saves them with the rest). */
+#if defined(_WIN64)
+#define ABI_A0 X64_RCX
+#define ABI_A1 X64_RDX
+#define ABI_A2 X64_R8
+#define ABI_SHADOW 32
+#else
+#define ABI_A0 X64_RDI
+#define ABI_A1 X64_RSI
+#define ABI_A2 X64_RDX
+#define ABI_SHADOW 0
 #endif
 
 #define R_CPU  X64_R13
@@ -145,7 +161,7 @@ static const dbt_block *s_blk;
 static uint32_t s_cur_lin, s_cur_ip_after, s_cur_ip_start, s_cur_n_done, s_cur_i;
 
 int dbt_jit_available(const x86_cpu *cpu) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     return cpu->mem_mirrored;
 #else
     (void)cpu;
@@ -156,7 +172,7 @@ int dbt_jit_available(const x86_cpu *cpu) {
 static void host_features(void) {
     if (s_bmi2 >= 0) return;
     s_bmi2 = 0;
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
     unsigned a, b, c, d;
     if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) s_bmi2 = (b >> 8) & 1;
 #endif
@@ -199,9 +215,11 @@ static void emit_spill_pinned(emit_t *e) {
  * Called from C as
  *   void trampoline(x86_cpu *cpu, uint8_t *mem, void *block, void *aux,
  *                   uint64_t budget);
- * i.e. RDI, RSI, RDX, RCX, R8. RSP is 8 mod 16 on entry; six pushes and
- * an 8-byte adjustment make it 0 mod 16 inside blocks, so a thunk (one
- * CALL deep) is at 8 and aligns with one more push before calling C.
+ * i.e. RDI, RSI, RDX, RCX, R8 (on Windows RCX, RDX, R8, R9 and the
+ * budget on the stack above the shadow space). RSP is 8 mod 16 on entry;
+ * six pushes (eight on Windows) and an 8-byte adjustment make it 0 mod 16
+ * inside blocks, so a thunk (one CALL deep) is at 8 and aligns with one
+ * more push before calling C.
  * ---------------------------------------------------------------------- */
 void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_t e = { .buf = dbt->code_buf, .offset = 0, .capacity = CODE_BUF_SIZE };
@@ -211,12 +229,23 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_push_r(&e, X64_RBX); emit_push_r(&e, X64_RBP);
     emit_push_r(&e, X64_R12); emit_push_r(&e, X64_R13);
     emit_push_r(&e, X64_R14); emit_push_r(&e, X64_R15);
+#if defined(_WIN64)
+    emit_push_r(&e, X64_RSI); emit_push_r(&e, X64_RDI);
+    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8);
+    emit_mov_rr(&e, 8, R_CPU, X64_RCX);
+    emit_mov_rr(&e, 8, R_MEM, X64_RDX);
+    emit_mov_rr(&e, 8, W_T2, X64_R8);
+    m = M(X64_RSP, 8 + 8 * 8 + 8 + 32); emit_mov_rm(&e, 8, W_T0, &m);   /* budget: past the pushes, the return address, the shadow space */
+    m = M(R_CPU, OFF_JIT_BUDGET); emit_mov_mr(&e, 8, &m, W_T0);
+    m = M(R_CPU, OFF_JIT_CNT);    emit_mov_mr(&e, 8, &m, W_T0);
+#else
     emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8);
     emit_mov_rr(&e, 8, R_CPU, X64_RDI);
     emit_mov_rr(&e, 8, R_MEM, X64_RSI);
     m = M(R_CPU, OFF_JIT_BUDGET); emit_mov_mr(&e, 8, &m, X64_R8);
     m = M(R_CPU, OFF_JIT_CNT);    emit_mov_mr(&e, 8, &m, X64_R8);
     emit_mov_rr(&e, 8, W_T2, X64_RDX);
+#endif
     emit_load_pinned(&e);
     emit_jmp_r(&e, W_T2);
 
@@ -240,6 +269,9 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     m = M(R_CPU, OFF_JIT_CNT);     emit_alu_rm(&e, 8, X64_ALU_SUB, W_T0, &m);
     m = M(R_CPU, OFF_INSN_COUNT);  emit_alu_mr(&e, 8, X64_ALU_ADD, &m, W_T0);
     emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8);
+#if defined(_WIN64)
+    emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
+#endif
     emit_pop_r(&e, X64_R15); emit_pop_r(&e, X64_R14);
     emit_pop_r(&e, X64_R13); emit_pop_r(&e, X64_R12);
     emit_pop_r(&e, X64_RBP); emit_pop_r(&e, X64_RBX);
@@ -256,10 +288,12 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_mov_rr(&e, 8, W_T2, W_T0);                          /* the index survives the spill in W_T2 */
     emit_spill_pinned(&e);
     emit_cld(&e);
-    emit_mov_rr(&e, 8, X64_RDI, R_CPU);
-    emit_mov_rr(&e, 4, X64_RSI, W_T2);
+    emit_mov_rr(&e, 8, ABI_A0, R_CPU);
+    emit_mov_rr(&e, 4, ABI_A1, W_T2);
     emit_mov_ri(&e, 8, X64_RAX, (uint64_t)(uintptr_t)dbt_h_exec);
+    if (ABI_SHADOW) emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, ABI_SHADOW);
     emit_call_r(&e, X64_RAX);
+    if (ABI_SHADOW) emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, ABI_SHADOW);
     emit_load_pinned(&e);
     emit_pop_r(&e, W_T3);
     /* The interpreter faulted inside the helper op: cpu->exc is set and
@@ -289,15 +323,15 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_push_r(&e, X64_RAX); emit_push_r(&e, X64_RCX); emit_push_r(&e, X64_RDX);
     emit_push_r(&e, X64_RSI); emit_push_r(&e, X64_RDI);
     emit_push_r(&e, W_T2); emit_push_r(&e, W_T3);
-    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8);             /* 16-byte alignment for the call */
+    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8 + ABI_SHADOW);  /* 16-byte alignment for the call */
     m = M(R_CPU, OFF_JIT_CUR_LIN); emit_mov_mr(&e, 4, &m, W_T1);
     m = M(R_CPU, OFF_JIT_CUR_HIT); emit_mov_mi(&e, 4, &m, 0);
-    emit_mov_rr(&e, 8, X64_RDI, R_CPU);
-    emit_mov_rr(&e, 4, X64_RSI, W_T0);
+    emit_mov_rr(&e, 8, ABI_A0, R_CPU);
+    emit_mov_rr(&e, 4, ABI_A1, W_T0);
     emit_cld(&e);
     emit_mov_ri(&e, 8, X64_RAX, (uint64_t)(uintptr_t)dbt_h_post_store);
     emit_call_r(&e, X64_RAX);
-    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8);
+    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8 + ABI_SHADOW);
     emit_pop_r(&e, W_T3); emit_pop_r(&e, W_T2);
     emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
     emit_pop_r(&e, X64_RDX); emit_pop_r(&e, X64_RCX); emit_pop_r(&e, X64_RAX);
@@ -320,15 +354,15 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_pushfq(&e);
     emit_push_r(&e, X64_RAX); emit_push_r(&e, X64_RCX); emit_push_r(&e, X64_RDX);
     emit_push_r(&e, X64_RSI); emit_push_r(&e, X64_RDI);
-    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8);
-    emit_mov_rr(&e, 8, X64_RDI, R_CPU);
-    emit_mov_rr(&e, 4, X64_RSI, W_T0);
-    emit_mov_rr(&e, 4, X64_RDX, W_T1);
+    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8 + ABI_SHADOW);
+    emit_mov_rr(&e, 4, ABI_A1, W_T0);                        /* before A2: on Windows A2 is R8, W_T0 */
+    emit_mov_rr(&e, 4, ABI_A2, W_T1);
+    emit_mov_rr(&e, 8, ABI_A0, R_CPU);
     emit_cld(&e);
     emit_mov_ri(&e, 8, X64_RAX, (uint64_t)(uintptr_t)dbt_h_out);
     emit_call_r(&e, X64_RAX);
     emit_mov_rr(&e, 4, W_T0, X64_RAX);
-    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8);
+    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8 + ABI_SHADOW);
     emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
     emit_pop_r(&e, X64_RDX); emit_pop_r(&e, X64_RCX); emit_pop_r(&e, X64_RAX);
     emit_popfq(&e);
