@@ -447,7 +447,9 @@ static void emit_dynamic_tail(x86_dbt *dbt, emit_t *e) {
     emit_alu_rr(e, 4, X64_ALU_XOR, W_T0, R_KEY);
     emit_alu_ri(e, 4, X64_ALU_AND, W_T0, BLOCK_CACHE_MASK);
     emit_shift_ri(e, 8, X64_SH_SHL, W_T0, 4);
-    emit_mov_ri(e, 8, W_T1, (uint64_t)(uintptr_t)dbt->aux->cache);
+    /* (X86_GOLDEN never runs a block: a fixed stand-in keeps the hash
+     * free of where ASLR put the cache, so two builds compare) */
+    emit_mov_ri(e, 8, W_T1, dbt->golden ? 0x60D1DE4ACAC4E000ull : (uint64_t)(uintptr_t)dbt->aux->cache);
     x64_mem_t m = x64_mi(W_T1, W_T0, 0, 0);
     emit_alu_rm(e, 8, X64_ALU_CMP, R_KEY, &m);
     uint32_t miss = emit_jcc_rel8(e, X64_CC_NE);
