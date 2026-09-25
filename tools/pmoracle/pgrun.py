@@ -15,6 +15,12 @@ lines: QEMU has no #AC and lets ring 3 run INVD and WBINVD (the SDM, and
 Bochs, say #GP), and its x87 pops on unmasked exceptions and misses #MF
 on waiting loads; Bochs's default CPU stores FCS and FDS as 0, as Intel's
 since Haswell do, where a 486 stores the selectors (QEMU agrees).
+vmtest.expected is Bochs 3.1's (vmtest.bochs) but for one line, T11 (case
+17: POPF at IOPL 3 in V86 mode, then HLT, which is #GP): Bochs 3.1 reports
+a double fault there with error code 8224h and CS:IP 3202:0000, which no
+#DF has; QEMU 11, Bochs 2.7 and we report the #GP. It is stored rather than
+taken from the host's QEMU because QEMU 8.2 clears RF in the EFLAGS image
+of a fault out of V86 mode, where the SDM, Bochs and QEMU 11 set it.
 c586test.expected is Bochs's pentium model verbatim (c586test.bochs); QEMU
 differs on two lines, both leniencies of its TCG: a WRMSR to the TSC does
 not change what RDMSR/RDTSC read (T13), and an MSR that does not exist
