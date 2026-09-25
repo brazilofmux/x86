@@ -42,7 +42,7 @@ HOST_ARCH := $(if $(filter a64,$(ARCH)),aarch64,$(shell uname -m))
 BACKEND ?= $(if $(filter aarch64 arm64,$(HOST_ARCH)),a64,x64)
 DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_translate.c dbt/dbt_$(BACKEND).c
 DBT_OBJS  = $(addprefix $(O)/,$(DBT_SRCS:.c=.o))
-PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c pc/pc_ps2.c pc/pc_ide.c pc/pc_uart.c pc/pc_pci.c
+PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c pc/pc_ps2.c pc/pc_ide.c pc/pc_uart.c pc/pc_pci.c pc/pc_e1000.c
 PC_OBJS   = $(addprefix $(O)/,$(PC_SRCS:.c=.o))
 DOS_SRCS  = dos/dos_load.c dos/dos_host.c dos/dos_int21.c dos/dos_dpmi.c
 DOS_OBJS  = $(addprefix $(O)/,$(DOS_SRCS:.c=.o))

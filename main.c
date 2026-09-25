@@ -31,6 +31,7 @@ static void usage(const char *prog) {
     printf("  -com1 stdio|FILE  a 16550 serial port at COM1 (3F8h, IRQ 4): the terminal is its far end,\n");
     printf("              or FILE receives what it sends (default: no serial port)\n");
     printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
+    printf("  -nic e1000  an Intel 82545EM network card on that bus (no network behind it yet)\n");
     printf("  -ro         the images are read-only: the guest may write, the files never change\n");
     printf("  -boot a|c|IMG  boot the machine from A: or C: (IMG: -fda IMG -boot a), no HLE DOS\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
@@ -317,6 +318,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
         else if (!strcmp(argv[i], "-com1") && i + 1 < argc) { if (pc_uart_open(argv[++i]) < 0) return 1; }
         else if (!strcmp(argv[i], "-pci")) pc_pci_enable();
+        else if (!strcmp(argv[i], "-nic") && i + 1 < argc) {
+            const char *n = argv[++i];
+            if (!strcmp(n, "e1000")) pc_e1000_enable();
+            else { fprintf(stderr, "-nic: e1000 (an Intel 82545EM on PCI)\n"); return 1; }
+        }
         else if (!strcmp(argv[i], "-fda") && i + 1 < argc) img_fd[0] = argv[++i];
         else if (!strcmp(argv[i], "-fdb") && i + 1 < argc) img_fd[1] = argv[++i];
         else if (!strcmp(argv[i], "-hda") && i + 1 < argc) img_hd[0] = argv[++i];

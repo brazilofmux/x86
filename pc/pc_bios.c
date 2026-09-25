@@ -335,7 +335,7 @@ static void pic_summary(void) {
  * highest, and all eight rank between the master's IRQ 1 and IRQ 3.
  * pc.irq_pending bit 10 says the slave has something to offer. Its one
  * source so far is IRQ 13, the coprocessor's FERR#. */
-static struct { uint8_t mask, base, icw_step, need_icw4, read_isr, irr, isr; } pic2 = { 0xFF, 0x70, 0, 0, 0, 0, 0 };
+static struct { uint8_t mask, base, icw_step, need_icw4, read_isr, irr, isr, lines; } pic2 = { 0xFF, 0x70, 0, 0, 0, 0, 0, 0 };
 
 /* (unmasked requests only: a masked one must not keep a halted machine
  * from sleeping until something it can take) */
@@ -383,6 +383,16 @@ static void intr_update(void);
  * request register, and a line that falls before the request is taken
  * withdraws it. */
 void pc_irq_line(int irq, int level) {
+    if (irq >= 9 && irq <= 15) {                  /* the slave's: a PCI card's INTA on IRQ 11 */
+        uint8_t m = (uint8_t)(1 << (irq - 8));
+        if (level) {
+            if (!(pic2.lines & m)) { pic2.irr |= m; if (pc.cpu) pc.cpu->jit_cur_hit = 1; }
+            pic2.lines |= m;
+        } else { pic2.lines &= (uint8_t)~m; pic2.irr &= (uint8_t)~m; }
+        pic2_summary();
+        intr_update();
+        return;
+    }
     if (irq < 3 || irq > 7) return;
     uint8_t m = (uint8_t)(1 << irq);
     if (level) {
@@ -489,6 +499,7 @@ static int poll(x86_cpu *c) {
     static uint64_t last_code_ns;
     pc_ps2_poll(now);
     pc_uart_poll();
+    pc_e1000_poll();
     aux_latch();
     if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2) && !pc.kbd_disabled
         && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
@@ -517,6 +528,30 @@ static int poll(x86_cpu *c) {
          * start + 30, could see it jump past and spin forever. */
         if (now - pc.next_tick_ns > period) pc.next_tick_ns = now;
         pc.irq_pending |= 1 << 8;
+    }
+
+    /* Translated code runs up to a quantum (a million instructions)
+     * between polls, and a loop chained to itself (an idle loop's jmp $)
+     * does not come back sooner: at a guest's 1 kHz timer (Xinu's) that
+     * was a tick every 7 ms. So cap its run at the instructions due before
+     * the next tick, from the recent rate — cpu->next_event, the cap the
+     * IDE drive's events use too. Under X86_VCLOCK the rate is the clock's
+     * own, so a -V run stays deterministic. */
+    {
+        static uint64_t last_ns, last_insn;
+        static double ipn;                        /* instructions per nanosecond */
+        if (last_ns && now > last_ns + 100000u && c->insn_count > last_insn) {
+            double r = (double)(c->insn_count - last_insn) / (double)(now - last_ns);
+            ipn = ipn > 0 ? ipn * 0.75 + r * 0.25 : r;
+        }
+        last_ns = now; last_insn = c->insn_count;
+        /* (a tick raised and not yet taken: the one after it is next) */
+        uint64_t due = pc.next_tick_ns > now ? pc.next_tick_ns : now + period;
+        if (ipn > 0) {
+            uint64_t ev = c->insn_count + (uint64_t)((double)(due - now) * ipn) + 1000u;
+            if (pc.ide_due != UINT64_MAX && pc.ide_due < ev) ev = pc.ide_due;
+            c->next_event = ev;
+        }
     }
 
     if (c->halted && pc.ide_due != UINT64_MAX) pc_ide_poll(1);   /* halted waiting for the disk: no instructions will pass */

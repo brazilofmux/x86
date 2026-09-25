@@ -528,7 +528,7 @@ static void deliver_pm(x86_cpu *c, int vector, int is_sw, uint32_t err) {
      * and only then the present bit. An all-zero gate is #GP, not #NP —
      * EMM386 leaves some vectors so and reflects the #GP an INT n from V86
      * raises; the #NP it treats as fatal ("error #11"). QEMU agrees. */
-    if ((type & 0x17) != 0x06) x86_fault(c, X86_EXC_GP, (off | 2));     /* not an interrupt/trap gate */
+    if ((type & 0x16) != 0x06) x86_fault(c, X86_EXC_GP, (off | 2));     /* not an interrupt or trap gate, 16- or 32-bit (6, 7, E, F) */
     /* A software INT may only use a gate at or below its own privilege. */
     int cpl = x86_cpl(c);
     if (is_sw && ((gattr >> 5) & 3) < cpl) x86_fault(c, X86_EXC_GP, (off | 2));

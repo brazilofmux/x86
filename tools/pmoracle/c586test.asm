@@ -31,6 +31,8 @@ SEL_CODE3   equ 0x18 | 3
 SEL_DATA3   equ 0x20 | 3
 SEL_TSS     equ 0x28
 RET_VEC     equ 0x30
+TRAP_VEC    equ 0x32                ; a 32-bit trap gate: IF stays as it was
+INTR_VEC    equ 0x33                ; a 32-bit interrupt gate: IF cleared
 CR4_TSD     equ 0x04
 CR4_PSE     equ 0x10
 
@@ -103,6 +105,20 @@ pm32:
         mov [edi], ax
         mov word [edi+2], SEL_CODE
         mov word [edi+4], 0xEE00
+        shr eax, 16
+        mov [edi+6], ax
+        mov edi, IDT_BASE + TRAP_VEC * 8
+        mov eax, if_probe
+        mov [edi], ax
+        mov word [edi+2], SEL_CODE
+        mov word [edi+4], 0x8F00
+        shr eax, 16
+        mov [edi+6], ax
+        mov edi, IDT_BASE + INTR_VEC * 8
+        mov eax, if_probe
+        mov [edi], ax
+        mov word [edi+2], SEL_CODE
+        mov word [edi+4], 0x8E00
         shr eax, 16
         mov [edi+6], ax
         lidt [idtr]
@@ -326,7 +342,21 @@ pm32:
         db 0x0F, 0xC7, 0xC8                 ; cmpxchg8b eax: #UD
         call ok_eax
 
-.t50:   xor eax, eax
+        ; ---- trap and interrupt gates: IF across the delivery (every IRQ is
+        ; masked at the PIC, so STI lets nothing in)
+.t50:   mov byte [tno], 0x30
+        mov dword [resume], .t31
+        sti
+        int TRAP_VEC
+        cli
+        call ok_eax                         ; 200: a trap gate leaves IF set
+.t31:   mov byte [tno], 0x31
+        mov dword [resume], .t60
+        sti
+        int INTR_VEC
+        cli
+        call ok_eax                         ; 0: an interrupt gate clears it
+.t60:   xor eax, eax
         mov cr4, eax
         mov esi, msg_done
         call puts
@@ -370,6 +400,12 @@ r3_cx8_cross:   mov edx, 0xBBBBBBBB
                 mov ebx, 0x44444444
                 cmpxchg8b [0x30FFC]
                 int RET_VEC
+if_probe:                                   ; EFLAGS.IF inside the handler
+        pushfd
+        pop eax
+        and eax, 0x200
+        iretd
+
 ret_trap:
         mov bx, SEL_DATA
         mov ds, bx
@@ -489,7 +525,7 @@ gdt:    dq 0
 gdt_end:
 gdtr:   dw gdt_end - gdt - 1
         dd gdt
-idtr:   dw 0x31 * 8 - 1
+idtr:   dw 0x34 * 8 - 1
         dd IDT_BASE
 
         times (STAGE2_SECS + 1) * 512 - ($ - $$) db 0

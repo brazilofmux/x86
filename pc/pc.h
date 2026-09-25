@@ -121,7 +121,7 @@ void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted mac
 void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
 void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads as an empty bus */
 void pc_irq_raise(int irq);          /* IRQ 8-15: a request to the slave 8259 */
-void pc_irq_line(int irq, int level); /* IRQ 3-7: a device's line into the master 8259 (it takes the rising edge) */
+void pc_irq_line(int irq, int level); /* IRQ 3-7, 9-15: a device's line into an 8259 (it takes the rising edge) */
 void pc_irq_unmask(int irq);         /* as the BIOS opens a line it has a handler for */
 
 /* pc_ps2.c: the PS/2 mouse on the 8042's auxiliary port */
@@ -223,12 +223,34 @@ void pc_disk_install(x86_cpu *c);
 void pc_mouse_reboot(x86_cpu *c);
 uint8_t *pc_disk_hd(int unit, size_t *size, int *cyls, int *heads, int *spt);   /* pc_ide.c's view */
 /* pc_ide.c: the primary IDE channel */
-/* pc_pci.c: a PCI bus (a host bridge, the BIOS32 PCI BIOS), when -pci asks for one */
+/* pc_pci.c: a PCI bus (a host bridge, the BIOS32 PCI BIOS), when -pci or a
+ * PCI card asks for one. A card is its configuration space, the sizes of
+ * its BARs (0: none; bar_io: an I/O BAR), the interrupt line POST gives
+ * it, and its callbacks: reset (at POST), written (after software changed
+ * a configuration byte), and its I/O BARs' ports (only while the command
+ * register enables I/O). */
+typedef struct pc_pci_dev {
+    uint8_t  cfg[256];
+    uint32_t bar_size[6];
+    uint8_t  bar_io[6];
+    uint8_t  irq;
+    void (*reset)(struct pc_pci_dev *);
+    void (*written)(struct pc_pci_dev *, unsigned reg);
+    int  (*io_read)(struct pc_pci_dev *, uint16_t port, int size, uint32_t *val);
+    int  (*io_write)(struct pc_pci_dev *, uint16_t port, uint32_t val, int size);
+} pc_pci_dev;
 void pc_pci_enable(void);
 int  pc_pci_present(void);
+void pc_pci_add(int dev, pc_pci_dev *d);                  /* at device DEV, function 0 */
+uint32_t pc_pci_bar(const pc_pci_dev *d, int i);          /* BAR I's base, type bits off */
 void pc_pci_post(x86_cpu *c);
 int  pc_pci_port_read(uint16_t port, int size, uint32_t *val);
 int  pc_pci_port_write(uint16_t port, uint32_t val, int size);
+void pc_pci_dma_read(x86_cpu *c, uint64_t phys, void *buf, uint32_t len);
+void pc_pci_dma_write(x86_cpu *c, uint64_t phys, const void *buf, uint32_t len);
+/* pc_e1000.c: an Intel 82545EM at 00:03.0, IRQ 11 (-nic e1000) */
+void pc_e1000_enable(void);
+void pc_e1000_poll(void);
 /* pc_uart.c: COM1, a 16550A, when -com1 asks for one */
 int  pc_uart_open(const char *spec);   /* "stdio", or a file for what is sent */
 void pc_uart_post(x86_cpu *c);

@@ -11,9 +11,8 @@
  * that uses it (Xinu's console, Linux's ttyS0) was written against:
  * - the divisor latch behind LCR bit 7 (DLAB), the scratch register;
  * - transmission completes at once: THRE and TEMT are always set, and a
- *   THR write raises the THRE interrupt again straight away, as does
- *   enabling it (IER bit 1) while the holding register is empty — how a
- *   driver "kicks" its output;
+ *   THR write raises the THRE interrupt again straight away, as does any
+ *   IER write that enables it (bit 1) — how a driver "kicks" its output;
  * - a 16-byte receive FIFO when FCR enables it (IIR bits 7:6 = 11): at or
  *   above the trigger level the received-data interrupt (IIR 04h), below
  *   it, but not empty, the character timeout (0Ch) — at once, rather than
@@ -25,7 +24,8 @@
  *   PC's serial card OUT2 gates it; QEMU and VirtualBox do not, and Xinu,
  *   developed on the latter, never sets it.
  * The line into the PIC is level-shaped (pc_irq_line) and the 8259 takes
- * its rising edge, as it does from any ISA card.
+ * its rising edge, as it does from any ISA card; a change of cause while it
+ * is up is a fresh edge (update).
  */
 #include "pc.h"
 #include <fcntl.h>
@@ -49,6 +49,7 @@ static struct {
     uint8_t rx[RXQ]; int rx_head, rx_n;
     int thr_ipending;               /* THRE interrupt raised and not yet taken */
     int line;                       /* the level last put on IRQ 4 */
+    uint8_t last_id;                /* the cause it was for */
 } u = { .out_fd = -1 };
 
 static struct termios saved_tio;
@@ -93,9 +94,18 @@ static uint8_t iir_id(void) {
     return 0x01;
 }
 
+/* The line into the 8259, which takes rising edges. When the cause the
+ * chip reports changes while the line stays up (received data read, the
+ * transmitter's turn next), it drops and rises again: a handler that
+ * takes one cause per interrupt and returns (Xinu's) would otherwise
+ * leave the next one with no edge to be seen by, and the output it just
+ * queued would never go. */
 static void update(void) {
-    int level = iir_id() != 0x01;
-    if (level != u.line) { u.line = level; pc_irq_line(4, level); }
+    uint8_t id = iir_id();
+    int level = id != 0x01;
+    if (level && u.line && id != u.last_id) { pc_irq_line(4, 0); pc_irq_line(4, 1); }
+    else if (level != u.line) { u.line = level; pc_irq_line(4, level); }
+    u.last_id = id;
 }
 
 static void rx_put(uint8_t b) {
@@ -163,9 +173,11 @@ int pc_uart_port_write(uint16_t port, uint32_t val, int size) {
         break;
     case 1:
         if (u.lcr & 0x80) { u.dlm = v; break; }
-        /* THRE enabled while the holding register is empty: that is an
-         * interrupt now (drivers start their output this way) */
-        if ((v & IER_THRE) && !(u.ier & IER_THRE)) u.thr_ipending = 1;
+        /* THRE enabled while the holding register is empty — newly or
+         * again — is an interrupt now: drivers start their output this way
+         * (Xinu's ttykickout rewrites IER with the bit already set, and
+         * QEMU's and VirtualBox's 16550s answer it) */
+        if (v & IER_THRE) u.thr_ipending = 1;
         u.ier = v & 0x0F;
         break;
     case 2:
