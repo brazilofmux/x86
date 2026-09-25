@@ -49,7 +49,8 @@ Two ways to run things:
     by their own Setup (WINNT from MS-DOS, the CD copied to a hard disk),
     to the desktop
   - Linux 6.12 (Tiny Core 16.2, loaded by GRUB 2 from a disk image) on the
-    Pentium, to a shell; and Purdue's Xinu, with a serial console (-com1)
+    Pentium, to a shell — from its initramfs, or with its root filesystem
+    on the IDE disk (ext2, through Linux's own pata_legacy); and Purdue's Xinu, with a serial console (-com1)
     and an Intel 82545EM on a PCI bus (-pci, -nic e1000)
 - **As a DOS program runner** (the default): an emulated DOS (INT 21h in
   the host, a host directory as C:, a DPMI host of our own) for running a

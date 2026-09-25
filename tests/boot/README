@@ -179,3 +179,11 @@ boot test runs it on -m 586 -mem 128 to the tc@box prompt and uname -a
 needed the keyboard's command replies to get through while scanning is
 off (F5h), and its console scrolls by moving the CRTC start address,
 which the text dump expect.py reads now follows.
+
+tests/boot/tcroot.sh builds disks/linux/tcroot.img: the same kernel on a
+small FAT16 partition, and Tiny Core's userland unpacked from core.gz onto
+an ext2 partition (mke2fs -d, then debugfs making every inode root's, as
+the initramfs has them; devtmpfs.mount=1 fills /dev, which a non-root
+unpack cannot). GRUB boots root=/dev/sda2 with no initramfs, so every file
+after the kernel comes through the IDE controller. The boot test writes
+/hello.txt as root and reads it back out of the image with debugfs.

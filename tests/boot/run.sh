@@ -147,4 +147,16 @@ if [ -f disks/linux/tc.img ]; then
     then echo "ok   linux 6.12 (tiny core) to a shell on the pentium"; else echo "FAIL linux 6.12 (tiny core)"; fail=1; fi
     rm -f tmp/boot-tc.img tmp/boot-tc.exp
 fi
+if [ -f disks/linux/tcroot.img ] && [ -x "$(brew --prefix e2fsprogs 2>/dev/null)/sbin/debugfs" ]; then
+    # ... and with its root filesystem on our IDE disk (tests/boot/tcroot.sh:
+    # ext2, no initramfs): Linux writes a file there as root, and it is in
+    # the image afterwards
+    cp disks/linux/tcroot.img tmp/boot-tcr.img
+    printf 'tc@box:~\\$\tsudo sh -c "echo written by linux > /hello.txt"; sync\\r\ndelay 15\n' > tmp/boot-tcr.exp
+    python3 tools/expect.py -t 280 tmp/boot-tcr.exp -- $DM -m 586 -mem 128 -W -T 270 -hda tmp/boot-tcr.img -boot c >/dev/null 2>&1
+    dd if=tmp/boot-tcr.img of=tmp/boot-tcr-p2.img bs=512 skip=67584 2>/dev/null
+    if [ "$("$(brew --prefix e2fsprogs)/sbin/debugfs" -R "cat /hello.txt" tmp/boot-tcr-p2.img 2>/dev/null)" = "written by linux" ]
+    then echo "ok   linux 6.12 with its root on the ide disk (ext2, read and written)"; else echo "FAIL linux root on the ide disk"; fail=1; fi
+    rm -f tmp/boot-tcr.img tmp/boot-tcr-p2.img tmp/boot-tcr.exp
+fi
 exit $fail
