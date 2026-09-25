@@ -1150,6 +1150,13 @@ static void emit_shift_cl(emit_t *e, const x86_insn *in, ea_t *ea, uint32_t live
 static void emit_pushf16(emit_t *e, uint32_t live_in);
 static void emit_popf16(emit_t *e, uint32_t live_in);
 
+/* POP [mem] addresses its destination with the SP it has already
+ * incremented; the inline POP computes the address first, so a [esp+...]
+ * destination is the helper's. */
+static int pop_via_sp(const x86_insn *in) {
+    return in->op == OP_POP && in->ops[0].kind == OPK_MEM && (in->base == R_SP || in->index == R_SP);
+}
+
 /* Can this instruction be emitted inline by the code below? (The plan's
  * class says the interpreter is not required; this says the emitter is
  * ready for it.) */
@@ -1241,7 +1248,7 @@ static int inline_ok_seg16(const dbt_block *b, const x86_insn *in) {
     case OP_MOVSEG:
         return in->ops[0].kind != OPK_SREG;
     case OP_POP:
-        if (in->ops[0].kind == OPK_SREG) return 0;
+        if (in->ops[0].kind == OPK_SREG || pop_via_sp(in)) return 0;
         break;
     default:
         break;
@@ -1292,7 +1299,7 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
     case OP_PUSH:
         return in->opsize == 4 && in->ops[0].kind != OPK_SREG;
     case OP_POP:
-        return in->opsize == 4 && in->ops[0].kind != OPK_SREG;
+        return in->opsize == 4 && in->ops[0].kind != OPK_SREG && !pop_via_sp(in);
     case OP_PUSHA: case OP_POPA: case OP_LEAVE:
         return in->opsize == 4;
     case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC:
