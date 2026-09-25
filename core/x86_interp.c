@@ -1636,7 +1636,12 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_CLD: c->eflags &= ~X86_DF; break;
     case OP_STD: c->eflags |= X86_DF; break;
     case OP_CLI: need_iopl(c); c->eflags &= ~X86_IF; break;
-    case OP_STI: need_iopl(c); c->eflags |= X86_IF; c->int_inhibit = 1; break;
+    case OP_STI:
+        need_iopl(c);
+        if (!(c->eflags & X86_IF) && c->intr_ready && c->intr_ready(c)) c->jit_cur_hit = 1;   /* (see intr_ready) */
+        c->eflags |= X86_IF;
+        c->int_inhibit = 1;
+        break;
 
     /* ---- bit ops ---------------------------------------------------- */
     case OP_BT: case OP_BTS: case OP_BTR: case OP_BTC: {

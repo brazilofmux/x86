@@ -243,6 +243,13 @@ typedef struct x86_cpu {
     uint32_t cr4;
     uint64_t tsc_base;
     uint64_t msr_perf[3];
+    /* Would the machine interrupt the CPU now if IF were set (a request
+     * the interrupt controller would pass on)? Asked by STI when it sets
+     * IF: translated code takes interrupts only between blocks, and an
+     * idle loop's "sti; nop; nop; cli" (Windows 2000's) never has IF set
+     * at one, so STI sends the block back to the run loop instead, which
+     * steps the shadowed instruction and delivers. NULL: never. */
+    int    (*intr_ready)(struct x86_cpu *);
 } x86_cpu;
 
 static inline uint64_t x86_tsc(const x86_cpu *c) { return c->insn_count + c->tsc_base; }

@@ -397,7 +397,12 @@ void pc_ide_post(x86_cpu *c) {
             if (d->extra) d->sectors = (uint32_t)want;
         }
         /* the default translation: the BIOS's heads and sectors, cylinders
-         * for the whole drive (to 16383, as ATA caps word 1) */
+         * for the whole drive (to 16383, as ATA caps word 1) — unless the
+         * BIOS geometry has more than 16 heads, which the device/head
+         * register's four bits cannot address: that geometry is the BIOS's
+         * own translation (diskbios goes by LBA underneath), and the drive
+         * reports what a drive would, 16 heads of 63 sectors. */
+        if (heads > 16) { heads = 16; spt = 63; }
         d->heads = heads; d->spt = spt;
         uint32_t cc = d->sectors / ((uint32_t)heads * (uint32_t)spt);
         d->cyls = cc > 16383 ? 16383 : (int)cc;

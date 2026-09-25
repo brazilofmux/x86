@@ -402,6 +402,7 @@ static void shadow_copy_regs(x86_dbt *dbt) {
     sh->dbt = NULL; sh->jit_aux = NULL;
     sh->smc_hook = shadow_smc_none;
     sh->ferr_hook = NULL;                /* IRQ 13 is the real machine's */
+    sh->intr_ready = NULL;               /* and so are its requests */
     /* Devices belong to the real machine: the shadow sees their memory as
      * plain bytes and never reaches back into their state. */
     sh->device_store = NULL;

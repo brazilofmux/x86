@@ -388,6 +388,18 @@ static void ferr_irq13(x86_cpu *c) {
      * until its budget is spent. */
     c->jit_cur_hit = 1;
 }
+/* cpu->intr_ready: pc_poll's conditions for delivering, less IF and the
+ * shadow — a request the 8259s would pass on now (the in-service
+ * forgiveness aside). */
+static int intr_ready(x86_cpu *c) {
+    (void)c;
+    if (!pc.irq_pending) return 0;
+    if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) return 1;
+    if ((pc.irq_pending & (1 << 9)) && !(pc.irq_in_service & 3) && !(pic.mask & 2)) return 1;
+    uint8_t req = pic2.irr & (uint8_t)~pic2.mask;
+    return req && !(pc.irq_in_service & 7) && !(pic.mask & 4) && !(pic2.isr & ((2u << __builtin_ctz(req)) - 1));
+}
+
 static void deliver(x86_cpu *c, int irq) {
     int vector = pic.base + irq;
     pc.irq_in_service |= 1 << irq;
@@ -818,6 +830,7 @@ static void post(x86_cpu *cpu) {
     pic2.mask = cpu->has_fpu ? 0xDE : 0xFE; pic2.base = 0x70; pic2.icw_step = 0; pic2.read_isr = 0;
     pic2.irr = pic2.isr = 0;
     cpu->ferr_hook = ferr_irq13;
+    cpu->intr_ready = intr_ready;
     pc.aux_full = 0;
     pc_ps2_post(cpu);
     pc_vga_rom(cpu);                             /* INT 10h's mode set, programmed by OUTs */
