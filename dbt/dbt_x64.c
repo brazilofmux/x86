@@ -2656,7 +2656,9 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
         s_cur_n_done = i + 1;
         n = i + 1;
         ip = b->ip_afters[i];
-        uint32_t live_out = b->fmask[i], live_in = b->live_in[i];
+        /* This backend materializes eagerly: a store's side exit wants the
+         * bits in fexit too (see dbt.h), so take the union. */
+        uint32_t live_out = b->fmask[i] | b->fexit[i], live_in = b->live_in[i];
         int is_inline = inl && b->cls[i] == C_INLINE;
         if (is_inline && (b->role[i] == ROLE_UNCOND || (b->role[i] == ROLE_COND && i == b->n_ops - 1))) {
             s_cur_n_done = 0;                                    /* the whole block is charged by the tail */

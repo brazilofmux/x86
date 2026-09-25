@@ -380,6 +380,9 @@ typedef struct {
     uint8_t  cls[MAX_BLOCK_INSNS];        /* C_INLINE or C_HELPER (refusals end the block) */
     uint8_t  role[MAX_BLOCK_INSNS];       /* ROLE_* */
     uint32_t fmask[MAX_BLOCK_INSNS];      /* arithmetic flags live AFTER op i (live-out) */
+    uint32_t fexit[MAX_BLOCK_INSNS];      /* and only on op i's own side exit (a store's SMC sweep): bits
+                                           * the block never reads, so a backend may emit them on that
+                                           * cold path instead. fmask | fexit is the eager mask. */
     uint32_t live_in[MAX_BLOCK_INSNS];    /* and BEFORE it: what bookkeeping emitted ahead of op i must not clobber */
     uint32_t dyn_lin[MAX_BLOCK_INSNS];    /* nonzero: read op i's immediate from this physical address */
     x86_insn decs[MAX_BLOCK_INSNS];       /* last: everything before it is cleared per block */

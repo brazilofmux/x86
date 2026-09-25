@@ -21,6 +21,7 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "a20.com $mode"   tests/dos/a20.out   $DM $mode tests/dos/a20.com
     check "smcpush $mode"   tests/dos/smcpush.out $DM $mode tests/dos/smcpush.com
     check "smcfar $mode"    tests/dos/smcfar.out  $DM $mode tests/dos/smcfar.com
+    check "smcflag $mode"   tests/dos/smcflag.out $DM $mode tests/dos/smcflag.com
     check "fileio $mode"    tests/dos/fileio.out  $DM $mode -L 50000000 tests/dos/fileio.com
 done
 # unreal mode (HIMEMX's): PE set with a real-mode CS, a 4 GB DS kept across real-mode loads

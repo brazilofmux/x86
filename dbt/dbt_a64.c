@@ -17,9 +17,13 @@
  * (operands LSL #16 or #24) so NZCV is exactly the guest's SF/ZF/CF/OF;
  * MRS + one table load turns it into the x86 bit layout. AF and PF are
  * computed separately and only when the liveness pass says they are
- * observed — which, thanks to the block-exit "all live" rule, means
- * before conditional side exits. That is the first thing to optimize
- * once -V is clean (defer the materialization into the side chunk).
+ * observed. A storing op's own side exit — the code-bitmap sweep — no
+ * longer counts as observing them on the hot path: those bits come in
+ * fexit and are emitted inside the guard (emit_ftail_flush), which is
+ * where that exit already branches. The block-exit "all live" rule is
+ * still eager, so AF and PF are materialized before conditional side
+ * exits; deferring that one wants liveness across a chained link, and
+ * is what is left to optimize here.
  *
  * Three instruction classes (dbt_translate.c):
  *   INLINE  — emitted directly.
@@ -678,6 +682,11 @@ static void emit_fault_chunks(emit_t *e) {
     s_nfault = 0;
 }
 
+/* A storing op's deferred flag tail (emit_ftail_*, below the flag
+ * emitters): the bits only its own side exit observes, emitted on the
+ * SMC guard's cold path instead of the hot one. */
+static void emit_ftail_flush(emit_t *e);
+
 /* Post-store SMC check for the `size` bytes at host address X3: one
  * load of their bitmap entries (LDRB/LDRH/LDR — a word store that starts
  * just before a block still reaches into it), CBZ over the thunk call,
@@ -709,6 +718,10 @@ static void emit_smc_check_x3(emit_t *e, int size) {
         emit_patch_cond19(e, dev_miss1, emit_pos(e));
         emit_patch_cond19(e, dev_miss2, emit_pos(e));
     }
+    /* Past here the sweep may abandon the block, which is the only way
+     * the storing op's deferred flag bits are ever read. The device fast
+     * path above returns into the block and needs none of them. */
+    emit_ftail_flush(e);
     emit_mov_x64_x64(e, A64_W0, R_CPU);
     emit_sub_x64(e, A64_W1, W_T3, R_MEM);
     if (size > 1) (void)emit_orr_w32_imm(e, A64_W1, A64_W1, (uint32_t)size << 28);
@@ -975,6 +988,14 @@ static void emit_read_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t dst) {
 /* Store + inline SMC check. Clobbers W_T2, W_T3, X0..X4 on the slow path. */
 static void emit_write_mem(emit_t *e, const ea_t *ea, int size, a64_reg_t src) {
     int check = size == 2 && !s_ea_checked && !s_flat && !s_seg16;
+    /* Two ways out of the instruction before its guard, neither of them a
+     * place to defer to: the wrap chunk stores a byte at a time and runs
+     * its own SMC checks, but is emitted after the block's ops, when W_VAL
+     * and W_SRC no longer hold this op's result and source; and a 16-bit
+     * segment's limit check is a #GP that leaves from here. Both keep the
+     * tail eager. (A flat or paged access diverts to its helper before the
+     * op's first state change, so it is not in this list.) */
+    if (check || (s_seg16 && !s_ea_checked)) emit_ftail_flush(e);
     if (s_seg16 && !s_ea_checked) emit_limit_check(e, ea->seg, ea->off, size);
     if (size == 4) emit_str_w32_reg_uxtw(e, src, ea->segp, ea->off);
     else if (size == 1) emit_strb_reg_uxtw(e, src, ea->segp, ea->off);
@@ -1052,6 +1073,39 @@ static void emit_flag_af(emit_t *e, a64_reg_t a, a64_reg_t b, a64_reg_t res) {
     emit_eor_w32(e, W_T1, W_T1, res);
     (void)emit_and_w32_imm(e, W_T1, W_T1, X86_AF);
     emit_orr_w32(e, R_F, R_F, W_T1);
+}
+
+/* ---- Deferred flag tail ----
+ * A store's fexit bits (dbt.h) are read only if the code-bitmap sweep
+ * abandons the block, and emit_smc_check_x3 already branches on exactly
+ * that. AF and PF are the two that cost instructions, and both can be
+ * rebuilt at the guard without keeping anything alive on the hot path:
+ * the result is still in `res` (the store came from there) and the source
+ * in `b`, and for ADD/SUB the pre-op destination is res -/+ b. The guard
+ * clobbers only W0..W4, which is why W_VAL, W_SRC and W_T1 reach it.
+ *
+ * Recorded per op and consumed by that op's guard. A store with no guard,
+ * or one whose guard lives in a chunk emitted later (the wrap slow path),
+ * flushes eagerly instead — correct, just not off the hot path. */
+typedef struct {
+    uint32_t  bits;      /* X86_PF and/or X86_AF left to emit */
+    int       sub;       /* AF: the pre-op destination is res + b, not res - b */
+    a64_reg_t b, res;
+} ftail_t;
+static ftail_t s_ftail;
+
+static void emit_ftail_flush(emit_t *e) {
+    ftail_t f = s_ftail;
+    if (!f.bits) return;
+    s_ftail.bits = 0;                      /* one flush per op, whoever gets there first */
+    if (f.bits & X86_PF) emit_flag_pf(e, f.res);
+    if (f.bits & X86_AF) {
+        /* AF is bit 4 of a ^ b ^ res, so the recovered operand needs no
+         * masking: bit 4 of res -/+ b is bit 4 of the original. */
+        if (f.sub) emit_add_w32(e, W_T0, f.res, f.b);
+        else       emit_sub_w32(e, W_T0, f.res, f.b);
+        emit_flag_af(e, W_T0, f.b, f.res);
+    }
 }
 
 /* Set host NZCV so that B.<returned cond> is taken iff x86 condition cc
@@ -1926,9 +1980,14 @@ static void emit_wait(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
     emit_patch_tb14(e, quiet, emit_pos(e));
 }
 
-static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32_t fmask) {
+/* fmask: what the block reads after this op. fexit: what only its own
+ * store-exit reads (dbt.h) — deferred to the SMC guard where it can be,
+ * eager otherwise, so the two are separate arguments rather than a union. */
+static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32_t fmask, uint32_t fexit) {
     nzcv_state nz_in = s_nzcv;          /* what the previous op left, for SETcc */
     s_nzcv.valid = 0;                   /* only the op just emitted can leave NZCV usable */
+    s_ftail.bits = 0;                   /* nothing carries from the op before */
+    uint32_t eager = fmask | fexit;
     if (cls == C_HELPER) { emit_helper_op(dbt, e, in); return; }
 
     ea_t ea = { 0, 0, 0 };
@@ -1944,7 +2003,18 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         int wr = (in->op != OP_CMP && in->op != OP_TEST);
         /* Pinned register destination of the full width: compute in place. */
         a64_reg_t res = (wr && d->kind == OPK_REG && (d->size == 4 || (d->size == 2 && !s_regs32))) ? a : W_VAL;
-        emit_alu(e, in->op, size, a, b, res, fmask);
+        /* A memory destination reaches an SMC guard with res and b intact,
+         * so PF and AF that only that exit reads go there. AF needs the
+         * pre-op destination back, which only ADD and SUB give up cheaply
+         * (ADC/SBB would want the carry that has since been overwritten,
+         * and the logicals leave AF undefined and never ask). */
+        uint32_t defer = 0;
+        if (wr && d->kind == OPK_MEM) {
+            defer = fexit & X86_PF;
+            if ((in->op == OP_ADD || in->op == OP_SUB) && (fexit & X86_AF)) defer |= X86_AF;
+        }
+        emit_alu(e, in->op, size, a, b, res, eager & ~defer);
+        if (defer) s_ftail = (ftail_t){ defer, in->op == OP_SUB, b, res };
         if (wr && res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
         /* Narrow ADC/SBB fix OF up after the table, so their NZCV is not
          * the guest's; a memory destination would clobber NZCV in the SMC
@@ -1959,7 +2029,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     case OP_INC: case OP_DEC: {
         a64_reg_t a = emit_read_operand(e, in, 0, &ea, W_VAL);
         a64_reg_t res = (d->kind == OPK_REG && (d->size == 4 || (d->size == 2 && !s_regs32))) ? a : W_VAL;
-        emit_incdec(e, in->op == OP_INC, size, a, res, fmask);
+        emit_incdec(e, in->op == OP_INC, size, a, res, eager);
         if (res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
         if (d->kind != OPK_MEM) {
             s_nzcv.valid = 1;
@@ -1979,7 +2049,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         a64_reg_t a = emit_read_operand(e, in, 0, &ea, W_VAL);
         emit_mov_w32_w32(e, W_SRC, a);
         emit_movz_w32(e, W_VAL, 0, 0);
-        emit_alu(e, OP_SUB, size, W_VAL, W_SRC, W_VAL, fmask);
+        emit_alu(e, OP_SUB, size, W_VAL, W_SRC, W_VAL, eager);
         emit_write_operand(e, in, 0, &ea, W_VAL);
         break;
     }
@@ -1989,8 +2059,8 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         if (!by_cl && cnt == 0) break;
         a64_reg_t a = emit_read_operand(e, in, 0, &ea, W_VAL);
         a64_reg_t res = (d->kind == OPK_REG && (d->size == 4 || (d->size == 2 && !s_regs32))) ? a : W_VAL;
-        if (by_cl) emit_shift_cl(e, in->op, a, res, fmask);   /* 32-bit only (classify_flat) */
-        else emit_shift_imm(e, in->op, size, cnt, a, res, fmask);
+        if (by_cl) emit_shift_cl(e, in->op, a, res, eager);   /* 32-bit only (classify_flat) */
+        else emit_shift_imm(e, in->op, size, cnt, a, res, eager);
         if (res == W_VAL) emit_write_operand(e, in, 0, &ea, W_VAL);
         break;
     }
@@ -2031,8 +2101,8 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         break;
     }
     case OP_LODS: case OP_STOS: case OP_MOVS: case OP_CMPS: case OP_SCAS:
-        if (!in->rep) emit_string1(e, in, fmask);
-        else if (in->op == OP_CMPS || in->op == OP_SCAS) emit_rep_cmp(e, in, fmask);
+        if (!in->rep) emit_string1(e, in, eager);
+        else if (in->op == OP_CMPS || in->op == OP_SCAS) emit_rep_cmp(e, in, eager);
         else emit_rep_store(e, in);                                  /* MOVS, STOS (classify) */
         break;
     case OP_PUSHF: emit_pushf16(e); break;
@@ -2067,7 +2137,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         a64_reg_t b = emit_read_operand(e, in, 1, &ea, W_SRC);
         if (shld) emit_extr_w32(e, W_T0, a, b, 32 - cnt);    /* (a:b) >> (32-cnt) */
         else      emit_extr_w32(e, W_T0, b, a, cnt);         /* (b:a) >> cnt */
-        if (fmask) {
+        if (eager) {
             emit_tst_w32(e, W_T0, W_T0);                        /* N, Z; C = V = 0 */
             emit_flags_from_nzcv(e, T_ADD);
             emit_ubfx_w32(e, W_T1, a, shld ? 32 - cnt : cnt - 1, 1);
@@ -2075,7 +2145,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
             emit_eor_w32(e, W_T1, a, W_T0);
             emit_lsr_w32_imm(e, W_T1, W_T1, 31);
             emit_orr_w32_lsl(e, R_F, R_F, W_T1, 11);
-            if (fmask & X86_PF) emit_flag_pf(e, W_T0);
+            if (eager & X86_PF) emit_flag_pf(e, W_T0);
         }
         emit_write_operand(e, in, 0, &ea, W_T0);
         break;
@@ -2083,7 +2153,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     case OP_MUL: case OP_IMUL:
         if (size < 4 && (in->op == OP_MUL || in->opcode2 != 0xAF)) {
             a64_reg_t src = emit_read_operand(e, in, 0, &ea, W_SRC);
-            emit_mul16(e, size, in->op == OP_IMUL, src, fmask);
+            emit_mul16(e, size, in->op == OP_IMUL, src, eager);
             break;
         }
         if (in->op == OP_MUL || in->opcode2 != 0xAF) {
@@ -2095,10 +2165,10 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
             if (is_signed) emit_smull(e, W_T0, R_GPR(R_AX), src);
             else emit_umull(e, W_T0, R_GPR(R_AX), src);
             emit_lsr_x64_imm(e, R_GPR(R_DX), W_T0, 32);
-            if (fmask) {
+            if (eager) {
                 emit_tst_w32(e, W_T0, W_T0);
                 emit_flags_from_nzcv(e, T_ADD);
-                if (fmask & X86_PF) emit_flag_pf(e, W_T0);
+                if (eager & X86_PF) emit_flag_pf(e, W_T0);
                 if (is_signed) emit_cmp_x64_w32_sxtw(e, W_T0, W_T0);
                 else (void)emit_subs_w32_imm(e, A64_WZR, R_GPR(R_DX), 0);
                 emit_cset_w32(e, W_T2, A64_COND_NE);
@@ -2123,11 +2193,11 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
             b = W_SRC;
         }
         emit_smull(e, W_T0, a, b);                               /* X6 = full product */
-        if (fmask) {
+        if (eager) {
             emit_asr_x64_imm(e, W_T2, W_T0, 32);                 /* W4 = high half */
             emit_tst_w32(e, W_T2, W_T2);
             emit_flags_from_nzcv(e, T_ADD);                      /* SF, ZF */
-            if (fmask & X86_PF) emit_flag_pf(e, W_T2);
+            if (eager & X86_PF) emit_flag_pf(e, W_T2);
             emit_cmp_x64_w32_sxtw(e, W_T0, W_T0);
             emit_cset_w32(e, W_T2, A64_COND_NE);
             emit_orr_w32(e, R_F, R_F, W_T2);                     /* CF */
@@ -2210,6 +2280,10 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     /* A flat or paged memory operand has a slow path — the helper — which
      * leaves no NZCV behind for a following Jcc to fuse on. */
     if ((s_flat || s_paged) && in->ea_valid && in->op != OP_LEA) s_nzcv.valid = 0;
+    /* A deferred tail must not outlive the op that recorded it: if no guard
+     * claimed it (a store that skips the check, or a path that never
+     * reached one), emit it here while res and b still hold. */
+    emit_ftail_flush(e);
 }
 
 /* ----------------------------------------------------------------------
@@ -2686,6 +2760,7 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
 
     const x86_insn *decs = b->decs;
     const uint32_t *ip_afters = b->ip_afters, *dyn_lin = b->dyn_lin, *fmask = b->fmask;
+    const uint32_t *fexit = b->fexit;
     const uint8_t *role = b->role, *cls = b->cls;
     uint32_t n_ops = b->n_ops, ip = b->end_ip;
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
@@ -2747,7 +2822,7 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
         }
         uint32_t first_slow = s_nfslow;
         s_dyn_imm_lin = dyn_lin[i];
-        emit_op(dbt, &e, in, cls[i], fmask[i]);
+        emit_op(dbt, &e, in, cls[i], fmask[i], fexit[i]);
         s_dyn_imm_lin = 0;
         for (uint32_t k = first_slow; k < s_nfslow; k++) s_fslow[k].back_off = emit_pos(&e);
     }

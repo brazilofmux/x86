@@ -509,9 +509,17 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
             /* 286+: a limit fault is an unplanned exit whose frame holds
              * the flags, so an op that can fault observes all of them. */
             if (cpu->model >= X86_MODEL_286 && !b->flat && op_may_fault(b, &decs[i])) rd |= ARITH;
-            /* A store can leave the block after the op (SMC): all live out. */
-            b->fmask[i] = live | (b->cls[i] == C_INLINE && op_stores(&decs[i]) ? ARITH : 0);
-            live = (b->fmask[i] & ~wr) | rd;
+            /* A store can leave the block after the op (SMC): all live out.
+             * Split that from what the block itself reads — the difference
+             * is observed only if the sweep does abandon the block, so a
+             * backend can emit those bits on the cold path (fexit) rather
+             * than the hot one. The propagation still uses the union: a bit
+             * live at this op's exit that this op does not write has to be
+             * materialized by whichever earlier op does write it. */
+            uint32_t full = live | (b->cls[i] == C_INLINE && op_stores(&decs[i]) ? ARITH : 0);
+            b->fmask[i] = live;
+            b->fexit[i] = full & ~live;
+            live = (full & ~wr) | rd;
             b->live_in[i] = live;
         }
     }
