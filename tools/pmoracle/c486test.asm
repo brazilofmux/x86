@@ -29,6 +29,7 @@ SEL_CODE3   equ 0x18 | 3
 SEL_DATA3   equ 0x20 | 3
 SEL_TSS     equ 0x28
 RET_VEC     equ 0x30
+R3_VEC      equ 0x31                ; a DPL 3 gate to ring-3 code: its frame goes on the ring-3 stack
 CR0_WP      equ 0x10000
 CR0_AM      equ 0x40000
 EFL_AC      equ 0x40000
@@ -101,6 +102,13 @@ pm32:
         mov eax, ret_trap
         mov [edi], ax
         mov word [edi+2], SEL_CODE
+        mov word [edi+4], 0xEE00
+        shr eax, 16
+        mov [edi+6], ax
+        mov edi, IDT_BASE + R3_VEC * 8
+        mov eax, r3_handler
+        mov [edi], ax
+        mov word [edi+2], SEL_CODE3
         mov word [edi+4], 0xEE00
         shr eax, 16
         mov [edi+6], ax
@@ -259,6 +267,12 @@ pm32:
         call ring3
         mov byte [tno], 0x2C
         mov ebx, r3_popf_ac                 ; AC cleared by the program itself
+        call ring3
+        mov byte [tno], 0x2E
+        mov ebx, r3_int_mis                 ; INT to a ring-3 handler, ESP odd: the frame's push is #AC(0)
+        call ring3
+        mov byte [tno], 0x2F
+        mov ebx, r3_int_ali                 ; the same, aligned: the handler runs
         call ring3
         mov eax, cr0
         and eax, ~CR0_AM
@@ -466,6 +480,13 @@ r3_lds:         mov word [0x30032], 0x1234  ; (word stores: a dword here would i
                 pop ds
                 movzx eax, ax
                 int RET_VEC
+r3_int_mis:     dec esp
+                int R3_VEC
+                int RET_VEC                 ; (not reached)
+r3_int_ali:     int R3_VEC
+                int RET_VEC                 ; (not reached)
+r3_handler:     mov eax, 0x5A5A             ; ring 3, on the interrupted ring-3 stack
+                int RET_VEC
 r3_popf_ac:     pushfd
                 and dword [esp], ~EFL_AC
                 popfd
@@ -607,7 +628,7 @@ gdt:    dq 0
 gdt_end:
 gdtr:   dw gdt_end - gdt - 1
         dd gdt
-idtr:   dw 0x31 * 8 - 1
+idtr:   dw 0x32 * 8 - 1
         dd IDT_BASE
 
         times (STAGE2_SECS + 1) * 512 - ($ - $$) db 0

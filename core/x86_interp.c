@@ -378,6 +378,9 @@ static void push_on(x86_cpu *c, const x86_seg *ss, uint32_t *sp, int size, uint3
      * while CS still says where the transfer came from */
     uint8_t s = c->pg_super;
     if ((ss->sel & 3) < 3) c->pg_super = 1;
+    /* ... and a CPL 3 stack is the program's: a frame built on it (an
+     * interrupt to a ring-3 handler) is alignment-checked like a PUSH */
+    else ac_check(c, ss->base, *sp, size, 1);
     x86_wr(c, ss->base, *sp, 0xFFFFFFFFu, size, v);
     c->pg_super = s;
 }
