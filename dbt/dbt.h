@@ -108,6 +108,27 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
                                              * sweep and code-page drops find either by address) */
 #define KEY_DSNULL         (1ull << 56)   /* ...and the same for DS */   /* 16-bit CS and SS, expand-up data segments: real-mode-shaped code with limits (dbt_seg16_ok) */
 
+/* Monotonic nanoseconds, cheap enough to take around every block run:
+ * the AArch64 virtual counter, scaled; clock_gettime elsewhere. */
+#include <time.h>
+static inline uint64_t dbt_now_ns(void) {
+#if defined(__aarch64__)
+    static uint64_t mult;
+    uint64_t v;
+    if (!mult) {
+        uint64_t f;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        mult = f ? (1000000000ull << 32) / f : 1ull << 32;
+    }
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return (uint64_t)(((unsigned __int128)v * mult) >> 32);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
 static inline uint64_t dbt_key(uint32_t cs_sel, uint32_t lin) { return ((uint64_t)cs_sel << 32) | lin; }
 static inline uint32_t dbt_key_lin(uint64_t key) { return (uint32_t)key; }
 /* Cache slot: the linear address, with the key's mode bits (48..52:
@@ -254,6 +275,14 @@ typedef struct {
     struct { uint64_t key, n; } fb_site[4096];   /* X86_FALLBACK_SITES: where (mode:CS:EIP), open-addressed */
     int      fb_sites;
     uint64_t helper_by_op[OP__COUNT];    /* which op helper calls ran (dynamic) — the promotion list */
+    /* Where the run's time went, exactly (dbt_now_ns is a counter read):
+     * translated code (helper calls from it included), host services
+     * (HLE steps: DOS, BIOS, DPMI), plain interpreter steps, translation,
+     * the host poll (keyboard, screen, timer, idle sleeps), -V's shadow.
+     * And the guest instructions each retired. */
+    int      phases;               /* X86_PHASES: take the times below (off by default: clock reads cost) */
+    uint64_t t_jit, t_svc, t_interp, t_xlate, t_poll, t_verify, t_run;
+    uint64_t n_jit, n_svc, n_interp;
     /* X86_PMPROF=1: what protected-mode code actually executes, to decide
      * what the backend learns first. Indexed [op][opsize==4][adsize==4]. */
     int      pmprof;

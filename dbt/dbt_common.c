@@ -60,6 +60,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     }
 
     if (getenv("X86_NO_SEG16")) dbt_seg16_enabled = 0;
+    dbt->phases = getenv("X86_PHASES") != NULL;
     dbt->aux       = calloc(1, sizeof(x86_jit_aux));
     dbt->span      = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));
     dbt->link_head = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));
@@ -452,8 +453,20 @@ static uint64_t run_budget(const x86_dbt *dbt) {
     return q;
 }
 
+static int dbt_run_loop(x86_dbt *dbt);
+/* A phase timestamp: a counter read with X86_PHASES, else nothing. */
+#define PH() (phases ? dbt_now_ns() : 0)
 int dbt_run(x86_dbt *dbt) {
+    if (!dbt->phases) return dbt_run_loop(dbt);
+    uint64_t t0 = dbt_now_ns();
+    int rc = dbt_run_loop(dbt);
+    dbt->t_run += dbt_now_ns() - t0;
+    return rc;
+}
+
+static int dbt_run_loop(x86_dbt *dbt) {
     x86_cpu *cpu = dbt->cpu;
+    const int phases = dbt->phases;
     trampoline_fn trampoline = (trampoline_fn)(void *)dbt->code_buf;
 
     if (dbt->verify && !dbt->shadow_live) {
@@ -476,7 +489,9 @@ int dbt_run(x86_dbt *dbt) {
          * change the shadow must copy. */
         if (dbt->poll && (cpu->halted || poll_countdown-- == 0)) {
             poll_countdown = 256;
+            uint64_t tp = PH();
             if (dbt->poll(cpu) && dbt->verify) dbt->shadow_stale = 1;
+            if (phases) dbt->t_poll += dbt_now_ns() - tp;
         }
         if (cpu->halted) return 0;
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
@@ -500,7 +515,9 @@ int dbt_run(x86_dbt *dbt) {
         uint8_t *code = be ? be->code : NULL;
         if (!be && !inhibited) {
             dbt_jit_writable_begin();
+            uint64_t tx = PH();
             code = dbt_translate_block(dbt, key);
+            if (phases) dbt->t_xlate += dbt_now_ns() - tx;
             dbt_jit_writable_end();
             dbt_cache_insert(dbt, key, code);
             if (code) dbt->blocks_translated++;
@@ -525,7 +542,10 @@ int dbt_run(x86_dbt *dbt) {
 
                 dbt->jit_block_entries++;
                 dev_log_arm(dbt);
+                uint64_t tj = PH();
                 trampoline(cpu, cpu->mem, code, dbt->aux, run_budget(dbt));
+                if (phases) { dbt->t_jit += dbt_now_ns() - tj; dbt->n_jit += cpu->insn_count - insns_before; }
+                uint64_t tv = PH();
                 poll_countdown = 0;
                 if (cpu->exc >= 0) x86_deliver_exception(cpu);
                 uint64_t jit_insns = cpu->insn_count - insns_before;
@@ -567,10 +587,13 @@ int dbt_run(x86_dbt *dbt) {
                     dump_block_bytes(cpu, key, "entry block, real mem");
                     return -1;
                 }
+                if (phases) dbt->t_verify += dbt_now_ns() - tv;
                 continue;
             }
             dbt->jit_block_entries++;
+            uint64_t tj = PH(), nj = cpu->insn_count;
             trampoline(cpu, cpu->mem, code, dbt->aux, run_budget(dbt));
+            if (phases) { dbt->t_jit += dbt_now_ns() - tj; dbt->n_jit += cpu->insn_count - nj; }
             poll_countdown = 0;
             if (cpu->exc >= 0) x86_deliver_exception(cpu);
             continue;
@@ -611,15 +634,17 @@ int dbt_run(x86_dbt *dbt) {
             if (x86_decode(&dc, &di)) dbt->fallback_by_op[di.op]++;
         }
         if (dbt->verify) dev_log_arm(dbt);
-        int timed = (dbt->interp_fallback_insns & 15) == 0;
-        struct timespec t0, t1;
-        if (timed) clock_gettime(CLOCK_MONOTONIC, &t0);
+        int timed = phases || (dbt->interp_fallback_insns & 15) == 0;
+        uint64_t ts = timed ? dbt_now_ns() : 0, ns = cpu->insn_count;
         int shadowed = cpu->int_inhibit != 0;
         int rc = x86_step(cpu);
         if (timed) {
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            dbt->interp_fallback_ns += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull
-                                     + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+            uint64_t dt = dbt_now_ns() - ts;
+            if ((dbt->interp_fallback_insns & 15) == 0) dbt->interp_fallback_ns += dt;   /* sampled, x16 when printed */
+            if (phases) {
+                if (hle_step) { dbt->t_svc += dt; dbt->n_svc++; }
+                else { dbt->t_interp += dt; dbt->n_interp += cpu->insn_count - ns; }
+            }
         }
         if (rc < 0) {
             fprintf(stderr, "dbt_run: interpreter stopped at %04X:%04X\n", cpu->seg[S_CS].sel, cpu->eip);
@@ -724,6 +749,30 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     fprintf(out, "  cache hits/misses:      %llu / %llu\n",
             (unsigned long long)dbt->cache_hits, (unsigned long long)dbt->cache_misses);
     fprintf(out, "  JIT block entries:      %llu\n", (unsigned long long)dbt->jit_block_entries);
+    if (dbt->phases && dbt->t_run) {
+        /* The one rate that means "how fast does the translator run guest
+         * code" is the first: instructions retired inside translated code
+         * over the time spent there (helper calls from it included). The
+         * others say where the rest of the wall time went. */
+        double run = dbt->t_run / 1e9;
+        uint64_t other = dbt->t_run - dbt->t_jit - dbt->t_svc - dbt->t_interp - dbt->t_xlate - dbt->t_poll - dbt->t_verify;
+        #define PCT(t) (100.0 * (double)(t) / (double)dbt->t_run)
+        #define RATE(n, t) ((t) ? (double)(n) / ((double)(t) / 1e9) / 1e6 : 0.0)
+        fprintf(out, "  time (%.3f s in the run loop):\n", run);
+        fprintf(out, "    translated code   %8.3f s %5.1f%%  %12llu insns  %8.1f MIPS\n", dbt->t_jit / 1e9, PCT(dbt->t_jit),
+                (unsigned long long)dbt->n_jit, RATE(dbt->n_jit, dbt->t_jit));
+        fprintf(out, "    host services     %8.3f s %5.1f%%  %12llu steps  %8.0f ns each\n", dbt->t_svc / 1e9, PCT(dbt->t_svc),
+                (unsigned long long)dbt->n_svc, dbt->n_svc ? (double)dbt->t_svc / (double)dbt->n_svc : 0.0);
+        fprintf(out, "    interpreter       %8.3f s %5.1f%%  %12llu insns  %8.1f MIPS\n", dbt->t_interp / 1e9, PCT(dbt->t_interp),
+                (unsigned long long)dbt->n_interp, RATE(dbt->n_interp, dbt->t_interp));
+        fprintf(out, "    translation       %8.3f s %5.1f%%  %12llu blocks\n", dbt->t_xlate / 1e9, PCT(dbt->t_xlate),
+                (unsigned long long)dbt->blocks_translated);
+        fprintf(out, "    host poll/idle    %8.3f s %5.1f%%\n", dbt->t_poll / 1e9, PCT(dbt->t_poll));
+        if (dbt->t_verify) fprintf(out, "    -V shadow         %8.3f s %5.1f%%\n", dbt->t_verify / 1e9, PCT(dbt->t_verify));
+        fprintf(out, "    run loop itself   %8.3f s %5.1f%%  (cache lookups, dispatch, delivery)\n", other / 1e9, PCT(other));
+        #undef PCT
+        #undef RATE
+    }
     fprintf(out, "  interp fallback insns:  %llu  (~%.1f ms host, ~%.0f ns each; sampled)\n",
             (unsigned long long)dbt->interp_fallback_insns,
             (double)dbt->interp_fallback_ns * 16.0 / 1e6,
