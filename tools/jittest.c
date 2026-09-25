@@ -404,6 +404,7 @@ static int run_pm_prog(int n, int stats) {
     x86_free(&cpu);
     return bad;
 }
+static int s_wild;       /* -X */
 static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     rng_state = seed ? seed : 0x9E3779B97F4A7C15ull;
     uint8_t prog[2048]; int plen = 0;
@@ -440,6 +441,11 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     cpu.r[R_DI] = 0x20000 + (rnd() % 0x90000);
     cpu.r[R_CX] = rnd() & 0xFF;
     cpu.r[R_SP] = DATA_PM + 0x80000 + (rnd() & 0xFFFC);
+    /* -X: wild addresses. SI and BP anywhere in 4 GB (mostly past memory),
+     * so the flat accesses that use them take the slow path: on the
+     * x86-64 backend, the fastmem fault handler. Drawn after everything
+     * above so a seed's program is the same with and without -X. */
+    if (s_wild) { cpu.r[R_SI] = (uint32_t)rnd(); cpu.r[R_BP] = (uint32_t)rnd(); }
     cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
     cpu.eip = CODE_PM;
     memcpy(cpu.mem + CODE_PM, prog, plen);
@@ -733,6 +739,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-s")) stats = 1;
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!strcmp(argv[i], "-P")) pm = 1;
+        else if (!strcmp(argv[i], "-X")) s_wild = 1;
         else if (!strcmp(argv[i], "-G")) pm = 2;
         else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] [-P] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
     }

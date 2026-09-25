@@ -77,6 +77,11 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>
 #endif
+#if defined(__linux__) && defined(__x86_64__)
+#define X64_FASTMEM 1                 /* flat accesses guarded by the page fault, not a compare (see below) */
+#include <signal.h>
+#include <ucontext.h>
+#endif
 
 /* The C calling convention the thunks and the trampoline speak: System V,
  * or on Windows the Microsoft x64 one � arguments in RCX RDX R8 R9, 32
@@ -223,7 +228,10 @@ static void emit_spill_pinned(emit_t *e) {
  * inside blocks, so a thunk (one CALL deep) is at 8 and aligns with one
  * more push before calling C.
  * ---------------------------------------------------------------------- */
+static void fastmem_init(x86_dbt *dbt);
+
 void dbt_emit_trampoline(x86_dbt *dbt) {
+    fastmem_init(dbt);                                       /* (a flush re-emits this: the trap table starts over) */
     emit_t e = { .buf = dbt->code_buf, .offset = 0, .capacity = CODE_BUF_SIZE };
     x64_mem_t m;
     host_features();
@@ -625,6 +633,8 @@ typedef struct {
     uint32_t patch_off, back_off;
     uint32_t ip_after, ip_start, n_done, op_i;
     uint32_t rf_after;        /* bits the continuation expects in RFLAGS */
+    uint8_t  trap;            /* a fastmem range: entered by the fault handler, not a Jcc */
+    uint32_t start, rf_at;    /* ...its first host byte, and the guest bits RFLAGS held there */
 } slow_site_t;
 #define SLOW_MAX 256
 static slow_site_t s_slow[SLOW_MAX];
@@ -643,6 +653,102 @@ static void slow_site(emit_t *e, int cc) {
     s->n_done = s_cur_n_done;
     s->op_i = s_cur_i;
     s->rf_after = 0;
+    s->trap = 0;
+}
+
+/* ----------------------------------------------------------------------
+ * Fastmem (Linux x86-64). A flat, unpaged access carries no range check:
+ * the reservation above guest memory is FFh read-only slack and then no
+ * access at all up to X86_FLAT_SPAN (x86.h), so an offset past memory
+ * faults. The instruction's host code, from its first check to its
+ * rejoin, is registered as a trap range; SIGSEGV inside one is sent to
+ * that instruction's slow-path chunk (the interpreter runs the whole
+ * instruction, exactly), after the guest flags RFLAGS held there are
+ * merged into the slot. Nothing of the instruction is committed before
+ * its first access (the rule every check already keeps); multi-access
+ * ops, string ops and high-byte forms keep their compares (s_trap_ok).
+ * X86_NO_FASTMEM=1 keeps the compares everywhere, for A/B.
+ * ---------------------------------------------------------------------- */
+static int s_fastmem;         /* this dbt's flat blocks use trap ranges */
+static int s_trap_ok;         /* ...and this instruction may */
+static int s_load_nosave;     /* ...and is a plain load: no check clobbers RFLAGS, so no save first */
+
+typedef struct { uint32_t start, end, chunk, rf; } trap_ent_t;
+static trap_ent_t *s_traps;
+static uint32_t s_ntraps, s_captraps;
+static x86_dbt *s_trap_dbt;
+
+static void trap_site(emit_t *e) {
+    if (s_nslow >= SLOW_MAX) { fprintf(stderr, "dbt: slow-path table overflow\n"); abort(); }
+    slow_site_t *t = &s_slow[s_nslow++];
+    t->patch_off = 0;
+    t->back_off = 0;
+    t->ip_after = s_cur_ip_after;
+    t->ip_start = s_cur_ip_start;
+    t->n_done = s_cur_n_done;
+    t->op_i = s_cur_i;
+    t->rf_after = 0;
+    t->trap = 1;
+    t->start = emit_pos(e);
+    t->rf_at = s_rf & ARITH;
+}
+
+static void trap_add(uint32_t start, uint32_t end, uint32_t chunk, uint32_t rf) {
+    if (s_ntraps == s_captraps) {
+        uint32_t cap = s_captraps ? s_captraps * 2 : 65536;
+        trap_ent_t *n = realloc(s_traps, cap * sizeof *n);
+        if (!n) { fprintf(stderr, "dbt: trap table\n"); abort(); }
+        s_traps = n; s_captraps = cap;
+    }
+    s_traps[s_ntraps++] = (trap_ent_t){ start, end, chunk, rf };
+}
+
+#if defined(X64_FASTMEM)
+static void trap_handler(int sig, siginfo_t *si, void *ctx) {
+    (void)sig;
+    ucontext_t *uc = ctx;
+    x86_dbt *d = s_trap_dbt;
+    uint64_t pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+    if (d && d->code_buf && pc >= (uint64_t)(uintptr_t)d->code_buf && pc < (uint64_t)(uintptr_t)(d->code_buf + d->code_used)) {
+        uint32_t off = (uint32_t)(pc - (uint64_t)(uintptr_t)d->code_buf), lo = 0, hi = s_ntraps;
+        while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (s_traps[mid].start <= off) lo = mid + 1; else hi = mid; }
+        const x86_cpu *c = d->cpu;
+        const uint8_t *a = si->si_addr;
+        if (lo && off < s_traps[lo - 1].end && c && a >= c->mem + X86_BM_DELTA && a < c->mem + X86_FLAT_SPAN) {
+            const trap_ent_t *t = &s_traps[lo - 1];
+            uint64_t efl = (uint64_t)uc->uc_mcontext.gregs[REG_EFL];
+            d->cpu->jit_flags = (d->cpu->jit_flags & ~(uint64_t)t->rf) | (efl & t->rf);
+            d->fastmem_traps++;
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)(d->code_buf + t->chunk);
+            return;
+        }
+    }
+    /* not ours: the default action, on the same fault again */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
+    sigaction(SIGSEGV, &sa, NULL);
+}
+#endif
+
+static void fastmem_init(x86_dbt *dbt) {
+    s_ntraps = 0;
+    s_trap_dbt = dbt;
+    s_fastmem = 0;
+#if defined(X64_FASTMEM)
+    if (!dbt->cpu || !dbt->cpu->mem_mirrored || getenv("X86_NO_FASTMEM") || X86_BM_DELTA >= 0) return;
+    static int installed;
+    if (!installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = trap_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGSEGV, &sa, NULL) != 0) return;
+        installed = 1;
+    }
+    s_fastmem = 1;
+#endif
 }
 /* After the inline code: where this instruction's chunk rejoins, and
  * what it must put back into RFLAGS. */
@@ -654,7 +760,10 @@ static void emit_slow_chunks(x86_dbt *dbt, emit_t *e) {
         slow_site_t *s = &s_slow[k];
         if (!s->back_off) { fprintf(stderr, "dbt: slow site without a rejoin (op %u)\n", s->op_i); abort(); }
         uint32_t chunk = emit_pos(e), j = k;
-        for (; j < s_nslow && s_slow[j].op_i == s->op_i; j++) emit_patch_rel32(e, s_slow[j].patch_off, chunk);
+        for (; j < s_nslow && s_slow[j].op_i == s->op_i; j++) {
+            if (s_slow[j].trap) trap_add(s_slow[j].start, s_slow[j].back_off, chunk, s_slow[j].rf_at);
+            else emit_patch_rel32(e, s_slow[j].patch_off, chunk);
+        }
         s_cur_ip_after = s->ip_after;
         s_cur_ip_start = s->ip_start;
         s_cur_n_done = s->n_done;
@@ -1376,13 +1485,34 @@ static void emit_check_flat(emit_t *e, ea_t *ea, int size, int store, int reads)
         if (store && !s_skip_smc) emit_check_smc(e, ea, size);
         return;
     }
-    emit_alu_ri(e, 4, X64_ALU_CMP, ea->off, FLAT_TOP);
-    slow_site(e, X64_CC_AE);
+    if (s_fastmem && s_trap_ok) {
+        /* the range by the fault; the window, when a device answers reads
+         * there, still by a compare (a read loads the VGA's latches) */
+        trap_site(e);
+        if (reads && s_blk->devread) {
+            x64_mem_t m = M(ea->off, -0xA0000);
+            emit_lea(e, 4, W_T3, &m);
+            emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, 0x10000);
+            slow_site(e, X64_CC_B);
+        }
+        if (store && !s_skip_smc) emit_check_smc(e, ea, size);
+        return;
+    }
     if (reads && s_blk->devread) {
-        x64_mem_t m = M(ea->off, -0xA0000);
+        /* In range and outside the VGA window, in one test for the common
+         * case (a program's data above the window): off - B0000h below
+         * FLAT_TOP - B0000h; else off below A0000h; anything else — the
+         * window, or past the fast range — is the slow path. */
+        x64_mem_t m = M(ea->off, -0xB0000);
         emit_lea(e, 4, W_T3, &m);
-        emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, 0x10000);
-        slow_site(e, X64_CC_B);
+        emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, FLAT_TOP - 0xB0000);
+        uint32_t ok = emit_jcc_rel8(e, X64_CC_B);
+        emit_alu_ri(e, 4, X64_ALU_CMP, ea->off, 0xA0000);
+        slow_site(e, X64_CC_AE);
+        emit_patch_rel8(e, ok, emit_pos(e));
+    } else {
+        emit_alu_ri(e, 4, X64_ALU_CMP, ea->off, FLAT_TOP);
+        slow_site(e, X64_CC_AE);
     }
     if (store && !s_skip_smc) emit_check_smc(e, ea, size);
 }
@@ -1393,6 +1523,10 @@ static void emit_check_flat(emit_t *e, ea_t *ea, int size, int store, int reads)
  * the instruction reads the operand (a pure store need not avoid the
  * window: the bitmap sends it to the device). */
 static void emit_checks_rw(emit_t *e, ea_t *ea, int size, int store, int reads, uint32_t live_in) {
+    if (s_flat && !s_paged && s_fastmem && s_trap_ok && s_load_nosave && !store && !(reads && s_blk->devread)) {
+        emit_check_flat(e, ea, size, store, reads);            /* nothing here touches RFLAGS: the live bits stay */
+        return;
+    }
     fl_save(e, live_in);
     if (s_flat) { emit_check_flat(e, ea, size, store, reads); return; }
     if (s_paged) {
@@ -1495,6 +1629,18 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
     int size = in->ops[0].size;
     const x86_operand *d = &in->ops[0], *s = &in->ops[1];
     s_slow_first = s_nslow;
+    s_trap_ok = s_fastmem && s_flat && !s_paged && !is_high8(d) && !is_high8(s);
+    switch (in->op) {
+    case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:   /* host RSI/RDI move before the access */
+    case OP_PUSHA: case OP_POPA: case OP_LEAVE:                             /* several accesses, or ESP first */
+        s_trap_ok = 0;
+        break;
+    default: break;
+    }
+    s_load_nosave = s_trap_ok && s->kind == OPK_MEM && d->kind == OPK_REG
+                 && (in->op == OP_MOV || in->op == OP_MOVZX || in->op == OP_MOVSX
+                     || in->op == OP_ADD || in->op == OP_OR || in->op == OP_ADC || in->op == OP_SBB
+                     || in->op == OP_AND || in->op == OP_SUB || in->op == OP_XOR || in->op == OP_CMP || in->op == OP_TEST);
     if (in->ea_valid && in->op != OP_LEA && in->op != OP_SETCC) emit_ea(e, in, &ea);
 
     switch (in->op) {
@@ -1504,8 +1650,13 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
 
     case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: {
         uint32_t wr = in->op == OP_NOT ? 0 : in->op == OP_NEG ? ARITH : (ARITH & ~X86_CF);
+        /* INC/DEC write every flag but CF. With CF live and only in the slot,
+         * RFLAGS would end up holding part of the image, and the next save
+         * would be a five-instruction merge; one BT first makes it whole. */
+        int cf_in = (in->op == OP_INC || in->op == OP_DEC) && (live_out & X86_CF);
         if (d->kind == OPK_MEM) {
             emit_checks(e, &ea, size, 1, live_in);
+            if (cf_in) fl_need_cf(e);
             m = ea_mem(&ea);
             if (in->op == OP_INC) emit_inc_m(e, size, &m);
             else if (in->op == OP_DEC) emit_dec_m(e, size, &m);
@@ -1515,6 +1666,7 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
             return;
         }
         int r = host_reg(d);
+        if (cf_in) fl_need_cf(e);
         if (in->op == OP_INC) emit_inc_r(e, size, r);
         else if (in->op == OP_DEC) emit_dec_r(e, size, r);
         else emit_g3_r(e, size, in->op == OP_NOT ? X64_G3_NOT : X64_G3_NEG, r);
@@ -2590,6 +2742,8 @@ static void emit_branch_ender(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint3
     ea_t ea;
     x64_mem_t m;
     s_slow_first = s_nslow;
+    s_trap_ok = s_fastmem && s_flat && !s_paged;               /* its pops and pushes: one access each */
+    s_load_nosave = 0;
     if (in->op == OP_JCC || in->op == OP_JCXZ || in->op == OP_LOOP || in->op == OP_LOOPE || in->op == OP_LOOPNE) {
         /* conditional in final position: two-edge ender */
         uint32_t patch = emit_cond_side_branch(e, in, ARITH);

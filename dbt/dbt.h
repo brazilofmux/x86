@@ -240,6 +240,7 @@ typedef struct {
     uint64_t interp_fallback_insns;
     uint64_t interp_fallback_ns;
     uint64_t helper_insns;         /* class-B ops emitted (translation time) */
+    uint64_t fastmem_traps;        /* x86-64: flat accesses past memory sent to their slow path by the fault handler */
     uint64_t jit_block_entries;
     uint64_t smc_invalidations;
     uint64_t a20_flushes;

@@ -417,12 +417,26 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
 #define X86_MEM_SIZE  (X86_LOW_SIZE + X86_EXT_SIZE)
 #define X86_MEM_MAX   (0x10000000u + 0x100000u)      /* 257 MB: 256 MB of extended memory, and the first 1 MB */
 #define X86_MEM_SLACK 0x10000u
-/* The code bitmap sits at this fixed distance above guest memory when the
+/* The code bitmap sits at this fixed distance from guest memory when the
  * mirrored layout is in use (x86_mem.c: one reservation holds both), so
  * translated code reaches a store's bitmap byte as [host_addr + delta]
- * with no register. Disp32-reachable, and past the memory's own span. */
-#define X86_BM_DELTA  0x20000000u
-_Static_assert(X86_BM_DELTA >= X86_MEM_MAX + X86_MEM_SLACK, "the bitmap must lie above guest memory");
+ * with no register; disp32-reachable, and clear of the memory's span.
+ *
+ * On POSIX hosts it lies BELOW the memory, and above the memory the
+ * reservation runs on to X86_FLAT_SPAN: 64 KB of read-only slack filled
+ * with FFh (the interpreter's open bus past mem_size), then no access at
+ * all, so any 32-bit flat offset lands either in memory, in the slack,
+ * or on a page that faults. The x86-64 backend's flat accesses rely on
+ * that fault instead of a range check (dbt_x64.c, fastmem). Windows keeps
+ * the bitmap above the memory and the explicit checks. */
+#if defined(_WIN32)
+#define X86_BM_DELTA  ((int64_t)0x20000000)
+#else
+#define X86_BM_DELTA  (-(int64_t)0x20000000)
+#endif
+#define X86_FLAT_SPAN (0x100000000ull + 0x20000u)     /* memory + slack + guard: past every 32-bit offset and a straddle */
+_Static_assert((X86_BM_DELTA < 0 ? -X86_BM_DELTA : X86_BM_DELTA) >= (int64_t)X86_MEM_MAX + X86_MEM_SLACK,
+               "the bitmap must lie clear of guest memory");
 
 void x86_set_mem_size(uint32_t bytes);          /* the next x86_init's memory, X86_MEM_SIZE..X86_MEM_MAX */
 int  x86_mem_alloc(x86_cpu *c);

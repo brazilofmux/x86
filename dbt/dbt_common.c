@@ -799,6 +799,7 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
         fprintf(out, "  helper calls from:      all-helper PM blocks %llu, helper ops in mixed blocks %llu, slow paths %llu\n",
                 (unsigned long long)by_tag[0], (unsigned long long)by_tag[1], (unsigned long long)by_tag[2]);
     }
+    if (dbt->fastmem_traps) fprintf(out, "  fastmem traps:          %llu\n", (unsigned long long)dbt->fastmem_traps);
     fprintf(out, "  helper calls by op (dynamic):");
     for (int n = 0; n < 14; n++) {
         int best = -1;

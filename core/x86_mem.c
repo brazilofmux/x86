@@ -14,11 +14,14 @@
  * The code bitmap (one byte per guest byte, nonzero while a translated
  * block covers it) is laid out identically, so the JIT's post-store
  * check `bitmap[host_addr - mem]` sees the same aliasing as the memory
- * it guards — and it sits X86_BM_DELTA above the memory in the same
+ * it guards — and it sits X86_BM_DELTA from the memory in the same
  * reservation, so the check is also `[host_addr + X86_BM_DELTA]`.
  *
  * Both regions carry X86_MEM_SLACK readable bytes past the end so a
- * decode or a straddling access at 0x10FFEF never faults.
+ * decode at the top never faults. On POSIX hosts the bitmap is below the
+ * memory, and the memory's slack is read-only and FFh — what the
+ * interpreter reads past mem_size — with nothing mapped after it up to
+ * X86_FLAT_SPAN (x86.h), so a flat access past the memory faults.
  */
 #include "x86.h"
 #include <stdio.h>
@@ -165,6 +168,13 @@ static int map_region(x86_cpu *c, uint8_t *base, off_t obj_off, int a20_on) {
     return s == (void *)(base + c->mem_size) ? 0 : -1;
 }
 
+/* The memory's slack, read-only and FFh (open bus): a flat read that runs
+ * past mem_size sees what the interpreter would, and a write faults. */
+static int seal_slack(uint8_t *slack) {
+    memset(slack, 0xFF, X86_MEM_SLACK);
+    return mprotect(slack, X86_MEM_SLACK, PROT_READ);
+}
+
 static int alloc_mirrored(x86_cpu *c) {
     int fd = -1;
 #if defined(__linux__)
@@ -179,19 +189,22 @@ static int alloc_mirrored(x86_cpu *c) {
     if (ftruncate(fd, (off_t)c->mem_size * 2) != 0) { close(fd); return -1; }
     c->mem_fd = fd;
 
-    /* one reservation: memory at 0, the bitmap at X86_BM_DELTA */
-    size_t region = (size_t)c->mem_size + X86_MEM_SLACK;
-    c->mem = reserve(X86_BM_DELTA + region);
-    if (!c->mem) return -1;
-    c->code_bitmap = c->mem + X86_BM_DELTA;
+    /* one reservation: the bitmap at its start, the memory X86_BM_DELTA
+     * after it, and PROT_NONE on to the memory's X86_FLAT_SPAN */
+    size_t below = (size_t)-X86_BM_DELTA;
+    uint8_t *r = reserve(below + X86_FLAT_SPAN);
+    if (!r) return -1;
+    c->code_bitmap = r;
+    c->mem = r + below;
     if (map_region(c, c->mem, 0, 0) < 0) return -1;
     if (map_region(c, c->code_bitmap, (off_t)c->mem_size, 0) < 0) return -1;
+    if (seal_slack(c->mem + c->mem_size) < 0) return -1;
     c->mem_mirrored = 1;
     return 0;
 }
 
 static void free_mirrored(x86_cpu *c) {
-    if (c->mem) munmap(c->mem, X86_BM_DELTA + (size_t)c->mem_size + X86_MEM_SLACK);   /* the bitmap lives inside the same reservation */
+    if (c->mem) munmap(c->mem + X86_BM_DELTA, (size_t)-X86_BM_DELTA + X86_FLAT_SPAN);   /* the bitmap lives inside the same reservation */
     if (c->mem_fd >= 0) close(c->mem_fd);
 }
 #endif
