@@ -1410,7 +1410,8 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     }
     case OP_PUSHF:
         if (v86_iopl_trap(c)) break;
-        push(c, in->opsize, in->opsize == 2 ? (c->eflags & 0xFFFF) : (c->eflags & (c->model >= X86_MODEL_486 ? 0x7FFFF : 0x3FFFF) & ~(X86_RF | X86_VM)));   /* 386: bits 18-31 push as 0 (measured); 486: AC too */
+        push(c, in->opsize, in->opsize == 2 ? (c->eflags & 0xFFFF)
+                 : (c->eflags & (c->model >= X86_MODEL_586 ? 0x27FFFF : c->model >= X86_MODEL_486 ? 0x7FFFF : 0x3FFFF) & ~(X86_RF | X86_VM)));   /* 386: bits 18-31 push as 0 (measured); 486: AC too; Pentium: ID */
         break;
     case OP_POPF: {
         if (v86_iopl_trap(c)) break;
@@ -1817,12 +1818,17 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             } else if (cr == 3) {
                 c->cr3 = v;
                 x86_tlb_flush(c);                   /* the 386 flushes its whole TLB on a CR3 load */
+            } else if (cr == 4 && c->model >= X86_MODEL_586) {
+                if (v & ~X86_CR4_P5) x86_fault(c, X86_EXC_GP, 0);   /* reserved, VME and PVI among them */
+                uint32_t was = c->cr4;
+                c->cr4 = v;
+                if ((v ^ was) & X86_CR4_PSE) x86_tlb_flush(c);    /* 4 MB pages come or go */
             } else {
                 RAISE(X86_EXC_UD);
             }
         } else {
-            if (cr != 0 && cr != 2 && cr != 3) RAISE(X86_EXC_UD);
-            wr_op(c, in, 0, ea, cr == 0 ? c->cr0 : cr == 2 ? c->cr2 : c->cr3);
+            if (cr != 0 && cr != 2 && cr != 3 && !(cr == 4 && c->model >= X86_MODEL_586)) RAISE(X86_EXC_UD);
+            wr_op(c, in, 0, ea, cr == 0 ? c->cr0 : cr == 2 ? c->cr2 : cr == 3 ? c->cr3 : c->cr4);
         }
         break;
     }
@@ -1880,11 +1886,84 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         need_cpl0(c);
         int to_dr = in->ops[0].kind == OPK_DR;
         int dr = to_dr ? in->ops[0].reg : in->ops[1].reg;
-        if (dr == 4 || dr == 5) dr += 2;
+        if (dr == 4 || dr == 5) {
+            if (c->cr4 & X86_CR4_DE) RAISE(X86_EXC_UD);         /* Pentium debugging extensions: no aliases */
+            dr += 2;
+        }
         if (to_dr) c->dr[dr] = rd_op(c, in, 1, ea);
         else wr_op(c, in, 0, ea, c->dr[dr]);
         break;
     }
+
+    /* ---- Pentium ---------------------------------------------------- */
+    case OP_CPUID: {
+        /* GenuineIntel, a P54C. The features are the ones built: FPU (when
+         * there is one), DE, PSE, TSC, MSR, MCE, CX8 — not VME. A leaf past
+         * the last is undefined on the Pentium; this one answers zeros. */
+        uint32_t leaf = c->r[R_AX], o[4] = { 0, 0, 0, 0 };   /* EAX EBX ECX EDX */
+        if (leaf == 0) {
+            o[0] = 1;
+            o[1] = 0x756E6547u; o[3] = 0x49656E69u; o[2] = 0x6C65746Eu;   /* "Genu" "ineI" "ntel" */
+        } else if (leaf == 1) {
+            o[0] = X86_586_SIGNATURE;
+            o[3] = (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8;
+        }
+        c->r[R_AX] = o[0]; c->r[R_BX] = o[1]; c->r[R_CX] = o[2]; c->r[R_DX] = o[3];
+        break;
+    }
+    case OP_RDTSC: {
+        if ((c->cr4 & X86_CR4_TSD) && c->pmode && x86_cpl(c) != 0) x86_fault(c, X86_EXC_GP, 0);
+        uint64_t t = x86_tsc(c);
+        c->r[R_AX] = (uint32_t)t; c->r[R_DX] = (uint32_t)(t >> 32);
+        break;
+    }
+    case OP_RDMSR: case OP_WRMSR: {
+        /* The P5's architectural few: the machine-check pair (read 0; no
+         * check ever fires), the TSC, and the event counters. Anything
+         * else is #GP(0), as the test registers are here. */
+        need_cpl0(c);
+        uint32_t msr = c->r[R_CX];
+        uint64_t v = (uint64_t)c->r[R_DX] << 32 | c->r[R_AX];
+        int wr = in->op == OP_WRMSR;
+        switch (msr) {
+        case 0x00: case 0x01: v = 0; break;                                      /* P5_MC_ADDR, P5_MC_TYPE */
+        case 0x10: if (wr) c->tsc_base = v - c->insn_count; else v = x86_tsc(c); break;
+        case 0x11: if (wr) c->msr_perf[0] = v & 0x01FF01FFu; else v = c->msr_perf[0]; break;   /* CESR */
+        case 0x12: case 0x13:                                                    /* CTR0, CTR1: 40 bits */
+            if (wr) c->msr_perf[msr - 0x11] = v & 0xFFFFFFFFFFull; else v = c->msr_perf[msr - 0x11];
+            break;
+        default: x86_fault(c, X86_EXC_GP, 0);
+        }
+        if (!wr) { c->r[R_AX] = (uint32_t)v; c->r[R_DX] = (uint32_t)(v >> 32); }
+        break;
+    }
+    case OP_CMPXCHG8B: {
+        /* EDX:EAX against m64: equal, ECX:EBX goes in and ZF is set; else
+         * the operand comes back into EDX:EAX, ZF clear. Only ZF changes.
+         * The operand is written either way (a locked read-modify-write),
+         * so both of its ends are translated for writing before anything
+         * lands: a page fault on the second half must not leave the first
+         * half changed for the instruction's re-execution to compare. */
+        uint8_t buf[8];
+        x86_fpu_mrd(c, in, ea, 8, 8, buf);
+        if (c->cr0 & X86_CR0_PG) {
+            /* the second page at its first byte: that is what CR2 names */
+            uint32_t base = c->seg[in->seg].base, m = wrapmask(c, admask(in));
+            uint32_t lo = base + ea, hi = base + ((ea + 7) & m);
+            (void)x86_lin(c, lo, 1);
+            if ((hi ^ lo) & 0xFFFFF000u) (void)x86_lin(c, hi & 0xFFFFF000u, 1);
+        }
+        uint64_t mem, acc = (uint64_t)c->r[R_DX] << 32 | c->r[R_AX];
+        memcpy(&mem, buf, 8);
+        int eq = mem == acc;
+        uint64_t out = eq ? (uint64_t)c->r[R_CX] << 32 | c->r[R_BX] : mem;
+        memcpy(buf, &out, 8);
+        x86_fpu_mwr(c, in, ea, 8, 8, buf);
+        if (eq) c->eflags |= X86_ZF;
+        else { c->eflags &= ~X86_ZF; c->r[R_AX] = (uint32_t)mem; c->r[R_DX] = (uint32_t)(mem >> 32); }
+        break;
+    }
+
     case OP_MOVTR:
     case OP_UD:
     default:

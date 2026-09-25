@@ -66,8 +66,9 @@ SF=7), so even the flag tables carry over.
 
 ### Guest Environment
 
-- **CPU**: 8086 → 486 (`-m 486`: AC, BSWAP/XADD/CMPXCHG, INVLPG, CR0.WP,
-  #AC). The x87 (`core/x86_fpu.c`) is a 486DX's, or a 387 beside a 386
+- **CPU**: 8086 → Pentium (`-m 486`: AC, BSWAP/XADD/CMPXCHG, INVLPG,
+  CR0.WP, #AC; `-m 586`, a P54C: EFLAGS.ID, CPUID, RDTSC, CMPXCHG8B, the
+  P5 MSRs, CR4 with PSE/TSD/DE/MCE — no VME yet). The x87 (`core/x86_fpu.c`) is a 486DX's, or a 387 beside a 386
   with `-fpu`: Berkeley SoftFloat 3e's 80-bit arithmetic (vendored in
   `core/softfloat/`) inside an x87 of our own, checked against Bochs and
   QEMU (`make test-fpu`), transcendentals against mpmath.

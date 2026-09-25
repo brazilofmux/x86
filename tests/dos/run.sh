@@ -58,6 +58,13 @@ for mode in -i -j -V; do
         check "cpu486 -m $m $mode" tests/dos/cpu486-$m.out $DM -m $m $mode -L 1000000 tests/dos/cpu486.com
     done
 done
+# the Pentium against the 486: EFLAGS.ID, CPUID, RDTSC, the MSRs,
+# CMPXCHG8B, CR4 and CR4.DE, or #UD
+for mode in -i -j -V; do
+    for m in 486 586; do
+        check "cpu586 -m $m $mode" tests/dos/cpu586-$m.out $DM -m $m $mode -L 1000000 tests/dos/cpu586.com
+    done
+done
 # The VGA text renderer (-G on a text screen: attributes, blink off, line
 # drawing, a block cursor), compared as decoded pixels; and the BIOS's
 # INT 9 translation of modified keys fed as xterm sequences; the INT 33h

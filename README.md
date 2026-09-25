@@ -1,12 +1,12 @@
 # dos-monster
 
-An 8086–80486 PC emulator built around a dynamic binary translator: x86
+An 8086–Pentium PC emulator built around a dynamic binary translator: x86
 real mode, protected mode, virtual-8086 mode and paging, and the 387/486
 floating-point unit, translated to
 AArch64 at run time, with the goal of running DOS software at billions of
-instructions per second. It boots FreeDOS, MS-DOS 6.22 and Windows 3.11 in
-386 enhanced mode from disk images, and runs DOOM, WordPerfect 5.1, Turbo
-Pascal and Microsoft COBOL.
+instructions per second. It boots FreeDOS, MS-DOS 6.22, Windows 3.11 in
+386 enhanced mode and Windows NT 4.0 from disk images, and runs DOOM,
+WordPerfect 5.1, Turbo Pascal and Microsoft COBOL.
 
 It is the successor to [z80](https://github.com/brazilofmux/z80) (Z80 +
 CP/M at 4.3 BIPS), [slow-32](https://github.com/brazilofmux/slow32-public)
@@ -177,7 +177,8 @@ MS-DOS 6.22 and Windows 3.11 from diskette images end to end, unattended.
 - `make test-jit` — the translator against the interpreter, instruction
   sequences fuzzed in real mode, flat and segmented protected mode
 - `make test-pm`, `test-pm-compare`, `test-pg` — protected mode, paging
-  and V86 mode against QEMU and Bochs (`tools/pmoracle`: boot images that
+  and V86 mode against QEMU and Bochs, and the 486's and the Pentium's
+  additions against Bochs as each (`tools/pmoracle`: boot images that
   log their observations)
 - `make test-fpu` — the x87: 6,600 cases (every instruction, the awkward
   operands, rounding and precision control, masked and unmasked

@@ -22,8 +22,8 @@ static void usage(const char *prog) {
     printf("  -V          JIT with lockstep verification against the interpreter\n");
     printf("  -S          with -V: verify after every block (no chaining)\n");
     printf("  -M N        with -V: compare guest memory every N block runs (default 1)\n");
-    printf("  -m MODEL    cpu model: 86, 186, 286, 386, 486 (default 286; DPMI clients need 386)\n");
-    printf("  -fpu, -nofpu  a 387 beside a 386, or a 486SX (default: a 486 has its FPU, nothing else has one)\n");
+    printf("  -m MODEL    cpu model: 86, 186, 286, 386, 486, 586 (default 286; DPMI clients need 386)\n");
+    printf("  -fpu, -nofpu  a 387 beside a 386, or a 486SX (default: a 486 or a Pentium has its FPU, nothing earlier does)\n");
     printf("  -mem N      N MB of memory, 17 to 257 (default 17: the first 1 MB and 16 MB above it)\n");
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
@@ -292,7 +292,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) {
             int m = atoi(argv[++i]);
             model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 286 ? X86_MODEL_286
-                  : m == 486 ? X86_MODEL_486 : X86_MODEL_386;
+                  : m == 486 ? X86_MODEL_486 : m == 586 ? X86_MODEL_586 : X86_MODEL_386;
         }
         else if (!strcmp(argv[i], "-mem") && i + 1 < argc) {
             long mb = atol(argv[++i]);

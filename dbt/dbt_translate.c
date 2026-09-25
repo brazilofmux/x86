@@ -82,6 +82,8 @@ static int classify_sem(const x86_insn *in) {
         return C_HELPER;
     case OP_WAIT:
         return C_INLINE;           /* a backend may test for nothing pending inline, else the helper */
+    case OP_CPUID: case OP_CMPXCHG8B:
+        return C_HELPER;           /* Pentium; RDTSC and the MSRs end the block (the TSC wants an exact count) */
     case OP_AAM:
         return in->ops[0].imm ? C_HELPER : C_REFUSE;
     case OP_MOVSEG:

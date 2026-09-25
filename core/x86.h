@@ -43,6 +43,7 @@
 #define X86_RF   0x00010000
 #define X86_VM   0x00020000
 #define X86_AC   0x00040000   /* 486: alignment check (writable; how software tells a 486 from a 386) */
+#define X86_ID   0x00200000   /* Pentium: writable, which is how software finds CPUID */
 
 #define X86_ARITH_FLAGS (X86_CF|X86_PF|X86_AF|X86_ZF|X86_SF|X86_OF)
 
@@ -52,8 +53,13 @@ enum {
     X86_MODEL_186  = 186,
     X86_MODEL_286  = 286,
     X86_MODEL_386  = 386,
-    X86_MODEL_486  = 486,    /* no FPU (a 486SX's view), no CPUID: EFLAGS.ID stays 0 */
+    X86_MODEL_486  = 486,    /* no CPUID: EFLAGS.ID stays 0 */
+    X86_MODEL_586  = 586,    /* a P54C Pentium: CPUID, RDTSC, CMPXCHG8B, MSRs, CR4 (PSE, TSD, DE, MCE) */
 };
+
+/* The Pentium's identity: CPUID 1's EAX, and EDX after reset. Family 5,
+ * model 2 (the P54C), stepping 12 (C0). */
+#define X86_586_SIGNATURE 0x0000052Cu
 
 /* Register indexes (encoding order) */
 enum { R_AX, R_CX, R_DX, R_BX, R_SP, R_BP, R_SI, R_DI };
@@ -228,7 +234,18 @@ typedef struct x86_cpu {
     /* FERR#: an unmasked x87 exception with CR0.NE clear; the machine
      * turns it into IRQ 13 (pc/pc_bios.c). NULL on the -V shadow. */
     void   (*ferr_hook)(struct x86_cpu *);
+    /* Pentium: CR4, and the time-stamp counter as an offset from the
+     * instruction count — one clock per instruction, so the interpreter,
+     * the translator and -V agree on it (translated code leaves the block
+     * for RDTSC, where the count is exact). WRMSR 10h moves the offset.
+     * The performance-monitoring MSRs (CESR, CTR0, CTR1) hold what they
+     * are given and count nothing. */
+    uint32_t cr4;
+    uint64_t tsc_base;
+    uint64_t msr_perf[3];
 } x86_cpu;
+
+static inline uint64_t x86_tsc(const x86_cpu *c) { return c->insn_count + c->tsc_base; }
 
 /* 8-bit register access: AL..BL are the low bytes of r[0..3], AH..BH are
  * byte 1 of r[0..3]. Little-endian host assumed (all targets are). */
@@ -277,6 +294,13 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 #define X86_CR0_ET  0x00000010u   /* 486: reads as 1 */
 #define X86_CR0_WP  0x00010000u   /* 486: supervisor writes honour read-only pages */
 #define X86_CR0_AM  0x00040000u   /* 486: EFLAGS.AC checks alignment at CPL 3 */
+/* Pentium CR4. VME and PVI (bits 0, 1) are not implemented, so CPUID does
+ * not claim VME and loading them is #GP, as any reserved bit is. */
+#define X86_CR4_TSD 0x00000004u   /* RDTSC is CPL 0 only */
+#define X86_CR4_DE  0x00000008u   /* DR4/DR5 are #UD instead of DR6/DR7 */
+#define X86_CR4_PSE 0x00000010u   /* a PDE with PS (bit 7) maps 4 MB */
+#define X86_CR4_MCE 0x00000040u   /* machine checks enabled (none ever happen) */
+#define X86_CR4_P5  (X86_CR4_TSD | X86_CR4_DE | X86_CR4_PSE | X86_CR4_MCE)
 #define X86_TLB_V   0x001u
 #define X86_TLB_U   0x002u
 #define X86_TLB_UW  0x004u

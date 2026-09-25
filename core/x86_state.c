@@ -194,8 +194,10 @@ uint32_t x86_flags_fixup(x86_cpu *c, uint32_t f) {
         break;
     default:
         /* 486: AC (bit 18) is real — the bit software toggles to tell a
-         * 486 from a 386 — and bits 19-31 read 0 (no CPUID, so no ID) */
-        f &= ~0x8000u & 0x0007FFFFu;
+         * 486 from a 386 — and bits 19-31 read 0 (no CPUID, so no ID).
+         * Pentium: ID (bit 21) is writable too, which says CPUID is
+         * there; VIF and VIP (19, 20) stay 0 without VME. */
+        f &= ~0x8000u & (c->model >= X86_MODEL_586 ? 0x0027FFFFu : 0x0007FFFFu);
         if (!c->pmode) f &= ~X86_VM;
         break;
     }
@@ -210,6 +212,10 @@ void x86_reset(x86_cpu *c) {
     x86_real_limits(c);
     c->cr0 = 0; c->cr2 = 0; c->cr3 = 0;
     if (c->model >= X86_MODEL_486) c->cr0 = 0x60000010u;   /* 486 reset: CD, NW (caches off), ET */
+    c->cr4 = 0;
+    c->tsc_base = 0 - c->insn_count;              /* the TSC starts again from 0 */
+    memset(c->msr_perf, 0, sizeof c->msr_perf);
+    if (c->model >= X86_MODEL_586) c->r[R_DX] = X86_586_SIGNATURE;
     x86_fpu_reset(c);
     c->pg_super = c->pg_probe = 0;
     x86_tlb_flush(c);

@@ -1,0 +1,11 @@
+EFLAGS.ID: toggles (CPUID)
+cpuid 0: 00000001 GenuineIntel
+cpuid 1: 0000052C 000001BD
+rdtsc: counts up
+wrmsr tsc 1:00000000, rdmsr: 00000001 + a few
+rdmsr 1Bh: #GP
+cmpxchg8b equal -> edx eax m64 flags: 11111111 22222222 33333333 44444444 8D0
+cmpxchg8b unequal -> edx eax m64 flags: 55555555 66666666 55555555 66666666 890
+cr4: 00000000 0000005C
+cr4 <- VME: #GP
+dr4 under CR4.DE: #UD

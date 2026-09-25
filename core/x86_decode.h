@@ -47,6 +47,7 @@ enum x86_op {
     OP_INT1,
     OP_SETMO,                   /* 8086 undocumented D0-D3 /6: operand = -1 (if count != 0) */
     OP_INVD, OP_WBINVD, OP_INVLPG,   /* 486: cache and TLB maintenance */
+    OP_CPUID, OP_RDTSC, OP_RDMSR, OP_WRMSR, OP_CMPXCHG8B,   /* Pentium */
     OP__COUNT
 };
 

@@ -49,10 +49,18 @@ static void phys_or8(x86_cpu *c, uint32_t p, uint8_t bits) {
  * physical page address with A20 applied, or X86_PG_BAD when a user
  * could not read it. For the translator, deciding whether a code page is
  * mapped one-to-one. */
+/* Pentium CR4.PSE: a PDE with PS set maps a 4 MB page itself — no page
+ * table; its U/S, R/W, accessed and dirty bits are the PDE's. Without
+ * PSE (and before the Pentium) the bit is ignored. */
+static inline int pse_big(const x86_cpu *c, uint32_t pde) {
+    return (pde & 0x80) && (c->cr4 & X86_CR4_PSE);
+}
+
 uint32_t x86_page_peek(x86_cpu *c, uint32_t lin, int user) {
     uint32_t need = user ? 5u : 1u;
     uint32_t pde = phys_rd32(c, (c->cr3 & 0xFFFFF000u) | ((lin >> 20) & 0xFFCu));
     if ((pde & need) != need) return X86_PG_BAD;
+    if (pse_big(c, pde)) return ((pde & 0xFFC00000u) | (lin & 0x003FF000u)) & c->a20_mask;
     uint32_t pte = phys_rd32(c, (pde & 0xFFFFF000u) | ((lin >> 10) & 0xFFCu));
     if ((pte & need) != need) return X86_PG_BAD;
     return (pte & 0xFFFFF000u) & c->a20_mask;
@@ -107,7 +115,13 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
     uint32_t pde = phys_rd32(c, pde_at);
     uint32_t pte_at = 0, pte = 0;
     int ok = (pde & 1) != 0;
-    if (ok) {
+    int big = ok && pse_big(c, pde);
+    if (big) {
+        /* the PDE is the whole translation: it stands in for the PTE below
+         * (both = pde & pte = pde; its A and D bits are the ones set) */
+        pte_at = pde_at;
+        pte = (pde & 0xFFC00000u) | (lin & 0x003FF000u) | (pde & 0xFFFu);
+    } else if (ok) {
         pte_at = (pde & 0xFFFFF000u) | ((lin >> 10) & 0xFFCu);
         pte = phys_rd32(c, pte_at);
         ok = (pte & 1) != 0;

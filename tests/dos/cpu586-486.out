@@ -1,0 +1,11 @@
+EFLAGS.ID: fixed (no CPUID)
+cpuid 0: #UD
+cpuid 1: #UD
+rdtsc: #UD
+wrmsr tsc 1:00000000, rdmsr: #UD
+rdmsr 1Bh: #UD
+cmpxchg8b equal -> edx eax m64 flags: #UD
+cmpxchg8b unequal -> edx eax m64 flags: #UD
+cr4: #UD
+cr4 <- VME: #UD
+dr4 under CR4.DE: ok

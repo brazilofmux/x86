@@ -46,6 +46,7 @@ enum {
     G_0F00,     /* SLDT.. */
     G_0F01,     /* SGDT.. */
     G_0FBA,     /* BT Ev,Ib .. */
+    G_0FC7,     /* CMPXCHG8B (Pentium) */
 };
 
 typedef struct { uint8_t op, d, s, grp; } opdesc;
@@ -135,6 +136,9 @@ static const opdesc map0f[256] = {
     [0x23] = E(OP_MOVDR, F_Dd, F_Rd),
     [0x24] = E(OP_MOVTR, F_Rd, F_Td),
     [0x26] = E(OP_MOVTR, F_Td, F_Rd),
+    [0x30] = E(OP_WRMSR, F_NONE, F_NONE),    /* Pentium (gated below) */
+    [0x31] = E(OP_RDTSC, F_NONE, F_NONE),
+    [0x32] = E(OP_RDMSR, F_NONE, F_NONE),
     [0x80] = E(OP_JCC, F_Jv, F_NONE), [0x81] = E(OP_JCC, F_Jv, F_NONE),
     [0x82] = E(OP_JCC, F_Jv, F_NONE), [0x83] = E(OP_JCC, F_Jv, F_NONE),
     [0x84] = E(OP_JCC, F_Jv, F_NONE), [0x85] = E(OP_JCC, F_Jv, F_NONE),
@@ -153,6 +157,7 @@ static const opdesc map0f[256] = {
     [0x9E] = E(OP_SETCC, F_Eb, F_NONE), [0x9F] = E(OP_SETCC, F_Eb, F_NONE),
     [0xA0] = E(OP_PUSH, F_Sop, F_NONE),  /* FS: Sop reads bits 4:3 = 4 → FS via special case */
     [0xA1] = E(OP_POP, F_Sop, F_NONE),
+    [0xA2] = E(OP_CPUID, F_NONE, F_NONE),    /* Pentium (gated below) */
     [0xA3] = E(OP_BT, F_Ev, F_Gv),
     [0xA4] = E(OP_SHLD, F_Ev, F_Gv),   /* third operand Ib in imm2 */
     [0xA5] = E(OP_SHLD, F_Ev, F_Gv),   /* third operand CL */
@@ -178,6 +183,7 @@ static const opdesc map0f[256] = {
     [0xBF] = E(OP_MOVSX, F_Gv, F_Ew),
     [0xC0] = E(OP_XADD, F_Eb, F_Gb),
     [0xC1] = E(OP_XADD, F_Ev, F_Gv),
+    [0xC7] = G(G_0FC7, F_M, F_NONE),         /* /1 CMPXCHG8B m64 (Pentium) */
     [0xC8] = E(OP_BSWAP, F_Zv, F_NONE), [0xC9] = E(OP_BSWAP, F_Zv, F_NONE),
     [0xCA] = E(OP_BSWAP, F_Zv, F_NONE), [0xCB] = E(OP_BSWAP, F_Zv, F_NONE),
     [0xCC] = E(OP_BSWAP, F_Zv, F_NONE), [0xCD] = E(OP_BSWAP, F_Zv, F_NONE),
@@ -448,6 +454,7 @@ done_prefix:
         if (in->reg == 4 || in->reg == 6) fd = F_Ew;                       /* SMSW/LMSW allow registers */
         break;
     case G_0FBA: in->op = grp0fba[in->reg]; break;
+    case G_0FC7: in->op = in->reg == 1 ? OP_CMPXCHG8B : OP_UD; break;
     }
 
     if (!fill_operand(&c, in, &in->ops[0], fd)) { in->op = OP_UD; goto out; }
@@ -472,6 +479,7 @@ done_prefix:
     /* Far-pointer memory operands for CALLF/JMPF through FF /3 /5 */
     if ((in->op == OP_CALLF || in->op == OP_JMPF) && in->ops[0].kind == OPK_MEM)
         in->ops[0].size = in->opsize == 2 ? 4 : 6;
+    if (in->op == OP_CMPXCHG8B) in->ops[0].size = 8;
 
     /* SETCC / 0F Jcc already have cond; Jcc in the primary map too */
     if (in->op == OP_SETCC) in->cond = in->opcode2 & 15;
@@ -485,6 +493,15 @@ done_prefix:
         default: break;
         }
     }
+    /* ... and the Pentium's on a 486 (ours has no CPUID; late 486s did,
+     * but a 486 without EFLAGS.ID is the one detection code expects). */
+    if (model < X86_MODEL_586) {
+        switch (in->op) {
+        case OP_CPUID: case OP_RDTSC: case OP_RDMSR: case OP_WRMSR: case OP_CMPXCHG8B:
+            in->op = OP_UD; break;
+        default: break;
+        }
+    }
 
     /* 386+: LOCK is only legal on the read-modify-write ALU ops with a
      * memory destination (and XCHG with a memory operand); anywhere
@@ -494,7 +511,7 @@ done_prefix:
         switch (in->op) {
         case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR:
         case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
-        case OP_BTS: case OP_BTR: case OP_BTC: case OP_XADD: case OP_CMPXCHG:
+        case OP_BTS: case OP_BTR: case OP_BTC: case OP_XADD: case OP_CMPXCHG: case OP_CMPXCHG8B:
             ok = in->ops[0].kind == OPK_MEM; break;
         case OP_XCHG:
             ok = in->ops[0].kind == OPK_MEM || in->ops[1].kind == OPK_MEM; break;
@@ -535,6 +552,7 @@ static const char *op_names[OP__COUNT] = {
     [OP_SLDT]="sldt",[OP_STR]="str",[OP_LLDT]="lldt",[OP_LTR]="ltr",[OP_VERR]="verr",[OP_VERW]="verw",[OP_SMSW]="smsw",[OP_LMSW]="lmsw",
     [OP_MOVCR]="mov",[OP_MOVDR]="mov",[OP_MOVTR]="mov",[OP_INT1]="int1",[OP_SETMO]="setmo",[OP_UD]="(bad)",
     [OP_INVD]="invd",[OP_WBINVD]="wbinvd",[OP_INVLPG]="invlpg",
+    [OP_CPUID]="cpuid",[OP_RDTSC]="rdtsc",[OP_RDMSR]="rdmsr",[OP_WRMSR]="wrmsr",[OP_CMPXCHG8B]="cmpxchg8b",
 };
 static const char *cc_names[16] = { "o","no","b","ae","e","ne","be","a","s","ns","p","np","l","ge","le","g" };
 static const char *r8n[8]  = { "al","cl","dl","bl","ah","ch","dh","bh" };
