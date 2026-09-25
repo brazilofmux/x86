@@ -107,6 +107,8 @@ static inline int R_GPR(int i) { return i == R_SP ? X64_R12 : i; }
 #define OFF_R(i)        ((int32_t)(offsetof(x86_cpu, r) + 4 * (i)))
 #define OFF_EIP         ((int32_t)offsetof(x86_cpu, eip))
 #define OFF_EFLAGS      ((int32_t)offsetof(x86_cpu, eflags))
+#define OFF_INT_INHIBIT ((int32_t)offsetof(x86_cpu, int_inhibit))
+#define OFF_INTR_WAIT   ((int32_t)offsetof(x86_cpu, intr_waiting))
 #define OFF_SEG_SEL(i)  ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, sel)))
 #define OFF_SEG_USABLE(i) ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, usable)))
 #define OFF_SEG_BASE(i) ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, base)))
@@ -1675,12 +1677,31 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
     case OP_CMC: fl_need_cf(e); emit_cmc(e); fl_produce(X86_CF); return;
     case OP_CLD: emit_cld(e); return;
     case OP_STD: emit_std(e); return;
-    case OP_CLI: case OP_STI:
+    case OP_CLI: case OP_STI: {
         fl_save(e, live_in);
         m = M(R_CPU, OFF_EFLAGS + 1);
-        if (in->op == OP_CLI) emit_alu_mi(e, 1, X64_ALU_AND, &m, (uint8_t)~(X86_IF >> 8));
-        else emit_alu_mi(e, 1, X64_ALU_OR, &m, X86_IF >> 8);
+        if (in->op == OP_CLI) { emit_alu_mi(e, 1, X64_ALU_AND, &m, (uint8_t)~(X86_IF >> 8)); return; }
+        /* STI. IF already set: nothing more. Else set it, and if an
+         * interrupt waits for it (cpu->intr_waiting, kept current by the
+         * machine) leave after the STI with its shadow up, as the helper
+         * STI does through jit_cur_hit: the run loop steps the next
+         * instruction and delivers. Otherwise a loop whose blocks all end
+         * with IF clear ("sti; nop; cli") never takes it. (#1) */
+        emit_test_mi(e, 1, &m, X86_IF >> 8);
+        uint32_t was_on = emit_jcc_rel8(e, X64_CC_NE);
+        emit_alu_mi(e, 1, X64_ALU_OR, &m, X86_IF >> 8);
+        x64_mem_t w = M(R_CPU, OFF_INTR_WAIT);
+        emit_alu_mi(e, 1, X64_ALU_CMP, &w, 0);
+        uint32_t none = emit_jcc_rel8(e, X64_CC_E);
+        x64_mem_t sh = M(R_CPU, OFF_INT_INHIBIT);
+        emit_mov_mi(e, 1, &sh, 1);
+        emit_mov_ri(e, 4, W_T0, 1);                              /* the leave chunk's "after it" */
+        if (s_nleave >= LEAVE_MAX) { fprintf(stderr, "dbt: leave-site table overflow\n"); abort(); }
+        s_leave[s_nleave++] = (leave_site_t){ emit_jmp_rel32(e), s_cur_ip_after, s_cur_ip_start, s_cur_n_done };
+        emit_patch_rel8(e, was_on, emit_pos(e));
+        emit_patch_rel8(e, none, emit_pos(e));
         return;
+    }
 
     case OP_SETCC: {
         int hc;
