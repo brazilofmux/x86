@@ -185,7 +185,7 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
     if (dbt->smc_win[phys] != now) { dbt->smc_win[phys] = now; dbt->smc_heat[phys] = 0; }
     if (dbt->smc_heat[phys] < 255) dbt->smc_heat[phys]++;
     sweep_blocks_at(dbt, phys);
-    uint16_t alias = dbt->phys_alias[phys >> 12];
+    uint32_t alias = dbt->phys_alias[phys >> 12];   /* a linear page + 1: past 16 bits for NT's kernel at 80000000h */
     if (alias) sweep_blocks_at(dbt, ((uint32_t)(alias - 1) << 12) | (phys & 0xFFF));
     dbt->smc_invalidations++;
     dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
