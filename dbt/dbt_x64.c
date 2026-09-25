@@ -1485,7 +1485,15 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         uint32_t cnt = s->imm & 0xFF;
         int sh = sh_of_op[in->op];
         int rot = in->op == OP_ROL || in->op == OP_ROR || in->op == OP_RCL || in->op == OP_RCR;
-        if (cnt == 0) return;                                    /* no flags, nothing (CONTRACT: count 0 leaves them) */
+        if (cnt == 0) {                                          /* no flags, no change (CONTRACT: count 0 leaves them)... */
+            if (d->kind == OPK_MEM) {                            /* ...but the operand is still read and written back:
+                                                                  * a limit, a page or a watched byte faults as the
+                                                                  * interpreter's would (the value itself is unchanged) */
+                emit_checks(e, &ea, size, 1, live_in);
+                slow_back(e, s_rf);
+            }
+            return;
+        }
         if (in->op == OP_RCL || in->op == OP_RCR) fl_need_cf(e);
         /* OF after a shift by more than one is the last step's on the
          * 8086 and undefined (and different) on the host: two steps then */
