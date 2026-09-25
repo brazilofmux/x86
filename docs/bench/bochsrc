@@ -1,0 +1,15 @@
+# Bochs 3.1 (Homebrew), for DOOM -timedemo demo1: the same MS-DOS 6.22
+# image as dos-monster boots (260 cylinders, 16 heads, 63 sectors), 16 MB,
+# no display, and the guest clock tied to the host's (sync=realtime), so
+# DOOM's realtics are wall-clock tics. No cpu: line: Bochs's default model.
+# doom-timedemo.sh fills in the paths.
+megs: 16
+romimage: file=@BOCHS_SHARE@/BIOS-bochs-latest
+vgaromimage: file=@BOCHS_SHARE@/VGABIOS-lgpl-latest.bin
+ata0-master: type=disk, path=@IMG@, mode=flat, cylinders=260, heads=16, spt=63, translation=none
+boot: disk
+clock: sync=realtime, time0=local
+display_library: nogui
+log: @LOG@
+panic: action=report
+error: action=report

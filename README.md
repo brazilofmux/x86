@@ -68,18 +68,20 @@ Power-on to `C:\>` is 2.5 s (2 of them MS-DOS's own F5/F8 pause), and
 `win` to a drawn Program Manager 0.8 s. `tests/boot/bench.sh` measures
 these.
 
-The same timedemo, same machine, bare MS-DOS in each:
+The same timedemo on the same machine (medians, 2026-09-25):
 
 | | realtics | |
 |---|---|---|
-| **dos-monster** | **93** | |
-| DOSBox-X 2026.08, `core=dynamic` (dynrec), `cycles=max` | 494 | 5.3× |
-| Bochs 3.1 (`clock: sync=realtime`) | 1,347 | 14.5× |
-| DOSBox-X, `core=normal` | 1,270 | 13.7× |
+| **dos-monster** (MS-DOS 6.22) | **93** | |
+| DOSBox-X 2026.08, `core=dynamic` (dynrec), `cycles=max`, its built-in DOS | 667 | 7.2× |
+| DOSBox-X, `core=normal` | 1,154 | 12.4× |
+| Bochs 3.1 (`clock: sync=realtime`, MS-DOS 6.22) | 1,224 | 13.2× |
 
 QEMU 11 (TCG, `qemu-system-i386`) was still in the middle of the demo
 after 90 seconds, and none of three runs lived to print a result, so it
-has no number here. One workload, one machine: take it as a data point.
+has no number here. [`docs/bench/`](docs/bench/) has every configuration,
+the individual runs, and `doom-timedemo.sh`, which reruns the comparison.
+One workload, one machine: take it as a data point.
 
 ### Why it is fast
 
