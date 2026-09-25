@@ -496,7 +496,7 @@ void dos_int21(x86_cpu *c, int vector) {
     case 0x19: SET_AL(dos.cur_drive); break;
     case 0x1A: dos.dta_seg = DS; dos.dta_off = DX; dos.dta_lin = P_DS(DX); break;
     case 0x1B: case 0x1C:
-        if (AH == 0x1C) { int dr = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
+        if (AH == 0x1C) { int dr = x86_get_r8(c, R_DL) ? (int)x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
                           if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { SET_AL(0xFF); break; } }
         SET_AL(8); SET_CX(512); SET_DX(0xFFF0);
         pc_wr8(c, DOS_SEG, 0x10, 0xF8);
@@ -551,7 +551,7 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     case 0x36: {
         struct statvfs vs;
-        int dr = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
+        int dr = x86_get_r8(c, R_DL) ? (int)x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
         if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { SET_AX(0xFFFF); break; }
         if (statvfs(dos.drives[dr].root, &vs) == 0) {
             uint64_t total = (uint64_t)vs.f_blocks * vs.f_frsize, avail = (uint64_t)vs.f_bavail * vs.f_frsize;
@@ -670,13 +670,13 @@ void dos_int21(x86_cpu *c, int vector) {
             break;
         case 0x07: SET_AL(0xFF); ok(c); break;
         case 0x08: {                                          /* removable? BL = drive (0 = current) */
-            int dr = x86_get_r8(c, R_BL) ? x86_get_r8(c, R_BL) - 1 : dos.cur_drive;
+            int dr = x86_get_r8(c, R_BL) ? (int)x86_get_r8(c, R_BL) - 1 : dos.cur_drive;
             if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { err(c, DE_INVALID_DRIVE); break; }
             SET_AX(dr < 2 ? 0 : 1); ok(c);
             break;
         }
         case 0x09: {                                          /* local/remote? BL = drive */
-            int dr = x86_get_r8(c, R_BL) ? x86_get_r8(c, R_BL) - 1 : dos.cur_drive;
+            int dr = x86_get_r8(c, R_BL) ? (int)x86_get_r8(c, R_BL) - 1 : dos.cur_drive;
             if (dr < 0 || dr >= 26 || !dos.drives[dr].root[0]) { err(c, DE_INVALID_DRIVE); break; }
             SET_DX(0); ok(c);
             break;
@@ -712,7 +712,7 @@ void dos_int21(x86_cpu *c, int vector) {
         break;
     }
     case 0x47: {
-        int drive = x86_get_r8(c, R_DL) ? x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
+        int drive = x86_get_r8(c, R_DL) ? (int)x86_get_r8(c, R_DL) - 1 : dos.cur_drive;
         if (drive < 0 || drive >= 26 || !dos.drives[drive].root[0]) { err(c, DE_INVALID_DRIVE); break; }
         const char *cw = dos.drives[drive].cwd;
         dos_write_str(c, P_DS(SI), cw[0] == '\\' ? cw + 1 : cw);
