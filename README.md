@@ -2,11 +2,12 @@
 
 An 8086–Pentium PC emulator built around a dynamic binary translator: x86
 real mode, protected mode, virtual-8086 mode and paging, and the 387/486
-floating-point unit, translated to
-AArch64 at run time, with the goal of running DOS software at billions of
-instructions per second. It boots FreeDOS, MS-DOS 6.22, Windows 3.11 in
-386 enhanced mode and Windows NT 4.0 from disk images, and runs DOOM,
-WordPerfect 5.1, Turbo Pascal and Microsoft COBOL.
+floating-point unit, translated to AArch64 or x86-64 at run time, with
+the goal of running DOS software at billions of instructions per second.
+It installs and boots FreeDOS, MS-DOS 6.22, Windows 3.11 in 386 enhanced
+mode, Windows NT 4.0 and Windows 2000 from disk images, and runs DOOM,
+WordPerfect 5.1, Turbo Pascal and Microsoft COBOL. It builds for macOS,
+Linux and Windows.
 
 It is the successor to [z80](https://github.com/brazilofmux/z80) (Z80 +
 CP/M at 4.3 BIPS), [slow-32](https://github.com/brazilofmux/slow32-public)
@@ -21,15 +22,21 @@ bitmap, and lockstep verification against an interpreter.
 | Windows 3.11 in 386 enhanced mode | An MS-DOS Prompt: a V86 VM beside Windows |
 | ![DOOM under EMM386](docs/img/doom-emm386.png) | ![WordPerfect 5.1](docs/img/wp51-msdos.png) |
 | DOOM (DOS/4GW via VCPI) under MS-DOS + EMM386 | WordPerfect 5.1 under MS-DOS 6.22 |
+| ![Windows NT 4.0 on a 486](docs/img/nt4-system-properties.png) | ![Windows 2000 on a Pentium](docs/img/win2k-system-properties.png) |
+| Windows NT 4.0 on the 486 (`-m 486`) | Windows 2000 on the Pentium (`-m 586`) |
 
 ## What runs
 
 Two ways to run things:
 
 - **As a PC booted from disk images** (`-boot`): a BIOS, INT 13h over
-  diskette and hard-disk images, CMOS, the 8259/8254/8042, a VGA (text,
-  mode 13h and unchained, 16-colour planar modes), A20, extended memory.
-  Real DOS runs on it:
+  diskette and hard-disk images, the two 8259s, the 8254, the 8042 with a
+  PS/2 mouse, an MC146818 real-time clock, an IDE (ATA) controller with
+  an AT disk BIOS that drives it in real instructions, a VGA (text, mode
+  13h and unchained, 16-colour planar modes), A20, and up to 257 MB of
+  memory (`-mem`). The CPU is an 8086, 186, 286, 386, 486 or Pentium
+  (`-m`), with an x87 on the 486 and the Pentium (and beside a 386 with
+  `-fpu`). On it:
   - FreeDOS 1.3 — installed by its own installer; under HIMEMX, JEMMEX
     and JEMM386
   - MS-DOS 6.22 — installed by its own Setup from diskette images; under
@@ -38,6 +45,9 @@ Two ways to run things:
     enhanced mode, with MS-DOS Prompt VMs
   - DOOM (DOS/4GW) under all of the above: raw XMS, VCPI under EMM386,
     and DPMI inside a Windows DOS box
+  - Windows NT 4.0 Workstation and Windows 2000 Professional — installed
+    by their own Setup (WINNT from MS-DOS, the CD copied to a hard disk),
+    to the desktop
 - **As a DOS program runner** (the default): an emulated DOS (INT 21h in
   the host, a host directory as C:, a DPMI host of our own) for running a
   program headless — WordPerfect 5.1, Turbo Pascal 5.5, MS COBOL 5.0,
@@ -118,10 +128,15 @@ instructions — runs clean that way.
 
 ## Building
 
-Developed on macOS on Apple Silicon; the AArch64 backend is the mature
-one. The x86-64 backend (`dbt/dbt_x64.c`, Linux) runs real-mode code
-inline and everything else through the interpreter's helpers so far —
-correct under `-V`, not yet fast. The backend is chosen by the host
+Developed on macOS on Apple Silicon (the AArch64 backend, `dbt/dbt_a64.c`)
+and on x86-64 Linux (the x86-64 backend, `dbt/dbt_x64.c`). Both translate
+every kind of block: real mode, V86, flat 32-bit and segmented 16-bit
+protected mode, all of them under paging too, with x87 ops as helpers in
+the block; both pass the translator fuzzers and the DOS suite, under
+`-V` too. On x86-64, DOOM's timedemo takes about 177–190 realtics as a
+DOS program on an EC2 Xeon Platinum 8259CL, and DOOM runs at about 950
+MIPS on a Cascade Lake t3.2xlarge under Windows. The backend is chosen
+by the host
 (`BACKEND=a64|x64` overrides it, for the golden set).
 
     make                 # dos-monster, tools/sst, tools/jittest
@@ -157,6 +172,7 @@ terminal, so use `-w` for the window there. A list of diskettes (`-A`,
     ./dos-monster -m 386 -C ~/dos WP.EXE              # a program, emulated DOS
     ./dos-monster -m 386 -hda c.img -boot c           # boot a hard-disk image
     ./dos-monster -m 386 -fda a1.img:a2.img -boot a   # diskettes; ESC + swaps
+    ./dos-monster -m 586 -mem 64 -hda c.img -hdb d.img -boot c   # a Pentium with 64 MB, two disks
 
 `-V` runs the translator in lockstep with the interpreter and stops at
 the first difference; `-s` prints statistics; `-h` lists the rest.
@@ -168,6 +184,9 @@ No DOS software is included — bring your own copies into `disks/`
 comes from and how its installer is driven, and
 `tests/boot/msinstall.sh` / `tests/boot/wininstall.sh`, which install
 MS-DOS 6.22 and Windows 3.11 from diskette images end to end, unattended.
+NT 4.0 and Windows 2000 install from MS-DOS on a hard disk: copy the CD's
+`I386` folder to a second disk image (FAT16; 500 MB is enough for NT 4,
+Windows 2000 wants about 2 GB) and run `WINNT` from it.
 
 ## Testing
 
@@ -191,7 +210,7 @@ MS-DOS 6.22 and Windows 3.11 from diskette images end to end, unattended.
 ## Layout
 
     core/   the x86: decoder, interpreter, paging, the x87 (and SoftFloat)
-    dbt/    the translator (AArch64)
+    dbt/    the translator (AArch64 and x86-64)
     pc/     the machine: BIOS, VGA, keyboard, timer, disks, CMOS, mouse
     dos/    the emulated DOS, MZ loader, DPMI host
     tools/  oracles, fuzzers, expect.py, the native BIOS routine
