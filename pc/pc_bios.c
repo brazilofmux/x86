@@ -372,10 +372,12 @@ static void rtc_trap(x86_cpu *c, int vector) {
     pc_rtc_pie(0);
 }
 
+static void intr_update(void);
 void pc_irq_raise(int irq) {
     if (irq < 8 || irq > 15) return;
     pic2.irr |= (uint8_t)(1 << (irq - 8));
     pic2_summary();
+    intr_update();
 }
 /* FERR# (core/x86_fpu.c): IRQ 13 */
 static void ferr_irq13(x86_cpu *c) {
@@ -398,6 +400,10 @@ static int intr_ready(x86_cpu *c) {
     if ((pc.irq_pending & (1 << 9)) && !(pc.irq_in_service & 3) && !(pic.mask & 2)) return 1;
     uint8_t req = pic2.irr & (uint8_t)~pic2.mask;
     return req && !(pc.irq_in_service & 7) && !(pic.mask & 4) && !(pic2.isr & ((2u << __builtin_ctz(req)) - 1));
+}
+/* cpu->intr_waiting: intr_ready, kept for translated code's inline STI */
+static void intr_update(void) {
+    if (pc.cpu) pc.cpu->intr_waiting = (uint8_t)intr_ready(pc.cpu);
 }
 
 static void deliver(x86_cpu *c, int irq) {
@@ -422,7 +428,13 @@ static void deliver(x86_cpu *c, int irq) {
 
 static uint64_t irq0_period_ns(void);
 
+static int poll(x86_cpu *c);
 int pc_poll(x86_cpu *c) {
+    int r = poll(c);
+    intr_update();
+    return r;
+}
+static int poll(x86_cpu *c) {
     uint64_t now = pc_now_ns();
     pc.now_ns = now;
     if (now >= pc.rtc_next_ns) pc_rtc_poll(now);        /* the RTC's next interrupt is due (IRQ 8) */
@@ -667,6 +679,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         } else if (pic.icw_step == 3) pic.icw_step = pic.need_icw4 ? 4 : 0;   /* ICW3 */
         else if (pic.icw_step == 4) pic.icw_step = 0;                          /* ICW4 */
         else pic.mask = (uint8_t)val;
+        intr_update();
         break;
     case 0x20:                                   /* EOI: non-specific clears the highest in service */
         if (val & 0x10) {                        /* ICW1: mask cleared, IRR selected, ICW2.. follow */
@@ -676,6 +689,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         else if ((val & 0x18) == 0x08) { if (val & 2) pic.read_isr = val & 1; }   /* OCW3 */
         else if ((val & 0xE0) == 0x60) pc.irq_in_service &= ~(1 << (val & 7));
         else if (val == 0x20) for (int i = 0; i < 8; i++) if (pc.irq_in_service & (1 << i)) { pc.irq_in_service &= ~(1 << i); break; }
+        intr_update();
         break;
     case 0xA1:
         if (pic2.icw_step == 2) { pic2.base = (uint8_t)(val & 0xF8); pic2.icw_step = 3; }   /* ICW2; a slave is always cascaded */
@@ -683,12 +697,14 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         else if (pic2.icw_step == 4) pic2.icw_step = 0;                                     /* ICW4 */
         else pic2.mask = (uint8_t)val;
         pic2_summary();
+        intr_update();
         break;
     case 0xA0:
         if (val & 0x10) { pic2.icw_step = 2; pic2.need_icw4 = val & 1; pic2.mask = 0; pic2.read_isr = 0; pic2.isr = 0; }
         else if ((val & 0x18) == 0x08) { if (val & 2) pic2.read_isr = val & 1; }           /* OCW3 */
         else if ((val & 0xE0) == 0x60) pic2.isr &= (uint8_t)~(1 << (val & 7));             /* specific EOI */
         else if (val == 0x20 && pic2.isr) pic2.isr &= (uint8_t)(pic2.isr - 1);              /* non-specific: the highest in service */
+        intr_update();
         break;
     /* The AT's coprocessor ports: F0h clears the busy/FERR# latch (and so
      * asserts IGNNE#), F1h resets the coprocessor. */

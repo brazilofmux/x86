@@ -22,6 +22,7 @@ for mode in -i -j -V "-m 86 -V" "-m 386 -V"; do
     check "smcpush $mode"   tests/dos/smcpush.out $DM $mode tests/dos/smcpush.com
     check "smcfar $mode"    tests/dos/smcfar.out  $DM $mode tests/dos/smcfar.com
     check "smcflag $mode"   tests/dos/smcflag.out $DM $mode tests/dos/smcflag.com
+    check "stiloop $mode"   tests/dos/stiloop.out $DM $mode -L 60000000 tests/dos/stiloop.com
     check "fileio $mode"    tests/dos/fileio.out  $DM $mode -L 50000000 tests/dos/fileio.com
 done
 # unreal mode (HIMEMX's): PE set with a real-mode CS, a 4 GB DS kept across real-mode loads

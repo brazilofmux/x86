@@ -250,6 +250,10 @@ typedef struct x86_cpu {
      * at one, so STI sends the block back to the run loop instead, which
      * steps the shadowed instruction and delivers. NULL: never. */
     int    (*intr_ready)(struct x86_cpu *);
+    /* The same answer, kept current by the machine (at each poll and when
+     * a request, mask or in-service bit changes): what translated code's
+     * inline STI reads, where calling intr_ready would cost a call. */
+    uint8_t  intr_waiting;
 } x86_cpu;
 
 static inline uint64_t x86_tsc(const x86_cpu *c) { return c->insn_count + c->tsc_base; }

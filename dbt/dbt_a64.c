@@ -84,6 +84,7 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 #define OFF_CR0         offsetof(x86_cpu, cr0)
 #define OFF_FPU_SW      (offsetof(x86_cpu, fpu) + offsetof(x86_fpu, sw))
 #define OFF_INT_INHIBIT offsetof(x86_cpu, int_inhibit)
+#define OFF_INTR_WAIT   offsetof(x86_cpu, intr_waiting)
 #define OFF_DEV_WPLANE  offsetof(x86_cpu, dev_wplane)
 #define OFF_DEV_RPLANE  offsetof(x86_cpu, dev_rplane)
 
@@ -2241,9 +2242,31 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
     case OP_CLD: case OP_STD: case OP_CLI: case OP_STI: {
         uint32_t bit = (in->op == OP_CLD || in->op == OP_STD) ? X86_DF : X86_IF;
         emit_ldr_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+        uint32_t was_on = 0;
+        if (in->op == OP_STI) { was_on = emit_pos(e); emit_tbnz_x64(e, W_T0, 9, 0); }   /* IF already set: nothing more */
         if (in->op == OP_CLD || in->op == OP_CLI) (void)emit_and_w32_imm(e, W_T0, W_T0, ~bit);
         else (void)emit_orr_w32_imm(e, W_T0, W_T0, bit);
         emit_str_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+        if (in->op == OP_STI) {
+            /* IF was clear and an interrupt waits for it (cpu->intr_waiting):
+             * leave after the STI with its shadow up, as the helper STI
+             * does through jit_cur_hit — the run loop steps the next
+             * instruction and delivers. Otherwise a loop whose blocks all
+             * end with IF clear ("sti; nop; cli") never takes it. */
+            emit_add_x64_big(e, W_T1, R_CPU, (uint32_t)OFF_INTR_WAIT);   /* (past LDRB's 4K reach) */
+            emit_ldrb_imm(e, W_T1, W_T1, 0);
+            uint32_t none = emit_pos(e);
+            emit_cbz_w32(e, W_T1, 0);
+            emit_movz_w32(e, W_T1, 1, 0);
+            emit_strb_imm(e, W_T1, R_CPU, OFF_INT_INHIBIT);
+            emit_mov_w32_imm32(e, A64_W3, s_cur_ip_after);
+            emit_movz_w32(e, A64_W4, (uint16_t)s_cur_n_done, 0);
+            emit_sub_x64(e, R_CNT, R_CNT, A64_W4);
+            emit_str_w32_imm(e, A64_W3, R_CPU, OFF_EIP);
+            emit_b(e, (int32_t)s_exit_eip_off - (int32_t)emit_pos(e));
+            emit_patch_cond19(e, none, emit_pos(e));
+            emit_patch_tb14(e, was_on, emit_pos(e));
+        }
         break;
     }
     case OP_PUSH: {

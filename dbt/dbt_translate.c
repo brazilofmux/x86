@@ -265,6 +265,7 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
     case OP_SAHF: *wr = X86_SF | X86_ZF | X86_AF | X86_PF | X86_CF; break;
     case OP_DIV: case OP_IDIV: case OP_OUT:
         *rd = ARITH; break;
+    case OP_STI:   *rd = ARITH; break;          /* it can leave the block for a waiting interrupt (all flags seen there) */
     case OP_CMPS: case OP_SCAS:
         if (!in->rep) *wr = ARITH;   /* repeated: none when CX = 0, so a pass-through */
         break;
