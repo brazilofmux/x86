@@ -30,7 +30,8 @@ CORE_OBJS = $(O)\core\x86_decode.obj $(O)\core\x86_interp.obj $(O)\core\x86_stat
 DBT_OBJS  = $(O)\dbt\dbt_common.obj $(O)\dbt\dbt_cache.obj $(O)\dbt\dbt_translate.obj $(O)\dbt\dbt_x64.obj
 PC_OBJS   = $(O)\pc\pc_bios.obj $(O)\pc\pc_video.obj $(O)\pc\pc_vga.obj $(O)\pc\pc_sdl.obj $(O)\pc\pc_kbd.obj \
             $(O)\pc\pc_font.obj $(O)\pc\pc_mouse.obj $(O)\pc\pc_disk.obj $(O)\pc\pc_cmos.obj $(O)\pc\pc_ps2.obj \
-            $(O)\pc\pc_ide.obj
+            $(O)\pc\pc_ide.obj \
+            $(O)\pc\pc_uart.obj $(O)\pc\pc_pci.obj
 DOS_OBJS  = $(O)\dos\dos_load.obj $(O)\dos\dos_host.obj $(O)\dos\dos_int21.obj $(O)\dos\dos_dpmi.obj
 
 TARGET  = $(O)\dos-monster.exe

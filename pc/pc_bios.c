@@ -320,7 +320,13 @@ static void bios_int15(x86_cpu *c, int vector) {
  * request register, or the in-service register after 0Bh). DOS/4GW under
  * a VCPI server tells IRQ 0 from a double fault, both vector 8, by
  * reading the ISR; a port that read 0 made every tick a double fault. */
-static struct { uint8_t mask, base, icw_step, need_icw4, single, read_isr; } pic = { 0xB8, 8, 0, 0, 0, 0 };
+static struct { uint8_t mask, base, icw_step, need_icw4, single, read_isr, irr, lines; } pic = { 0xB8, 8, 0, 0, 0, 0, 0, 0 };
+/* IRQ 0 and 1 are the timer's and the keyboard's own (pc.irq_pending bits
+ * 8 and 9); IRQ 3-7 come from devices through pic.irr (bit 11 says one is
+ * there, unmasked), IRQ 2 is the slave's (bit 10). */
+static void pic_summary(void) {
+    if (pic.irr & ~pic.mask & 0xF8) pc.irq_pending |= 1 << 11; else pc.irq_pending &= ~(1 << 11);
+}
 
 /* The slave 8259, cascaded into the master's IRQ 2 (ports A0h/A1h,
  * vectors from 70h): IRQs 8-15. It keeps its own request and in-service
@@ -373,6 +379,23 @@ static void rtc_trap(x86_cpu *c, int vector) {
 }
 
 static void intr_update(void);
+/* A device's level on IRQ 3-7: the master latches its rising edge in the
+ * request register, and a line that falls before the request is taken
+ * withdraws it. */
+void pc_irq_line(int irq, int level) {
+    if (irq < 3 || irq > 7) return;
+    uint8_t m = (uint8_t)(1 << irq);
+    if (level) {
+        if (!(pic.lines & m)) {
+            pic.irr |= m;
+            if (pc.cpu) pc.cpu->jit_cur_hit = 1;     /* taken at the next boundary, as the IDE's IRQ 14 is */
+        }
+        pic.lines |= m;
+    }
+    else { pic.lines &= (uint8_t)~m; pic.irr &= (uint8_t)~m; }
+    pic_summary();
+    intr_update();
+}
 void pc_irq_raise(int irq) {
     if (irq < 8 || irq > 15) return;
     pic2.irr |= (uint8_t)(1 << (irq - 8));
@@ -399,7 +422,9 @@ static int intr_ready(x86_cpu *c) {
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) return 1;
     if ((pc.irq_pending & (1 << 9)) && !(pc.irq_in_service & 3) && !(pic.mask & 2)) return 1;
     uint8_t req = pic2.irr & (uint8_t)~pic2.mask;
-    return req && !(pc.irq_in_service & 7) && !(pic.mask & 4) && !(pic2.isr & ((2u << __builtin_ctz(req)) - 1));
+    if (req && !(pc.irq_in_service & 7) && !(pic.mask & 4) && !(pic2.isr & ((2u << __builtin_ctz(req)) - 1))) return 1;
+    uint8_t r1 = pic.irr & (uint8_t)~pic.mask & 0xF8;
+    return r1 && !(pc.irq_in_service & ((2u << __builtin_ctz(r1)) - 1));
 }
 /* cpu->intr_waiting: intr_ready, kept for translated code's inline STI */
 static void intr_update(void) {
@@ -463,6 +488,7 @@ static int poll(x86_cpu *c) {
      * our INT 9, says the code has been used. */
     static uint64_t last_code_ns;
     pc_ps2_poll(now);
+    pc_uart_poll();
     aux_latch();
     if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2) && !pc.kbd_disabled
         && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
@@ -502,7 +528,13 @@ static int poll(x86_cpu *c) {
         int rtc_first = pc.rtc_next_ns < next;
         if (rtc_first) next = pc.rtc_next_ns;
         uint64_t hnow = pc_now_ns();
-        if (next > hnow) { uint64_t w0 = pc_wall_ns(); usleep((useconds_t)((next - hnow) / 1000 + 1)); pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++; }
+        /* a serial console's keys come from stdin: look every 5 ms */
+        uint64_t nap = next > hnow ? next - hnow : 0;
+        if (pc_uart_owns_stdin() && nap > 5000000ull) nap = 5000000ull;
+        if (nap) { uint64_t w0 = pc_wall_ns(); usleep((useconds_t)(nap / 1000 + 1)); pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++; }
+        pc_uart_poll();
+        if (pc.irq_pending) break;
+        if (pc_now_ns() < next) continue;
         if (rtc_first) pc_rtc_poll(pc_now_ns());
         else pc.irq_pending |= 1 << 8;
     }
@@ -543,6 +575,17 @@ static int poll(x86_cpu *c) {
             return 1;
         }
     }
+    /* then the master's own IRQ 3-7 (the serial port's 4), highest first */
+    uint8_t r1 = pic.irr & (uint8_t)~pic.mask & 0xF8;
+    if (r1) {
+        int n = __builtin_ctz(r1);
+        if (!(pc.irq_in_service & ((2u << n) - 1))) {
+            pic.irr &= (uint8_t)~(1 << n);
+            pic_summary();
+            deliver(c, n);
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -554,8 +597,40 @@ static int poll(x86_cpu *c) {
  * timing loops on it work; no sound. PIC mask register at 21h is just
  * stored. */
 #define PIT_HZ 1193182ull
-static struct { uint16_t reload; uint16_t latch; int latched, rw_phase, mode_rw; } pit[3];
+static struct { uint16_t reload; uint16_t latch; int latched, rw_phase, mode_rw, mode; } pit[3];
 static uint8_t pit_speaker;
+
+/* Channel 2 counts from its load, and only while its gate (port 61h bit 0)
+ * is up: its count and its OUT (port 61h bit 5) are what timing code reads
+ * — GRUB 2 calibrates the TSC by loading it in mode 0 and waiting for OUT
+ * to rise at the terminal count; Linux reads the count itself. A low gate
+ * holds mode 0 and 1 where they are and restarts modes 2 and 3 when it
+ * rises. (Channel 0 runs free from power-on: it is IRQ 0's clock.) */
+static struct { uint64_t base_ticks, run_ns; } ch2;
+static uint64_t ch2_elapsed(void) {
+    uint64_t t = ch2.base_ticks;
+    if (pit_speaker & 1) t += (pc_now_ns() - ch2.run_ns) * PIT_HZ / 1000000000ull;
+    return t;
+}
+static void ch2_loaded(void) { ch2.base_ticks = 0; ch2.run_ns = pc_now_ns(); }
+static void ch2_gate(int was, int now) {
+    if (was == now) return;
+    if (now) { ch2.run_ns = pc_now_ns(); if (pit[2].mode == 2 || pit[2].mode == 3) ch2.base_ticks = 0; }
+    else ch2.base_ticks += (pc_now_ns() - ch2.run_ns) * PIT_HZ / 1000000000ull;
+}
+static uint16_t ch2_count(void) {
+    uint64_t reload = pit[2].reload ? pit[2].reload : 65536, e = ch2_elapsed();
+    if (pit[2].mode == 2 || pit[2].mode == 3) return (uint16_t)(reload - e % reload);
+    return (uint16_t)(reload - e);                    /* mode 0, 1: on past zero, wrapping */
+}
+static int ch2_out(void) {
+    uint64_t reload = pit[2].reload ? pit[2].reload : 65536, e = ch2_elapsed();
+    switch (pit[2].mode) {
+    case 0: case 1: return e >= reload;               /* low from the load to the terminal count */
+    case 3: return e % reload < (reload + 1) / 2;     /* a square wave, high half first */
+    default: return 1;                                /* rate generator, strobes: high but for a tick */
+    }
+}
 
 /* Channel 0's period: reload 0 means 65536, the BIOS's 54.9 ms.
  * X86_PIT_SCALE=N (measurement aid) makes the timer tick N times faster
@@ -571,6 +646,7 @@ static uint64_t irq0_period_ns(void) {
 }
 
 static uint16_t pit_now(int ch) {
+    if (ch == 2) return ch2_count();
     uint64_t ticks = (pc_now_ns() - pc.t0_ns) * PIT_HZ / 1000000000ull;
     uint32_t reload = pit[ch].reload ? pit[ch].reload : 65536;
     return (uint16_t)(reload - (ticks % reload));
@@ -599,6 +675,8 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
     (void)size;
     uint32_t vv;
     if (pc_ide_port_read(port, size, &vv)) return vv;
+    if (pc_uart_port_read(port, size, &vv)) return vv;
+    if (pc_pci_port_read(port, size, &vv)) return vv;
     if (pc_vga_port_read(port, &vv)) return vv;
     if (pc_cmos_port_read(port, &vv)) return vv;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
@@ -617,7 +695,7 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
     }
     case 0x43: return 0xFF;
     case 0x20: return pic.read_isr ? (uint32_t)(pc.irq_in_service & 0xFF)
-                                   : (uint32_t)(((pc.irq_pending >> 8) & 3) | (pic2.irr ? 4 : 0));
+                                   : (uint32_t)(((pc.irq_pending >> 8) & 3) | (pic2.irr ? 4 : 0) | pic.irr);
     case 0x21: return pic.mask;
     case 0xA0: return pic2.read_isr ? pic2.isr : pic2.irr;
     case 0xA1: return pic2.mask;
@@ -629,7 +707,7 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
         /* bit 4 toggles with the DRAM refresh, every 15.085 us — the
          * AT's own timing reference (IO.SYS counts its toggles while it
          * waits for the keyboard; a bit that never moved hung it) */
-        return (uint32_t)((pit_speaker & 0x0F) | ((pc_now_ns() / 15085u) & 1u) << 4);
+        return (uint32_t)((pit_speaker & 0x0F) | ((pc_now_ns() / 15085u) & 1u) << 4 | (uint32_t)ch2_out() << 5);
     /* 8042 status: not busy, system flag; bit 0 = output buffer full — a
      * controller reply, or a scancode latched for IRQ 1 and not yet read
      * (WIN386's keyboard VxD looks here before it reads port 60h) */
@@ -650,6 +728,8 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     if (pc.debug > 1 && (port == 0x20 || port == 0x21 || port == 0xA0 || port == 0xA1))
         fprintf(stderr, "[pic] out %02X <- %02X (isr %02X/%02X) @%llu\n", port, val & 0xFF, pc.irq_in_service & 0xFF, pic2.isr, (unsigned long long)c->insn_count);
     if (pc_ide_port_write(port, val, size)) return;
+    if (pc_uart_port_write(port, val, size)) return;
+    if (pc_pci_port_write(port, val, size)) return;
     if (pc_vga_port_write(port, val, size)) return;
     if (pc_cmos_port_write(port, val)) return;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61 || port == 0x20))
@@ -660,7 +740,11 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         if (ch == 3) break;                      /* read-back: unsupported */
         int rw = (val >> 4) & 3;
         if (rw == 0) { pit[ch].latch = pit_now(ch); pit[ch].latched = 1; pit[ch].rw_phase = 0; }
-        else { pit[ch].mode_rw = rw; pit[ch].rw_phase = 0; }
+        else {
+            pit[ch].mode_rw = rw; pit[ch].rw_phase = 0;
+            pit[ch].mode = (val >> 1) & 7;
+            if (pit[ch].mode > 5) pit[ch].mode -= 4;         /* 6, 7 are 2, 3 */
+        }
         break;
     }
     case 0x40: case 0x41: case 0x42: {
@@ -670,6 +754,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         else if (rw == 2) pit[ch].reload = (uint16_t)((pit[ch].reload & 0x00FF) | ((val & 0xFF) << 8));
         else if (pit[ch].rw_phase == 0) { pit[ch].reload = (uint16_t)((pit[ch].reload & 0xFF00) | (val & 0xFF)); pit[ch].rw_phase = 1; }
         else { pit[ch].reload = (uint16_t)((pit[ch].reload & 0x00FF) | ((val & 0xFF) << 8)); pit[ch].rw_phase = 0; }
+        if (ch == 2 && !(rw == 3 && pit[ch].rw_phase)) ch2_loaded();   /* the count is in: counting starts */
         break;
     }
     case 0x21:
@@ -679,6 +764,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         } else if (pic.icw_step == 3) pic.icw_step = pic.need_icw4 ? 4 : 0;   /* ICW3 */
         else if (pic.icw_step == 4) pic.icw_step = 0;                          /* ICW4 */
         else pic.mask = (uint8_t)val;
+        pic_summary();
         intr_update();
         break;
     case 0x20:                                   /* EOI: non-specific clears the highest in service */
@@ -710,7 +796,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
      * asserts IGNNE#), F1h resets the coprocessor. */
     case 0xF0: c->fpu.ferr = 0; break;
     case 0xF1: if (c->has_fpu) x86_fpu_finit(c); break;
-    case 0x61: pit_speaker = (uint8_t)(val & 0x0F); break;
+    case 0x61: ch2_gate(pit_speaker & 1, (int)(val & 1)); pit_speaker = (uint8_t)(val & 0x0F); break;
     case 0x64:
         /* The 8042's commands. Only 60h and D1h-D4h take a data byte
          * (kbc_cmd); a command that took one by mistake swallowed the
@@ -865,7 +951,9 @@ static void post(x86_cpu *cpu) {
 
     /* BIOS data area */
     for (int i = 0; i < 0x100; i++) pc_wr8(cpu, PC_BDA_SEG, (uint16_t)i, 0);
-    pc_wr16(cpu, PC_BDA_SEG, 0x10, (uint16_t)(0x0025 | (cpu->has_fpu ? 0x0002 : 0)));   /* equipment: 80x25 colour, 1 floppy, a PS/2 mouse, the coprocessor */
+    pc_wr16(cpu, PC_BDA_SEG, 0x10, (uint16_t)(0x0025 | (cpu->has_fpu ? 0x0002 : 0) | (pc_uart_present() ? 0x0200 : 0)));   /* equipment: 80x25 colour, 1 floppy, a PS/2 mouse, the coprocessor, a serial port */
+    pc_uart_post(cpu);                           /* COM1's address in the BDA, the chip reset */
+    pc_pci_post(cpu);                            /* the host bridge; the BIOS32 PCI BIOS at F3000h */
     if (cpu->has_fpu) x86_fpu_finit(cpu);        /* POST leaves it initialised */
     pc_wr16(cpu, PC_BDA_SEG, 0x13, PC_CONV_KB);
     pc_wr8 (cpu, PC_BDA_SEG, 0x17, 0x00);        /* shift flags */

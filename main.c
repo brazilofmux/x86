@@ -28,6 +28,9 @@ static void usage(const char *prog) {
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
     printf("  -fda IMG    diskette image as drive 00h (also -fdb); -hda IMG fixed disk 80h (also -hdb)\n");
+    printf("  -com1 stdio|FILE  a 16550 serial port at COM1 (3F8h, IRQ 4): the terminal is its far end,\n");
+    printf("              or FILE receives what it sends (default: no serial port)\n");
+    printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
     printf("  -ro         the images are read-only: the guest may write, the files never change\n");
     printf("  -boot a|c|IMG  boot the machine from A: or C: (IMG: -fda IMG -boot a), no HLE DOS\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
@@ -312,6 +315,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-W")) window = 0;
         else if (!strcmp(argv[i], "-M") && i + 1 < argc) mem_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
+        else if (!strcmp(argv[i], "-com1") && i + 1 < argc) { if (pc_uart_open(argv[++i]) < 0) return 1; }
+        else if (!strcmp(argv[i], "-pci")) pc_pci_enable();
         else if (!strcmp(argv[i], "-fda") && i + 1 < argc) img_fd[0] = argv[++i];
         else if (!strcmp(argv[i], "-fdb") && i + 1 < argc) img_fd[1] = argv[++i];
         else if (!strcmp(argv[i], "-hda") && i + 1 < argc) img_hd[0] = argv[++i];
@@ -487,6 +492,7 @@ int main(int argc, char **argv) {
     pc_video_shutdown();
     pc_sdl_shutdown();
     pc_kbd_shutdown();
+    pc_uart_shutdown();
     if (!tty) fflush(stdout);
     if (dump) {
         FILE *f = strcmp(dump, "-") ? fopen(dump, "w") : stdout;

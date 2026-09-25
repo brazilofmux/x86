@@ -42,7 +42,7 @@ HOST_ARCH := $(if $(filter a64,$(ARCH)),aarch64,$(shell uname -m))
 BACKEND ?= $(if $(filter aarch64 arm64,$(HOST_ARCH)),a64,x64)
 DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_translate.c dbt/dbt_$(BACKEND).c
 DBT_OBJS  = $(addprefix $(O)/,$(DBT_SRCS:.c=.o))
-PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c pc/pc_ps2.c pc/pc_ide.c
+PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c pc/pc_ps2.c pc/pc_ide.c pc/pc_uart.c pc/pc_pci.c
 PC_OBJS   = $(addprefix $(O)/,$(PC_SRCS:.c=.o))
 DOS_SRCS  = dos/dos_load.c dos/dos_host.c dos/dos_int21.c dos/dos_dpmi.c
 DOS_OBJS  = $(addprefix $(O)/,$(DOS_SRCS:.c=.o))
@@ -66,6 +66,12 @@ pc/pc_diskbios.h: tools/diskbios.asm
 	nasm -f bin -o $(O)/tools/diskbios.bin $< && \
 	python3 -c "import sys; b=open(sys.argv[1],'rb').read(); print('/* tools/diskbios.asm, assembled (make pc/pc_diskbios.h) */'); print('static const unsigned char diskbios[%d] = {' % len(b)); [print('    ' + ', '.join('0x%02X' % x for x in b[i:i+16]) + ',') for i in range(0, len(b), 16)]; print('};')" $(O)/tools/diskbios.bin > $@
 $(O)/pc/pc_disk.o: pc/pc_diskbios.h
+# ... and the BIOS32 directory with the 32-bit PCI BIOS (tools/pcibios.asm), the same way
+pc/pc_pcibios.h: tools/pcibios.asm
+	@mkdir -p $(O)/tools
+	nasm -f bin -o $(O)/tools/pcibios.bin $< && \
+	python3 -c "import sys; b=open(sys.argv[1],'rb').read(); print('/* tools/pcibios.asm, assembled (make pc/pc_pcibios.h) */'); print('static const unsigned char pcibios[%d] = {' % len(b)); [print('    ' + ', '.join('0x%02X' % x for x in b[i:i+16]) + ',') for i in range(0, len(b), 16)]; print('};')" $(O)/tools/pcibios.bin > $@
+$(O)/pc/pc_pci.o: pc/pc_pcibios.h
 
 $(O)/pc/pc_sdl.o: pc/pc_sdl.c
 	@mkdir -p $(dir $@)

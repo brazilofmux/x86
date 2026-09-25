@@ -121,6 +121,7 @@ void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted mac
 void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
 void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads as an empty bus */
 void pc_irq_raise(int irq);          /* IRQ 8-15: a request to the slave 8259 */
+void pc_irq_line(int irq, int level); /* IRQ 3-7: a device's line into the master 8259 (it takes the rising edge) */
 void pc_irq_unmask(int irq);         /* as the BIOS opens a line it has a handler for */
 
 /* pc_ps2.c: the PS/2 mouse on the 8042's auxiliary port */
@@ -152,6 +153,7 @@ int  pc_rtc_alarm_on(void);
 #define PC_TRAP_PS2     0xF3       /* F000:00F3: INT 74h's packet assembly, the byte from port 60h in AL */
 #define PC_STUB_INT74   0x0050     /* IRQ 12: IN 60h, the host's assembly, the program's routine with the packet, EOIs */
 #define PC_STUB_DISKBIOS 0x1000    /* INT 13h for the fixed disks, in real instructions (tools/diskbios.asm) */
+#define PC_STUB_PCIBIOS 0x2000     /* F3000h: the BIOS32 directory and the 32-bit PCI BIOS (tools/pcibios.asm), with -pci */
 #define PC_STUB_INT76   0x0098     /* IRQ 14: the hard-disk interrupt flag at 40:8Eh, EOIs */
 #define PC_PS2_VARS     0x00C0     /*   its data: the routine (offset, segment), then status, X, Y as words */
 #define PC_TRAP_RTC     0xF4       /* F000:00F4: INT 70h's bookkeeping (INT 15h AH=83h's wait), register C in AL */
@@ -221,6 +223,21 @@ void pc_disk_install(x86_cpu *c);
 void pc_mouse_reboot(x86_cpu *c);
 uint8_t *pc_disk_hd(int unit, size_t *size, int *cyls, int *heads, int *spt);   /* pc_ide.c's view */
 /* pc_ide.c: the primary IDE channel */
+/* pc_pci.c: a PCI bus (a host bridge, the BIOS32 PCI BIOS), when -pci asks for one */
+void pc_pci_enable(void);
+int  pc_pci_present(void);
+void pc_pci_post(x86_cpu *c);
+int  pc_pci_port_read(uint16_t port, int size, uint32_t *val);
+int  pc_pci_port_write(uint16_t port, uint32_t val, int size);
+/* pc_uart.c: COM1, a 16550A, when -com1 asks for one */
+int  pc_uart_open(const char *spec);   /* "stdio", or a file for what is sent */
+void pc_uart_post(x86_cpu *c);
+int  pc_uart_present(void);
+int  pc_uart_owns_stdin(void);
+int  pc_uart_port_read(uint16_t port, int size, uint32_t *val);
+int  pc_uart_port_write(uint16_t port, uint32_t val, int size);
+void pc_uart_poll(void);
+void pc_uart_shutdown(void);
 void pc_ide_post(x86_cpu *c);
 int  pc_ide_port_read(uint16_t port, int size, uint32_t *val);
 int  pc_ide_port_write(uint16_t port, uint32_t val, int size);

@@ -257,6 +257,7 @@ static void fill_pending(void) {
 
 /* Translate one key from the pending bytes; returns 0 if none. */
 static int next_key(x86_cpu *c, int blocking) {
+    if (pc_uart_owns_stdin()) return 0;          /* stdin is COM1's (-com1 stdio): keys come from the window */
     if (!npending) { if (blocking || host_readable(0)) fill_pending(); }
     if (!npending) return 0;
     uint8_t b = pending[0];

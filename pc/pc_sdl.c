@@ -256,6 +256,7 @@ void pc_sdl_poll(x86_cpu *c, uint64_t now) {
         case SDL_QUIT:
             fprintf(stderr, "dos-monster: window closed\n");
             pc_kbd_shutdown();
+            pc_uart_shutdown();
             SDL_Quit();
             exit(0);
         case SDL_KEYDOWN: key(&e.key, 1); break;

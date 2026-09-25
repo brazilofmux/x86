@@ -59,6 +59,11 @@ for mode in -i -j -V; do
         check "cpu486 -m $m $mode" tests/dos/cpu486-$m.out $DM -m $m $mode -L 1000000 tests/dos/cpu486.com
     done
 done
+# COM1's 16550 (-com1) in loopback: registers, FIFO, IRQ 4; none without it
+for mode in -i -j -V; do
+    check "uart $mode" tests/dos/uart.out $DM -m 386 $mode -com1 /dev/null -L 2000000 tests/dos/uart.com
+done
+check "uart none" tests/dos/uart-none.out $DM -m 386 -j -L 2000000 tests/dos/uart.com
 # the Pentium against the 486: EFLAGS.ID, CPUID, RDTSC, the MSRs,
 # CMPXCHG8B, CR4 and CR4.DE, or #UD
 for mode in -i -j -V; do

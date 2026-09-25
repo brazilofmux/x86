@@ -1,0 +1,7 @@
+COM1 at 03F8, ports 01
+scratch 5A
+loopback MSR A0
+sent A: LSR 61 RBR 41
+IIR idle, THRE on, after 01 02 01
+FIFO IIR, data, after CC 123 C1
+IRQ 4 hits, IIR, byte 01 04 5A
