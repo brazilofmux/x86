@@ -169,3 +169,13 @@ Before it, C:\> took 12.6 s: HIMEM tests extended memory flipping A20
 around each chunk, ~14500 times, and every flip flushed the whole
 translation cache. The A20 state is now part of the block key
 (KEY_A20OFF), and a flip flushes nothing.
+
+Linux: tests/boot/tcimage.sh builds disks/linux/tc.img from Tiny Core
+16.2's ISO (Core-16.2.iso, from distro.ibiblio.org/tinycorelinux over
+HTTPS): a 64 MB disk with the kernel and initramfs on a FAT16 partition,
+GRUB 2 (Homebrew's i686-elf-grub) in the MBR and the gap after it. The
+boot test runs it on -m 586 -mem 128 to the tc@box prompt and uname -a
+(about two minutes, most of it Tiny Core's own start-up). Linux's atkbd
+needed the keyboard's command replies to get through while scanning is
+off (F5h), and its console scrolls by moving the CRTC start address,
+which the text dump expect.py reads now follows.

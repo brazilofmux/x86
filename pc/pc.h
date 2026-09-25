@@ -195,6 +195,7 @@ void pc_kbd_int16(x86_cpu *c, int vector);
 void pc_kbd_int9(x86_cpu *c, int vector);                /* default INT 9: latched code → BIOS buffer */
 void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode);
 int  pc_kbd_raw_pending(void);
+int  pc_kbd_raw_reply_pending(void);                 /* a command's reply is next (goes out even with scanning off) */
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */
 void pc_vga_rom(x86_cpu *c);                               /* POST: the native mode-set code and its tables */
@@ -203,6 +204,8 @@ int  pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h);   /* RGB24, at most
 int  pc_vga_text_frame(x86_cpu *c, uint8_t *rgb, int maxw, int maxh, int *w, int *h, unsigned frame);   /* -1 if not text */
 void pc_vga_set_cursor_pos(uint16_t words);               /* CRTC 0E/0F, as the BIOS keeps them */
 void pc_vga_set_start(uint16_t words);                    /* CRTC 0C/0D: the displayed page */
+uint16_t pc_vga_start(void);                              /* ... where the display starts, in words */
+void pc_vga_text_geometry(int *rows, int *cols);          /* the text screen's shape, from the CRTC */
 void pc_vga_set_cursor_shape(uint8_t start, uint8_t end); /* CRTC 0A/0B */
 void pc_vga_set_char_height(int h);                       /* CRTC 09 */
 uint8_t pc_vga_get_ac(int i);

@@ -328,6 +328,7 @@ static void text_default(x86_cpu *c) {
 /* ---- what the BIOS sets as it goes (INT 10h) ------------------------------ */
 void pc_vga_set_cursor_pos(uint16_t words) { vga.crtc[0x0E] = (uint8_t)(words >> 8); vga.crtc[0x0F] = (uint8_t)words; }
 void pc_vga_set_start(uint16_t words)      { vga.crtc[0x0C] = (uint8_t)(words >> 8); vga.crtc[0x0D] = (uint8_t)words; }
+uint16_t pc_vga_start(void)               { return (uint16_t)(vga.crtc[0x0C] << 8 | vga.crtc[0x0D]); }
 void pc_vga_set_cursor_shape(uint8_t start, uint8_t end) { vga.crtc[0x0A] = start; vga.crtc[0x0B] = end; }
 void pc_vga_set_char_height(int h) { vga.crtc[0x09] = (uint8_t)((vga.crtc[0x09] & 0xE0) | ((h - 1) & 0x1F)); }
 uint8_t pc_vga_get_ac(int i) { return i < 0x15 ? vga.ac[i] : 0; }
@@ -535,6 +536,15 @@ int pc_video_png(x86_cpu *c, const char *path) {
 /* ---- text modes ------------------------------------------------------------ */
 
 static int text_mode(void) { return !is_graphics(); }
+
+/* The text screen's shape as the CRTC has it: what the display shows,
+ * whatever the BIOS data area says (a kernel that owns the machine need
+ * not keep it). */
+void pc_vga_text_geometry(int *rows, int *cols) {
+    int ch = (vga.crtc[0x09] & 0x1F) + 1;
+    *cols = vga.crtc[0x01] + 1; if (*cols < 1 || *cols > 132) *cols = 80;
+    *rows = crtc_lines() / ch; if (*rows < 1 || *rows > 60) *rows = 25;
+}
 
 /* Draw the text screen into rgb (RGB24, width *w, height *h, at most
  * maxw x maxh): 0, or -1 when the display is not in a text mode. frame

@@ -489,16 +489,24 @@ void pc_video_flush(int force) {
     }
 }
 
+/* The text the display shows: from where the CRTC's start address says
+ * (INT 10h AH=05h sets it for a page; Linux's console scrolls by moving
+ * it), wrapping in the 32 KB window as the display does. */
 void pc_video_dump(x86_cpu *c, FILE *f) {
-    int nr = rows(c) < PC_ROWS ? rows(c) : PC_ROWS, nc = cols(c) < PC_COLS ? cols(c) : PC_COLS;
-    const uint8_t *vm = c->mem + ((uint32_t)PC_VIDEO_SEG << 4) + page_off(page(c));
+    int vr, vc;
+    pc_vga_text_geometry(&vr, &vc);
+    int nr = vr < PC_ROWS ? vr : PC_ROWS, nc = vc < PC_COLS ? vc : PC_COLS;
+    const uint8_t *vm = c->mem + ((uint32_t)PC_VIDEO_SEG << 4);
+    uint32_t start = pc_vga_start();
+#define CELL(r, col) vm[((start + (uint32_t)((r) * vc + (col))) * 2) & 0x7FFF]
     for (int r = 0; r < nr; r++) {
         int last = nc;
-        while (last > 0 && (vm[(r * cols(c) + last - 1) * 2] == ' ' || vm[(r * cols(c) + last - 1) * 2] == 0)) last--;
+        while (last > 0 && (CELL(r, last - 1) == ' ' || CELL(r, last - 1) == 0)) last--;
         for (int col = 0; col < last; col++) {
-            uint8_t ch = vm[(r * cols(c) + col) * 2];
+            uint8_t ch = CELL(r, col);
             put_utf8(f, ch ? cp437[ch] : ' ');
         }
         fputc('\n', f);
     }
+#undef CELL
 }

@@ -501,7 +501,9 @@ static int poll(x86_cpu *c) {
     pc_uart_poll();
     pc_e1000_poll();
     aux_latch();
-    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2) && !pc.kbd_disabled
+    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2)
+        && !(pc.kbd_disabled & 1)                                        /* the 8042's interface (ADh) holds everything */
+        && (!(pc.kbd_disabled & 2) || pc_kbd_raw_reply_pending())        /* scanning off (F5h) holds keys, not replies */
         && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
         uint8_t code;
         pc_kbd_raw_next(&code);

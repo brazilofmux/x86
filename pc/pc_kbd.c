@@ -98,16 +98,23 @@ int pc_kbd_raw_pending(void) { return rawq_head != rawq_tail; }
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii) { raw_enqueue(code, ascii); }
 /* The keyboard's answer to a command byte (FAh, ACK): ahead of any keys
  * still waiting, as the keyboard sends it straight back. */
+static int nreply;                     /* how many at the head are command replies */
 void pc_kbd_raw_reply(uint8_t code) {
     int prev = (rawq_head - 1) & 255;
     if (prev == rawq_tail) return;
     rawq_head = prev;
     rawq[rawq_head] = (rawkey){ code, 0 };
+    nreply++;
 }
+/* A reply waits at the head: it goes to the host even while scanning is
+ * off (F5h), since only keystrokes wait for F4h — Linux's atkbd disables
+ * the keyboard and waits for that very command's ACK. */
+int pc_kbd_raw_reply_pending(void) { return nreply > 0 && rawq_head != rawq_tail; }
 int pc_kbd_raw_next(uint8_t *code) {
     if (rawq_head == rawq_tail) return 0;
     *code = rawq[rawq_head].code; latched_ascii = rawq[rawq_head].ascii;
     rawq_head = (rawq_head + 1) & 255;
+    if (nreply > 0) nreply--;
     return 1;
 }
 

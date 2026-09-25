@@ -138,4 +138,13 @@ if [ -f disks/win311/c.img ] && mdir -i disks/win311/c.img@@32256 ::/WINDOWS/WIN
     then echo "ok   windows 3.11 enhanced mode, 32-bit disk access (wdctrl)"; else echo "FAIL windows 3.11 32-bit disk access"; fail=1; fi
     rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-win.png tmp/boot-system.ini
 fi
+if [ -f disks/linux/tc.img ]; then
+    # Linux 6.12 (Tiny Core 16.2, tests/boot/tcimage.sh) on the Pentium:
+    # GRUB 2 from the disk, the kernel and its initramfs, the shell, a command
+    cp disks/linux/tc.img tmp/boot-tc.img
+    printf 'tc@box:~\\$\tuname -a\\r\ni586 GNU/Linux\t\n' > tmp/boot-tc.exp
+    if python3 tools/expect.py -t 280 tmp/boot-tc.exp -- $DM -m 586 -mem 128 -W -T 270 -hda tmp/boot-tc.img -boot c >/dev/null 2>&1
+    then echo "ok   linux 6.12 (tiny core) to a shell on the pentium"; else echo "FAIL linux 6.12 (tiny core)"; fail=1; fi
+    rm -f tmp/boot-tc.img tmp/boot-tc.exp
+fi
 exit $fail
