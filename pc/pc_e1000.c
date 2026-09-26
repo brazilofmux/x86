@@ -315,6 +315,7 @@ static int rx_accept(const uint8_t *f) {
  * RXDMT0 once the free descriptors are down to RCTL.RDMTS's share. 0: no
  * room — the frame waits (pc_net's queue) for the driver to give more. */
 static int rx_frame(const uint8_t *frame, uint32_t flen) {
+    if (!e.enabled) return 1;
     if (!(R(RCTL) & RCTL_EN) || flen < 14) return 1;     /* not receiving: the frame is lost */
     if (!rx_accept(frame)) return 1;
     x86_cpu *c = pc.cpu;
@@ -355,11 +356,6 @@ static int rx_frame(const uint8_t *frame, uint32_t flen) {
     return 1;
 }
 
-/* What the network has sent, while the ring has room for it */
-static void rx_drain(void) {
-    const uint8_t *f; uint32_t len;
-    while ((f = pc_net_rx_peek(&len)) && rx_frame(f, len)) pc_net_rx_pop();
-}
 
 static uint32_t reg_read(uint32_t off) {
     off &= 0x1FFFC;
@@ -407,8 +403,8 @@ static void reg_write(uint32_t off, uint32_t v) {
     case IMC: R(IMS) &= ~v; update_irq(); return;
     case TDT: R(TDT) = v & 0xFFFF; transmit(); return;
     case TDH: case RDH: R(off) = v & 0xFFFF; return;
-    case RDT: R(RDT) = v & 0xFFFF; rx_drain(); return;
-    case RCTL: R(RCTL) = v; rx_drain(); return;
+    case RDT: R(RDT) = v & 0xFFFF; pc_net_rx_drain(); return;   /* room for what waits */
+    case RCTL: R(RCTL) = v; pc_net_rx_drain(); return;
     case TDLEN: case RDLEN: R(off) = v & 0xFFF80; return;
     case TCTL: R(TCTL) = v; transmit(); return;
     default: R(off) = v; return;
@@ -481,11 +477,6 @@ void pc_e1000_enable(void) {
     d->mmio_write = mmio_wr;
     eeprom_init();
     pc_pci_add(3, d);
+    pc_net_attach(rx_frame);
 }
 
-/* From pc_poll: the network's sockets, and what it has for the card */
-void pc_e1000_poll(void) {
-    if (!e.enabled || !pc_net_present()) return;
-    pc_net_poll(0);
-    rx_drain();
-}

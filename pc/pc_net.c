@@ -1,6 +1,6 @@
 /* pc_net.c — the far end of the network card's cable
  *
- * -nic e1000,user: libslirp, the user-mode network QEMU uses. The guest is
+ * -nic e1000,user or -nic ne2000,user: libslirp, the user-mode network QEMU uses. The guest is
  * on 10.0.2.0/24 as 10.0.2.15 (slirp's DHCP server hands that out), the
  * gateway is 10.0.2.2 and the DNS server 10.0.2.3, both slirp's; TCP and
  * UDP out of it become the host's own sockets — NAT, with no privileges
@@ -13,8 +13,10 @@
  *
  * Frames to the guest can come at any time — from slirp_input itself (an
  * ARP reply, a DHCP answer) while the card is in the middle of sending —
- * so they wait in a queue here until the card has receive descriptors
- * for them (pc_e1000.c takes them with pc_net_rx_peek/pc_net_rx_pop).
+ * so they wait in a queue here until the card has room for them: the
+ * card attaches a deliver function (pc_net_attach), which takes a frame
+ * or says there is no room yet, and the queue drains into it after each
+ * poll and whenever the card frees space (pc_net_rx_drain).
  */
 #include "pc.h"
 #include <stdio.h>
@@ -42,16 +44,17 @@ static void rx_queue(const void *buf, size_t len) {
     net.n++;
 }
 
-const uint8_t *pc_net_rx_peek(uint32_t *len) {
-    if (!net.n) return NULL;
-    *len = net.q[net.head].n;
-    return net.q[net.head].p;
-}
-void pc_net_rx_pop(void) {
-    if (!net.n) return;
-    free(net.q[net.head].p);
-    net.head = (net.head + 1) % RXQ;
-    net.n--;
+static int (*deliver)(const uint8_t *frame, uint32_t len);
+void pc_net_attach(int (*d)(const uint8_t *, uint32_t)) { deliver = d; }
+
+/* Frames into the card while it takes them (1: taken, or dropped by its
+ * filter; 0: no room — the frame waits) */
+void pc_net_rx_drain(void) {
+    while (net.n && deliver && deliver(net.q[net.head].p, net.q[net.head].n)) {
+        free(net.q[net.head].p);
+        net.head = (net.head + 1) % RXQ;
+        net.n--;
+    }
 }
 
 #ifdef HAVE_SLIRP
@@ -151,7 +154,7 @@ void pc_net_poll(int wait_ms) {
     if (!slirp) return;
     static uint64_t last;
     uint64_t now = pc_wall_ns();
-    if (!wait_ms && now - last < 500000) return;
+    if (!wait_ms && now - last < 500000) { pc_net_rx_drain(); return; }
     last = now;
     uint32_t timeout = wait_ms > 0 ? (uint32_t)wait_ms : 0;
     nfds = 0;
@@ -168,6 +171,7 @@ void pc_net_poll(int wait_ms) {
             timers[i].expire_ms = -1;
             timers[i].cb(timers[i].opaque);
         }
+    pc_net_rx_drain();
 }
 
 #else

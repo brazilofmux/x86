@@ -147,6 +147,24 @@ if [ -f disks/linux/tc.img ]; then
     then echo "ok   linux 6.12 (tiny core) to a shell on the pentium"; else echo "FAIL linux 6.12 (tiny core)"; fail=1; fi
     rm -f tmp/boot-tc.img tmp/boot-tc.exp
 fi
+if [ -f disks/freedos/c.img ] && [ -f disks/freedos/net/crynwr.zip ] && [ -f disks/freedos/net/mtcp.zip ] \
+   && $DM -nic ne2000,user -h >/dev/null 2>&1; then
+    # FreeDOS on the network: the NE2000 (ISA, 300h, IRQ 3), Crynwr's
+    # packet driver from 1993 and mTCP (FreeDOS 1.3's crynwr and mtcp
+    # packages, from its repository's net group, in disks/freedos/net):
+    # DHCP from slirp, two pings answered by its gateway
+    cp disks/freedos/c.img tmp/boot-net.img
+    rm -rf tmp/boot-net && mkdir -p tmp/boot-net
+    unzip -q -j -o disks/freedos/net/crynwr.zip DRIVERS/CRYNWR/NE2000.COM -d tmp/boot-net
+    unzip -q -j -o disks/freedos/net/mtcp.zip NET/MTCP/DHCP.EXE NET/MTCP/PING.EXE -d tmp/boot-net
+    printf 'PACKETINT 0x60\r\n' > tmp/boot-net/MTCP.CFG
+    mmd -i tmp/boot-net.img@@32256 ::/NET && mcopy -i tmp/boot-net.img@@32256 tmp/boot-net/* ::/NET/
+    printf '%s\t%s\n' 'C:.>$' 'cd \\net\r' 'NET>$' 'ne2000 0x60 3 0x300\r' 'NET>$' 'set mtcpcfg=c:\\net\\mtcp.cfg\r' \
+        'NET>$' 'dhcp\r' 'NET>$' 'ping -count 2 10.0.2.2\r' '*Replies received: 2' '' > tmp/boot-net.exp
+    if python3 tools/expect.py -t 90 tmp/boot-net.exp -- $DM -m 386 -W -T 80 -nic ne2000,user -hda tmp/boot-net.img -boot c >/dev/null 2>&1
+    then echo "ok   freedos on the network: an ne2000, crynwr's packet driver, mtcp dhcp and ping"; else echo "FAIL freedos on the network (ne2000)"; fail=1; fi
+    rm -rf tmp/boot-net tmp/boot-net.img tmp/boot-net.exp
+fi
 if [ -f disks/linux/tc.img ] && $DM -nic e1000,user -h >/dev/null 2>&1; then
     # ... with the e1000 on a slirp network (a build with libslirp): Linux's
     # DHCP client gets slirp's 10.0.2.15, and slirp's gateway answers two

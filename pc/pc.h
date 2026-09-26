@@ -257,14 +257,17 @@ void pc_pci_dma_read(x86_cpu *c, uint64_t phys, void *buf, uint32_t len);
 void pc_pci_dma_write(x86_cpu *c, uint64_t phys, const void *buf, uint32_t len);
 /* pc_e1000.c: an Intel 82545EM at 00:03.0, IRQ 11 (-nic e1000) */
 void pc_e1000_enable(void);
-void pc_e1000_poll(void);
+/* pc_ne2000.c: an NE2000 on the ISA bus, 300h, IRQ 3 (-nic ne2000) */
+void pc_ne2000_enable(void);
+int  pc_ne2000_port_read(uint16_t port, int size, uint32_t *val);
+int  pc_ne2000_port_write(uint16_t port, uint32_t val, int size);
 /* pc_net.c: the network behind it (-nic e1000,user: libslirp) */
 int  pc_net_open(const char *spec);
 int  pc_net_present(void);
 void pc_net_send(const uint8_t *frame, uint32_t len);
 void pc_net_poll(int wait_ms);
-const uint8_t *pc_net_rx_peek(uint32_t *len);
-void pc_net_rx_pop(void);
+void pc_net_attach(int (*deliver)(const uint8_t *frame, uint32_t len));
+void pc_net_rx_drain(void);
 /* pc_uart.c: COM1, a 16550A, when -com1 asks for one */
 int  pc_uart_open(const char *spec);   /* "stdio", or a file for what is sent */
 void pc_uart_post(x86_cpu *c);

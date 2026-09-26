@@ -33,6 +33,7 @@ static void usage(const char *prog) {
     printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
     printf("  -nic e1000[,user]  an Intel 82545EM network card on that bus; ,user puts\n"
            "              a NAT network behind it (libslirp: DHCP gives 10.0.2.15)\n");
+    printf("  -nic ne2000[,user] a Novell NE2000 on the ISA bus instead (300h, IRQ 3)\n");
     printf("  -ro         the images are read-only: the guest may write, the files never change\n");
     printf("  -boot a|c|IMG  boot the machine from A: or C: (IMG: -fda IMG -boot a), no HLE DOS\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
@@ -324,7 +325,8 @@ int main(int argc, char **argv) {
             const char *comma = strchr(n, ',');
             size_t len = comma ? (size_t)(comma - n) : strlen(n);
             if (len == 5 && !strncmp(n, "e1000", 5)) pc_e1000_enable();
-            else { fprintf(stderr, "-nic: e1000[,user] (an Intel 82545EM on PCI)\n"); return 1; }
+            else if (len == 6 && !strncmp(n, "ne2000", 6)) pc_ne2000_enable();
+            else { fprintf(stderr, "-nic: e1000[,user] (an Intel 82545EM on PCI) or ne2000[,user] (ISA, 300h, IRQ 3)\n"); return 1; }
             if (comma && pc_net_open(comma + 1) < 0) return 1;
         }
         else if (!strcmp(argv[i], "-fda") && i + 1 < argc) img_fd[0] = argv[++i];

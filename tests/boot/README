@@ -227,3 +227,15 @@ root login, a C program compiled and run.
   typing anything into the dialog: the kernel keeps console switches.)
 - expect.py takes a script line starting with # for a comment: a root
   prompt's pattern is [#].
+
+FreeDOS on the network: -nic ne2000,user, a Novell NE2000 (the DP8390;
+pc/pc_ne2000.c) on the ISA bus at 300h, IRQ 3, with slirp behind it.
+The software is FreeDOS 1.3's own, from its repository's net group
+(https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/repositories/
+1.3/net/: crynwr.zip and mtcp.zip, into disks/freedos/net): Crynwr's
+NE2000.COM packet driver from 1993 ("ne2000 0x60 3 0x300") and mTCP,
+whose DHCP gets 10.0.2.15. The boot test pings slirp's gateway. By hand,
+HTGET fetched a page off the Internet, and 2 MB from an HTTP server on
+the host (10.0.2.2) came through byte-exact at about 160 KB/s; -V is
+clean through the driver, DHCP and ping (the card has no DMA: everything
+crosses its ports, which -V's log already replays).

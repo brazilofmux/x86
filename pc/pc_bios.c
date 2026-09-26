@@ -499,7 +499,7 @@ static int poll(x86_cpu *c) {
     static uint64_t last_code_ns;
     pc_ps2_poll(now);
     pc_uart_poll();
-    pc_e1000_poll();
+    pc_net_poll(0);                              /* the network card's far end */
     aux_latch();
     if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2)
         && !(pc.kbd_disabled & 1)                                        /* the 8042's interface (ADh) holds everything */
@@ -577,7 +577,7 @@ static int poll(x86_cpu *c) {
             pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++;
         }
         pc_uart_poll();
-        pc_e1000_poll();
+        pc_net_poll(0);
         if (pc.irq_pending) break;
         if (pc_now_ns() < next) continue;
         if (rtc_first) pc_rtc_poll(pc_now_ns());
@@ -721,6 +721,7 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
     uint32_t vv;
     if (pc_ide_port_read(port, size, &vv)) return vv;
     if (pc_uart_port_read(port, size, &vv)) return vv;
+    if (pc_ne2000_port_read(port, size, &vv)) return vv;
     if (pc_pci_port_read(port, size, &vv)) return vv;
     if (pc_vga_port_read(port, &vv)) return vv;
     if (pc_cmos_port_read(port, &vv)) return vv;
@@ -774,6 +775,7 @@ static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
         fprintf(stderr, "[pic] out %02X <- %02X (isr %02X/%02X) @%llu\n", port, val & 0xFF, pc.irq_in_service & 0xFF, pic2.isr, (unsigned long long)c->insn_count);
     if (pc_ide_port_write(port, val, size)) return;
     if (pc_uart_port_write(port, val, size)) return;
+    if (pc_ne2000_port_write(port, val, size)) return;
     if (pc_pci_port_write(port, val, size)) return;
     if (pc_vga_port_write(port, val, size)) return;
     if (pc_cmos_port_write(port, val)) return;

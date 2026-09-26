@@ -54,6 +54,8 @@ Two ways to run things:
     network: an Intel 82545EM on a PCI bus (-nic e1000,user), DHCP, DNS and
     TCP out through a NAT (libslirp); and Purdue's Xinu, with a serial
     console (-com1) and the same card
+  - FreeDOS on the network: a Novell NE2000 on the ISA bus (-nic
+    ne2000,user), Crynwr's packet driver and mTCP (DHCP, ping, HTGET, FTP)
   - Slackware 3.1 ("Slackware 96": Linux 2.0.0, gcc 2.7.2, XFree86 3.1.2)
     — installed by its own setup from its disk sets on a DOS partition,
     booted by LILO
@@ -157,7 +159,8 @@ by the host
 Needs a C11 compiler and zlib; SDL2 (via `pkg-config`) adds a window for
 graphics modes and is optional — without it the machine is headless.
 libslirp (also via `pkg-config`; `brew install libslirp`, `apt install
-libslirp-dev`) puts a network behind the e1000 (`-nic e1000,user`) and is
+libslirp-dev`) puts a network behind the network card (`-nic e1000,user`,
+`-nic ne2000,user`) and is
 optional too — without it the card has nothing on the other end.
 The tests also use `nasm`, `python3`, `mtools`, `qemu-system-i386` and
 `bochs`. The x87's arithmetic is Berkeley SoftFloat 3e (BSD licence,
