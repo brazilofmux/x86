@@ -31,7 +31,8 @@ static void usage(const char *prog) {
     printf("  -com1 stdio|FILE  a 16550 serial port at COM1 (3F8h, IRQ 4): the terminal is its far end,\n");
     printf("              or FILE receives what it sends (default: no serial port)\n");
     printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
-    printf("  -nic e1000  an Intel 82545EM network card on that bus (no network behind it yet)\n");
+    printf("  -nic e1000[,user]  an Intel 82545EM network card on that bus; ,user puts\n"
+           "              a NAT network behind it (libslirp: DHCP gives 10.0.2.15)\n");
     printf("  -ro         the images are read-only: the guest may write, the files never change\n");
     printf("  -boot a|c|IMG  boot the machine from A: or C: (IMG: -fda IMG -boot a), no HLE DOS\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
@@ -320,8 +321,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-pci")) pc_pci_enable();
         else if (!strcmp(argv[i], "-nic") && i + 1 < argc) {
             const char *n = argv[++i];
-            if (!strcmp(n, "e1000")) pc_e1000_enable();
-            else { fprintf(stderr, "-nic: e1000 (an Intel 82545EM on PCI)\n"); return 1; }
+            const char *comma = strchr(n, ',');
+            size_t len = comma ? (size_t)(comma - n) : strlen(n);
+            if (len == 5 && !strncmp(n, "e1000", 5)) pc_e1000_enable();
+            else { fprintf(stderr, "-nic: e1000[,user] (an Intel 82545EM on PCI)\n"); return 1; }
+            if (comma && pc_net_open(comma + 1) < 0) return 1;
         }
         else if (!strcmp(argv[i], "-fda") && i + 1 < argc) img_fd[0] = argv[++i];
         else if (!strcmp(argv[i], "-fdb") && i + 1 < argc) img_fd[1] = argv[++i];

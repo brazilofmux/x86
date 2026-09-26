@@ -147,6 +147,17 @@ if [ -f disks/linux/tc.img ]; then
     then echo "ok   linux 6.12 (tiny core) to a shell on the pentium"; else echo "FAIL linux 6.12 (tiny core)"; fail=1; fi
     rm -f tmp/boot-tc.img tmp/boot-tc.exp
 fi
+if [ -f disks/linux/tc.img ] && $DM -nic e1000,user -h >/dev/null 2>&1; then
+    # ... with the e1000 on a slirp network (a build with libslirp): Linux's
+    # DHCP client gets slirp's 10.0.2.15, and slirp's gateway answers two
+    # pings a second apart (a clock that runs on through HLT). Nothing
+    # outside the host is reached.
+    cp disks/linux/tc.img tmp/boot-tcn.img
+    printf '%s\t%s\\r\n%s\t\n' 'tc@box:~\$' "ifconfig eth0 | grep -q addr:10.0.2.15 && [ \$(ping -c 2 10.0.2.2 | grep -c 'bytes from') = 2 ] && echo NET-O''K" '*NET-OK' > tmp/boot-tcn.exp
+    if python3 tools/expect.py -t 280 tmp/boot-tcn.exp -- $DM -m 586 -mem 128 -W -T 270 -nic e1000,user -hda tmp/boot-tcn.img -boot c >/dev/null 2>&1
+    then echo "ok   linux 6.12 on the network: an e1000, dhcp and ping through slirp"; else echo "FAIL linux on the network (e1000, slirp)"; fail=1; fi
+    rm -f tmp/boot-tcn.img tmp/boot-tcn.exp
+fi
 if [ -f disks/linux/tcroot.img ] && [ -x "$(brew --prefix e2fsprogs 2>/dev/null)/sbin/debugfs" ]; then
     # ... and with its root filesystem on our IDE disk (tests/boot/tcroot.sh:
     # ext2, no initramfs): Linux writes a file there as root, and it is in

@@ -568,8 +568,16 @@ static int poll(x86_cpu *c) {
         /* a serial console's keys come from stdin: look every 5 ms */
         uint64_t nap = next > hnow ? next - hnow : 0;
         if (pc_uart_owns_stdin() && nap > 5000000ull) nap = 5000000ull;
-        if (nap) { uint64_t w0 = pc_wall_ns(); usleep((useconds_t)(nap / 1000 + 1)); pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++; }
+        /* ... and a network's frames every millisecond, waiting in its poll() */
+        int netwait = pc_net_present() && nap >= 1000000ull;
+        if (pc_net_present() && nap > 1000000ull) nap = 1000000ull;
+        if (nap) {
+            uint64_t w0 = pc_wall_ns();
+            if (netwait) pc_net_poll(1); else usleep((useconds_t)(nap / 1000 + 1));
+            pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++;
+        }
         pc_uart_poll();
+        pc_e1000_poll();
         if (pc.irq_pending) break;
         if (pc_now_ns() < next) continue;
         if (rtc_first) pc_rtc_poll(pc_now_ns());
@@ -1065,6 +1073,19 @@ void pc_reboot(x86_cpu *c) {
     c->eflags |= X86_IF;
 }
 
+/* The Pentium's time-stamp counter: 200 MHz (a Pentium 200) of the
+ * machine's clock, the one the PIT and the RTC keep too — so it runs on
+ * through HLT, and Linux, which takes it for its clocksource, finds it
+ * agreeing with the PIT. Never the same reading twice (a host clock's
+ * nanoseconds can be coarser than 5 ns): code times loops by it. */
+static uint64_t tsc_clock(x86_cpu *c) {
+    (void)c;
+    static uint64_t last;
+    uint64_t t = pc_now_ns() / 5;
+    if (t <= last) t = last + 1;
+    return last = t;
+}
+
 void pc_init(x86_cpu *cpu, int tty_mode) {
     memset(&pc, 0, sizeof pc);
     pc.cpu = cpu;
@@ -1075,6 +1096,8 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     cpu->hle = hle_dispatch;
     cpu->io_read = port_read;
     cpu->io_write = port_write;
+    cpu->tsc_clock = tsc_clock;
+    cpu->tsc_base = 0 - tsc_clock(cpu);                 /* from 0 at power-on */
     post(cpu);
     pc_set_trap(TRAP_RESET, reset_trap, HLE_RET_IRET);
 

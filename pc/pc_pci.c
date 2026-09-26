@@ -72,6 +72,36 @@ static pc_pci_dev *selected(void) {
     return pci.slot[dev];
 }
 
+/* The cards' memory BARs, from the CPU's accesses above memory
+ * (x86_cpu.mmio_read/mmio_write): a BAR decodes only while its card's
+ * command register enables memory, as on the bus. */
+static pc_pci_dev *mmio_find(uint32_t phys, int *bar, uint32_t *off) {
+    for (int s = 1; s < 32; s++) {
+        pc_pci_dev *d = pci.slot[s];
+        if (!d || !d->mmio_read || !(d->cfg[4] & 2)) continue;
+        for (int i = 0; i < 6; i++) {
+            if (!d->bar_size[i] || d->bar_io[i]) continue;
+            uint32_t base = pc_pci_bar(d, i);
+            if (phys - base < d->bar_size[i]) { *bar = i; *off = phys - base; return d; }
+        }
+    }
+    return NULL;
+}
+static int mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val) {
+    (void)c;
+    int bar; uint32_t off;
+    pc_pci_dev *d = mmio_find(phys, &bar, &off);
+    if (!d) return 0;
+    *val = d->mmio_read(d, bar, off, size);
+    return 1;
+}
+static void mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val) {
+    (void)c;
+    int bar; uint32_t off;
+    pc_pci_dev *d = mmio_find(phys, &bar, &off);
+    if (d && d->mmio_write) d->mmio_write(d, bar, off, size, val);
+}
+
 /* POST: the host bridge; each card's BARs (I/O from C000h, memory from
  * FEB00000h down, each aligned to its size) and interrupt line, the way
  * a PC BIOS leaves them; the BIOS32 directory and the PCI BIOS */
@@ -101,6 +131,7 @@ void pc_pci_post(x86_cpu *c) {
             for (int b = 0; b < 4; b++) cfg_write8(d, 0x10 + 4 * (unsigned)i + (unsigned)b, (uint8_t)(base >> (8 * b)));
         }
         if (d->cfg[0x3D]) cfg_write8(d, 0x3C, d->irq);
+        if (d->mmio_read) { c->mmio_read = mmio_read; c->mmio_write = mmio_write; }
     }
     for (size_t i = 0; i < sizeof pcibios; i++) pc_wr8(c, PC_STUB_SEG, (uint16_t)(PC_STUB_PCIBIOS + i), pcibios[i]);
     uint8_t sum = 0;
@@ -153,6 +184,7 @@ void pc_pci_dma_read(x86_cpu *c, uint64_t phys, void *buf, uint32_t len) {
 }
 void pc_pci_dma_write(x86_cpu *c, uint64_t phys, const void *buf, uint32_t len) {
     const uint8_t *b = buf;
+    c->dma_wrote = 1;
     for (uint32_t i = 0; i < len; i++) {
         if (phys + i >= c->mem_size) break;
         uint32_t p = (uint32_t)(phys + i);

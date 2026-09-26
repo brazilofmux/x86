@@ -213,7 +213,7 @@ void x86_reset(x86_cpu *c) {
     c->cr0 = 0; c->cr2 = 0; c->cr3 = 0;
     if (c->model >= X86_MODEL_486) c->cr0 = 0x60000010u;   /* 486 reset: CD, NW (caches off), ET */
     c->cr4 = 0;
-    c->tsc_base = 0 - c->insn_count;              /* the TSC starts again from 0 */
+    c->tsc_base = 0 - x86_tsc_raw(c);              /* the TSC starts again from 0 */
     memset(c->msr_perf, 0, sizeof c->msr_perf);
     if (c->model >= X86_MODEL_586) c->r[R_DX] = X86_586_SIGNATURE;
     x86_fpu_reset(c);

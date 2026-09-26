@@ -234,10 +234,10 @@ typedef struct x86_cpu {
     /* FERR#: an unmasked x87 exception with CR0.NE clear; the machine
      * turns it into IRQ 13 (pc/pc_bios.c). NULL on the -V shadow. */
     void   (*ferr_hook)(struct x86_cpu *);
-    /* Pentium: CR4, and the time-stamp counter as an offset from the
-     * instruction count — one clock per instruction, so the interpreter,
-     * the translator and -V agree on it (translated code leaves the block
-     * for RDTSC, where the count is exact). WRMSR 10h moves the offset.
+    /* Pentium: CR4, and the time-stamp counter as an offset from its
+     * clock (tsc_clock, below; translated code leaves the block for RDTSC,
+     * and -V replays the real cpu's readings to the shadow). WRMSR 10h
+     * moves the offset.
      * The performance-monitoring MSRs (CESR, CTR0, CTR1) hold what they
      * are given and count nothing. */
     uint32_t cr4;
@@ -254,9 +254,28 @@ typedef struct x86_cpu {
      * a request, mask or in-service bit changes): what translated code's
      * inline STI reads, where calling intr_ready would cost a call. */
     uint8_t  intr_waiting;
+    /* Memory-mapped devices (a PCI card's BAR): physical addresses at or
+     * above mem_size + X86_MEM_SLACK go to these, one access of the
+     * instruction's size (a register read that clears — an e1000's ICR —
+     * must not be split into bytes). mmio_read returns 0 for an address
+     * nothing answers (the bus floats: all ones). NULL: no such device,
+     * and x86_rd/x86_wr do not even look. */
+    int    (*mmio_read)(struct x86_cpu *, uint32_t phys, int size, uint32_t *val);
+    void   (*mmio_write)(struct x86_cpu *, uint32_t phys, int size, uint32_t val);
+    /* The TSC's clock: the machine's time, at the CPU's rate (pc_bios.c),
+     * so it keeps counting while the CPU sits in HLT — as a Pentium's
+     * does, and as Linux, whose clocksource it is, needs: counted in
+     * instructions it stood still in an idle guest, and a sleep never
+     * ended. NULL (the bare CPU: tools/sst and the like): instructions. */
+    uint64_t (*tsc_clock)(struct x86_cpu *);
+    /* A bus master wrote memory (pc_pci_dma_write: a network card's
+     * descriptors and frames) — behind the CPU's back, so -V's shadow,
+     * which has no devices, has to be resynced rather than compared. */
+    uint8_t  dma_wrote;
 } x86_cpu;
 
-static inline uint64_t x86_tsc(const x86_cpu *c) { return c->insn_count + c->tsc_base; }
+static inline uint64_t x86_tsc_raw(x86_cpu *c) { return c->tsc_clock ? c->tsc_clock(c) : c->insn_count; }
+static inline uint64_t x86_tsc(x86_cpu *c) { return x86_tsc_raw(c) + c->tsc_base; }
 
 /* 8-bit register access: AL..BL are the low bytes of r[0..3], AH..BH are
  * byte 1 of r[0..3]. Little-endian host assumed (all targets are). */
@@ -388,13 +407,33 @@ static inline void x86_sup_wr(x86_cpu *c, uint32_t base, uint32_t off, int size,
 /* Segment-relative access with in-segment offset wrap. offmask is
  * 0xFFFF for 16-bit addressing and 0xFFFFFFFF for 32-bit; a word that
  * straddles the wrap point really does touch base+FFFF and base+0000. */
+#define X86_MEM_SLACK 0x10000u      /* (as below: readable slack past the end of memory) */
+/* A device's register, when the access lands on one (x86_cpu.mmio_read):
+ * within one page, translated once, above memory. 1 if it did. */
+static inline int x86_mmio_rd(x86_cpu *c, uint32_t lin, int size, uint32_t *v) {
+    if ((lin & 0xFFF) + (uint32_t)size > 0x1000) return 0;
+    uint32_t p = x86_lin(c, lin, 0);
+    if (p == X86_PG_BAD || p < c->mem_size + X86_MEM_SLACK) return 0;
+    if (!c->mmio_read(c, p, size, v)) *v = 0xFFFFFFFFu;
+    if (size < 4) *v &= (1u << (8 * size)) - 1;
+    return 1;
+}
+static inline int x86_mmio_wr(x86_cpu *c, uint32_t lin, int size, uint32_t v) {
+    if ((lin & 0xFFF) + (uint32_t)size > 0x1000) return 0;
+    uint32_t p = x86_lin(c, lin, 1);
+    if (p == X86_PG_BAD || p < c->mem_size + X86_MEM_SLACK) return 0;
+    c->mmio_write(c, p, size, v);
+    return 1;
+}
 static inline uint32_t x86_rd(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size) {
     uint32_t v = 0;
+    if (__builtin_expect(c->mmio_read != NULL, 0) && x86_mmio_rd(c, base + (off & offmask), size, &v)) return v;
     for (int i = 0; i < size; i++)
         v |= (uint32_t)x86_phys_rd8(c, base + ((off + i) & offmask)) << (8 * i);
     return v;
 }
 static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size, uint32_t v) {
+    if (__builtin_expect(c->mmio_write != NULL, 0) && x86_mmio_wr(c, base + (off & offmask), size, v)) return;
     for (int i = 0; i < size; i++)
         x86_phys_wr8(c, base + ((off + i) & offmask), (uint8_t)(v >> (8 * i)));
 }

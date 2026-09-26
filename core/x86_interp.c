@@ -1935,7 +1935,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         int wr = in->op == OP_WRMSR;
         switch (msr) {
         case 0x00: case 0x01: v = 0; break;                                      /* P5_MC_ADDR, P5_MC_TYPE */
-        case 0x10: if (wr) c->tsc_base = v - c->insn_count; else v = x86_tsc(c); break;
+        case 0x10: if (wr) c->tsc_base = v - x86_tsc_raw(c); else v = x86_tsc(c); break;
         case 0x11: if (wr) c->msr_perf[0] = v & 0x01FF01FFu; else v = c->msr_perf[0]; break;   /* CESR */
         case 0x12: case 0x13:                                                    /* CTR0, CTR1: 40 bits */
             if (wr) c->msr_perf[msr - 0x11] = v & 0xFFFFFFFFFFull; else v = c->msr_perf[msr - 0x11];

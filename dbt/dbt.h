@@ -268,6 +268,7 @@ typedef struct {
     uint64_t tlb_flushes;           /* TLB flushes seen (CR3, PG, A20)... */
     uint64_t tlb_page_drops;        /* ...and code pages whose blocks went because the page moved */
     uint64_t desc_flushes;
+    uint64_t wipe_code, wipe_pool, wipe_pending, wipe_dev;   /* whole-cache wipes, by reason (-s) */
     uint64_t verify_blocks_checked;
     uint64_t links_created, links_patched, links_unpatched;
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
@@ -315,6 +316,8 @@ typedef struct {
     uint32_t devlog_n, devlog_cap, devlog_pos;
     /* the same for port reads (IN inside a run: a V86 helper) */
     uint32_t (*io_read_real)(x86_cpu *, uint16_t, int);
+    int (*mmio_read_real)(struct x86_cpu *, uint32_t, int, uint32_t *);
+    uint64_t (*tsc_clock_real)(struct x86_cpu *);
     uint32_t *iolog;
     uint32_t iolog_n, iolog_cap, iolog_pos;
     int verify_mem_every;          /* compare guest memory every N block runs (0 = each) */

@@ -241,6 +241,10 @@ typedef struct pc_pci_dev {
     void (*written)(struct pc_pci_dev *, unsigned reg);
     int  (*io_read)(struct pc_pci_dev *, uint16_t port, int size, uint32_t *val);
     int  (*io_write)(struct pc_pci_dev *, uint16_t port, uint32_t val, int size);
+    /* its memory BARs (only while the command register enables memory):
+     * OFF within BAR BAR, one access of SIZE bytes */
+    uint32_t (*mmio_read)(struct pc_pci_dev *, int bar, uint32_t off, int size);
+    void     (*mmio_write)(struct pc_pci_dev *, int bar, uint32_t off, int size, uint32_t val);
 } pc_pci_dev;
 void pc_pci_enable(void);
 int  pc_pci_present(void);
@@ -254,6 +258,13 @@ void pc_pci_dma_write(x86_cpu *c, uint64_t phys, const void *buf, uint32_t len);
 /* pc_e1000.c: an Intel 82545EM at 00:03.0, IRQ 11 (-nic e1000) */
 void pc_e1000_enable(void);
 void pc_e1000_poll(void);
+/* pc_net.c: the network behind it (-nic e1000,user: libslirp) */
+int  pc_net_open(const char *spec);
+int  pc_net_present(void);
+void pc_net_send(const uint8_t *frame, uint32_t len);
+void pc_net_poll(int wait_ms);
+const uint8_t *pc_net_rx_peek(uint32_t *len);
+void pc_net_rx_pop(void);
 /* pc_uart.c: COM1, a 16550A, when -com1 asks for one */
 int  pc_uart_open(const char *spec);   /* "stdio", or a file for what is sent */
 void pc_uart_post(x86_cpu *c);

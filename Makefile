@@ -27,6 +27,13 @@ ifneq ($(SDL_CFLAGS),)
   SDL_LIBS   += -lSDL2
 endif
 
+# ... and so is the network behind the card: libslirp (pc/pc_net.c)
+SLIRP_CFLAGS := $(if $(NO_SLIRP),,$(shell pkg-config --cflags slirp 2>/dev/null))
+SLIRP_LIBS   := $(if $(NO_SLIRP),,$(shell pkg-config --libs slirp 2>/dev/null))
+ifneq ($(SLIRP_CFLAGS),)
+  SLIRP_CFLAGS += -DHAVE_SLIRP
+endif
+
 CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c core/x86_fpu.c
 # Berkeley SoftFloat 3e (core/softfloat/README): the x87's arithmetic,
 # built with upstream's options and its own warnings left alone
@@ -42,7 +49,7 @@ HOST_ARCH := $(if $(filter a64,$(ARCH)),aarch64,$(shell uname -m))
 BACKEND ?= $(if $(filter aarch64 arm64,$(HOST_ARCH)),a64,x64)
 DBT_SRCS  = dbt/dbt_common.c dbt/dbt_cache.c dbt/dbt_translate.c dbt/dbt_$(BACKEND).c
 DBT_OBJS  = $(addprefix $(O)/,$(DBT_SRCS:.c=.o))
-PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c pc/pc_ps2.c pc/pc_ide.c pc/pc_uart.c pc/pc_pci.c pc/pc_e1000.c
+PC_SRCS   = pc/pc_bios.c pc/pc_video.c pc/pc_vga.c pc/pc_sdl.c pc/pc_kbd.c pc/pc_font.c pc/pc_mouse.c pc/pc_disk.c pc/pc_cmos.c pc/pc_ps2.c pc/pc_ide.c pc/pc_uart.c pc/pc_pci.c pc/pc_e1000.c pc/pc_net.c
 PC_OBJS   = $(addprefix $(O)/,$(PC_SRCS:.c=.o))
 DOS_SRCS  = dos/dos_load.c dos/dos_host.c dos/dos_int21.c dos/dos_dpmi.c
 DOS_OBJS  = $(addprefix $(O)/,$(DOS_SRCS:.c=.o))
@@ -57,7 +64,7 @@ MAIN_O = $(O)/main.o
 all: $(TARGET) $(SST) $(JITTEST)
 
 $(TARGET): $(MAIN_O) $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz $(SDL_LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz $(SDL_LIBS) $(SLIRP_LIBS)
 
 # The fixed-disk BIOS in real instructions (tools/diskbios.asm), assembled
 # into a header that is checked in: a build needs NASM only after an edit
@@ -72,6 +79,10 @@ pc/pc_pcibios.h: tools/pcibios.asm
 	nasm -f bin -o $(O)/tools/pcibios.bin $< && \
 	python3 -c "import sys; b=open(sys.argv[1],'rb').read(); print('/* tools/pcibios.asm, assembled (make pc/pc_pcibios.h) */'); print('static const unsigned char pcibios[%d] = {' % len(b)); [print('    ' + ', '.join('0x%02X' % x for x in b[i:i+16]) + ',') for i in range(0, len(b), 16)]; print('};')" $(O)/tools/pcibios.bin > $@
 $(O)/pc/pc_pci.o: pc/pc_pcibios.h
+
+$(O)/pc/pc_net.o: pc/pc_net.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(O)/pc/pc_sdl.o: pc/pc_sdl.c
 	@mkdir -p $(dir $@)

@@ -260,6 +260,7 @@ void dbt_a20_changed(x86_cpu *cpu, int on) {
 void dbt_dev_changed(x86_cpu *cpu) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     if (!dbt) return;
+    dbt->wipe_dev++;
     flush_under_running_code(dbt);
 }
 

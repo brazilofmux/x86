@@ -50,8 +50,10 @@ Two ways to run things:
     to the desktop
   - Linux 6.12 (Tiny Core 16.2, loaded by GRUB 2 from a disk image) on the
     Pentium, to a shell — from its initramfs, or with its root filesystem
-    on the IDE disk (ext2, through Linux's own pata_legacy); and Purdue's Xinu, with a serial console (-com1)
-    and an Intel 82545EM on a PCI bus (-pci, -nic e1000)
+    on the IDE disk (ext2, through Linux's own pata_legacy), and on the
+    network: an Intel 82545EM on a PCI bus (-nic e1000,user), DHCP, DNS and
+    TCP out through a NAT (libslirp); and Purdue's Xinu, with a serial
+    console (-com1) and the same card
 - **As a DOS program runner** (the default): an emulated DOS (INT 21h in
   the host, a host directory as C:, a DPMI host of our own) for running a
   program headless — WordPerfect 5.1, Turbo Pascal 5.5, MS COBOL 5.0,
@@ -151,6 +153,9 @@ by the host
 
 Needs a C11 compiler and zlib; SDL2 (via `pkg-config`) adds a window for
 graphics modes and is optional — without it the machine is headless.
+libslirp (also via `pkg-config`; `brew install libslirp`, `apt install
+libslirp-dev`) puts a network behind the e1000 (`-nic e1000,user`) and is
+optional too — without it the card has nothing on the other end.
 The tests also use `nasm`, `python3`, `mtools`, `qemu-system-i386` and
 `bochs`. The x87's arithmetic is Berkeley SoftFloat 3e (BSD licence,
 `core/softfloat/COPYING.txt`).

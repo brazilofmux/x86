@@ -340,6 +340,41 @@ static uint32_t io_record(x86_cpu *c, uint16_t port, int size) {
     return v;
 }
 static void shadow_io_write(x86_cpu *c, uint16_t port, uint32_t v, int size) { (void)c; (void)port; (void)v; (void)size; }
+/* A card's memory-mapped registers, the same way, in the same log: the
+ * shadow reads them in the order the real cpu did. */
+static int mmio_record(x86_cpu *c, uint32_t p, int size, uint32_t *v) {
+    x86_dbt *dbt = (x86_dbt *)c->dbt;
+    int hit = dbt->mmio_read_real(c, p, size, v);
+    if (!hit) *v = 0xFFFFFFFFu;
+    if (dbt->iolog_n == dbt->iolog_cap) {
+        dbt->iolog_cap = dbt->iolog_cap ? dbt->iolog_cap * 2 : 4096;
+        dbt->iolog = realloc(dbt->iolog, dbt->iolog_cap * sizeof *dbt->iolog);
+    }
+    dbt->iolog[dbt->iolog_n++] = *v;
+    return 1;
+}
+static int shadow_mmio_read(x86_cpu *c, uint32_t p, int size, uint32_t *v) {
+    (void)p; (void)size;
+    *v = shadow_io_read(c, 0, 4);
+    return 1;
+}
+static void shadow_mmio_write(x86_cpu *c, uint32_t p, int size, uint32_t v) { (void)c; (void)p; (void)size; (void)v; }
+/* ... and the TSC's clock, two words a reading */
+static uint64_t tsc_record(x86_cpu *c) {
+    x86_dbt *dbt = (x86_dbt *)c->dbt;
+    uint64_t t = dbt->tsc_clock_real(c);
+    if (dbt->iolog_n + 2 > dbt->iolog_cap) {
+        dbt->iolog_cap = dbt->iolog_cap ? dbt->iolog_cap * 2 : 4096;
+        dbt->iolog = realloc(dbt->iolog, dbt->iolog_cap * sizeof *dbt->iolog);
+    }
+    dbt->iolog[dbt->iolog_n++] = (uint32_t)t;
+    dbt->iolog[dbt->iolog_n++] = (uint32_t)(t >> 32);
+    return t;
+}
+static uint64_t shadow_tsc_clock(x86_cpu *c) {
+    uint64_t lo = shadow_io_read(c, 0, 4);
+    return lo | (uint64_t)shadow_io_read(c, 0, 4) << 32;
+}
 
 /* -V: the real cpu's device reads go through dev_record, which logs what
  * the device answered; the shadow's go through dev_replay, which hands
@@ -373,6 +408,14 @@ static void dev_log_arm(x86_dbt *dbt) {
     if (cpu->io_read && cpu->io_read != io_record) {
         dbt->io_read_real = cpu->io_read;
         cpu->io_read = io_record;
+    }
+    if (cpu->tsc_clock && cpu->tsc_clock != tsc_record) {
+        dbt->tsc_clock_real = cpu->tsc_clock;
+        cpu->tsc_clock = tsc_record;
+    }
+    if (cpu->mmio_read && cpu->mmio_read != mmio_record) {
+        dbt->mmio_read_real = cpu->mmio_read;
+        cpu->mmio_read = mmio_record;
     }
     dbt->iolog_n = dbt->iolog_pos = 0;
 }
@@ -415,6 +458,9 @@ static void shadow_copy_regs(x86_dbt *dbt) {
     sh->tlb_hook = NULL;
     sh->io_read = shadow_io_read;
     sh->io_write = shadow_io_write;
+    sh->tsc_clock = cpu->tsc_clock ? shadow_tsc_clock : NULL;
+    sh->mmio_read = cpu->mmio_read ? shadow_mmio_read : NULL;
+    sh->mmio_write = cpu->mmio_read ? shadow_mmio_write : NULL;
     sh->hle = NULL;
     sh->trace_exc = NULL;
     /* The shadow's HMA window must alias the same way before any copy,
@@ -491,6 +537,7 @@ static int dbt_run_loop(x86_dbt *dbt) {
             poll_countdown = 256;
             uint64_t tp = PH();
             if (dbt->poll(cpu) && dbt->verify) dbt->shadow_stale = 1;
+            if (cpu->dma_wrote && dbt->verify) { cpu->dma_wrote = 0; dbt->shadow_stale = 1; }   /* ... or at the poll */
             if (phases) dbt->t_poll += dbt_now_ns() - tp;
         }
         if (cpu->halted) return 0;
@@ -576,6 +623,7 @@ static int dbt_run_loop(x86_dbt *dbt) {
                     mem_ok = shadow_mem_equal(dbt, cpu->mem_size);
                 if (cpu->device_store) memcpy(dbt->shadow.mem + DEV_LO, cpu->mem + DEV_LO, DEV_HI - DEV_LO);
                 if (a20_moved) { mem_ok = 1; dbt->shadow_stale = 1; }
+                if (cpu->dma_wrote) { cpu->dma_wrote = 0; mem_ok = 1; dbt->shadow_stale = 1; }   /* a card's DMA, mid-run */
                 if (!regs_ok || !mem_ok) {
                     fprintf(stderr, "\n[verify] divergence after JIT run from %04X:%04X (%llu insns)\n",
                             pre.seg[S_CS].sel, pre.eip, (unsigned long long)jit_insns);
@@ -784,6 +832,10 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     if (dbt->tlb_flushes) fprintf(out, "  TLB flushes:            %llu (code pages dropped: %llu)\n",
                                   (unsigned long long)dbt->tlb_flushes, (unsigned long long)dbt->tlb_page_drops);
     if (dbt->desc_flushes) fprintf(out, "  CS descriptor flushes:  %llu\n", (unsigned long long)dbt->desc_flushes);
+    if (dbt->wipe_code || dbt->wipe_pool || dbt->wipe_pending || dbt->wipe_dev)
+        fprintf(out, "  whole-cache wipes:      %llu code buffer full, %llu helper pool full, %llu asked for, %llu device read hook\n",
+                (unsigned long long)dbt->wipe_code, (unsigned long long)dbt->wipe_pool,
+                (unsigned long long)dbt->wipe_pending, (unsigned long long)dbt->wipe_dev);
     fprintf(out, "  links created/patched/unpatched: %llu / %llu / %llu\n",
             (unsigned long long)dbt->links_created, (unsigned long long)dbt->links_patched,
             (unsigned long long)dbt->links_unpatched);

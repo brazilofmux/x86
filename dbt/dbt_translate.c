@@ -577,6 +577,9 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     x86_cpu *cpu = dbt->cpu;
 
     if (dbt->flush_pending || dbt->code_used + 65536 > CODE_BUF_SIZE || dbt->insn_used + MAX_BLOCK_INSNS > INSN_POOL_SIZE) {
+        if (dbt->flush_pending) dbt->wipe_pending++;
+        else if (dbt->code_used + 65536 > CODE_BUF_SIZE) dbt->wipe_code++;
+        else dbt->wipe_pool++;
         /* Out of JIT space (or A20 flipped): wipe and restart. Already
          * inside the W^X bracket (the run loop wraps us) — do not nest
          * another. */

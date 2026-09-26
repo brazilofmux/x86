@@ -187,3 +187,20 @@ the initramfs has them; devtmpfs.mount=1 fills /dev, which a non-root
 unpack cannot). GRUB boots root=/dev/sda2 with no initramfs, so every file
 after the kernel comes through the IDE controller. The boot test writes
 /hello.txt as root and reads it back out of the image with debugfs.
+
+The network: tc.img again, with -nic e1000,user — the 82545EM with
+libslirp's NAT behind it. Tiny Core's udhcpc gets 10.0.2.15 at boot; the
+test pings slirp's gateway (10.0.2.2) twice, so nothing outside the host
+is involved. By hand, nslookup and wget reach the Internet, and 2-3 MB
+each way over TCP to a listener on the host (10.0.2.2 is the host's
+loopback) came through byte-exact at 13-21 MB/s — Linux's e1000 uses the
+card's checksum insertion and TSO for what it sends, and gets the FCS on
+what it receives. Two things it took besides the card:
+- the TSC counted instructions, and Linux, having no other clocksource
+  on this machine, kept it even after its watchdog called it unstable: a
+  guest idle in HLT runs no instructions, so its clock stood still, and
+  sleep 2 (or ping's second packet) waited forever. The TSC now runs on
+  the machine's clock at 200 MHz (cpu->tsc_clock; -V replays its
+  readings to the shadow).
+- libslirp before config version 6 calls register_poll_fd without
+  looking: a NULL there crashed the first UDP socket it opened (DNS).
