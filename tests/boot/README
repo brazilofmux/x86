@@ -204,3 +204,26 @@ what it receives. Two things it took besides the card:
   readings to the shadow).
 - libslirp before config version 6 calls register_poll_fd without
   looking: a NULL there crashed the first UDP socket it opened (DNS).
+
+Slackware 3.1 ("Slackware 96": Linux 2.0.0, gcc 2.7.2, XFree86 3.1.2),
+installed by its own setup. tests/boot/slackimage.sh makes the install
+disk from a copy of the release (https://mirrors.slackware.com/slackware/
+slackware-3.1/: slakware/, kernels/bare.i/zImage, rootdsks/color.gz, into
+disks/slack31/): 504 MB, 1015x16x63, with a FAT16 partition holding the
+disk sets as \SLAKWARE\A1 ... (INSTALL.TXT 3.4.2.2's "from an MS-DOS
+partition"), a Linux one and swap. The machine has no floppy controller,
+so GRUB 2 plays LOADLIN: bare.i with the root disk as its initrd. Then
+tests/boot/slackinstall.sh answers setup's dialogs (about 45 minutes,
+most of it gzip and tar in 16 MB) — A AP D E F N X XAP Y, LILO in the
+MBR — and the boot test starts from the BIOS: LILO, Linux from hda2, a
+root login, a C program compiled and run.
+- The mirror has lost four packages (procmail, seyon, xfileman, xv).
+  xap4 held only xv: left empty, setup's "*.tgz" matched nothing and it
+  stopped for the literal name. The image leaves the disk out and moves
+  its install.end to xap3.
+- Linux 2.0 blanks the console after ten idle minutes, and a prompt that
+  comes after the packages is then invisible to expect.py; the install
+  script turns blanking off first. (By hand, Alt+F1 unblanks it without
+  typing anything into the dialog: the kernel keeps console switches.)
+- expect.py takes a script line starting with # for a comment: a root
+  prompt's pattern is [#].

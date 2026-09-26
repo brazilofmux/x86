@@ -170,4 +170,14 @@ if [ -f disks/linux/tcroot.img ] && [ -x "$(brew --prefix e2fsprogs 2>/dev/null)
     then echo "ok   linux 6.12 with its root on the ide disk (ext2, read and written)"; else echo "FAIL linux root on the ide disk"; fail=1; fi
     rm -f tmp/boot-tcr.img tmp/boot-tcr-p2.img tmp/boot-tcr.exp
 fi
+if [ -f disks/slack31/slack-installed.img ]; then
+    # Slackware 3.1 (1996: Linux 2.0.0, gcc 2.7.2), installed by its own
+    # setup (tests/boot/slackimage.sh, slackinstall.sh): the BIOS, LILO
+    # from the MBR, the kernel from hda2, a login as root, and a C program
+    # compiled and run with the gcc it came with
+    printf '%s\t%s\n' 'darkstar login:' 'root\r' '[#] *$' "echo 'main(){printf(\"%d\\\\n\",1995+1);}' > /tmp/y.c; gcc -o /tmp/y /tmp/y.c; /tmp/y\\r" '*(?m)^1996$' '' > tmp/boot-slack.exp
+    if python3 tools/expect.py -t 200 tmp/boot-slack.exp -- $DM -m 586 -mem 17 -W -T 190 -ro -hda disks/slack31/slack-installed.img -boot c >/dev/null 2>&1
+    then echo "ok   slackware 3.1 (linux 2.0.0) from lilo, gcc 2.7.2 compiles"; else echo "FAIL slackware 3.1"; fail=1; fi
+    rm -f tmp/boot-slack.exp
+fi
 exit $fail

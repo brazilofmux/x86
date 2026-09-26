@@ -54,6 +54,9 @@ Two ways to run things:
     network: an Intel 82545EM on a PCI bus (-nic e1000,user), DHCP, DNS and
     TCP out through a NAT (libslirp); and Purdue's Xinu, with a serial
     console (-com1) and the same card
+  - Slackware 3.1 ("Slackware 96": Linux 2.0.0, gcc 2.7.2, XFree86 3.1.2)
+    — installed by its own setup from its disk sets on a DOS partition,
+    booted by LILO
 - **As a DOS program runner** (the default): an emulated DOS (INT 21h in
   the host, a host directory as C:, a DPMI host of our own) for running a
   program headless — WordPerfect 5.1, Turbo Pascal 5.5, MS COBOL 5.0,
