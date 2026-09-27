@@ -151,6 +151,17 @@ if [ -f "$G/vbe.mod" ] && command -v i686-elf-grub-mkimage >/dev/null; then
     then echo "ok   vesa bios extensions: grub lists the modes, draws at 1024x768x32"; else echo "FAIL vesa bios extensions (grub videotest)"; fail=1; fi
     rm -f tmp/boot-vbe.cfg tmp/boot-vbe.core tmp/boot-vbe.flp tmp/boot-vbe.exp
 fi
+if [ -f disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso ]; then
+    # Haiku R1/beta6 (32-bit, x86_gcc2h), its anyboot image as the hard
+    # disk, read-only: the boot loader through VBE at 1024x768, the kernel,
+    # the app_server, to the "Welcome to Haiku!" window — its yellow tab
+    # on the blue desktop (about 3 minutes)
+    printf 'waitpix 60,60 51 102 152\nwaitpix 345,147 255 233 148\n' > tmp/boot-haiku.exp
+    if python3 tools/expect.py -t 420 tmp/boot-haiku.exp -- $DM -m 586 -mem 257 -vbe -W -T 410 -ro \
+         -hda disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso -boot c >/dev/null 2>&1
+    then echo "ok   haiku r1/beta6 to its welcome window (vbe, 1024x768)"; else echo "FAIL haiku r1/beta6"; fail=1; fi
+    rm -f tmp/boot-haiku.exp
+fi
 if [ -f disks/linux/tc.img ]; then
     # Linux 6.12 (Tiny Core 16.2, tests/boot/tcimage.sh) on the Pentium:
     # GRUB 2 from the disk, the kernel and its initramfs, the shell, a command

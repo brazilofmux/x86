@@ -130,6 +130,13 @@ static const opdesc map0f[256] = {
     [0x06] = E(OP_CLTS, F_NONE, F_NONE),
     [0x08] = E(OP_INVD, F_NONE, F_NONE),     /* 486 (gated below) */
     [0x09] = E(OP_WBINVD, F_NONE, F_NONE),
+    /* 0F 18-1F: the hint-NOP space — NOP r/m (0F 1F /0, "nopl"), the
+     * multi-byte NOP compilers pad with, and the prefetch hints — a
+     * ModRM operand never accessed. The P6's; gated below. */
+    [0x18] = E(OP_NOP, F_Ev, F_NONE), [0x19] = E(OP_NOP, F_Ev, F_NONE),
+    [0x1A] = E(OP_NOP, F_Ev, F_NONE), [0x1B] = E(OP_NOP, F_Ev, F_NONE),
+    [0x1C] = E(OP_NOP, F_Ev, F_NONE), [0x1D] = E(OP_NOP, F_Ev, F_NONE),
+    [0x1E] = E(OP_NOP, F_Ev, F_NONE), [0x1F] = E(OP_NOP, F_Ev, F_NONE),
     [0x20] = E(OP_MOVCR, F_Rd, F_Cd),
     [0x21] = E(OP_MOVDR, F_Rd, F_Dd),
     [0x22] = E(OP_MOVCR, F_Cd, F_Rd),
@@ -502,6 +509,11 @@ done_prefix:
         default: break;
         }
     }
+    /* The hint NOPs (0F 18-1F) are the Pentium Pro's, #UD on a P54C; our
+     * Pentium takes them, as QEMU's Pentium models do: Haiku's kernel,
+     * built for "Pentium or better", pads its loops with 0F 1F 00 and
+     * dies on the #UD. Earlier models keep the #UD. */
+    if (in->op == OP_NOP && in->opcode2 >= 0x18 && in->opcode2 <= 0x1F && model < X86_MODEL_586) in->op = OP_UD;
 
     /* 386+: LOCK is only legal on the read-modify-write ALU ops with a
      * memory destination (and XCHG with a memory operand); anywhere
