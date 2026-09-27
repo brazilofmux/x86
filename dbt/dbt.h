@@ -64,8 +64,12 @@
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <pthread.h>
 #define DBT_JIT_MMAP_FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT)
-static inline void dbt_jit_writable_begin(void) { pthread_jit_write_protect_np(0); }
-static inline void dbt_jit_writable_end(void)   { pthread_jit_write_protect_np(1); }
+/* Nested brackets keep the buffer writable until the outermost ends: a
+ * translation (bracketed by the run loop) may drop or park a page, whose
+ * link repatching brackets itself. */
+extern int dbt_jit_wdepth;
+static inline void dbt_jit_writable_begin(void) { if (dbt_jit_wdepth++ == 0) pthread_jit_write_protect_np(0); }
+static inline void dbt_jit_writable_end(void)   { if (--dbt_jit_wdepth == 0) pthread_jit_write_protect_np(1); }
 #else
 #define DBT_JIT_MMAP_FLAGS (MAP_PRIVATE | MAP_ANONYMOUS)
 static inline void dbt_jit_writable_begin(void) { }
@@ -266,25 +270,38 @@ typedef struct {
 #define DBT_SPACES 16
 #define DBT_PCODE_MAX  16384
 #define DBT_PCODE_HASH 16384
-    struct { uint32_t lin_page, phys_page; int32_t hnext, snext; uint8_t user, space; } pcode[DBT_PCODE_MAX];
+    struct { uint32_t lin_page, phys_page; int32_t hnext, snext, blocks; uint8_t user, space, parked; } pcode[DBT_PCODE_MAX];
     int32_t  pcode_hash[DBT_PCODE_HASH];   /* chains through hnext; -1 ends */
     int32_t  pcode_space[DBT_SPACES];      /* each space's pages, through snext */
     int32_t  pcode_free;                   /* unused entries, through snext */
     uint32_t n_pcode;                      /* in use */
-    /* The address spaces paged blocks were translated in: CR3 values, by
-     * the id their keys carry (KEY_SPACE). A VCPI client switches between
-     * its page tables and its server's on every call down to DOS; the
-     * other space's blocks wait, unchecked, until it is current again. */
-    uint32_t space_cr3[DBT_SPACES];
+    /* The blocks on each code page (pcode[].blocks, through next): what
+     * leaves the cache when the page is dropped or parked, and what comes
+     * back when it is unparked, without a scan of the page's 12288 slots.
+     * A record goes stale when its block is evicted some other way (a slot
+     * conflict, an SMC sweep): its slot no longer holds it, and it is
+     * skipped. Full (pblk_full): a block went unrecorded, so dropping and
+     * parking scan the slots as well, and unparking brings back only what
+     * was recorded. Reset by a wipe. */
+#define DBT_PBLK_MAX (1u << 19)
+    struct { uint64_t key; uint32_t code_off, span; int32_t next; uint8_t state; } pblk[DBT_PBLK_MAX];
+    uint32_t pblk_used;
+    uint8_t  pblk_full;
+    /* Code spaces: the ids paged keys carry (KEY_SPACE), 16 at a time.
+     * A kernel space (space_kernel) keys CPL 0 code, a user space CPL 3
+     * and V86 code; either is shared by every CR3 whose page tables fit
+     * it (dbt_space_current) — an OS's kernel, the same in every process,
+     * and the same program in every process that runs it — so each is
+     * translated once instead of once per process. */
     uint8_t  space_used[DBT_SPACES], space_next;
-    /* Kernel spaces: CPL 0 code is keyed not by its process's space but by
-     * one of these, shared by every CR3 whose page tables map all of its
-     * code pages the same way — an OS's kernel, the same in every process,
-     * translated once instead of once per process. space_kernel marks an
-     * id as one; space_kspace is the one a CR3's space uses (0xFF: none
-     * chosen yet). */
-    uint8_t  space_kernel[DBT_SPACES], space_kspace[DBT_SPACES];
-    uint64_t space_evictions, kspace_moves;
+    uint8_t  space_kernel[DBT_SPACES];
+    /* The CR3s seen lately, with the code spaces each was last found to
+     * fit (0xFF: none yet). Forgetting one drops nothing. */
+#define DBT_CR3S 64
+    struct { uint32_t cr3, lru; uint8_t used, kspace, uspace; } cr3s[DBT_CR3S];
+    uint32_t cr3_clock;
+    uint64_t space_evictions, kspace_moves, uspace_moves;
+    uint64_t pages_parked, pages_unparked, blocks_reinstated;
     /* A remapped code page (UMB code, a memory manager mapped high, any
      * page of a paged OS): the block keys are linear, the code bitmap and
      * every SMC report physical. phys_alias[physical page] heads a list
@@ -400,6 +417,7 @@ void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
 void dbt_a20_changed(x86_cpu *cpu, int on);
 void dbt_dev_changed(x86_cpu *cpu);
 void             dbt_tlb_flushed(x86_cpu *cpu);
+uint8_t         *dbt_page_revive(x86_dbt *dbt, uint64_t key);
 int              dbt_note_alias(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page);
 int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user, uint8_t space);
 void             dbt_space_current(x86_dbt *dbt);   /* register CR3's space, set cpu->pg_space */

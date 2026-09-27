@@ -36,9 +36,14 @@ static void evict_slot(x86_dbt *dbt, uint32_t slot) {
     dbt_links_repatch(dbt, old, NULL);
 }
 
+static void page_record(x86_dbt *dbt, uint64_t key, uint8_t *code, uint32_t span);
+static int32_t pcode_find(x86_dbt *dbt, uint32_t lin_page, uint8_t sp);
+static void page_evict(x86_dbt *dbt, int32_t i, int park);
+
 void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
     uint32_t slot = dbt_slot(key);
     x86_block_entry *e = &dbt->aux->cache[slot];
+    if (code && e->key == key && e->code == code) return;   /* already in: a block unparked for this miss (dbt_page_revive) */
     /* Another key in this slot: the old block's direct links would
      * otherwise keep running it after the probe stopped finding it. */
     if (e->key != BLOCK_EMPTY_KEY && (e->key & ~BLOCK_REFUSED_BIT) != key)
@@ -50,6 +55,7 @@ void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
     dbt->span[slot] = code ? dbt->last_block_bytes : 0xFFFFFFFFu;
     e->code = code;
     dbt_links_repatch(dbt, key, code);
+    if (code && (key & KEY_PAGED)) page_record(dbt, key, code, dbt->span[slot]);
 }
 
 /* NOTE: every caller also rewinds the code buffer (dbt_init; the
@@ -62,6 +68,9 @@ static void pcode_reset(x86_dbt *dbt) {
     for (int32_t i = 0; i < DBT_PCODE_MAX; i++) dbt->pcode[i].snext = i + 1 < DBT_PCODE_MAX ? i + 1 : -1;
     dbt->pcode_free = 0;
     dbt->n_pcode = 0;
+    dbt->pblk_used = 0;
+    dbt->pblk_full = 0;
+    memset(dbt->cr3s, 0, sizeof dbt->cr3s);
 }
 
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
@@ -201,6 +210,16 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
     sweep_blocks_at(dbt, phys);
     for (uint32_t a = dbt->phys_alias[phys >> 12]; a; a = dbt->alias_pool[a - 1].next)
         sweep_blocks_at(dbt, (dbt->alias_pool[a - 1].lin_page << 12) | (phys & 0xFFF));
+    /* A parked page on it — at its own address, or an alias — would bring
+     * its blocks back unswept: they go */
+    for (uint32_t a = dbt->phys_alias[phys >> 12], lp = phys >> 12;; lp = dbt->alias_pool[a - 1].lin_page, a = dbt->alias_pool[a - 1].next) {
+        for (int s = 0; s < DBT_SPACES; s++) {
+            if (!dbt->space_used[s]) continue;
+            int32_t i = pcode_find(dbt, lp, (uint8_t)s);
+            if (i >= 0 && dbt->pcode[i].parked) { page_evict(dbt, i, 0); dbt->pcode[i].parked = 0; }
+        }
+        if (!a) break;
+    }
     dbt->smc_invalidations++;
     dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
 }
@@ -281,6 +300,12 @@ void dbt_dev_changed(x86_cpu *cpu) {
 static uint32_t pcode_bucket(uint32_t lin_page, uint8_t space) {
     return ((lin_page * 2654435761u) ^ ((uint32_t)space * 0x9E3779B9u)) >> 18 & (DBT_PCODE_HASH - 1);
 }
+/* The entry for (space, linear page), or -1 */
+static int32_t pcode_find(x86_dbt *dbt, uint32_t lin_page, uint8_t sp) {
+    for (int32_t i = dbt->pcode_hash[pcode_bucket(lin_page, sp)]; i >= 0; i = dbt->pcode[i].hnext)
+        if (dbt->pcode[i].lin_page == lin_page && dbt->pcode[i].space == sp) return i;
+    return -1;
+}
 /* Entry I leaves the hash and goes back on the free list; the caller has
  * already unlinked it from its space's list. */
 static void pcode_release(x86_dbt *dbt, int32_t i) {
@@ -292,31 +317,114 @@ static void pcode_release(x86_dbt *dbt, int32_t i) {
     dbt->n_pcode--;
 }
 
-/* Drop code page I's paged blocks (those of its address space); its alias
- * stays listed until the next wipe. The caller unlinks the entry
- * (pcode_release). A page's blocks sit in
- * 4096 consecutive slots per key mode (its linear address XOR the folded
- * mode bits): V86, flat 32-bit PM, and segmented 16-bit PM. */
-static void drop_code_page(x86_dbt *dbt, uint32_t i) {
+enum { PB_LIVE, PB_PARKED, PB_DEAD };
+
+/* A block just went into the cache: on its code page's list */
+static void page_record(x86_dbt *dbt, uint64_t key, uint8_t *code, uint32_t span) {
+    int32_t i = pcode_find(dbt, dbt_key_lin(key) >> 12, (uint8_t)((key & KEY_SPACE_MASK) >> KEY_SPACE_SHIFT));
+    if (i < 0 || dbt->pblk_used == DBT_PBLK_MAX) { dbt->pblk_full = 1; return; }   /* untracked: scans from now on */
+    uint32_t n = dbt->pblk_used++;
+    dbt->pblk[n].key = key;
+    dbt->pblk[n].code_off = (uint32_t)(code - dbt->code_buf);
+    dbt->pblk[n].span = span;
+    dbt->pblk[n].state = PB_LIVE;
+    dbt->pblk[n].next = dbt->pcode[i].blocks;
+    dbt->pcode[i].blocks = (int32_t)n;
+}
+
+/* Every block of LIN's page in space SP still in the cache, whatever its
+ * record says: the slow way, for blocks that went unrecorded. A page's
+ * blocks sit in 4096 consecutive slots per key mode: V86, flat 32-bit
+ * PM, and segmented 16-bit PM. */
+static void scan_evict_page(x86_dbt *dbt, uint32_t lin, uint8_t sp) {
     static const uint32_t modes[3] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
                                        (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT),
                                        (uint32_t)((KEY_PMODE | KEY_SEG16) >> KEY_MODE_SHIFT) };
-    uint32_t lin = dbt->pcode[i].lin_page << 12;
-    uint64_t space = (uint64_t)dbt->pcode[i].space << KEY_SPACE_SHIFT;
+    uint64_t space = (uint64_t)sp << KEY_SPACE_SHIFT;
     for (int m = 0; m < 3; m++)
         for (uint32_t k = 0; k < 4096; k++) {
-            uint32_t slot = dbt_slot_hash(lin + k, modes[m], dbt->pcode[i].space);
+            uint32_t slot = dbt_slot_hash(lin + k, modes[m], sp);
             x86_block_entry *e = &dbt->aux->cache[slot];
             if (e->key == BLOCK_EMPTY_KEY || !(e->key & KEY_PAGED) || dbt_key_lin(e->key) != lin + k
                 || (e->key & KEY_SPACE_MASK) != space) continue;
             evict_slot(dbt, slot);
         }
+}
+
+/* Page I's blocks leave the cache: kept to come back (PARK: the live ones
+ * become parked), or for good (all of them dead). Dead records unlink. */
+static void page_evict(x86_dbt *dbt, int32_t i, int park) {
+    int32_t *pp = &dbt->pcode[i].blocks;
+    while (*pp >= 0) {
+        uint32_t n = (uint32_t)*pp;
+        if (dbt->pblk[n].state == PB_LIVE) {
+            uint32_t slot = dbt_slot(dbt->pblk[n].key);
+            x86_block_entry *e = &dbt->aux->cache[slot];
+            if (e->key == dbt->pblk[n].key && e->code == dbt->code_buf + dbt->pblk[n].code_off) {
+                evict_slot(dbt, slot);
+                dbt->pblk[n].state = park ? PB_PARKED : PB_DEAD;
+            } else dbt->pblk[n].state = PB_DEAD;
+        } else if (!park) dbt->pblk[n].state = PB_DEAD;
+        if (dbt->pblk[n].state == PB_DEAD) { *pp = dbt->pblk[n].next; continue; }
+        pp = &dbt->pblk[n].next;
+    }
+    uint32_t lin = dbt->pcode[i].lin_page << 12;
+    if (dbt->pblk_full) scan_evict_page(dbt, lin, dbt->pcode[i].space);
     if ((dbt->cpu->jit_cur_lin & 0xFFFFF000u) == lin) dbt->cpu->jit_cur_hit = 1;
+}
+
+/* Drop code page I's blocks, parked ones included; its alias stays listed
+ * until the next wipe. The caller unlinks the entry (pcode_release) or
+ * points it somewhere new. */
+static void drop_code_page(x86_dbt *dbt, uint32_t i) {
+    page_evict(dbt, (int32_t)i, 0);
+    dbt->pcode[i].parked = 0;
     dbt->tlb_page_drops++;
 }
 
-/* Space ID's code pages and their blocks go, and the id is free. A
- * kernel space's CR3s choose again at their next load. */
+/* Page I is not mapped in the page tables now current, or not the way
+ * its blocks were translated: out of reach, kept for a CR3 that does map
+ * it — or for this one, once the page is faulted in. */
+static void park_page(x86_dbt *dbt, int32_t i) {
+    if (dbt->pcode[i].parked) return;
+    page_evict(dbt, i, 1);
+    dbt->pcode[i].parked = 1;
+    dbt->pages_parked++;
+}
+
+/* Page I maps as it did: its parked blocks back into the cache, their
+ * link sites patched again (links into them were unrecorded when they
+ * left: those sites reach them through the cache probe). */
+static void unpark_page(x86_dbt *dbt, int32_t i) {
+    if (!dbt->pcode[i].parked) return;
+    int32_t *pp = &dbt->pcode[i].blocks;
+    while (*pp >= 0) {
+        uint32_t n = (uint32_t)*pp;
+        if (dbt->pblk[n].state == PB_PARKED) {
+            uint64_t key = dbt->pblk[n].key;
+            uint32_t slot = dbt_slot(key);
+            x86_block_entry *e = &dbt->aux->cache[slot];
+            if (e->key != BLOCK_EMPTY_KEY && (e->key & ~BLOCK_REFUSED_BIT) == key) dbt->pblk[n].state = PB_DEAD;   /* translated again meanwhile */
+            else {
+                if (e->key != BLOCK_EMPTY_KEY) evict_slot(dbt, slot);
+                uint8_t *code = dbt->code_buf + dbt->pblk[n].code_off;
+                e->key = key;
+                e->code = code;
+                dbt->span[slot] = dbt->pblk[n].span;
+                dbt_links_repatch(dbt, key, code);
+                dbt->pblk[n].state = PB_LIVE;
+                dbt->blocks_reinstated++;
+            }
+        }
+        if (dbt->pblk[n].state == PB_DEAD) { *pp = dbt->pblk[n].next; continue; }
+        pp = &dbt->pblk[n].next;
+    }
+    dbt->pcode[i].parked = 0;
+    dbt->pages_unparked++;
+}
+
+/* Space ID's code pages and their blocks go, and the id is free. The
+ * CR3s that used it choose again at their next load. */
 static void space_free(x86_dbt *dbt, uint8_t id) {
     while (dbt->pcode_space[id] >= 0) {
         int32_t i = dbt->pcode_space[id];
@@ -324,9 +432,10 @@ static void space_free(x86_dbt *dbt, uint8_t id) {
         dbt->pcode_space[id] = dbt->pcode[i].snext;
         pcode_release(dbt, i);
     }
-    if (dbt->space_kernel[id])
-        for (int s = 0; s < DBT_SPACES; s++)
-            if (dbt->space_used[s] && !dbt->space_kernel[s] && dbt->space_kspace[s] == id) dbt->space_kspace[s] = 0xFF;
+    for (int c = 0; c < DBT_CR3S; c++) {
+        if (dbt->cr3s[c].kspace == id) dbt->cr3s[c].kspace = 0xFF;
+        if (dbt->cr3s[c].uspace == id) dbt->cr3s[c].uspace = 0xFF;
+    }
     dbt->space_used[id] = dbt->space_kernel[id] = 0;
     dbt->space_evictions++;
 }
@@ -359,66 +468,118 @@ static int kspace_fits(x86_dbt *dbt, uint8_t k, int drop) {
     return 1;
 }
 
-/* The space CR3 names, registered if new — the oldest one making room,
- * its blocks gone — made cpu->pg_space; and the kernel space its CPL 0
- * code runs in: the one it had if that still fits, else any other that
- * fits, else a new one — cpu->pg_kspace. */
+/* How many of user space U's pages map somewhere other than where their
+ * blocks were translated (0: U fits the page tables now, up to LIMIT).
+ * A page mapped nowhere does not count against it — a process just
+ * forked or exec'd has faulted in almost nothing — it is parked
+ * (uspace_enter). */
+static uint32_t uspace_conflicts(x86_dbt *dbt, uint8_t u, uint32_t limit) {
+    uint32_t n = 0;
+    for (int32_t i = dbt->pcode_space[u]; i >= 0 && n < limit; i = dbt->pcode[i].snext) {
+        uint32_t p = x86_page_peek(dbt->cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user);
+        if (p != X86_PG_BAD && p != dbt->pcode[i].phys_page << 12) n++;
+    }
+    return n;
+}
+/* U is current: its pages mapped as they were are in reach, those not
+ * mapped parked, those mapped elsewhere — other code at that address in
+ * this process — dropped */
+static void uspace_enter(x86_dbt *dbt, uint8_t u) {
+    int32_t *pp = &dbt->pcode_space[u];
+    while (*pp >= 0) {
+        int32_t i = *pp;
+        uint32_t p = x86_page_peek(dbt->cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user);
+        if (p == dbt->pcode[i].phys_page << 12) unpark_page(dbt, i);
+        else if (p == X86_PG_BAD) park_page(dbt, i);
+        else {
+            drop_code_page(dbt, (uint32_t)i);
+            *pp = dbt->pcode[i].snext;
+            pcode_release(dbt, i);
+            continue;
+        }
+        pp = &dbt->pcode[i].snext;
+    }
+}
+
+/* CR3's entry in the table, made if new (the least recently used goes) */
+static int cr3_entry(x86_dbt *dbt, uint32_t cr3) {
+    int lru = 0;
+    for (int c = 0; c < DBT_CR3S; c++) {
+        if (dbt->cr3s[c].used && dbt->cr3s[c].cr3 == cr3) { dbt->cr3s[c].lru = ++dbt->cr3_clock; return c; }
+        if (!dbt->cr3s[c].used || (dbt->cr3s[lru].used && dbt->cr3s[c].lru < dbt->cr3s[lru].lru)) lru = c;
+    }
+    dbt->cr3s[lru].used = 1;
+    dbt->cr3s[lru].cr3 = cr3;
+    dbt->cr3s[lru].lru = ++dbt->cr3_clock;
+    dbt->cr3s[lru].kspace = dbt->cr3s[lru].uspace = 0xFF;
+    return lru;
+}
+
+/* The page tables CR3 names are current: the code spaces its code runs
+ * in. Kernel (cpu->pg_kspace): the one it had if that still fits, else
+ * any other that fits, else a new one. User (cpu->pg_space): the same,
+ * trying next the space of the process that ran just before — a child
+ * forked from it, or itself before an exec — whose pages it has not
+ * faulted in are parked until it does. */
 void dbt_space_current(x86_dbt *dbt) {
     x86_cpu *cpu = dbt->cpu;
-    uint32_t cr3 = cpu->cr3 & 0xFFFFF000u;
-    int s = -1;
-    for (int i = 0; i < DBT_SPACES; i++)
-        if (dbt->space_used[i] && !dbt->space_kernel[i] && dbt->space_cr3[i] == cr3) { s = i; break; }
-    if (s < 0) {
-        s = space_alloc(dbt, dbt->space_used[cpu->pg_kspace] && dbt->space_kernel[cpu->pg_kspace] ? cpu->pg_kspace : -1);
-        dbt->space_cr3[s] = cr3;
-        dbt->space_kspace[s] = 0xFF;
-    }
-    uint8_t k = dbt->space_kspace[s];
+    int c = cr3_entry(dbt, cpu->cr3 & 0xFFFFF000u);
+    uint8_t prev = cpu->pg_space;
+    uint8_t k = dbt->cr3s[c].kspace;
     if (k == 0xFF || !kspace_fits(dbt, k, 1)) {
         uint8_t was = k;
         k = 0xFF;
         for (int j = 0; j < DBT_SPACES && k == 0xFF; j++)
             if (j != was && dbt->space_used[j] && dbt->space_kernel[j] && kspace_fits(dbt, (uint8_t)j, 0)) k = (uint8_t)j;
         if (k == 0xFF) {
-            k = space_alloc(dbt, s);
+            k = space_alloc(dbt, dbt->cr3s[c].uspace == 0xFF ? -1 : dbt->cr3s[c].uspace);
             dbt->space_kernel[k] = 1;
         }
         if (was != 0xFF) dbt->kspace_moves++;
-        dbt->space_kspace[s] = k;
+        dbt->cr3s[c].kspace = k;
     }
-    cpu->pg_space = (uint8_t)s;
+    /* User: the first space with nothing mapped elsewhere — its own, the
+     * last process's, any — else its own (or a free id, or the last
+     * process's), whose pages mapped elsewhere go. Library pages sit at
+     * random addresses in each process, so two processes' code overlaps
+     * here and there: moving to another space for every such page took
+     * thousands of moves and evicted spaces wholesale. */
+    uint8_t own = dbt->cr3s[c].uspace, u = 0xFF;
+    #define USER_SPACE(j) (dbt->space_used[j] && !dbt->space_kernel[j])
+    if (own != 0xFF && uspace_conflicts(dbt, own, 1) == 0) u = own;
+    else if (prev != own && USER_SPACE(prev) && uspace_conflicts(dbt, prev, 1) == 0) u = prev;
+    else {
+        for (int j = 0; j < DBT_SPACES && u == 0xFF; j++)
+            if (j != own && j != prev && USER_SPACE(j) && uspace_conflicts(dbt, (uint8_t)j, 1) == 0) u = (uint8_t)j;
+        if (u == 0xFF && own != 0xFF) u = own;
+        if (u == 0xFF) {
+            for (int j = 0; j < DBT_SPACES && u == 0xFF; j++)
+                if (!dbt->space_used[j]) { u = (uint8_t)j; dbt->space_used[j] = 1; dbt->space_kernel[j] = 0; }
+            if (u == 0xFF) u = USER_SPACE(prev) ? prev : space_alloc(dbt, k);
+        }
+    }
+    #undef USER_SPACE
+    if (u != own) { if (own != 0xFF) dbt->uspace_moves++; dbt->cr3s[c].uspace = u; }
+    uspace_enter(dbt, u);
+    cpu->pg_space = u;
     cpu->pg_kspace = k;
 }
 
 /* cpu->tlb_hook: the page tables may map differently now (CR3 load, PG
- * toggled, A20). A CR3 reload is how a memory manager flushes after any
- * remap (JEMM with NOINVLPG does it for every A20 emulation), and a VCPI
- * client switches spaces on every call down to DOS, so dropping
- * translations wholesale thrashes: DOOM under EMM386 retranslated itself
- * every time DOS/4GW reflected an interrupt. Only the code pages of the
- * space now current are re-peeked, and only those that moved lose their
- * blocks; another space's are checked when it is current again (its
- * tables may have changed meanwhile, but using them takes a CR3 load,
- * which comes back here). With paging off no paged block is reachable,
- * and nothing is dropped. */
+ * toggled, A20, INVLPG). A CR3 reload is how a memory manager flushes
+ * after any remap (JEMM with NOINVLPG does it for every A20 emulation),
+ * and a VCPI client switches page tables on every call down to DOS, so
+ * dropping translations wholesale thrashes. The code spaces the current
+ * tables fit are chosen again (dbt_space_current): their pages re-peeked,
+ * those that moved dropped (kernel) or the tables moved to a space they
+ * fit (user), those not mapped parked. With paging off no paged block is
+ * reachable, and nothing is dropped. */
 void dbt_tlb_flushed(x86_cpu *cpu) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     if (!dbt) return;
     dbt->tlb_flushes++;
     if (!(cpu->cr0 & X86_CR0_PG)) return;
     dbt_space_current(dbt);
-    int32_t *pp = &dbt->pcode_space[cpu->pg_space];
-    while (*pp >= 0) {
-        int32_t i = *pp;
-        if (x86_page_peek(cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user) == dbt->pcode[i].phys_page << 12) {
-            pp = &dbt->pcode[i].snext;
-            continue;
-        }
-        drop_code_page(dbt, (uint32_t)i);
-        *pp = dbt->pcode[i].snext;
-        pcode_release(dbt, i);
-    }
 }
 
 /* LIN_PAGE maps onto PHYS_PAGE: on its alias list. 0 if the pool is
@@ -434,25 +595,47 @@ int dbt_note_alias(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page) {
     return 1;
 }
 
+/* A miss on a paged key: if its page is parked — out of reach since the
+ * page tables were loaded, as not mapped then — and now maps as it did
+ * (faulted in since), its blocks come back without translating; the
+ * wanted one, if it is among them, is the answer. A page mapped elsewhere
+ * has other code at that address: its parked blocks go. NULL: translate. */
+uint8_t *dbt_page_revive(x86_dbt *dbt, uint64_t key) {
+    int32_t i = pcode_find(dbt, dbt_key_lin(key) >> 12, (uint8_t)((key & KEY_SPACE_MASK) >> KEY_SPACE_SHIFT));
+    if (i < 0 || !dbt->pcode[i].parked) return NULL;
+    uint32_t p = x86_page_peek(dbt->cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user);
+    if (p != dbt->pcode[i].phys_page << 12) { drop_code_page(dbt, (uint32_t)i); return NULL; }
+    unpark_page(dbt, i);
+    uint32_t slot = dbt_slot(key);
+    x86_block_entry *e = &dbt->aux->cache[slot];
+    if (e->key != key || !e->code) return NULL;
+    dbt->last_block_bytes = dbt->span[slot];
+    return e->code;
+}
+
 /* A paged block is being translated on LIN_PAGE, which maps to PHYS_PAGE
- * (both page numbers) in space SP (the key's: a process's, or a kernel
- * space): note it for dbt_tlb_flushed.
- * 0 if the list is full — the caller then does not translate. */
+ * (both page numbers) in space SP (the key's: a user space, or a kernel
+ * space): note it for dbt_tlb_flushed. A page noted before at another
+ * physical page loses the blocks translated there. 0 if the list is full
+ * — the caller then does not translate. */
 int dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user, uint8_t sp) {
-    int32_t *head = &dbt->pcode_hash[pcode_bucket(lin_page, sp)];
-    for (int32_t i = *head; i >= 0; i = dbt->pcode[i].hnext)
-        if (dbt->pcode[i].lin_page == lin_page && dbt->pcode[i].space == sp) {
-            dbt->pcode[i].phys_page = phys_page;
-            dbt->pcode[i].user = (uint8_t)user;
-            return 1;
-        }
-    int32_t i = dbt->pcode_free;
+    int32_t i = pcode_find(dbt, lin_page, sp);
+    if (i >= 0) {
+        if (dbt->pcode[i].phys_page != phys_page || dbt->pcode[i].parked) drop_code_page(dbt, (uint32_t)i);
+        dbt->pcode[i].phys_page = phys_page;
+        dbt->pcode[i].user = (uint8_t)user;
+        return 1;
+    }
+    i = dbt->pcode_free;
     if (i < 0) return 0;
     dbt->pcode_free = dbt->pcode[i].snext;
     dbt->pcode[i].lin_page = lin_page;
     dbt->pcode[i].phys_page = phys_page;
     dbt->pcode[i].user = (uint8_t)user;
     dbt->pcode[i].space = sp;
+    dbt->pcode[i].blocks = -1;
+    dbt->pcode[i].parked = 0;
+    int32_t *head = &dbt->pcode_hash[pcode_bucket(lin_page, sp)];
     dbt->pcode[i].hnext = *head;
     *head = i;
     dbt->pcode[i].snext = dbt->pcode_space[sp];

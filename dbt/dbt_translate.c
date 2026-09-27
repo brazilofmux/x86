@@ -602,6 +602,12 @@ uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
         }
     }
 
+    /* A parked page mapped as it was again: its blocks, not a translation */
+    if (key & KEY_PAGED) {
+        uint8_t *code = dbt_page_revive(dbt, key);
+        if (code) return code;
+    }
+
     /* HLE stub segment: the interpreter step dispatches the host service. */
     if (cpu->hle && cpu->seg[S_CS].base == ((uint32_t)cpu->hle_seg << 4)) return NULL;
 

@@ -791,6 +791,10 @@ static void print_pmprof(x86_dbt *dbt, FILE *out) {
     free(v);
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+int dbt_jit_wdepth;
+#endif
+
 void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     print_pmprof(dbt, out);
     fprintf(out, "  blocks translated:      %llu\n", (unsigned long long)dbt->blocks_translated);
@@ -832,8 +836,12 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     if (dbt->tlb_flushes) fprintf(out, "  TLB flushes:            %llu (code pages dropped: %llu)\n",
                                   (unsigned long long)dbt->tlb_flushes, (unsigned long long)dbt->tlb_page_drops);
     if (dbt->space_evictions || dbt->n_pcode)
-        fprintf(out, "  address spaces evicted: %llu, kernel space moves %llu (code pages watched now: %u)\n",
-                (unsigned long long)dbt->space_evictions, (unsigned long long)dbt->kspace_moves, dbt->n_pcode);
+        fprintf(out, "  code spaces evicted: %llu, kernel/user space moves %llu / %llu (code pages watched now: %u)\n"
+                     "  pages parked/unparked: %llu / %llu, blocks reinstated %llu%s\n",
+                (unsigned long long)dbt->space_evictions, (unsigned long long)dbt->kspace_moves,
+                (unsigned long long)dbt->uspace_moves, dbt->n_pcode,
+                (unsigned long long)dbt->pages_parked, (unsigned long long)dbt->pages_unparked,
+                (unsigned long long)dbt->blocks_reinstated, dbt->pblk_full ? " (block records full: scanning)" : "");
     if (dbt->desc_flushes) fprintf(out, "  CS descriptor flushes:  %llu\n", (unsigned long long)dbt->desc_flushes);
     if (dbt->wipe_code || dbt->wipe_pool || dbt->wipe_pending || dbt->wipe_dev)
         fprintf(out, "  whole-cache wipes:      %llu code buffer full, %llu helper pool full, %llu asked for, %llu device read hook\n",
