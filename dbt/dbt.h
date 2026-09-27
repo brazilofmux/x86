@@ -285,12 +285,18 @@ typedef struct {
      * chosen yet). */
     uint8_t  space_kernel[DBT_SPACES], space_kspace[DBT_SPACES];
     uint64_t space_evictions, kspace_moves;
-    /* A remapped code page (UMB code, a memory manager mapped high): the
-     * block keys are linear, the code bitmap and every SMC report
-     * physical. phys_alias[physical page] is the linear page + 1 whose
-     * blocks a store there must also sweep. One alias per physical page;
-     * a second linear page onto the same one is not translated. */
+    /* A remapped code page (UMB code, a memory manager mapped high, any
+     * page of a paged OS): the block keys are linear, the code bitmap and
+     * every SMC report physical. phys_alias[physical page] heads a list
+     * (index + 1 into alias_pool) of the linear pages translated on it,
+     * whose blocks a store there must also sweep — several, since one
+     * library page sits at a different address in each process. The lists
+     * only grow until the cache is wiped: a linear page that no longer
+     * has blocks costs a sweep that finds nothing. */
     uint32_t phys_alias[X86_MEM_MAX >> 12];
+#define DBT_ALIAS_MAX 32768
+    struct { uint32_t lin_page, next; } alias_pool[DBT_ALIAS_MAX];   /* next: index + 1, 0 ends */
+    uint32_t alias_used;
     uint64_t smc_hot_refusals;      /* blocks ended before a patched instruction */
     uint64_t tlb_flushes;           /* TLB flushes seen (CR3, PG, A20)... */
     uint64_t tlb_page_drops;        /* ...and code pages whose blocks went because the page moved */
@@ -394,6 +400,7 @@ void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
 void dbt_a20_changed(x86_cpu *cpu, int on);
 void dbt_dev_changed(x86_cpu *cpu);
 void             dbt_tlb_flushed(x86_cpu *cpu);
+int              dbt_note_alias(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page);
 int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user, uint8_t space);
 void             dbt_space_current(x86_dbt *dbt);   /* register CR3's space, set cpu->pg_space */
 

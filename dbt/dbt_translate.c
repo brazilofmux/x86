@@ -393,9 +393,7 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
         if (phys == X86_PG_BAD || phys + 0xFFFu >= cpu->mem_size) return 0;
         if (!dbt_note_code_page(dbt, code_page >> 12, phys >> 12, user, (uint8_t)((key & KEY_SPACE_MASK) >> KEY_SPACE_SHIFT))) return 0;
         if (phys != (code_page & cpu->a20_mask)) {
-            uint32_t *alias = &dbt->phys_alias[phys >> 12];
-            if (*alias && *alias != (code_page >> 12) + 1) return 0;   /* one alias per physical page */
-            *alias = (code_page >> 12) + 1;
+            if (!dbt_note_alias(dbt, code_page >> 12, phys >> 12)) return 0;
             code_delta = phys - code_page;
         }
         (void)x86_phys_rd8(cpu, code_page | ((cpu->seg[S_CS].base + cpu->eip) & 0xFFF));   /* the fetch's walk: accessed bits */

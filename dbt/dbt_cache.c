@@ -67,6 +67,7 @@ static void pcode_reset(x86_dbt *dbt) {
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
     pcode_reset(dbt);
     memset(dbt->phys_alias, 0, sizeof dbt->phys_alias);
+    dbt->alias_used = 0;
     memset(dbt->space_used, 0, sizeof dbt->space_used);   /* ids start over */
     memset(dbt->space_kernel, 0, sizeof dbt->space_kernel);
     dbt->space_next = 0;
@@ -198,8 +199,8 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
     if (dbt->smc_win[phys] != now) { dbt->smc_win[phys] = now; dbt->smc_heat[phys] = 0; }
     if (dbt->smc_heat[phys] < 255) dbt->smc_heat[phys]++;
     sweep_blocks_at(dbt, phys);
-    uint32_t alias = dbt->phys_alias[phys >> 12];   /* a linear page + 1: past 16 bits for NT's kernel at 80000000h */
-    if (alias) sweep_blocks_at(dbt, ((uint32_t)(alias - 1) << 12) | (phys & 0xFFF));
+    for (uint32_t a = dbt->phys_alias[phys >> 12]; a; a = dbt->alias_pool[a - 1].next)
+        sweep_blocks_at(dbt, (dbt->alias_pool[a - 1].lin_page << 12) | (phys & 0xFFF));
     dbt->smc_invalidations++;
     dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
 }
@@ -291,17 +292,17 @@ static void pcode_release(x86_dbt *dbt, int32_t i) {
     dbt->n_pcode--;
 }
 
-/* Drop code page I's paged blocks (those of its address space) and the
- * entry's alias. The caller unlinks the entry (pcode_release). A page's blocks sit in
+/* Drop code page I's paged blocks (those of its address space); its alias
+ * stays listed until the next wipe. The caller unlinks the entry
+ * (pcode_release). A page's blocks sit in
  * 4096 consecutive slots per key mode (its linear address XOR the folded
  * mode bits): V86, flat 32-bit PM, and segmented 16-bit PM. */
 static void drop_code_page(x86_dbt *dbt, uint32_t i) {
     static const uint32_t modes[3] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
                                        (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT),
                                        (uint32_t)((KEY_PMODE | KEY_SEG16) >> KEY_MODE_SHIFT) };
-    uint32_t lin = dbt->pcode[i].lin_page << 12, was = dbt->pcode[i].phys_page << 12;
+    uint32_t lin = dbt->pcode[i].lin_page << 12;
     uint64_t space = (uint64_t)dbt->pcode[i].space << KEY_SPACE_SHIFT;
-    if (dbt->phys_alias[was >> 12] == dbt->pcode[i].lin_page + 1) dbt->phys_alias[was >> 12] = 0;
     for (int m = 0; m < 3; m++)
         for (uint32_t k = 0; k < 4096; k++) {
             uint32_t slot = dbt_slot_hash(lin + k, modes[m], dbt->pcode[i].space);
@@ -418,6 +419,19 @@ void dbt_tlb_flushed(x86_cpu *cpu) {
         *pp = dbt->pcode[i].snext;
         pcode_release(dbt, i);
     }
+}
+
+/* LIN_PAGE maps onto PHYS_PAGE: on its alias list. 0 if the pool is
+ * full — the caller then does not translate. */
+int dbt_note_alias(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page) {
+    for (uint32_t a = dbt->phys_alias[phys_page]; a; a = dbt->alias_pool[a - 1].next)
+        if (dbt->alias_pool[a - 1].lin_page == lin_page) return 1;
+    if (dbt->alias_used == DBT_ALIAS_MAX) return 0;
+    uint32_t n = dbt->alias_used++;
+    dbt->alias_pool[n].lin_page = lin_page;
+    dbt->alias_pool[n].next = dbt->phys_alias[phys_page];
+    dbt->phys_alias[phys_page] = n + 1;
+    return 1;
 }
 
 /* A paged block is being translated on LIN_PAGE, which maps to PHYS_PAGE
