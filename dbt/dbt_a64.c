@@ -372,8 +372,11 @@ static void emit_dynamic_tail(emit_t *e, uint32_t exit_stub_off) {
         emit_b(e, (int32_t)exit_stub_off - (int32_t)emit_pos(e));
         return;
     }
-    emit_lsr_x64_imm(e, W_T2, A64_W0, KEY_MODE_SHIFT);          /* slot = (lin ^ mode << 16) & mask, as dbt_slot */
+    emit_lsr_x64_imm(e, W_T2, A64_W0, KEY_MODE_SHIFT);          /* slot = (lin ^ mode << 16 ^ space << 12) & mask, as dbt_slot */
     emit_eor_w32_lsl(e, W_T2, A64_W0, W_T2, 16);
+    emit_lsr_x64_imm(e, W_T3, A64_W0, KEY_SPACE_SHIFT);
+    (void)emit_and_w32_imm(e, W_T3, W_T3, 0xF);
+    emit_eor_w32_lsl(e, W_T2, W_T2, W_T3, 12);
     (void)emit_and_w32_imm(e, W_T2, W_T2, BLOCK_CACHE_MASK);
     emit_add_x64_imm_lsl12(e, W_T3, R_AUX, AUX_CACHE >> 12);
     emit_add_x64_w32_uxtw_lsl(e, W_T3, W_T3, W_T2, 4);

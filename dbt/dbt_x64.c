@@ -480,7 +480,7 @@ static void emit_cond_setup(emit_t *e, int cc, uint32_t live, int *hostcc) {
  * ---------------------------------------------------------------------- */
 
 /* Dynamic tail. R_KEY = next key. Probe the cache:
- *   slot = (lin ^ mode << 16) & mask (dbt_slot); entry = cache + slot * 16;
+ *   slot = (lin ^ mode << 16 ^ space << 12) & mask (dbt_slot); entry = cache + slot * 16;
  *   CMP key; JMP [entry + 8] or exit. RFLAGS is free at every tail. */
 static void emit_dynamic_tail(x86_dbt *dbt, emit_t *e) {
     if (s_strict_exit > 0) { emit_jmp_rel32_to(e, dbt->exit_stub_off); return; }
@@ -489,6 +489,11 @@ static void emit_dynamic_tail(x86_dbt *dbt, emit_t *e) {
     emit_alu_ri(e, 4, X64_ALU_AND, W_T0, KEY_MODE_MASK);
     emit_shift_ri(e, 4, X64_SH_SHL, W_T0, 16);
     emit_alu_rr(e, 4, X64_ALU_XOR, W_T0, R_KEY);
+    emit_mov_rr(e, 8, W_T1, R_KEY);                  /* the address space, bits 12..15 */
+    emit_shift_ri(e, 8, X64_SH_SHR, W_T1, KEY_SPACE_SHIFT);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T1, 0xF);
+    emit_shift_ri(e, 4, X64_SH_SHL, W_T1, 12);
+    emit_alu_rr(e, 4, X64_ALU_XOR, W_T0, W_T1);
     emit_alu_ri(e, 4, X64_ALU_AND, W_T0, BLOCK_CACHE_MASK);
     emit_shift_ri(e, 8, X64_SH_SHL, W_T0, 4);
     /* (X86_GOLDEN never runs a block: a fixed stand-in keeps the hash

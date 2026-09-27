@@ -101,7 +101,7 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_PAGED          (1ull << 54)   /* under paging: V86 through cpu->pgd_r/pgd_w, flat PM through cpu->tlb */
 #define KEY_ESNULL         (1ull << 55)   /* flat, but ES is null (a monitor entered from V86): ES accesses are the interpreter's */
 #define KEY_SPACE_SHIFT    58             /* paged keys: which address space (CR3) the block was translated in, */
-#define KEY_SPACE_MASK     (0xFull << KEY_SPACE_SHIFT)   /* 16 at a time (dbt_tlb_flushed); outside the slot hash */
+#define KEY_SPACE_MASK     (0xFull << KEY_SPACE_SHIFT)   /* 16 at a time (dbt_tlb_flushed); in the slot hash (dbt_slot) */
 #define KEY_SS32           (1ull << 62)   /* segmented 16-bit code on a 32-bit stack (SS.B): push/pop move all of ESP */
 #define KEY_A20OFF         (1ull << 57)   /* translated with the A20 gate off: far targets and wraps bake the 1 MB mask
                                              * (outside the slot hash: both states' blocks share a slot, and the SMC
@@ -139,8 +139,21 @@ static inline uint32_t dbt_key_lin(uint64_t key) { return (uint32_t)key; }
  * keys (no mode bits) stay 1:1 over low memory. */
 #define KEY_MODE_SHIFT 48
 #define KEY_MODE_MASK  0x1Fu
-static inline uint32_t dbt_slot_mode(uint32_t lin, uint32_t mode) { return (lin ^ (mode << 16)) & BLOCK_CACHE_MASK; }
-static inline uint32_t dbt_slot(uint64_t key) { return dbt_slot_mode((uint32_t)key, (uint32_t)(key >> KEY_MODE_SHIFT) & KEY_MODE_MASK); }
+/* ... and a paged key's address space (KEY_SPACE) into bits 12..15, above
+ * the page offset, so a page's blocks still fill 4096 consecutive slots.
+ * Without it every process's copy of the same kernel code sat in one
+ * slot: each context switch evicted the last process's kernel blocks and
+ * retranslated them — a Linux boot translated 50 thousand kernel blocks
+ * 20 million times, and wiped the full code buffer 400 times doing it.
+ * The backends' cache probe (emit_dynamic_tail) computes the same. */
+static inline uint32_t dbt_slot_hash(uint32_t lin, uint32_t mode, uint32_t space) {
+    return (lin ^ (mode << 16) ^ (space << 12)) & BLOCK_CACHE_MASK;
+}
+static inline uint32_t dbt_slot_mode(uint32_t lin, uint32_t mode) { return dbt_slot_hash(lin, mode, 0); }
+static inline uint32_t dbt_slot(uint64_t key) {
+    return dbt_slot_hash((uint32_t)key, (uint32_t)(key >> KEY_MODE_SHIFT) & KEY_MODE_MASK,
+                         (uint32_t)(key >> KEY_SPACE_SHIFT) & 0xFu);
+}
 /* Every mode-bit combination a key can carry: real; PM 16-bit; PM 32-bit;
  * flat; segmented 16-bit. The SMC sweep probes each. */
 #define KEY_MODE_VARIANTS 6
@@ -246,15 +259,22 @@ typedef struct {
     uint64_t a20_flushes;
     /* Code pages paged blocks were translated on (V86 or flat protected
      * mode), with the physical page each mapped to then: a TLB flush
-     * re-peeks them and drops the blocks of any that moved. */
-#define DBT_PCODE_MAX 2048
-    struct { uint32_t lin_page, phys_page; uint8_t user, space; } pcode[DBT_PCODE_MAX];
-    uint32_t n_pcode;
+     * re-peeks the current space's and drops the blocks of any that moved.
+     * Found by (space, page) through a hash, walked per space: an OS with
+     * a dozen processes has thousands, and a linear list of 2048 filled —
+     * whatever it refused ran in the interpreter. */
+#define DBT_SPACES 16
+#define DBT_PCODE_MAX  16384
+#define DBT_PCODE_HASH 16384
+    struct { uint32_t lin_page, phys_page; int32_t hnext, snext; uint8_t user, space; } pcode[DBT_PCODE_MAX];
+    int32_t  pcode_hash[DBT_PCODE_HASH];   /* chains through hnext; -1 ends */
+    int32_t  pcode_space[DBT_SPACES];      /* each space's pages, through snext */
+    int32_t  pcode_free;                   /* unused entries, through snext */
+    uint32_t n_pcode;                      /* in use */
     /* The address spaces paged blocks were translated in: CR3 values, by
      * the id their keys carry (KEY_SPACE). A VCPI client switches between
      * its page tables and its server's on every call down to DOS; the
      * other space's blocks wait, unchecked, until it is current again. */
-#define DBT_SPACES 16
     uint32_t space_cr3[DBT_SPACES];
     uint8_t  space_used[DBT_SPACES], space_next;
     uint64_t space_evictions;

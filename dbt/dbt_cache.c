@@ -56,8 +56,16 @@ void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
  * buffer-full path in dbt_translate_block). The link registry leans on
  * that: resetting the pool silently abandons all patch sites, sound
  * only because the code containing them is being discarded. */
-void dbt_cache_invalidate_all(x86_dbt *dbt) {
+static void pcode_reset(x86_dbt *dbt) {
+    memset(dbt->pcode_hash, 0xFF, sizeof dbt->pcode_hash);
+    memset(dbt->pcode_space, 0xFF, sizeof dbt->pcode_space);
+    for (int32_t i = 0; i < DBT_PCODE_MAX; i++) dbt->pcode[i].snext = i + 1 < DBT_PCODE_MAX ? i + 1 : -1;
+    dbt->pcode_free = 0;
     dbt->n_pcode = 0;
+}
+
+void dbt_cache_invalidate_all(x86_dbt *dbt) {
+    pcode_reset(dbt);
     memset(dbt->phys_alias, 0, sizeof dbt->phys_alias);
     memset(dbt->space_used, 0, sizeof dbt->space_used);   /* ids start over; the current space is 0 */
     dbt->space_next = 0;
@@ -157,10 +165,14 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
  * lin] and whose span reaches lin, under each mode variant. */
 static void sweep_blocks_at(x86_dbt *dbt, uint32_t lin) {
     uint32_t window = dbt->max_block_bytes;
+    /* paged modes' blocks sit by address space too: each one in use */
+    uint8_t spaces[DBT_SPACES]; int nsp = 0;
+    for (int s = 0; s < DBT_SPACES; s++) if (s == 0 || dbt->space_used[s]) spaces[nsp++] = (uint8_t)s;
     for (uint32_t k = 0; k < window && k <= lin; k++) {
         uint32_t p = lin - k;
-        for (int m = 0; m < KEY_MODE_VARIANTS; m++) {
-            uint32_t slot = dbt_slot_mode(p, dbt_key_modes[m]);
+        for (int m = 0; m < KEY_MODE_VARIANTS; m++)
+        for (int si = 0; si < ((dbt_key_modes[m] & 4) || dbt_key_modes[m] == 9 || dbt_key_modes[m] == 16 ? nsp : 1); si++) {
+            uint32_t slot = dbt_slot_hash(p, dbt_key_modes[m], spaces[si]);
             x86_block_entry *e = &dbt->aux->cache[slot];
             if (e->key == BLOCK_EMPTY_KEY || dbt_key_lin(e->key) != p || k >= dbt->span[slot]) continue;
             uint64_t old = e->key & ~BLOCK_REFUSED_BIT;
@@ -264,8 +276,22 @@ void dbt_dev_changed(x86_cpu *cpu) {
     flush_under_running_code(dbt);
 }
 
+static uint32_t pcode_bucket(uint32_t lin_page, uint8_t space) {
+    return ((lin_page * 2654435761u) ^ ((uint32_t)space * 0x9E3779B9u)) >> 18 & (DBT_PCODE_HASH - 1);
+}
+/* Entry I leaves the hash and goes back on the free list; the caller has
+ * already unlinked it from its space's list. */
+static void pcode_release(x86_dbt *dbt, int32_t i) {
+    int32_t *pp = &dbt->pcode_hash[pcode_bucket(dbt->pcode[i].lin_page, dbt->pcode[i].space)];
+    while (*pp != i) pp = &dbt->pcode[*pp].hnext;
+    *pp = dbt->pcode[i].hnext;
+    dbt->pcode[i].snext = dbt->pcode_free;
+    dbt->pcode_free = i;
+    dbt->n_pcode--;
+}
+
 /* Drop code page I's paged blocks (those of its address space) and the
- * entry's alias. The caller compacts the list. A page's blocks sit in
+ * entry's alias. The caller unlinks the entry (pcode_release). A page's blocks sit in
  * 4096 consecutive slots per key mode (its linear address XOR the folded
  * mode bits): V86, flat 32-bit PM, and segmented 16-bit PM. */
 static void drop_code_page(x86_dbt *dbt, uint32_t i) {
@@ -277,7 +303,7 @@ static void drop_code_page(x86_dbt *dbt, uint32_t i) {
     if (dbt->phys_alias[was >> 12] == dbt->pcode[i].lin_page + 1) dbt->phys_alias[was >> 12] = 0;
     for (int m = 0; m < 3; m++)
         for (uint32_t k = 0; k < 4096; k++) {
-            uint32_t slot = dbt_slot_mode(lin + k, modes[m]);
+            uint32_t slot = dbt_slot_hash(lin + k, modes[m], dbt->pcode[i].space);
             x86_block_entry *e = &dbt->aux->cache[slot];
             if (e->key == BLOCK_EMPTY_KEY || !(e->key & KEY_PAGED) || dbt_key_lin(e->key) != lin + k
                 || (e->key & KEY_SPACE_MASK) != space) continue;
@@ -297,12 +323,12 @@ void dbt_space_current(x86_dbt *dbt) {
     uint8_t id = dbt->space_next;
     dbt->space_next = (uint8_t)((id + 1) % DBT_SPACES);
     if (dbt->space_used[id]) {
-        uint32_t kept = 0;
-        for (uint32_t i = 0; i < dbt->n_pcode; i++) {
-            if (dbt->pcode[i].space == id) { drop_code_page(dbt, i); continue; }
-            dbt->pcode[kept++] = dbt->pcode[i];
+        while (dbt->pcode_space[id] >= 0) {
+            int32_t i = dbt->pcode_space[id];
+            drop_code_page(dbt, (uint32_t)i);
+            dbt->pcode_space[id] = dbt->pcode[i].snext;
+            pcode_release(dbt, i);
         }
-        dbt->n_pcode = kept;
         dbt->space_evictions++;
     }
     dbt->space_used[id] = 1;
@@ -327,17 +353,17 @@ void dbt_tlb_flushed(x86_cpu *cpu) {
     dbt->tlb_flushes++;
     if (!(cpu->cr0 & X86_CR0_PG)) return;
     dbt_space_current(dbt);
-    uint8_t sp = cpu->pg_space;
-    uint32_t kept = 0;
-    for (uint32_t i = 0; i < dbt->n_pcode; i++) {
-        if (dbt->pcode[i].space != sp
-            || x86_page_peek(cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user) == dbt->pcode[i].phys_page << 12) {
-            dbt->pcode[kept++] = dbt->pcode[i];
+    int32_t *pp = &dbt->pcode_space[cpu->pg_space];
+    while (*pp >= 0) {
+        int32_t i = *pp;
+        if (x86_page_peek(cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user) == dbt->pcode[i].phys_page << 12) {
+            pp = &dbt->pcode[i].snext;
             continue;
         }
-        drop_code_page(dbt, i);
+        drop_code_page(dbt, (uint32_t)i);
+        *pp = dbt->pcode[i].snext;
+        pcode_release(dbt, i);
     }
-    dbt->n_pcode = kept;
 }
 
 /* A paged block is being translated on LIN_PAGE, which maps to PHYS_PAGE
@@ -345,17 +371,24 @@ void dbt_tlb_flushed(x86_cpu *cpu) {
  * 0 if the list is full — the caller then does not translate. */
 int dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user) {
     uint8_t sp = dbt->cpu->pg_space;
-    for (uint32_t i = 0; i < dbt->n_pcode; i++)
+    int32_t *head = &dbt->pcode_hash[pcode_bucket(lin_page, sp)];
+    for (int32_t i = *head; i >= 0; i = dbt->pcode[i].hnext)
         if (dbt->pcode[i].lin_page == lin_page && dbt->pcode[i].space == sp) {
             dbt->pcode[i].phys_page = phys_page;
             dbt->pcode[i].user = (uint8_t)user;
             return 1;
         }
-    if (dbt->n_pcode == DBT_PCODE_MAX) return 0;
-    dbt->pcode[dbt->n_pcode].lin_page = lin_page;
-    dbt->pcode[dbt->n_pcode].phys_page = phys_page;
-    dbt->pcode[dbt->n_pcode].user = (uint8_t)user;
-    dbt->pcode[dbt->n_pcode].space = sp;
+    int32_t i = dbt->pcode_free;
+    if (i < 0) return 0;
+    dbt->pcode_free = dbt->pcode[i].snext;
+    dbt->pcode[i].lin_page = lin_page;
+    dbt->pcode[i].phys_page = phys_page;
+    dbt->pcode[i].user = (uint8_t)user;
+    dbt->pcode[i].space = sp;
+    dbt->pcode[i].hnext = *head;
+    *head = i;
+    dbt->pcode[i].snext = dbt->pcode_space[sp];
+    dbt->pcode_space[sp] = i;
     dbt->n_pcode++;
     return 1;
 }

@@ -831,6 +831,9 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     if (dbt->smc_hot_refusals) fprintf(out, "  SMC-hot block ends:     %llu\n", (unsigned long long)dbt->smc_hot_refusals);
     if (dbt->tlb_flushes) fprintf(out, "  TLB flushes:            %llu (code pages dropped: %llu)\n",
                                   (unsigned long long)dbt->tlb_flushes, (unsigned long long)dbt->tlb_page_drops);
+    if (dbt->space_evictions || dbt->n_pcode)
+        fprintf(out, "  address spaces evicted: %llu (code pages watched now: %u)\n",
+                (unsigned long long)dbt->space_evictions, dbt->n_pcode);
     if (dbt->desc_flushes) fprintf(out, "  CS descriptor flushes:  %llu\n", (unsigned long long)dbt->desc_flushes);
     if (dbt->wipe_code || dbt->wipe_pool || dbt->wipe_pending || dbt->wipe_dev)
         fprintf(out, "  whole-cache wipes:      %llu code buffer full, %llu helper pool full, %llu asked for, %llu device read hook\n",
