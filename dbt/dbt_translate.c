@@ -35,6 +35,7 @@
  * the 286 on). A static rather than a plan field so the exported
  * dbt_classify_op* (tools/jittest's fuzzer) see the last model planned. */
 static int s_cls_model = X86_MODEL_286;
+static int s_cls_tsc_clock;        /* the machine keeps the TSC (cpu->tsc_clock): RDTSC reads a clock, not the count */
 
 /* ----------------------------------------------------------------------
  * Classification
@@ -83,7 +84,15 @@ static int classify_sem(const x86_insn *in) {
     case OP_WAIT:
         return C_INLINE;           /* a backend may test for nothing pending inline, else the helper */
     case OP_CPUID: case OP_CMPXCHG8B:
-        return C_HELPER;           /* Pentium; RDTSC and the MSRs end the block (the TSC wants an exact count) */
+        return C_HELPER;           /* Pentium */
+    case OP_RDTSC:
+        /* In the block when the TSC is the machine's clock: nothing about
+         * the reading depends on where in a block it is taken, and -V
+         * replays the real cpu's readings to the shadow. A bare CPU's TSC
+         * is its instruction count, exact only between blocks. (Linux
+         * reads it millions of times in a boot — its clocksource.) The
+         * MSRs still end the block: WRMSR 10h moves the TSC. */
+        return s_cls_tsc_clock ? C_HELPER : C_REFUSE;
     case OP_AAM:
         return in->ops[0].imm ? C_HELPER : C_REFUSE;
     case OP_MOVSEG:
@@ -408,6 +417,7 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
     uint8_t buf[16];
     x86_dec_ctx ctx = { buf, cpu->model, (uint8_t)b->flat };
     s_cls_model = cpu->model;
+    s_cls_tsc_clock = cpu->tsc_clock != NULL;
 
     while (n_ops < MAX_BLOCK_INSNS) {
         x86_insn *in = &decs[n_ops];
