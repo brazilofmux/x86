@@ -222,6 +222,7 @@ int dbt_classify_op_seg16(const x86_insn *in) { return classify_seg16(shape_bloc
 static int op_may_fault(const dbt_block *b, const x86_insn *in) {
     switch (in->op) {
     case OP_PUSH: case OP_POP: case OP_CALL: case OP_RET: case OP_CALLF: case OP_RETF: case OP_JMPF:
+    case OP_LEAVE: case OP_ENTER: case OP_PUSHA: case OP_POPA:   /* (the stack: no memory operand, still an access) */
         return 1;
     case OP_INT: case OP_INT3:
         return 1;                     /* the frame carries FLAGS: all of them must be materialized */

@@ -148,6 +148,7 @@ static int s_strict_exit = -1;
 static uint64_t s_mode_bits;
 static int s_regs32;          /* 386: the pinned registers hold 32 bits, 16-bit values need masking as addresses */
 static int s_flat;            /* a flat block: 32-bit code and addresses off R_MEM, no segment arithmetic */
+static int s_based;           /* ...through based, limited segments (a based block, KEY_SEG16|KEY_BIG; s_flat and s_paged are set too) */
 static int s_seg16;           /* segmented 16-bit protected mode: the real-mode shape with limit checks in place of wrap checks */
 static int s_ss32;            /* ...on a 32-bit stack (SS.B): pushes and pops move all of ESP */
 static int s_paged;           /* under paging: each access translated — V86 through cpu->pgd_r/pgd_w (emit_paged), flat and seg16 through cpu->tlb */
@@ -1220,7 +1221,8 @@ static void emit_push32(emit_t *e, int val) {
     emit_check_flat(e, &ea, 4, 1, 0);
     m = ea_mem(&ea);
     emit_mov_mr(e, 4, &m, val);
-    emit_mov_rr(e, 4, X64_R12, W_T0);
+    m = M(X64_R12, -4);                                      /* (a based block's check left the linear address in W_T0) */
+    emit_lea(e, 4, X64_R12, &m);
 }
 static void emit_pop32(emit_t *e, int dst) {
     ea_t ea = { R_MEM, X64_R12, S_SS };
@@ -1421,7 +1423,10 @@ static int inline_ok_v86(const dbt_block *b, const x86_insn *in) {
 
 /* Flat protected mode: 32-bit code and addressing through DS/ES/SS. */
 static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
-    if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS))) return 0;
+    /* (a based block reaches FS and GS too — Linux 2.0 addresses user
+     * memory through FS — but not CS, whose readability is not checked) */
+    if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS
+                                             && !(b->based && (in->seg == S_FS || in->seg == S_GS))))) return 0;
     if (b->paged) {                                      /* one translated access an instruction */
         switch (in->op) {
         case OP_MOVS: case OP_STOS: case OP_CMPS: case OP_SCAS: case OP_LODS: case OP_PUSHA: case OP_POPA:
@@ -1457,7 +1462,13 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
     case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
         return in->opsize == 4 && in->adsize == 4;
     case OP_XLAT:
-        return in->adsize == 4;
+        /* its operand is implicit (no ea_valid, so the test at the top
+         * missed it): DS or ES unless the key says it is null, SS, and in
+         * a based block FS or GS too, whose run-time check covers them */
+        if (in->adsize != 4) return 0;
+        if (in->seg == S_DS) return !b->dsnull;
+        if (in->seg == S_ES) return !b->esnull;
+        return in->seg == S_SS || (b->based && (in->seg == S_FS || in->seg == S_GS));
     case OP_MOVS: case OP_STOS: case OP_CMPS: case OP_SCAS: case OP_LODS:
         if (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS)) return 0;
         if (in->rep && in->op == OP_LODS) return 0;
@@ -1476,7 +1487,7 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
  * yet: the flat emitters address off R_MEM with no segment base or limit,
  * and the dynamic key takes EIP for the linear address. Until they learn
  * both, that code stays the interpreter's on this backend, as before. */
-int dbt_arch_seg32(void) { return 0; }
+int dbt_arch_seg32(void) { return 1; }
 
 int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
     if (getenv("X86_X64_HELPERS")) return 0;
@@ -1490,8 +1501,36 @@ int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
 /* Flat checks: the offset below FLAT_TOP (every access of up to 4 bytes
  * then stays inside memory); a read outside the VGA window while a device
  * answers reads there; a store's bitmap bytes. RFLAGS must be free. */
+/* A based block's access: the 32-bit offset against the segment's limit
+ * — the last byte's offset formed in 64 bits, since offset + size - 1 can
+ * pass 4 GB — and the segment usable (a null FS or GS; SS always is),
+ * both read from the cpu at run time; #GP(0), or #SS(0) through SS. Then
+ * linear = base + offset, wrapping at 4 GB as the CPU's does, into W_T0:
+ * the offset the paged path translates. Clobbers W_T1, W_T3 and RFLAGS. */
+static void emit_based_linear(emit_t *e, ea_t *ea, int size) {
+    int seg = ea->seg;
+    uint8_t vec = (uint8_t)(seg == S_SS ? X86_EXC_SS : X86_EXC_GP);
+    emit_mov_rr(e, 4, W_T3, ea->off);                        /* zero-extended */
+    if (size > 1) emit_alu_ri(e, 8, X64_ALU_ADD, W_T3, (uint32_t)(size - 1));
+    x64_mem_t m = M(R_CPU, OFF_SEG_LIMIT(seg));
+    emit_mov_rm(e, 4, W_T1, &m);
+    emit_alu_rr(e, 8, X64_ALU_CMP, W_T3, W_T1);
+    fault_site(e, X64_CC_A, vec);
+    if (seg != S_SS && !(s_usable_ok & (1u << seg))) {       /* (a segment load ends the block: asked once) */
+        m = M(R_CPU, OFF_SEG_USABLE(seg));
+        emit_alu_mi(e, 1, X64_ALU_CMP, &m, 0);
+        fault_site(e, X64_CC_E, vec);
+        s_usable_ok |= 1u << seg;
+    }
+    m = M(R_CPU, OFF_SEG_BASE(seg));
+    if (ea->off == W_T0) emit_alu_rm(e, 4, X64_ALU_ADD, W_T0, &m);
+    else { emit_mov_rm(e, 4, W_T0, &m); emit_alu_rr(e, 4, X64_ALU_ADD, W_T0, ea->off); }
+    ea->off = W_T0;
+}
+
 static void emit_check_flat(emit_t *e, ea_t *ea, int size, int store, int reads) {
     if (s_paged) {
+        if (s_based) emit_based_linear(e, ea, size);
         emit_pgflat(e, ea, size, store, store && s_skip_smc);      /* (the window: reads have no MEM entry, pure stores go by the bitmap) */
         if (store && !s_skip_smc) emit_check_smc(e, ea, size);
         return;
@@ -1957,12 +1996,21 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
 
     case OP_PUSHA: emit_pusha32(e, live_in); slow_back(e, 0); return;
     case OP_POPA:  emit_popa32(e, live_in); slow_back(e, 0); return;
-    case OP_LEAVE:                                               /* ESP = EBP; POP EBP */
+    case OP_LEAVE: {                                             /* ESP = EBP; POP EBP */
+        /* the saved EBP read through [EBP] first, checked (a limit or a
+         * page can fault it), and only then ESP and EBP: a fault commits
+         * nothing, as the interpreter's LEAVE */
         fl_save(e, live_in);
-        emit_mov_rr(e, 4, X64_R12, X64_RBP);
-        emit_pop32(e, X64_RBP);
+        ea_t sp = { R_MEM, X64_RBP, S_SS };
+        emit_check_flat(e, &sp, 4, 0, 1);
+        m = ea_mem(&sp);
+        emit_mov_rm(e, 4, W_T2, &m);
+        m = M(X64_RBP, 4);
+        emit_lea(e, 4, X64_R12, &m);
+        emit_mov_rr(e, 4, X64_RBP, W_T2);
         slow_back(e, 0);
         return;
+    }
 
     case OP_BT: case OP_BTS: case OP_BTR: case OP_BTC: {
         int bt = in->op == OP_BT ? X64_BT_BT : in->op == OP_BTS ? X64_BT_BTS : in->op == OP_BTR ? X64_BT_BTR : X64_BT_BTC;
@@ -2594,13 +2642,17 @@ static void emit_shift_cl(emit_t *e, const x86_insn *in, ea_t *ea, uint32_t live
     x64_mem_t m, slot = M(R_CPU, OFF_JIT_FLAGS);
     int rcx = in->op == OP_RCL || in->op == OP_RCR;
     if (d->kind == OPK_MEM) emit_checks(e, ea, size, 1, live_in); else fl_save(e, live_in);
+    /* the temporary: W_T3, unless the operand's address lives there (a
+     * paged access leaves its translated pointer in W_T3), then W_T1 —
+     * free after the translation, and never both at once */
+    int t = (d->kind == OPK_MEM && (ea->segp == W_T3 || ea->off == W_T3)) ? W_T1 : W_T3;
     emit_test_ri(e, 1, X64_CL, 0x1F);
     uint32_t zero = emit_jcc_rel32(e, X64_CC_E);
     int fix_of = (live_out & X86_OF) != 0 && in->op != OP_SAR;
     if (fix_of && in->op == OP_SHR) {                            /* the original's sign, for a count of one */
-        if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_load_val(e, size, W_T3, &m); emit_shift_ri(e, 4, X64_SH_SHR, W_T3, size * 8 - 1); }
-        else { emit_mov_rr(e, 4, W_T3, is_high8(d) ? (d->reg & 3) : host_reg(d)); emit_shift_ri(e, 4, X64_SH_SHR, W_T3, is_high8(d) ? 15 : size * 8 - 1); }
-        emit_alu_ri(e, 4, X64_ALU_AND, W_T3, 1);
+        if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_load_val(e, size, t, &m); emit_shift_ri(e, 4, X64_SH_SHR, t, size * 8 - 1); }
+        else { emit_mov_rr(e, 4, t, is_high8(d) ? (d->reg & 3) : host_reg(d)); emit_shift_ri(e, 4, X64_SH_SHR, t, is_high8(d) ? 15 : size * 8 - 1); }
+        emit_alu_ri(e, 4, X64_ALU_AND, t, 1);
     }
     if (rcx) fl_need_cf(e);
     if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_shift_mcl(e, size, sh, &m); }
@@ -2608,10 +2660,10 @@ static void emit_shift_cl(emit_t *e, const x86_insn *in, ea_t *ea, uint32_t live
     int rot = in->op == OP_ROL || in->op == OP_ROR || rcx;
     if (!rot) { emit_pushfq(e); emit_pop_m(e, &slot); }
     else {                                                       /* a rotate writes CF and OF only: merge */
-        emit_pushfq(e); emit_pop_r(e, W_T3);
-        emit_alu_ri(e, 4, X64_ALU_AND, W_T3, X86_CF | X86_OF);
+        emit_pushfq(e); emit_pop_r(e, t);
+        emit_alu_ri(e, 4, X64_ALU_AND, t, X86_CF | X86_OF);
         emit_alu_mi(e, 4, X64_ALU_AND, &slot, ~(uint32_t)(X86_CF | X86_OF));
-        emit_alu_mr(e, 4, X64_ALU_OR, &slot, W_T3);
+        emit_alu_mr(e, 4, X64_ALU_OR, &slot, t);
     }
     if (fix_of) {
         /* OF, the last step's on the guest (the rotates leave SF alone,
@@ -2625,26 +2677,26 @@ static void emit_shift_cl(emit_t *e, const x86_insn *in, ea_t *ea, uint32_t live
             emit_alu_ri(e, 4, X64_ALU_AND, W_T2, 0x1F);
             emit_alu_ri(e, 4, X64_ALU_CMP, W_T2, 1);
             uint32_t one = emit_jcc_rel8(e, X64_CC_E);
-            emit_mov_ri(e, 4, W_T3, 0);
+            emit_mov_ri(e, 4, t, 0);
             emit_patch_rel8(e, one, emit_pos(e));
         } else {
-            if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_load_val(e, size, W_T3, &m); }
-            else emit_mov_rr(e, 4, W_T3, is_high8(d) ? (d->reg & 3) : host_reg(d));
+            if (d->kind == OPK_MEM) { m = ea_mem(ea); emit_load_val(e, size, t, &m); }
+            else emit_mov_rr(e, 4, t, is_high8(d) ? (d->reg & 3) : host_reg(d));
             if (in->op == OP_ROR || in->op == OP_RCR) {
-                emit_mov_rr(e, 4, W_T2, W_T3);
-                emit_shift_ri(e, 4, X64_SH_SHR, W_T3, msb);
+                emit_mov_rr(e, 4, W_T2, t);
+                emit_shift_ri(e, 4, X64_SH_SHR, t, msb);
                 emit_shift_ri(e, 4, X64_SH_SHR, W_T2, msb - 1);
-                emit_alu_rr(e, 4, X64_ALU_XOR, W_T3, W_T2);
+                emit_alu_rr(e, 4, X64_ALU_XOR, t, W_T2);
             } else {
-                emit_shift_ri(e, 4, X64_SH_SHR, W_T3, msb);
+                emit_shift_ri(e, 4, X64_SH_SHR, t, msb);
                 emit_mov_rm(e, 4, W_T2, &slot);
-                emit_alu_rr(e, 4, X64_ALU_XOR, W_T3, W_T2);           /* CF is bit 0 */
+                emit_alu_rr(e, 4, X64_ALU_XOR, t, W_T2);           /* CF is bit 0 */
             }
         }
-        emit_alu_ri(e, 4, X64_ALU_AND, W_T3, 1);
-        emit_shift_ri(e, 4, X64_SH_SHL, W_T3, 11);
+        emit_alu_ri(e, 4, X64_ALU_AND, t, 1);
+        emit_shift_ri(e, 4, X64_SH_SHL, t, 11);
         emit_alu_mi(e, 4, X64_ALU_AND, &slot, ~(uint32_t)X86_OF);
-        emit_alu_mr(e, 4, X64_ALU_OR, &slot, W_T3);
+        emit_alu_mr(e, 4, X64_ALU_OR, &slot, t);
     }
     emit_patch_rel32(e, zero, emit_pos(e));
     s_rf = 0;
@@ -2850,6 +2902,7 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
     s_regs32 = b->regs32;
     s_flat = b->flat;
     s_seg16 = b->seg16;
+    s_based = b->based;
     s_ss32 = b->ss32;
     s_paged = b->paged;
     s_pg_user = b->pg_user;
