@@ -391,7 +391,7 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
         code_page = (cpu->seg[S_CS].base + (b->flat ? cpu->eip : (cpu->eip & 0xFFFF))) & 0xFFFFF000u;
         uint32_t phys = x86_page_peek(cpu, code_page, user);
         if (phys == X86_PG_BAD || phys + 0xFFFu >= cpu->mem_size) return 0;
-        if (!dbt_note_code_page(dbt, code_page >> 12, phys >> 12, user)) return 0;
+        if (!dbt_note_code_page(dbt, code_page >> 12, phys >> 12, user, (uint8_t)((key & KEY_SPACE_MASK) >> KEY_SPACE_SHIFT))) return 0;
         if (phys != (code_page & cpu->a20_mask)) {
             uint32_t *alias = &dbt->phys_alias[phys >> 12];
             if (*alias && *alias != (code_page >> 12) + 1) return 0;   /* one alias per physical page */

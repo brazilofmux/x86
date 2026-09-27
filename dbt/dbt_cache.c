@@ -67,7 +67,8 @@ static void pcode_reset(x86_dbt *dbt) {
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
     pcode_reset(dbt);
     memset(dbt->phys_alias, 0, sizeof dbt->phys_alias);
-    memset(dbt->space_used, 0, sizeof dbt->space_used);   /* ids start over; the current space is 0 */
+    memset(dbt->space_used, 0, sizeof dbt->space_used);   /* ids start over */
+    memset(dbt->space_kernel, 0, sizeof dbt->space_kernel);
     dbt->space_next = 0;
     if (dbt->cpu && (dbt->cpu->cr0 & X86_CR0_PG)) dbt_space_current(dbt);
     /* An empty slot is all-ones in both words (its code pointer is never
@@ -313,27 +314,80 @@ static void drop_code_page(x86_dbt *dbt, uint32_t i) {
     dbt->tlb_page_drops++;
 }
 
+/* Space ID's code pages and their blocks go, and the id is free. A
+ * kernel space's CR3s choose again at their next load. */
+static void space_free(x86_dbt *dbt, uint8_t id) {
+    while (dbt->pcode_space[id] >= 0) {
+        int32_t i = dbt->pcode_space[id];
+        drop_code_page(dbt, (uint32_t)i);
+        dbt->pcode_space[id] = dbt->pcode[i].snext;
+        pcode_release(dbt, i);
+    }
+    if (dbt->space_kernel[id])
+        for (int s = 0; s < DBT_SPACES; s++)
+            if (dbt->space_used[s] && !dbt->space_kernel[s] && dbt->space_kspace[s] == id) dbt->space_kspace[s] = 0xFF;
+    dbt->space_used[id] = dbt->space_kernel[id] = 0;
+    dbt->space_evictions++;
+}
+
+/* An id for a new space: the oldest makes room, but never KEEP */
+static uint8_t space_alloc(x86_dbt *dbt, int keep) {
+    uint8_t id;
+    do { id = dbt->space_next; dbt->space_next = (uint8_t)((id + 1) % DBT_SPACES); } while (id == keep);
+    if (dbt->space_used[id]) space_free(dbt, id);
+    dbt->space_used[id] = 1;
+    return id;
+}
+
+/* Does kernel space K fit the page tables now: does every page it has
+ * code on map as it did? A page that maps nowhere means another layout
+ * — a VCPI client's tables beside its server's — and K does not fit
+ * (without DROP, neither does a remapped one). With DROP a page mapped
+ * somewhere else has moved within this layout: its blocks go, K stays. */
+static int kspace_fits(x86_dbt *dbt, uint8_t k, int drop) {
+    int32_t *pp = &dbt->pcode_space[k];
+    while (*pp >= 0) {
+        int32_t i = *pp;
+        uint32_t p = x86_page_peek(dbt->cpu, dbt->pcode[i].lin_page << 12, 0);
+        if (p == dbt->pcode[i].phys_page << 12) { pp = &dbt->pcode[i].snext; continue; }
+        if (p == X86_PG_BAD || !drop) return 0;
+        drop_code_page(dbt, (uint32_t)i);
+        *pp = dbt->pcode[i].snext;
+        pcode_release(dbt, i);
+    }
+    return 1;
+}
+
 /* The space CR3 names, registered if new — the oldest one making room,
- * its blocks gone — and made cpu->pg_space. */
+ * its blocks gone — made cpu->pg_space; and the kernel space its CPL 0
+ * code runs in: the one it had if that still fits, else any other that
+ * fits, else a new one — cpu->pg_kspace. */
 void dbt_space_current(x86_dbt *dbt) {
     x86_cpu *cpu = dbt->cpu;
     uint32_t cr3 = cpu->cr3 & 0xFFFFF000u;
+    int s = -1;
     for (int i = 0; i < DBT_SPACES; i++)
-        if (dbt->space_used[i] && dbt->space_cr3[i] == cr3) { cpu->pg_space = (uint8_t)i; return; }
-    uint8_t id = dbt->space_next;
-    dbt->space_next = (uint8_t)((id + 1) % DBT_SPACES);
-    if (dbt->space_used[id]) {
-        while (dbt->pcode_space[id] >= 0) {
-            int32_t i = dbt->pcode_space[id];
-            drop_code_page(dbt, (uint32_t)i);
-            dbt->pcode_space[id] = dbt->pcode[i].snext;
-            pcode_release(dbt, i);
-        }
-        dbt->space_evictions++;
+        if (dbt->space_used[i] && !dbt->space_kernel[i] && dbt->space_cr3[i] == cr3) { s = i; break; }
+    if (s < 0) {
+        s = space_alloc(dbt, dbt->space_used[cpu->pg_kspace] && dbt->space_kernel[cpu->pg_kspace] ? cpu->pg_kspace : -1);
+        dbt->space_cr3[s] = cr3;
+        dbt->space_kspace[s] = 0xFF;
     }
-    dbt->space_used[id] = 1;
-    dbt->space_cr3[id] = cr3;
-    cpu->pg_space = id;
+    uint8_t k = dbt->space_kspace[s];
+    if (k == 0xFF || !kspace_fits(dbt, k, 1)) {
+        uint8_t was = k;
+        k = 0xFF;
+        for (int j = 0; j < DBT_SPACES && k == 0xFF; j++)
+            if (j != was && dbt->space_used[j] && dbt->space_kernel[j] && kspace_fits(dbt, (uint8_t)j, 0)) k = (uint8_t)j;
+        if (k == 0xFF) {
+            k = space_alloc(dbt, s);
+            dbt->space_kernel[k] = 1;
+        }
+        if (was != 0xFF) dbt->kspace_moves++;
+        dbt->space_kspace[s] = k;
+    }
+    cpu->pg_space = (uint8_t)s;
+    cpu->pg_kspace = k;
 }
 
 /* cpu->tlb_hook: the page tables may map differently now (CR3 load, PG
@@ -367,10 +421,10 @@ void dbt_tlb_flushed(x86_cpu *cpu) {
 }
 
 /* A paged block is being translated on LIN_PAGE, which maps to PHYS_PAGE
- * (both page numbers) in the current space: note it for dbt_tlb_flushed.
+ * (both page numbers) in space SP (the key's: a process's, or a kernel
+ * space): note it for dbt_tlb_flushed.
  * 0 if the list is full — the caller then does not translate. */
-int dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user) {
-    uint8_t sp = dbt->cpu->pg_space;
+int dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user, uint8_t sp) {
     int32_t *head = &dbt->pcode_hash[pcode_bucket(lin_page, sp)];
     for (int32_t i = *head; i >= 0; i = dbt->pcode[i].hnext)
         if (dbt->pcode[i].lin_page == lin_page && dbt->pcode[i].space == sp) {

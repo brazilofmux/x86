@@ -277,7 +277,14 @@ typedef struct {
      * other space's blocks wait, unchecked, until it is current again. */
     uint32_t space_cr3[DBT_SPACES];
     uint8_t  space_used[DBT_SPACES], space_next;
-    uint64_t space_evictions;
+    /* Kernel spaces: CPL 0 code is keyed not by its process's space but by
+     * one of these, shared by every CR3 whose page tables map all of its
+     * code pages the same way — an OS's kernel, the same in every process,
+     * translated once instead of once per process. space_kernel marks an
+     * id as one; space_kspace is the one a CR3's space uses (0xFF: none
+     * chosen yet). */
+    uint8_t  space_kernel[DBT_SPACES], space_kspace[DBT_SPACES];
+    uint64_t space_evictions, kspace_moves;
     /* A remapped code page (UMB code, a memory manager mapped high): the
      * block keys are linear, the code bitmap and every SMC report
      * physical. phys_alias[physical page] is the linear page + 1 whose
@@ -387,7 +394,7 @@ void dbt_host_wrote(x86_cpu *cpu, uint32_t phys, uint32_t len);
 void dbt_a20_changed(x86_cpu *cpu, int on);
 void dbt_dev_changed(x86_cpu *cpu);
 void             dbt_tlb_flushed(x86_cpu *cpu);
-int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user);
+int              dbt_note_code_page(x86_dbt *dbt, uint32_t lin_page, uint32_t phys_page, int user, uint8_t space);
 void             dbt_space_current(x86_dbt *dbt);   /* register CR3's space, set cpu->pg_space */
 
 /* X86_GOLDEN=<path>: translate-only mode (dbt_common.c). The interpreter
@@ -531,7 +538,8 @@ static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
         && (dbt_seg_flat(&c->seg[S_DS], 0) || !c->seg[S_DS].usable)
         && (dbt_seg_flat(&c->seg[S_ES], 0) || !c->seg[S_ES].usable)) {
         b |= KEY_FLAT | (c->seg[S_ES].usable ? 0 : KEY_ESNULL) | (c->seg[S_DS].usable ? 0 : KEY_DSNULL);
-        if (c->cr0 & X86_CR0_PG) b |= KEY_PAGED | (uint64_t)c->pg_space << KEY_SPACE_SHIFT;
+        if (c->cr0 & X86_CR0_PG)
+            b |= KEY_PAGED | (uint64_t)((c->seg[S_CS].sel & 3) ? c->pg_space : c->pg_kspace) << KEY_SPACE_SHIFT;
     }
     else if (dbt_seg16_enabled && dbt_seg16_ok(c)) {
         b |= KEY_SEG16 | (c->seg[S_SS].big ? KEY_SS32 : 0);

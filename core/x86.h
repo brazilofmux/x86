@@ -148,7 +148,8 @@ typedef struct x86_cpu {
     void    *jit_aux;       /* DBT aux block base, reloaded by helper-call sequences */
     uint64_t jit_budget;    /* insn budget handed to the trampoline (exit stub math) */
     uint64_t jit_cnt_save;  /* pinned budget register parked across helper calls */
-    uint8_t  pg_space;      /* DBT: id of the address space CR3 names (paged block keys carry it) */
+    uint8_t  pg_space;      /* DBT: id of the address space CR3 names (paged block keys carry it)... */
+    uint8_t  pg_kspace;     /* ...and of the kernel space CPL 0 code is keyed by (dbt_space_current) */
     uint32_t jit_cur_lin;   /* linear address of the block making a helper call... */
     uint32_t jit_cur_hit;   /* ...set by the SMC sweep if that block got invalidated */
     uint64_t jit_flags;     /* x86-64 backend: the guest's arithmetic flags between blocks (an RFLAGS image; 64 bits: it is POPped into) */
