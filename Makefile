@@ -124,7 +124,8 @@ test-jit: $(JITTEST)
 	$(JITTEST) -p 0 && $(JITTEST) -p 1 && $(JITTEST) -m 286 -p 0 && \
 	$(JITTEST) -f 2000 && $(JITTEST) -m 286 -f 2000 && $(JITTEST) -m 386 -f 2000 && \
 	$(JITTEST) -P -f 3000 && $(JITTEST) -P -f 1000 -r 100000 -n 40 && \
-	$(JITTEST) -G -f 3000 && $(JITTEST) -G -f 1000 -r 100000 -n 40
+	$(JITTEST) -G -f 3000 && $(JITTEST) -G -f 1000 -r 100000 -n 40 && \
+	$(JITTEST) -B -f 3000 && $(JITTEST) -B -f 1000 -r 100000 -n 40 && $(JITTEST) -B -X -f 1000
 
 # DOS-level smoke tests (tests/dos/run.sh; uses disks/tp55 when present)
 test-dos: $(TARGET)

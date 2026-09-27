@@ -227,7 +227,7 @@ static int run_prog(int n, int model, int verify, int strict, int stats) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ref_s = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
 
-    x86_dbt dbt;
+    static x86_dbt dbt;          /* 12 MB (its per-page block records): not the stack's */
     if (dbt_init(&dbt, &cpu) < 0) return 1;
     dbt.verify = verify;
     dbt.insn_limit = verify ? 10000000 : 0;
@@ -284,8 +284,9 @@ static int fuzz_accept(const x86_insn *in) {
 /* Flat 32-bit protected mode (-P): what may go into a random block. No
  * control transfer, no segment load, nothing that raises (DIV, BOUND,
  * INTO, #UD) or changes TF/IOPL (POPF), no gates. */
+static int s_based;      /* -B: the flat fuzz through based, limited segments under paging */
 static int fuzz_accept_pm(const x86_insn *in) {
-    if (in->seg_override == S_CS || in->seg_override == S_FS || in->seg_override == S_GS) return 0;
+    if (in->seg_override == S_CS || (!s_based && (in->seg_override == S_FS || in->seg_override == S_GS))) return 0;
     if (in->lock) return 0;
     /* ECX is a random 32-bit value as soon as anything writes it: a REP
      * string op could then run for 4G iterations (on both machines). The
@@ -350,6 +351,53 @@ static void pm_flat_setup(x86_cpu *cpu) {
     cpu->eip = CODE_PM;
 }
 
+/* -B: the same machine made Linux 2.0's — paging on, with linear 0-8 MB
+ * and C0000000h-C0800000h both onto physical 0-8 MB, and every segment
+ * based at 0 or at C0000000h (offsets stay what the flat fuzz set, so a
+ * seed's program and registers are the same with and without -B) with a
+ * limit: the full 3 GB / 1 GB, or one inside the data window so some
+ * accesses run past it — #GP, or #SS through SS, through the IDT to the
+ * HLT. FS and GS sometimes null. */
+static void put_desc32(x86_cpu *cpu, uint32_t at, uint32_t base, uint32_t limit, uint32_t access) {
+    uint32_t lp = limit >> 12;
+    uint32_t lo = (lp & 0xFFFF) | ((base & 0xFFFF) << 16);
+    uint32_t hi = ((base >> 16) & 0xFF) | (access << 8) | (((lp >> 16) & 0xF) << 16) | (0xCu << 20) | (base & 0xFF000000u);
+    memcpy(cpu->mem + at, &lo, 4); memcpy(cpu->mem + at + 4, &hi, 4);
+}
+static void pm_based_adjust(x86_cpu *cpu) {
+    uint32_t pd = 0x130000, pt = 0x131000;
+    memset(cpu->mem + pd, 0, 0x3000);
+    for (uint32_t i = 0; i < 2048; i++) { uint32_t e = (i << 12) | 0x67; memcpy(cpu->mem + pt + 4 * i, &e, 4); }
+    for (uint32_t k = 0; k < 2; k++) {
+        uint32_t e = (pt + 0x1000u * k) | 0x27;
+        memcpy(cpu->mem + pd + 4 * k, &e, 4);
+        memcpy(cpu->mem + pd + 4 * (0x300 + k), &e, 4);
+    }
+    cpu->cr3 = pd;
+    cpu->cr0 |= X86_CR0_PG;
+    x86_tlb_flush(cpu);
+    uint32_t base = (rnd() & 1) ? 0xC0000000u : 0;
+    uint32_t full = base ? 0x3FFFFFFFu : 0xBFFFFFFFu;
+    static const uint16_t sels[6] = { 0x18, 0x08, 0x20, 0x10, 0x28, 0x30 };   /* ES CS SS DS FS GS */
+    for (int s = 0; s < 6; s++) {
+        x86_seg *g = &cpu->seg[s];
+        uint32_t lim = (s == S_CS || (rnd() % 4)) ? full : (DATA_PM + (rnd() & 0xFF000)) | 0xFFF;
+        int null = (s == S_FS || s == S_GS) && (rnd() % 4) == 0;
+        uint32_t access = s == S_CS ? 0x9B : 0x93;
+        put_desc32(cpu, 0x110000 + sels[s], base, lim, access);
+        memset(g, 0, sizeof *g);
+        if (null) continue;
+        g->sel = sels[s]; g->usable = 1; g->base = base; g->limit = lim; g->big = 1;
+        g->attr = (uint16_t)(access | 0xC00);
+    }
+    cpu->gdtr.limit = 0x37;
+    for (int v = 0; v < 32; v++) {
+        uint32_t gate[2] = { (DE_STUB_PM & 0xFFFF) | (0x08u << 16), (DE_STUB_PM & 0xFFFF0000u) | 0x8E00u };
+        memcpy(cpu->mem + 0x110100 + 8 * v, gate, sizeof gate);
+    }
+    cpu->idtr.limit = 32 * 8 - 1;
+}
+
 enum { P_OUTER, P_INNER, P_PATCH1, P_PATCH2 };
 /* PM program 0: R_DrawColumn's shape. Per outer pass, store a new step
  * into the imm32 of two `add ebp, imm32` inside the inner loop, then run
@@ -390,7 +438,7 @@ static int run_pm_prog(int n, int stats) {
     pm_flat_setup(&cpu);
     cpu.r[R_SP] = DATA_PM + 0x80000;
     memcpy(cpu.mem + CODE_PM, A.buf, A.len);
-    x86_dbt dbt;
+    static x86_dbt dbt;          /* 12 MB (its per-page block records): not the stack's */
     if (dbt_init(&dbt, &cpu) < 0) return 1;
     dbt.verify = 1;
     dbt.insn_limit = 10000000;
@@ -448,6 +496,7 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     if (s_wild) { cpu.r[R_SI] = (uint32_t)rnd(); cpu.r[R_BP] = (uint32_t)rnd(); }
     cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
     cpu.eip = CODE_PM;
+    if (s_based) pm_based_adjust(&cpu);
     memcpy(cpu.mem + CODE_PM, prog, plen);
     for (uint32_t i = 0; i < 0x110000; i++) cpu.mem[DATA_PM + i] = (uint8_t)rnd();
     for (uint32_t i = 0x20000; i < 0xC0000; i++) cpu.mem[i] = (uint8_t)rnd();
@@ -457,7 +506,7 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
         for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
         fprintf(stderr, "\n");
     }
-    x86_dbt dbt;
+    static x86_dbt dbt;          /* 12 MB (its per-page block records): not the stack's */
     if (dbt_init(&dbt, &cpu) < 0) return 1;
     dbt.verify = 1;
     dbt.verify_mem_every = 1;
@@ -465,7 +514,10 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     int rc = dbt_run(&dbt);
     if (verbose) dbt_print_stats(&dbt, stderr);
     if (rc != 0 || verbose) {
-        fprintf(stderr, "%s seed=%llu pm len=%d:", rc ? "FAIL" : "ok", (unsigned long long)seed, len);
+        fprintf(stderr, "%s seed=%llu %s len=%d:", rc ? "FAIL" : "ok", (unsigned long long)seed, s_based ? "based" : "pm", len);
+        if (s_based) fprintf(stderr, " [base %08X lim cs %X ds %X es %X ss %X fs %X/%d gs %X/%d]", cpu.seg[S_CS].base, cpu.seg[S_CS].limit,
+                             cpu.seg[S_DS].limit, cpu.seg[S_ES].limit, cpu.seg[S_SS].limit, cpu.seg[S_FS].limit, cpu.seg[S_FS].usable,
+                             cpu.seg[S_GS].limit, cpu.seg[S_GS].usable);
         for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
         fprintf(stderr, "\n");
         uint32_t ip = 0; uint8_t buf[16]; x86_insn in; char d[128];
@@ -588,7 +640,7 @@ static int fuzz_one_seg16(int len, uint64_t seed, int verbose) {
         for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
         fprintf(stderr, "\n");
     }
-    x86_dbt dbt;
+    static x86_dbt dbt;          /* 12 MB (its per-page block records): not the stack's */
     if (dbt_init(&dbt, &cpu) < 0) return 1;
     dbt.verify = 1;
     dbt.verify_mem_every = 1;
@@ -698,7 +750,7 @@ static int fuzz_one(int model, int len, uint64_t seed, int verbose) {
         for (int i = 0; i < plen; i++) fprintf(stderr, " %02X", prog[i]);
         fprintf(stderr, "\n");
     }
-    x86_dbt dbt;
+    static x86_dbt dbt;          /* 12 MB (its per-page block records): not the stack's */
     if (dbt_init(&dbt, &cpu) < 0) return 1;
     dbt.verify = 1;
     dbt.insn_limit = 1000000;
@@ -741,7 +793,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-P")) pm = 1;
         else if (!strcmp(argv[i], "-X")) s_wild = 1;
         else if (!strcmp(argv[i], "-G")) pm = 2;
-        else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] [-P] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "-B")) { pm = 1; s_based = 1; }
+        else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] [-P|-B|-G] [-X] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
     }
     if (prog >= 0 && pm) return run_pm_prog(prog, stats);
     if (prog >= 0) return run_prog(prog, model, verify, strict, stats);
@@ -751,7 +804,8 @@ int main(int argc, char **argv) {
             fails += pm == 2 ? fuzz_one_seg16(len, seed + (uint64_t)i, verbose)
                    : pm ? fuzz_one_pm(len, seed + (uint64_t)i, verbose) : fuzz_one(model, len, seed + (uint64_t)i, verbose);
         printf("fuzz: %d/%d failed (seeds %llu..%llu, %s, len %d)\n", fails, fuzz,
-               (unsigned long long)seed, (unsigned long long)(seed + fuzz - 1), pm == 2 ? "segmented 16-bit PM" : pm ? "flat PM" : "real mode", len);
+               (unsigned long long)seed, (unsigned long long)(seed + fuzz - 1),
+               pm == 2 ? "segmented 16-bit PM" : s_based ? "based 32-bit PM" : pm ? "flat PM" : "real mode", len);
         return fails != 0;
     }
     return 2;

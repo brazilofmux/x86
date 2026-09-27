@@ -46,6 +46,7 @@ static void build_tables(x86_jit_aux *aux) {
 }
 
 int dbt_seg16_enabled = 1;
+int dbt_seg32_enabled = 1;
 
 int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     memset(dbt, 0, sizeof(*dbt));
@@ -60,6 +61,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     }
 
     if (getenv("X86_NO_SEG16")) dbt_seg16_enabled = 0;
+    if (getenv("X86_NO_SEG32") || !dbt_arch_seg32()) dbt_seg32_enabled = 0;
     dbt->phases = getenv("X86_PHASES") != NULL;
     dbt->aux       = calloc(1, sizeof(x86_jit_aux));
     dbt->span      = calloc(BLOCK_CACHE_SIZE, sizeof(uint32_t));

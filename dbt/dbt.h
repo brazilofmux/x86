@@ -99,7 +99,8 @@ _Static_assert(BLOCK_CACHE_SIZE >= X86_LOW_SIZE, "real mode must not alias in th
 #define KEY_PMODE          (1ull << 48)
 #define KEY_BIG            (1ull << 49)   /* CS D bit: 32-bit default operand/address size */
 #define KEY_FLAT           (1ull << 50)   /* CS, DS, ES, SS all base 0, limit 4G, 32-bit (dbt_seg_flat) */
-#define KEY_SEG16          (1ull << 51)
+#define KEY_SEG16          (1ull << 51)   /* segmented, limits checked: with KEY_BIG clear a 16-bit code segment
+                                             * (dbt_seg16_ok), with it set a 32-bit one (dbt_seg32_ok: a based block) */
 #define KEY_V86            (1ull << 52)   /* virtual-8086 mode: real-mode-shaped code at CPL 3 */
 #define KEY_IOPL3          (1ull << 53)   /* V86 at IOPL 3: CLI/STI/PUSHF behave as in real mode */
 #define KEY_PAGED          (1ull << 54)   /* under paging: V86 through cpu->pgd_r/pgd_w, flat PM through cpu->tlb */
@@ -160,8 +161,10 @@ static inline uint32_t dbt_slot(uint64_t key) {
 }
 /* Every mode-bit combination a key can carry: real; PM 16-bit; PM 32-bit;
  * flat; segmented 16-bit. The SMC sweep probes each. */
-#define KEY_MODE_VARIANTS 6
-static const uint32_t dbt_key_modes[KEY_MODE_VARIANTS] = { 0, 1, 3, 7, 9, 16 };
+#define KEY_MODE_VARIANTS 7
+static const uint32_t dbt_key_modes[KEY_MODE_VARIANTS] = { 0, 1, 3, 7, 9, 11, 16 };
+/* ... and which of those a paged key can carry (V86, flat, seg16, based) */
+static inline int dbt_key_mode_paged(uint32_t m) { return m == 7 || m == 9 || m == 11 || m == 16; }
 
 #ifndef MAX_BLOCK_INSNS
 #define MAX_BLOCK_INSNS    64
@@ -453,6 +456,7 @@ typedef struct {
     int      model;             /* cpu->model */
     /* The block's shape, from the key and the cpu. */
     uint8_t  flat, seg16, ss32, v86, paged, iopl3, pg_user, esnull, dsnull;
+    uint8_t  based;                /* a flat-shaped block through based, limited segments (flat is set too) */
     uint8_t  devread;           /* a device answers reads in the VGA window (planar VGA) */
     uint8_t  regs32;            /* 386: the pinned registers hold all 32 bits */
     uint8_t  wrap_exact;        /* < 286: word accesses at offset FFFF wrap in-segment */
@@ -497,6 +501,7 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b);   /* host code f
  * every instruction the interpreter does not claim; a no makes it a
  * helper. b->decs is not filled in yet when this is called. */
 int      dbt_arch_can_inline(const dbt_block *b, const x86_insn *in);
+int      dbt_arch_seg32(void);     /* does the backend emit based blocks? (else they stay the interpreter's) */
 void     dbt_emit_trampoline(x86_dbt *dbt);
 void     dbt_arch_patch_link(x86_dbt *dbt, uint32_t site_off, uint8_t *target);
 
@@ -550,6 +555,33 @@ static inline int dbt_seg16_ok(const x86_cpu *c) {
 
 extern int dbt_seg16_enabled;   /* X86_NO_SEG16 clears it: segmented 16-bit PM blocks stay all-helper (A/B) */
 
+/* 32-bit segmented protected mode (a based block: KEY_SEG16 with
+ * KEY_BIG): flat-shaped code — 32-bit offsets, ESP, full EIP — through
+ * segments with a base and a limit. Linux 2.0's kernel runs in segments
+ * based at C0000000h with a 1 GB limit, its programs in ones based at 0
+ * with a 3 GB limit; nothing there is flat by dbt_seg_flat, and it all
+ * ran in the interpreter. Each access checks the offset against the
+ * segment's limit and adds its base, both read from the cpu at run time
+ * (the block's key names CS only; DS/ES/FS/GS change under it, and every
+ * segment load ends a block, so a segment is re-examined here before the
+ * next one). Needs 32-bit CS and SS, expand-up; data segments null or
+ * writable expand-up data (a store through a read-only or code segment
+ * is a #GP the run-time check does not make, so such a segment keeps the
+ * interpreter); and paging, whose TLB path the accesses go through. */
+static inline int dbt_seg32_data_ok(const x86_seg *g) {
+    if (!g->usable) return 1;
+    return X86_AR_S(g->attr) && !(g->attr & X86_TYPE_CODE) && (g->attr & X86_TYPE_WRITABLE) && !(g->attr & X86_TYPE_EXPDOWN);
+}
+static inline int dbt_seg32_ok(const x86_cpu *c) {
+    const x86_seg *cs = &c->seg[S_CS], *ss = &c->seg[S_SS];
+    if (!cs->usable || !cs->big || !X86_AR_S(cs->attr) || !(cs->attr & X86_TYPE_CODE)) return 0;
+    if (!ss->usable || !ss->big || !X86_AR_S(ss->attr) || (ss->attr & X86_TYPE_CODE)
+        || !(ss->attr & X86_TYPE_WRITABLE) || (ss->attr & X86_TYPE_EXPDOWN)) return 0;
+    return dbt_seg32_data_ok(&c->seg[S_DS]) && dbt_seg32_data_ok(&c->seg[S_ES])
+        && dbt_seg32_data_ok(&c->seg[S_FS]) && dbt_seg32_data_ok(&c->seg[S_GS]);
+}
+extern int dbt_seg32_enabled;   /* X86_NO_SEG32 clears it: 32-bit segmented paged PM stays the interpreter's */
+
 /* Mode bits of a key for the current segments. */
 static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
     uint64_t a20 = c->a20_mask != 0xFFFFFFFFu ? KEY_A20OFF : 0;
@@ -569,6 +601,9 @@ static inline uint64_t dbt_cpu_mode_bits(const x86_cpu *c) {
     else if (dbt_seg16_enabled && dbt_seg16_ok(c)) {
         b |= KEY_SEG16 | (c->seg[S_SS].big ? KEY_SS32 : 0);
         if (c->cr0 & X86_CR0_PG) b |= KEY_PAGED | (uint64_t)c->pg_space << KEY_SPACE_SHIFT;
+    }
+    else if (dbt_seg32_enabled && (c->cr0 & X86_CR0_PG) && dbt_seg32_ok(c)) {   /* based: KEY_SEG16 with KEY_BIG */
+        b |= KEY_SEG16 | KEY_PAGED | (uint64_t)((c->seg[S_CS].sel & 3) ? c->pg_space : c->pg_kspace) << KEY_SPACE_SHIFT;
     }
     return b;
 }

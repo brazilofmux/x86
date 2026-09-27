@@ -182,7 +182,7 @@ static void sweep_blocks_at(x86_dbt *dbt, uint32_t lin) {
     for (uint32_t k = 0; k < window && k <= lin; k++) {
         uint32_t p = lin - k;
         for (int m = 0; m < KEY_MODE_VARIANTS; m++)
-        for (int si = 0; si < ((dbt_key_modes[m] & 4) || dbt_key_modes[m] == 9 || dbt_key_modes[m] == 16 ? nsp : 1); si++) {
+        for (int si = 0; si < (dbt_key_mode_paged(dbt_key_modes[m]) ? nsp : 1); si++) {
             uint32_t slot = dbt_slot_hash(p, dbt_key_modes[m], spaces[si]);
             x86_block_entry *e = &dbt->aux->cache[slot];
             if (e->key == BLOCK_EMPTY_KEY || dbt_key_lin(e->key) != p || k >= dbt->span[slot]) continue;
@@ -337,11 +337,12 @@ static void page_record(x86_dbt *dbt, uint64_t key, uint8_t *code, uint32_t span
  * blocks sit in 4096 consecutive slots per key mode: V86, flat 32-bit
  * PM, and segmented 16-bit PM. */
 static void scan_evict_page(x86_dbt *dbt, uint32_t lin, uint8_t sp) {
-    static const uint32_t modes[3] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
+    static const uint32_t modes[4] = { (uint32_t)(KEY_V86 >> KEY_MODE_SHIFT),
                                        (uint32_t)((KEY_PMODE | KEY_BIG | KEY_FLAT) >> KEY_MODE_SHIFT),
-                                       (uint32_t)((KEY_PMODE | KEY_SEG16) >> KEY_MODE_SHIFT) };
+                                       (uint32_t)((KEY_PMODE | KEY_SEG16) >> KEY_MODE_SHIFT),
+                                       (uint32_t)((KEY_PMODE | KEY_BIG | KEY_SEG16) >> KEY_MODE_SHIFT) };
     uint64_t space = (uint64_t)sp << KEY_SPACE_SHIFT;
-    for (int m = 0; m < 3; m++)
+    for (int m = 0; m < 4; m++)
         for (uint32_t k = 0; k < 4096; k++) {
             uint32_t slot = dbt_slot_hash(lin + k, modes[m], sp);
             x86_block_entry *e = &dbt->aux->cache[slot];
@@ -454,12 +455,22 @@ static uint8_t space_alloc(x86_dbt *dbt, int keep) {
  * — a VCPI client's tables beside its server's — and K does not fit
  * (without DROP, neither does a remapped one). With DROP a page mapped
  * somewhere else has moved within this layout: its blocks go, K stays. */
+static void park_page(x86_dbt *dbt, int32_t i);
+static void unpark_page(x86_dbt *dbt, int32_t i);
 static int kspace_fits(x86_dbt *dbt, uint8_t k, int drop) {
     int32_t *pp = &dbt->pcode_space[k];
     while (*pp >= 0) {
         int32_t i = *pp;
-        uint32_t p = x86_page_peek(dbt->cpu, dbt->pcode[i].lin_page << 12, 0);
-        if (p == dbt->pcode[i].phys_page << 12) { pp = &dbt->pcode[i].snext; continue; }
+        int acc;
+        uint32_t p = x86_page_peek_acc(dbt->cpu, dbt->pcode[i].lin_page << 12, 0, &acc);
+        if (p == dbt->pcode[i].phys_page << 12) {
+            /* mapped as it was: in reach — unless its accessed bits are
+             * clear (a fresh page table), when its first fetch must walk:
+             * parked until then (dbt_page_revive) */
+            if (drop) { if (acc) unpark_page(dbt, i); else park_page(dbt, i); }
+            pp = &dbt->pcode[i].snext;
+            continue;
+        }
         if (p == X86_PG_BAD || !drop) return 0;
         drop_code_page(dbt, (uint32_t)i);
         *pp = dbt->pcode[i].snext;
@@ -488,8 +499,9 @@ static void uspace_enter(x86_dbt *dbt, uint8_t u) {
     int32_t *pp = &dbt->pcode_space[u];
     while (*pp >= 0) {
         int32_t i = *pp;
-        uint32_t p = x86_page_peek(dbt->cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user);
-        if (p == dbt->pcode[i].phys_page << 12) unpark_page(dbt, i);
+        int acc;
+        uint32_t p = x86_page_peek_acc(dbt->cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user, &acc);
+        if (p == dbt->pcode[i].phys_page << 12) { if (acc) unpark_page(dbt, i); else park_page(dbt, i); }   /* (accessed bits clear: parked, see kspace_fits) */
         else if (p == X86_PG_BAD) park_page(dbt, i);
         else {
             drop_code_page(dbt, (uint32_t)i);
@@ -605,6 +617,9 @@ uint8_t *dbt_page_revive(x86_dbt *dbt, uint64_t key) {
     if (i < 0 || !dbt->pcode[i].parked) return NULL;
     uint32_t p = x86_page_peek(dbt->cpu, dbt->pcode[i].lin_page << 12, dbt->pcode[i].user);
     if (p != dbt->pcode[i].phys_page << 12) { drop_code_page(dbt, (uint32_t)i); return NULL; }
+    /* the fetch the interpreter would make here: a walk that sets the
+     * page's accessed bits (and fills the TLB), once, at first execution */
+    (void)x86_phys_rd8(dbt->cpu, dbt_key_lin(key));
     unpark_page(dbt, i);
     uint32_t slot = dbt_slot(key);
     x86_block_entry *e = &dbt->aux->cache[slot];

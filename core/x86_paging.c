@@ -56,14 +56,25 @@ static inline int pse_big(const x86_cpu *c, uint32_t pde) {
     return (pde & 0x80) && (c->cr4 & X86_CR4_PSE);
 }
 
-uint32_t x86_page_peek(x86_cpu *c, uint32_t lin, int user) {
+/* ... and whether a walk would still change the tables: *accessed says
+ * both levels carry their accessed bit. A fetch of a cached block on a
+ * page that lacks one must walk once (dbt_page_revive), as the
+ * interpreter's fetch would, or the guest's page tables — and -V — see
+ * a difference. */
+uint32_t x86_page_peek_acc(x86_cpu *c, uint32_t lin, int user, int *accessed) {
     uint32_t need = user ? 5u : 1u;
     uint32_t pde = phys_rd32(c, (c->cr3 & 0xFFFFF000u) | ((lin >> 20) & 0xFFCu));
+    *accessed = 0;
     if ((pde & need) != need) return X86_PG_BAD;
-    if (pse_big(c, pde)) return ((pde & 0xFFC00000u) | (lin & 0x003FF000u)) & c->a20_mask;
+    if (pse_big(c, pde)) { *accessed = (pde & 0x20) != 0; return ((pde & 0xFFC00000u) | (lin & 0x003FF000u)) & c->a20_mask; }
     uint32_t pte = phys_rd32(c, (pde & 0xFFFFF000u) | ((lin >> 10) & 0xFFCu));
     if ((pte & need) != need) return X86_PG_BAD;
+    *accessed = (pde & pte & 0x20) != 0;
     return (pte & 0xFFFFF000u) & c->a20_mask;
+}
+uint32_t x86_page_peek(x86_cpu *c, uint32_t lin, int user) {
+    int acc;
+    return x86_page_peek_acc(c, lin, user, &acc);
 }
 
 /* Is a physical page one translated code may address straight? */

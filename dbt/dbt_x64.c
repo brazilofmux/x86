@@ -1472,6 +1472,12 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
 }
 
 /* The front end asks: real-mode-shaped blocks and flat ones, unpaged. */
+/* Based blocks (32-bit segmented PM, dbt_seg32_ok) are not emitted here
+ * yet: the flat emitters address off R_MEM with no segment base or limit,
+ * and the dynamic key takes EIP for the linear address. Until they learn
+ * both, that code stays the interpreter's on this backend, as before. */
+int dbt_arch_seg32(void) { return 0; }
+
 int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
     if (getenv("X86_X64_HELPERS")) return 0;
     if (b->paged && getenv("X86_X64_NOPAGED")) return 0;

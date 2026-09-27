@@ -214,13 +214,13 @@ static int op_may_fault(const dbt_block *b, const x86_insn *in) {
     case OP_INT: case OP_INT3:
         return 1;                     /* the frame carries FLAGS: all of them must be materialized */
     case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
-        return in->ops[0].size >= 2 || b->seg16;    /* the slow path's helper can fault, frame and all */
+        return in->ops[0].size >= 2 || b->seg16 || b->based;   /* the slow path's helper can fault, frame and all */
     case OP_XLAT:
-        return b->seg16;                            /* an implicit byte read: only a limit can fault it */
+        return b->seg16 || b->based;                /* an implicit byte read: only a limit can fault it */
     default: break;
     }
     for (int i = 0; i < 2; i++)
-        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || b->seg16)) return 1;   /* seg16: a limit is any size's problem */
+        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || b->seg16 || b->based)) return 1;   /* a limit is any size's problem */
     return 0;
 }
 
@@ -381,7 +381,10 @@ static int plan_pm(x86_dbt *dbt, dbt_block *b) {
 static int plan_block(x86_dbt *dbt, dbt_block *b) {
     x86_cpu *cpu = dbt->cpu;
     uint64_t key = b->key;
-    b->flat = cpu->pmode && !b->v86 && (key & KEY_FLAT) != 0;    /* from here on: real mode or V86, a flat block, or a segmented 16-bit one */
+    /* from here on: real mode or V86, a flat block (based or not), or a
+     * segmented 16-bit one */
+    b->based = cpu->pmode && !b->v86 && (key & (KEY_SEG16 | KEY_BIG)) == (KEY_SEG16 | KEY_BIG);
+    b->flat = cpu->pmode && !b->v86 && ((key & KEY_FLAT) != 0 || b->based);
     b->seg16 = cpu->pmode && !b->v86 && !b->flat;
     b->ss32 = b->seg16 && (key & KEY_SS32) != 0;
     b->mode_bits = key & 0x7FFF000000000000ull;
@@ -389,6 +392,7 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
     b->devread = cpu->device_read != NULL;
     b->dsnull = (key & KEY_DSNULL) != 0;
     b->pg_user = (b->flat || b->seg16) && b->paged && (cpu->seg[S_CS].sel & 3) == 3;
+    if (b->based && !dbt_arch_seg32()) return 0;   /* (the key is never made then; belt and braces) */
     uint32_t code_page = 0, code_delta = 0;     /* physical - linear, mod 2^32: add it before indexing mem */
     if (b->paged) {
         /* A paged block (V86, or flat protected mode) stays on one code
@@ -453,7 +457,7 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
                 if (dbt_smc_hot(dbt->smc_heat, dbt->smc_win, at + k, now)) { hot = 1; break; }
             if (hot) { dbt->smc_hot_refusals++; break; }
         }
-        if (b->seg16 && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
+        if ((b->seg16 || b->based) && ip + in->len - 1 > cpu->seg[S_CS].limit) break;   /* past the code limit: #GP is the interpreter's */
         int c = b->flat ? classify_flat(b, in) : b->seg16 ? classify_seg16(b, in) : classify(b, in);
         if (b->v86) c = classify_v86(b, in, c);
         if (b->seg16 && b->paged && c == C_INLINE) {
@@ -475,6 +479,14 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
             if (b->esnull && in->ea_valid && in->seg == S_ES) c = C_HELPER;          /* #GP: the interpreter's */
             if (b->dsnull && in->ea_valid && in->seg == S_DS) c = C_HELPER;
             if (b->paged && (in->op == OP_PUSHA || in->op == OP_POPA)) c = C_HELPER;  /* two accesses */
+        }
+        if (b->based && c == C_INLINE) {
+            /* the string ops address through two segments at once, each
+             * with a base and a limit of its own: the interpreter's */
+            switch (in->op) {
+            case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS: c = C_HELPER; break;
+            default: break;
+            }
         }
         if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
         /* 486: POPFD can set EFLAGS.AC; ending the block with the run loop
@@ -519,7 +531,15 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
             op_flag_effects(&decs[i], b->cls[i], &rd, &wr);
             /* 286+: a limit fault is an unplanned exit whose frame holds
              * the flags, so an op that can fault observes all of them. */
-            if (cpu->model >= X86_MODEL_286 && !b->flat && op_may_fault(b, &decs[i])) rd |= ARITH;
+            /* (A plain flat block is exempt: no access through a flat segment
+             * faults on a limit. Under paging one can still #PF, and the
+             * frame then shows the flags dead at that op as they were —
+             * which no guest instruction reads before rewriting them, so
+             * only -V sees it; under -V they are kept exact, at the 3-5%
+             * that costs a paged guest. A based block's accesses fault on
+             * their limits, so it keeps its flags exact, as seg16 does.) */
+            if (cpu->model >= X86_MODEL_286 && (!b->flat || b->based || (b->paged && dbt->verify)) && op_may_fault(b, &decs[i]))
+                rd |= ARITH;
             /* A store can leave the block after the op (SMC): all live out.
              * Split that from what the block itself reads — the difference
              * is observed only if the sweep does abandon the block, so a

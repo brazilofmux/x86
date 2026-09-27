@@ -125,6 +125,7 @@ static inline uint32_t topshift(int size) { return size == 1 ? 24 : size == 2 ? 
 /* Flat protected mode (a KEY_FLAT block, see dbt_seg_flat): 32-bit
  * effective addresses straight off R_MEM, keys built with s_mode_bits. */
 static int s_flat;
+static int s_based;           /* ... a flat block through based, limited segments (s_flat is set too) */
 static uint64_t s_mode_bits;
 /* Virtual-8086 blocks (KEY_V86) are real-mode blocks at CPL 3: what V86
  * does differently goes to the interpreter (classify_v86, dbt_translate.c), and under
@@ -442,6 +443,7 @@ static a64_reg_t seg_ptr_reg(int s) {
 
 static void emit_flat_check(emit_t *e, a64_reg_t off);
 static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only);
+static void emit_limit_check32(emit_t *e, int seg, a64_reg_t off, int size);
 static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea);
 static void emit_ea_seg16_paged(emit_t *e, const x86_insn *in, ea_t *ea);
 static void flat_slow_site(emit_t *e);
@@ -475,14 +477,27 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
         ea->off = acc;
     }
     if (in->op == OP_LEA) return;
+    int store_only = in->op == OP_MOV && in->ops[0].kind == OPK_MEM;   /* a MOV to memory only stores: the VGA window is fine for that */
+    if (s_based) {
+        /* A based segment: the offset against its limit, then the linear
+         * address, base + offset (wrapping at 4 GB, as the CPU's), through
+         * the TLB as any paged flat access — both from the cpu, since the
+         * segment may differ from the last time this block ran. */
+        int size = flat_access_size(in);
+        emit_limit_check32(e, in->seg, ea->off, size);
+        emit_ldr_w32_imm(e, W_T2, R_CPU, OFF_SEG_BASE(in->seg));
+        emit_add_w32(e, W_OFF, W_T2, ea->off);
+        emit_pgflat(e, W_OFF, size, !writes_mem_operand(in) ? PG_READ : store_only ? PG_STORE : PG_RMW);
+        ea->segp = X_SEGP;
+        ea->off = W_OFF;
+        return;
+    }
     if (s_paged) {
-        /* a MOV to memory only stores: the VGA window is fine for that */
-        int store_only = in->op == OP_MOV && in->ops[0].kind == OPK_MEM;
         emit_pgflat(e, ea->off, flat_access_size(in), !writes_mem_operand(in) ? PG_READ : store_only ? PG_STORE : PG_RMW);
         ea->segp = X_SEGP;
         return;
     }
-    emit_flat_check_as(e, ea->off, in->op == OP_MOV && in->ops[0].kind == OPK_MEM);
+    emit_flat_check_as(e, ea->off, store_only);
 }
 
 /* Compute the effective address. Uses W_OFF (and X_SEGP for CS/FS/GS);
@@ -671,6 +686,24 @@ static void emit_limit_check(emit_t *e, int seg, a64_reg_t off, int size) {
     emit_ldrb_imm(e, W_T1, R_CPU, OFF_SEG_USABLE(seg));
     emit_ccmp_w32_imm(e, W_T1, 0, 0x4, A64_COND_LS);   /* in range: Z = !usable; past it: Z = 1 */
     fault_site(e, (uint8_t)(seg == S_SS && s_regs32 ? X86_EXC_SS : X86_EXC_GP));
+    emit_b_cond(e, A64_COND_EQ, 0);
+}
+
+/* The same for a 32-bit offset (a based block): the last byte's offset is
+ * formed in 64 bits, since offset + 3 can wrap past 4 GB, and compared
+ * as such. Clobbers W_T1, W_T3. */
+static void emit_limit_check32(emit_t *e, int seg, a64_reg_t off, int size) {
+    a64_reg_t hi = off;
+    if (size > 1) {
+        emit_movz_w32(e, W_T3, (uint16_t)(size - 1), 0);
+        emit_add_x64_w32_uxtw(e, W_T3, W_T3, off);
+        hi = W_T3;
+    }
+    emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_LIMIT(seg));
+    emit_cmp_x64_x64(e, hi, W_T1);
+    emit_ldrb_imm(e, W_T1, R_CPU, OFF_SEG_USABLE(seg));
+    emit_ccmp_w32_imm(e, W_T1, 0, 0x4, A64_COND_LS);   /* in range: Z = !usable; past it: Z = 1 */
+    fault_site(e, (uint8_t)(seg == S_SS ? X86_EXC_SS : X86_EXC_GP));
     emit_b_cond(e, A64_COND_EQ, 0);
 }
 
@@ -1783,21 +1816,32 @@ static void emit_load_seg_real(emit_t *e, int s, a64_reg_t sel) {
  * access (slow path: the whole instruction through the helper) before
  * anything moves; ESP is re-derived after the SMC check, which clobbers
  * the scratch registers when it fires. */
+/* The stack slot at SS:OFF (32-bit ESP) of a based block: SS's limit,
+ * then base + offset through the TLB; X_SEGP + W_OFF addresses it after.
+ * Clobbers W_T1, W_T3, X0-X2 besides. */
+static void emit_stk_based(emit_t *e, a64_reg_t off, int size, int mode) {
+    emit_limit_check32(e, S_SS, off, size);
+    emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_BASE(S_SS));
+    emit_add_w32(e, W_OFF, W_T1, off);
+    emit_pgflat(e, W_OFF, size, mode);
+}
 static void emit_push32_flat(emit_t *e, a64_reg_t val) {
     emit_sub_w32_imm(e, W_T2, R_GPR(R_SP), 4);
-    a64_reg_t base = R_MEM;
-    if (s_paged) { emit_pgflat(e, W_T2, 4, 1); base = X_SEGP; }
+    a64_reg_t base = R_MEM, off = W_T2;
+    if (s_based) { emit_stk_based(e, W_T2, 4, PG_STORE); base = X_SEGP; off = W_OFF; }
+    else if (s_paged) { emit_pgflat(e, W_T2, 4, 1); base = X_SEGP; }
     else emit_flat_check_as(e, W_T2, 1);
-    emit_str_w32_reg_uxtw(e, val, base, W_T2);
-    emit_add_x64_w32_uxtw(e, W_T3, base, W_T2);
+    emit_str_w32_reg_uxtw(e, val, base, off);
+    emit_add_x64_w32_uxtw(e, W_T3, base, off);
     emit_smc_check_x3(e, 4);
     emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
 }
 static void emit_pop32_flat(emit_t *e, a64_reg_t dst) {
-    a64_reg_t base = R_MEM;
-    if (s_paged) { emit_pgflat(e, R_GPR(R_SP), 4, 0); base = X_SEGP; }
+    a64_reg_t base = R_MEM, off = R_GPR(R_SP);
+    if (s_based) { emit_stk_based(e, R_GPR(R_SP), 4, PG_READ); base = X_SEGP; off = W_OFF; }
+    else if (s_paged) { emit_pgflat(e, R_GPR(R_SP), 4, 0); base = X_SEGP; }
     else emit_flat_check(e, R_GPR(R_SP));
-    emit_ldr_w32_reg_uxtw(e, dst, base, R_GPR(R_SP));
+    emit_ldr_w32_reg_uxtw(e, dst, base, off);
     emit_add_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
 }
 
@@ -2699,8 +2743,12 @@ static int a64_real_inline(const x86_insn *in) {
  * what they cover with 32-bit addressing through DS/ES/SS. Near
  * transfers need a 32-bit operand size (a 16-bit one truncates EIP) and
  * the LOOP family a 32-bit address size (ECX). */
-static int a64_flat_inline(const x86_insn *in) {
-    if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS))) return 0;
+static int a64_flat_inline(const x86_insn *in, int based) {
+    /* (a based block reaches FS and GS too — Linux 2.0 addresses user
+     * memory through FS — but not CS, whose readability the run-time
+     * check does not test) */
+    if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS
+                                             && !(based && (in->seg == S_FS || in->seg == S_GS))))) return 0;
     switch (in->op) {
     case OP_ADD: case OP_OR: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP: case OP_TEST:
     case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:
@@ -2763,8 +2811,10 @@ static int a64_seg16_inline(const x86_insn *in) {
     return a64_real_inline(in);
 }
 
+int dbt_arch_seg32(void) { return 1; }
+
 int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
-    if (b->flat) return a64_flat_inline(in);
+    if (b->flat) return a64_flat_inline(in, b->based);
     if (b->seg16) return a64_seg16_inline(in);
     return a64_real_inline(in);
 }
@@ -2778,7 +2828,7 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
         s_strict_exit = dbt->verify && getenv("X86_VERIFY_STRICT") != NULL;
     /* the block's shape, for every emitter below */
     s_v86 = b->v86; s_paged = b->paged; s_iopl3 = b->iopl3;
-    s_flat = b->flat; s_seg16 = b->seg16; s_ss32 = b->ss32;
+    s_flat = b->flat; s_based = b->based; s_seg16 = b->seg16; s_ss32 = b->ss32;
     s_mode_bits = b->mode_bits;
     s_esnull = b->esnull; s_dsnull = b->dsnull; s_devread = b->devread; s_pg_user = b->pg_user;
     s_cur_lin = dbt_key_lin(b->key);

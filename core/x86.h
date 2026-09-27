@@ -343,6 +343,7 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 uint32_t x86_page_walk(struct x86_cpu *c, uint32_t lin, int write);
 void     x86_tlb_flush(struct x86_cpu *c);
 uint32_t x86_page_peek(struct x86_cpu *c, uint32_t lin, int user);   /* LIN's physical page, no side effects */
+uint32_t x86_page_peek_acc(struct x86_cpu *c, uint32_t lin, int user, int *accessed);   /* ... and are its accessed bits set */
 uint32_t x86_tlb_from_pgd(struct x86_cpu *c, uint32_t lin);          /* a low page's delta, into the TLB too */
 int      x86_cpl(const struct x86_cpu *c);
 /* 486: alignment checking is on (CR0.AM, EFLAGS.AC, CPL 3). Translated
