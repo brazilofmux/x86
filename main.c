@@ -31,6 +31,8 @@ static void usage(const char *prog) {
     printf("  -com1 stdio|FILE  a 16550 serial port at COM1 (3F8h, IRQ 4): the terminal is its far end,\n");
     printf("              or FILE receives what it sends (default: no serial port)\n");
     printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
+    printf("  -vbe        VESA BIOS Extensions 3.0: 640x480 to 1280x1024 at 8/16/32 bpp, a linear\n"
+           "              framebuffer in the top 8 MB of RAM (needs -mem 32 or more)\n");
     printf("  -nic e1000[,user]  an Intel 82545EM network card on that bus; ,user puts\n"
            "              a NAT network behind it (libslirp: DHCP gives 10.0.2.15)\n");
     printf("  -nic ne2000[,user] a Novell NE2000 on the ISA bus instead (300h, IRQ 3)\n");
@@ -277,6 +279,7 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
 }
 
 int main(int argc, char **argv) {
+    long mem_mb = 17;                  /* -mem */
     int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0, fpu = -1;
     uint64_t limit = 0;
     int mem_every = 0;          /* -M N: whole-memory -V compare every N block runs (0: the DBT default) */
@@ -304,6 +307,7 @@ int main(int argc, char **argv) {
             long mb = atol(argv[++i]);
             if (mb < 17 || mb > 257) { fprintf(stderr, "-mem: 17 to 257 (MB)\n"); return 1; }
             x86_set_mem_size((uint32_t)mb << 20);
+            mem_mb = mb;
         }
         else if (!strcmp(argv[i], "-fpu")) fpu = 1;
         else if (!strcmp(argv[i], "-nofpu")) fpu = 0;
@@ -320,6 +324,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
         else if (!strcmp(argv[i], "-com1") && i + 1 < argc) { if (pc_uart_open(argv[++i]) < 0) return 1; }
         else if (!strcmp(argv[i], "-pci")) pc_pci_enable();
+        else if (!strcmp(argv[i], "-vbe")) pc_vbe_enable();
         else if (!strcmp(argv[i], "-nic") && i + 1 < argc) {
             const char *n = argv[++i];
             const char *comma = strchr(n, ',');
@@ -345,6 +350,7 @@ int main(int argc, char **argv) {
         }
         else { fprintf(stderr, "unknown option %s\n", argv[i]); usage(argv[0]); return 2; }
     }
+    if (pc_vbe_enabled() && mem_mb < 32) { fprintf(stderr, "-vbe: its 8 MB framebuffer comes off the top of RAM: -mem 32 or more\n"); return 2; }
     x86_cpu cpu;
     int boot_drive = -1;
     if (boot_img) {

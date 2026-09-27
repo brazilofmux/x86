@@ -197,6 +197,7 @@ void pc_video_int10(x86_cpu *c, int vector) {
     int pg = page(c);
     switch (ah) {
     case 0x00:
+        pc_vbe_vga_mode();                           /* a VBE mode's picture gives way to the VGA's */
         set_mode(c, al);
         if (pc.booted) {
             /* ... and then the registers again, by OUT instructions from
@@ -369,6 +370,9 @@ void pc_video_int10(x86_cpu *c, int vector) {
         x86_set_r8(c, R_AL, 0);      /* not supported */
         break;
     case 0xFE:                        /* TopView: get video buffer — unchanged */
+        break;
+    case 0x4F:                        /* VESA BIOS Extensions (pc_vbe.c; -vbe) */
+        pc_vbe_int10(c);
         break;
     default:
         break;

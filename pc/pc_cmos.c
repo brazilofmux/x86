@@ -199,7 +199,7 @@ void pc_rtc_pie(int on) {
 
 /* Top of physical memory the model can address, and KB above 1 MB. */
 static uint32_t mem_top(const x86_cpu *c) {
-    uint32_t top = c->mem_size;
+    uint32_t top = c->mem_size - pc_vbe_reserved();                        /* (-vbe: the framebuffer, at the top) */
     if (c->model < X86_MODEL_386 && top > 0x1000000u) top = 0x1000000u;   /* 24 address lines */
     return top;
 }
@@ -370,12 +370,13 @@ static void e820(x86_cpu *c) {
     uint32_t idx = c->r[R_BX], base, len, type;
     if (idx < 2) { base = fixed[idx].base; len = fixed[idx].len; type = fixed[idx].type; }
     else if (idx == 2 && top > 0x100000u) { base = 0x100000u; len = top - 0x100000u; type = 1; }
+    else if (idx == 3 && pc_vbe_reserved()) { base = c->mem_size - pc_vbe_reserved(); len = pc_vbe_reserved(); type = 2; }   /* the framebuffer */
     else { x86_set_r8(c, R_AH, 0x86); c->eflags |= X86_CF; return; }
     uint32_t buf = ((uint32_t)c->seg[S_ES].sel << 4) + x86_get_r16(c, R_DI);
     uint32_t v[5] = { base, 0, len, 0, type };
     for (int k = 0; k < 5; k++)
         for (int b = 0; b < 4; b++) x86_phys_wr8(c, buf + 4u * (uint32_t)k + (uint32_t)b, (uint8_t)(v[k] >> (8 * b)));
-    int last = idx == 2 || (idx == 1 && top <= 0x100000u);
+    int last = pc_vbe_reserved() ? idx == 3 : (idx == 2 || (idx == 1 && top <= 0x100000u));
     c->r[R_AX] = 0x534D4150;                     /* 'SMAP' */
     c->r[R_CX] = 20;
     c->r[R_BX] = last ? 0 : idx + 1;

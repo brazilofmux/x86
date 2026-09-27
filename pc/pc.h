@@ -261,6 +261,14 @@ void pc_e1000_enable(void);
 void pc_ne2000_enable(void);
 int  pc_ne2000_port_read(uint16_t port, int size, uint32_t *val);
 int  pc_ne2000_port_write(uint16_t port, uint32_t val, int size);
+/* pc_vbe.c: VESA BIOS Extensions 3.0, a linear framebuffer at the top of RAM (-vbe) */
+void     pc_vbe_enable(void);
+int      pc_vbe_enabled(void);
+uint32_t pc_vbe_reserved(void);           /* bytes of RAM at the top the framebuffer takes (0 without -vbe) */
+void     pc_vbe_vga_mode(void);           /* INT 10h AH=00h: the VGA's picture again */
+int      pc_vbe_active(void);
+void     pc_vbe_int10(x86_cpu *c);        /* AH=4Fh */
+int      pc_vbe_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h);
 /* pc_net.c: the network behind it (-nic e1000,user: libslirp) */
 int  pc_net_open(const char *spec);
 int  pc_net_present(void);

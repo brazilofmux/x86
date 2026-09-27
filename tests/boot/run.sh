@@ -138,6 +138,19 @@ if [ -f disks/win311/c.img ] && mdir -i disks/win311/c.img@@32256 ::/WINDOWS/WIN
     then echo "ok   windows 3.11 enhanced mode, 32-bit disk access (wdctrl)"; else echo "FAIL windows 3.11 32-bit disk access"; fail=1; fi
     rm -f tmp/boot-c.img tmp/boot-c.exp tmp/boot-win.png tmp/boot-system.ini
 fi
+G=$(brew --prefix i686-elf-grub 2>/dev/null)/lib/i686-elf/grub/i386-pc
+if [ -f "$G/vbe.mod" ] && command -v i686-elf-grub-mkimage >/dev/null; then
+    # VESA BIOS Extensions (-vbe): GRUB 2's vbe driver lists the modes
+    # (videoinfo), then draws its test pattern at 1024x768x32 (videotest)
+    # into the linear framebuffer — the red square top left is the proof
+    printf 'insmod vbe\nvideoinfo\nsleep 2\nset gfxmode=1024x768x32\nvideotest\n' > tmp/boot-vbe.cfg
+    i686-elf-grub-mkimage -O i386-pc -d "$G" -o tmp/boot-vbe.core -c tmp/boot-vbe.cfg -p '(fd0)' biosdisk vbe video videoinfo videotest sleep
+    cat "$G/boot.img" tmp/boot-vbe.core > tmp/boot-vbe.flp && truncate -s 1474560 tmp/boot-vbe.flp
+    printf '*1024 x  768 x 32 .4096.  Direct color\t\nwaitpix 50,50 255 0 0\n' > tmp/boot-vbe.exp
+    if python3 tools/expect.py -t 40 tmp/boot-vbe.exp -- $DM -m 586 -mem 64 -vbe -W -T 35 -fda tmp/boot-vbe.flp -boot a >/dev/null 2>&1
+    then echo "ok   vesa bios extensions: grub lists the modes, draws at 1024x768x32"; else echo "FAIL vesa bios extensions (grub videotest)"; fail=1; fi
+    rm -f tmp/boot-vbe.cfg tmp/boot-vbe.core tmp/boot-vbe.flp tmp/boot-vbe.exp
+fi
 if [ -f disks/linux/tc.img ]; then
     # Linux 6.12 (Tiny Core 16.2, tests/boot/tcimage.sh) on the Pentium:
     # GRUB 2 from the disk, the kernel and its initramfs, the shell, a command

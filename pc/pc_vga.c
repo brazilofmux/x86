@@ -488,6 +488,7 @@ static void frame16(uint8_t *rgb, int w, int h) {
  * mode 13h at 320x200, or a 16-colour mode at its size. 0, or -1 if the
  * screen is in neither. The window and the PNG writer both use it. */
 int pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h) {
+    if (pc_vbe_frame(c, rgb, w, h) == 0) return 0;   /* a VBE mode (up to 1280x1024) */
     if (!is_graphics()) return -1;
     gfx_size(w, h);
     if (is_16()) { frame16(rgb, *w, *h); return 0; }
@@ -508,7 +509,7 @@ int pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h) {
  * the VGA draws it (720x400 for 80x25), blink and cursor in their "on"
  * phase. 0, or -1 if neither or the file cannot be written. */
 int pc_video_png(x86_cpu *c, const char *path) {
-    enum { MW = 1188, MH = 480 };
+    enum { MW = 1280, MH = 1024 };               /* the largest picture: a VBE mode's */
     static uint8_t rgb[MW * MH * 3], raw[MH * (1 + MW * 3)];
     int W = 320, H = 200;
     if (pc_vga_frame(c, rgb, &W, &H) < 0 && pc_vga_text_frame(c, rgb, MW, MH, &W, &H, 0) < 0) return -1;

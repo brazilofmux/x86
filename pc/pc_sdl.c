@@ -211,7 +211,7 @@ static int draw_text(x86_cpu *c) {
 
 void pc_sdl_poll(x86_cpu *c, uint64_t now) {
     if (!allowed) return;
-    static uint8_t rgb[640 * 480 * 3];
+    static uint8_t rgb[1280 * 1024 * 3];        /* the largest picture: a VBE mode's */
     static int gw = 320, gh = 200;
     if (now >= next_frame_ns) {
         next_frame_ns = now + FRAME_NS;
@@ -227,6 +227,8 @@ void pc_sdl_poll(x86_cpu *c, uint64_t now) {
             if (graphics && (fw != gw || fh != gh)) {    /* the mode changed size: a texture to match */
                 SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, fw, fh);
                 if (t) { SDL_DestroyTexture(tex); tex = t; gw = fw; gh = fh; }
+                /* a VBE mode's frame at its own size; the VGA's as 4:3 640x480 */
+                if (fw > 640) SDL_RenderSetLogicalSize(ren, fw, fh); else SDL_RenderSetLogicalSize(ren, 640, 480);
             }
             if (graphics && fw == gw) SDL_UpdateTexture(tex, NULL, rgb, gw * 3);
             if (graphics || text) {
