@@ -149,11 +149,11 @@ test-hwflags: $(HWFLAGS)
 test-pm:
 	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 pmrun.py
 
-# Paging and V86 transcript images: dos-monster against QEMU (pgtest) or
-# against a stored, adjudicated transcript (vmtest, c486test, c586test:
-# what QEMU says there depends on its version, and Bochs is the reference)
+# Paging and V86 transcript images: dos-monster against stored, adjudicated
+# transcripts (what QEMU says there depends on its version, and Bochs is the
+# reference), so no emulator on the host is needed
 test-pg: $(TARGET)
-	cd tools/pmoracle && python3 pgrun.py pgtest.asm && python3 pgrun.py vmtest.asm --expect vmtest.expected && \
+	cd tools/pmoracle && python3 pgrun.py pgtest.asm --expect pgtest.expected && python3 pgrun.py vmtest.asm --expect vmtest.expected && \
 	    python3 pgrun.py c486test.asm --m486 --expect c486test.expected && \
 	    python3 pgrun.py c486test.asm --m486 --expect c486test.expected -- -V && \
 	    python3 pgrun.py c586test.asm --m586 --expect c586test.expected && \

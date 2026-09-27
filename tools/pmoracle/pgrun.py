@@ -15,6 +15,8 @@ lines: QEMU has no #AC and lets ring 3 run INVD and WBINVD (the SDM, and
 Bochs, say #GP), and its x87 pops on unmasked exceptions and misses #MF
 on waiting loads; Bochs's default CPU stores FCS and FDS as 0, as Intel's
 since Haswell do, where a 486 stores the selectors (QEMU agrees).
+pgtest.expected is Bochs 2.7's (Debian's; pgtest.bochs) verbatim, with no
+line to adjudicate: ours agrees on all 23 (QEMU was its reference before).
 vmtest.expected is Bochs 3.1's (vmtest.bochs) but for one line, T11 (case
 17: POPF at IOPL 3 in V86 mode, then HLT, which is #GP): Bochs 3.1 reports
 a double fault there with error code 8224h and CS:IP 3202:0000, which no
