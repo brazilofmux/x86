@@ -305,7 +305,9 @@ static int fuzz_accept_pm(const x86_insn *in) {
         return in->ops[0].kind != OPK_SREG;
     case OP_OUT:
         return 1;                    /* no ports on this machine: exercises the port thunk */
-    case OP_IN: case OP_INS: case OP_OUTS:
+    case OP_IN:
+        return 1;                    /* ... and the IN helper: all ones, replayed to the shadow */
+    case OP_INS: case OP_OUTS:
         return 0;
     default:
         return dbt_classify_op_pm(in) != 0;
@@ -550,7 +552,7 @@ static int fuzz_accept_seg16(const x86_insn *in) {
     case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
     case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INTO: case OP_INT: case OP_INT3:
     case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_HLT:
-    case OP_IN: case OP_INS: case OP_OUTS: case OP_AAM: case OP_BOUND: case OP_ENTER: case OP_UD:
+    case OP_INS: case OP_OUTS: case OP_AAM: case OP_BOUND: case OP_ENTER: case OP_UD:
         return 0;
     case OP_POP: case OP_PUSH:
         return in->ops[0].kind != OPK_SREG;

@@ -85,6 +85,16 @@ static int classify_sem(const x86_insn *in) {
         return C_INLINE;           /* a backend may test for nothing pending inline, else the helper */
     case OP_CPUID: case OP_CMPXCHG8B:
         return C_HELPER;           /* Pentium */
+    case OP_IN:
+        /* In the block, through the interpreter (the port, and in
+         * protected mode IOPL and the TSS bitmap, whose #GP the thunk's
+         * fault exit delivers): a driver polling a status port (Linux
+         * 2.0's IDE, 14 million reads in 45 s of Slackware) left
+         * translated code for every read. -V replays the real cpu's port
+         * reads to the shadow. A polling loop now spins in its block
+         * until the budget runs out or the next device event, which caps
+         * the budget (cpu->next_event), as for any other loop. */
+        return C_HELPER;
     case OP_RDTSC:
         /* In the block when the TSC is the machine's clock: nothing about
          * the reading depends on where in a block it is taken, and -V

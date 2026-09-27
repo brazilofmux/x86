@@ -170,7 +170,13 @@ static void busy(int what) {
     ide.busy = what;
     ide.status = ST_BSY | ST_DSC;
     pc.ide_due = (pc.cpu ? pc.cpu->insn_count : 0) + IDE_BUSY_INSNS;
-    if (pc.cpu) pc.cpu->next_event = pc.ide_due;
+    /* The run that started the command (an OUT from translated code) has
+     * its budget already: back to the run loop, whose next run stops at
+     * ide_due. Otherwise a driver polling the status inside its block —
+     * IN is a helper — spun out the whole quantum, millions of
+     * instructions, before the drive was seen ready: 0.6 s of Windows
+     * 2000's boot, in NTLDR's disk driver. */
+    if (pc.cpu) { pc.cpu->next_event = pc.ide_due; pc.cpu->jit_cur_hit = 1; }
 }
 void pc_ide_poll(int now) {
     if (!ide.busy) { pc.ide_due = UINT64_MAX; return; }
