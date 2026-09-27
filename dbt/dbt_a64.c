@@ -645,6 +645,14 @@ static void emit_thunk_args(emit_t *e) {
  * fault, so neither path raises. */
 #define FLAT_TOP 0x1000000u
 _Static_assert(FLAT_TOP + 4 <= X86_MEM_SIZE, "flat fast path must stay inside guest memory");
+/* ... the least of it. A machine of 32 MB or less keeps the single TST
+ * against 16 MB (the default 17 MB one: DOS extenders, DOOM). A bigger
+ * one compares against its own size, so the fast path reaches the top
+ * of memory: GRUB, flat and unpaged, copies Linux's initramfs to the top
+ * of a 128 MB machine, and every one of those 46 million accesses was
+ * an interpreter trip. */
+static uint32_t s_flat_lim;          /* 0: TST against FLAT_TOP; else offsets below this are in memory, 4 bytes and all */
+static uint32_t flat_lim_for(uint32_t mem_size) { return mem_size > 2 * FLAT_TOP + 4 ? mem_size - 3 : 0; }
 typedef struct {
     uint32_t patch_off, back_off;
     uint32_t ip_after, n_done;
@@ -676,7 +684,21 @@ static void flat_slow_site(emit_t *e) {
  * so the VGA window need not be avoided. */
 static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only) {
     a64_cond_t slow = A64_COND_NE;
-    if (store_only) {
+    if (s_flat_lim) {
+        /* a big machine: off against its size (W_T1), and for a read the
+         * VGA window as below (above 16 MB the same bits are slow too,
+         * harmlessly) */
+        emit_mov_w32_imm32(e, W_T1, s_flat_lim);
+        if (store_only) {
+            emit_cmp_w32_w32(e, off, W_T1);
+            slow = A64_COND_HS;
+        } else {
+            emit_ubfx_w32(e, W_T3, off, 16, 8);
+            emit_cmp_w32_w32(e, off, W_T1);
+            emit_ccmp_w32_imm(e, W_T3, 0xA, 0x4, A64_COND_LO);
+            slow = A64_COND_EQ;
+        }
+    } else if (store_only) {
         (void)emit_tst_w32_imm(e, off, ~(FLAT_TOP - 1));              /* off >= 16 MB */
     } else {
         /* slow if off >= 16 MB, or bits 23:16 are 0xA (the VGA window):
@@ -2864,6 +2886,7 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
     /* the block's shape, for every emitter below */
     s_v86 = b->v86; s_paged = b->paged; s_iopl3 = b->iopl3;
     s_flat = b->flat; s_based = b->based; s_seg16 = b->seg16; s_ss32 = b->ss32;
+    s_flat_lim = flat_lim_for(cpu->mem_size);
     s_mode_bits = b->mode_bits;
     s_esnull = b->esnull; s_dsnull = b->dsnull; s_devread = b->devread; s_pg_user = b->pg_user;
     s_cur_lin = dbt_key_lin(b->key);
