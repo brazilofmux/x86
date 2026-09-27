@@ -206,7 +206,9 @@ int dbt_classify_op_pm(const x86_insn *in) { return classify_pm(in); }
 int dbt_classify_op_seg16(const x86_insn *in) { return classify_seg16(shape_block(0, 1), in); }
 
 /* Inline ops with a word-sized memory or stack access: the 286+ limit
- * check in front of it can raise #GP. Byte accesses cannot straddle. */
+ * check in front of it can raise #GP. Byte accesses cannot straddle a
+ * limit; under paging any access can #PF (the caller asks only under -V
+ * for a plain flat block). */
 static int op_may_fault(const dbt_block *b, const x86_insn *in) {
     switch (in->op) {
     case OP_PUSH: case OP_POP: case OP_CALL: case OP_RET: case OP_CALLF: case OP_RETF: case OP_JMPF:
@@ -214,13 +216,13 @@ static int op_may_fault(const dbt_block *b, const x86_insn *in) {
     case OP_INT: case OP_INT3:
         return 1;                     /* the frame carries FLAGS: all of them must be materialized */
     case OP_MOVS: case OP_STOS: case OP_LODS: case OP_CMPS: case OP_SCAS:
-        return in->ops[0].size >= 2 || b->seg16 || b->based;   /* the slow path's helper can fault, frame and all */
+        return in->ops[0].size >= 2 || b->seg16 || b->based || b->paged;   /* the slow path's helper can fault, frame and all */
     case OP_XLAT:
-        return b->seg16 || b->based;                /* an implicit byte read: only a limit can fault it */
+        return b->seg16 || b->based || b->paged;    /* an implicit byte read: a limit, or a page, can fault it */
     default: break;
     }
     for (int i = 0; i < 2; i++)
-        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || b->seg16 || b->based)) return 1;   /* a limit is any size's problem */
+        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || b->seg16 || b->based || b->paged)) return 1;   /* a limit, or a page, is any size's problem */
     return 0;
 }
 

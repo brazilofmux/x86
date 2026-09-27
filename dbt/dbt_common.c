@@ -310,14 +310,39 @@ static void dump_mem_diff(const uint8_t *a, const uint8_t *b, uint32_t size, con
     }
 }
 
-static void dump_block_bytes(const x86_cpu *c, uint64_t key, const char *tag) {
-    uint32_t lin = dbt_key_lin(key);
-    fprintf(stderr, "    block bytes (%s):", tag);
-    for (int i = 0; i < 32; i++) {
-        if ((i & 0xF) == 0) fprintf(stderr, "\n      %05X:", lin + i);
-        fprintf(stderr, " %02X", c->mem[lin + i]);
+/* A byte of guest code at a linear address, through the page tables when
+ * they are on (a peek: no side effects), for the divergence dump. */
+static uint8_t peek_code_byte(x86_cpu *c, uint32_t lin, int *ok) {
+    uint32_t p = lin;
+    if (c->cr0 & X86_CR0_PG) {
+        p = x86_page_peek(c, lin & 0xFFFFF000u, 0);
+        if (p == X86_PG_BAD) { *ok = 0; return 0; }
+        p |= lin & 0xFFF;
     }
-    fprintf(stderr, "\n");
+    p &= c->a20_mask;
+    *ok = p < c->mem_size;
+    return *ok ? c->mem[p] : 0;
+}
+static void dump_block_bytes(const x86_cpu *c0, uint64_t key, const char *tag) {
+    x86_cpu *c = (x86_cpu *)c0;
+    uint32_t lin = dbt_key_lin(key);
+    uint8_t b[64]; int n = 0, ok = 1;
+    for (; n < 64; n++) { b[n] = peek_code_byte(c, lin + (uint32_t)n, &ok); if (!ok) break; }
+    fprintf(stderr, "    block bytes (%s):", tag);
+    for (int i = 0; i < n && i < 32; i++) {
+        if ((i & 0xF) == 0) fprintf(stderr, "\n      %08X:", lin + (uint32_t)i);
+        fprintf(stderr, " %02X", b[i]);
+    }
+    fprintf(stderr, "%s\n", n < 32 ? " (unmapped past here)" : "");
+    /* ... and as instructions, in the block's CS shape (the key's KEY_BIG) */
+    uint32_t ip = 0;
+    for (int k = 0; k < 12 && ip + 16 <= (uint32_t)n; k++) {
+        x86_dec_ctx ctx = { b + ip, c->model, (key & KEY_BIG) != 0 };
+        x86_insn in; char d[128];
+        if (!x86_decode(&ctx, &in)) break;
+        fprintf(stderr, "      %08X: %s\n", lin + ip, x86_disasm(&in, d, sizeof d));
+        ip += in.len;
+    }
 }
 
 static void shadow_smc_none(x86_cpu *c, uint32_t p) { (void)c; (void)p; }
