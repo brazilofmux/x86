@@ -286,7 +286,7 @@ static int fuzz_accept(const x86_insn *in) {
  * INTO, #UD) or changes TF/IOPL (POPF), no gates. */
 static int s_based;      /* -B: the flat fuzz through based, limited segments under paging */
 static int fuzz_accept_pm(const x86_insn *in) {
-    if (in->seg_override == S_CS || (!s_based && (in->seg_override == S_FS || in->seg_override == S_GS))) return 0;
+    if (in->seg_override == S_CS) return 0;
     if (in->lock) return 0;
     /* ECX is a random 32-bit value as soon as anything writes it: a REP
      * string op could then run for 4G iterations (on both machines). The
@@ -400,6 +400,32 @@ static void pm_based_adjust(x86_cpu *cpu) {
     cpu->idtr.limit = 32 * 8 - 1;
 }
 
+/* The plain flat fuzz's FS and GS: what a flat block reaches through
+ * them with run-time checks — a data segment based a little way into
+ * memory, with the full limit or one inside the data window, or null,
+ * read-only, expand-down or code, whose accesses the slow path's
+ * interpreter faults (every vector's gate ends the run at the HLT). */
+static void pm_fsgs_random(x86_cpu *cpu) {
+    static const uint16_t sels[2] = { 0x18, 0x20 };
+    static const uint8_t kinds[6] = { 0x93, 0x93, 0x93, 0x91, 0x97, 0x9B };   /* rw, rw, rw, ro, expand-down, code */
+    for (int k = 0; k < 2; k++) {
+        int s = k ? S_GS : S_FS;
+        x86_seg *g = &cpu->seg[s];
+        memset(g, 0, sizeof *g);
+        if (rnd() % 5 == 0) continue;                                  /* null */
+        uint32_t base = (rnd() & 1) ? 0 : (rnd() & 0xFF) << 12;
+        uint32_t lim = (rnd() % 3) ? 0xFFFFFFFFu : (DATA_PM + (rnd() & 0xFF000)) | 0xFFF;
+        uint8_t acc = kinds[rnd() % 6];
+        g->sel = sels[k]; g->usable = 1; g->base = base; g->limit = lim; g->big = 1;
+        g->attr = (uint16_t)(acc | 0xC00);
+    }
+    for (int v = 0; v < 32; v++) {
+        uint32_t gate[2] = { (DE_STUB_PM & 0xFFFF) | (0x08u << 16), (DE_STUB_PM & 0xFFFF0000u) | 0x8E00u };
+        memcpy(cpu->mem + 0x110100 + 8 * v, gate, sizeof gate);
+    }
+    cpu->idtr.limit = 32 * 8 - 1;
+}
+
 enum { P_OUTER, P_INNER, P_PATCH1, P_PATCH2 };
 /* PM program 0: R_DrawColumn's shape. Per outer pass, store a new step
  * into the imm32 of two `add ebp, imm32` inside the inner loop, then run
@@ -499,6 +525,7 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     cpu.eflags = x86_flags_fixup(&cpu, rnd() & 0x0CD5);
     cpu.eip = CODE_PM;
     if (s_based) pm_based_adjust(&cpu);
+    else pm_fsgs_random(&cpu);
     memcpy(cpu.mem + CODE_PM, prog, plen);
     for (uint32_t i = 0; i < 0x110000; i++) cpu.mem[DATA_PM + i] = (uint8_t)rnd();
     for (uint32_t i = 0x20000; i < 0xC0000; i++) cpu.mem[i] = (uint8_t)rnd();

@@ -72,6 +72,7 @@
 #define OFF_SEG_BIG(i)  (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, big))
 _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and attr share one word store");
 #define OFF_SEG_USABLE(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, usable))
+#define OFF_SEG_ATTR(i) (offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, attr))
 #define OFF_EXC_ERR     offsetof(x86_cpu, exc_err)
 #define OFF_INSN_COUNT  offsetof(x86_cpu, insn_count)
 #define OFF_CODE_BITMAP offsetof(x86_cpu, code_bitmap)
@@ -478,6 +479,39 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
     }
     if (in->op == OP_LEA) return;
     int store_only = in->op == OP_MOV && in->ops[0].kind == OPK_MEM;   /* a MOV to memory only stores: the VGA window is fine for that */
+    if (!s_based && (in->seg == S_FS || in->seg == S_GS)) {
+        /* FS or GS in a flat block (Linux's per-CPU data and TLS, NT's
+         * processor and thread blocks): the key says nothing about them,
+         * which change under the block, so everything is checked here at
+         * run time — usable, a data segment, expand-up, writable for a
+         * write, the offset within the limit — and anything else is the
+         * slow path, whose interpreter raises the fault exactly. Then the
+         * linear address, base + offset, as any flat access. Clobbers
+         * W_T1, W_T3 besides. */
+        int size = flat_access_size(in), wr = writes_mem_operand(in);
+        emit_ldrh_imm(e, W_T1, R_CPU, OFF_SEG_ATTR(in->seg));
+        (void)emit_and_w32_imm(e, W_T1, W_T1, wr ? 0x1E : 0x1C);
+        emit_cmp_w32_imm(e, W_T1, wr ? 0x12 : 0x10);
+        flat_slow_site(e);
+        emit_b_cond(e, A64_COND_NE, 0);
+        emit_ldrb_imm(e, W_T1, R_CPU, OFF_SEG_USABLE(in->seg));
+        flat_slow_site(e);
+        emit_cbz_w32(e, W_T1, 0);
+        emit_movz_w32(e, W_T3, (uint16_t)(size - 1), 0);
+        emit_add_x64_w32_uxtw(e, W_T3, W_T3, ea->off);            /* the last byte's offset, in 64 bits */
+        emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_LIMIT(in->seg));
+        emit_cmp_x64_x64(e, W_T3, W_T1);
+        flat_slow_site(e);
+        emit_b_cond(e, A64_COND_HI, 0);
+        emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_BASE(in->seg));
+        emit_add_w32(e, W_OFF, W_T1, ea->off);
+        ea->off = W_OFF;
+        if (s_paged) {
+            emit_pgflat(e, W_OFF, size, !wr ? PG_READ : store_only ? PG_STORE : PG_RMW);
+            ea->segp = X_SEGP;
+        } else emit_flat_check_as(e, W_OFF, store_only);
+        return;
+    }
     if (s_based) {
         /* A based segment: the offset against its limit, then the linear
          * address, base + offset (wrapping at 4 GB, as the CPU's), through
@@ -2747,8 +2781,9 @@ static int a64_flat_inline(const x86_insn *in, int based) {
     /* (a based block reaches FS and GS too — Linux 2.0 addresses user
      * memory through FS — but not CS, whose readability the run-time
      * check does not test) */
+    (void)based;
     if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS
-                                             && !(based && (in->seg == S_FS || in->seg == S_GS))))) return 0;
+                                             && in->seg != S_FS && in->seg != S_GS))) return 0;
     switch (in->op) {
     case OP_ADD: case OP_OR: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP: case OP_TEST:
     case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG: case OP_MOV: case OP_XCHG: case OP_LEA:

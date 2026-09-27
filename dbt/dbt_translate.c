@@ -232,7 +232,8 @@ static int op_may_fault(const dbt_block *b, const x86_insn *in) {
     default: break;
     }
     for (int i = 0; i < 2; i++)
-        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || b->seg16 || b->based || b->paged)) return 1;   /* a limit, or a page, is any size's problem */
+        if (in->ops[i].kind == OPK_MEM && (in->ops[i].size >= 2 || b->seg16 || b->based || b->paged
+                                           || in->seg == S_FS || in->seg == S_GS)) return 1;   /* a limit, or a page, is any size's problem */
     return 0;
 }
 
@@ -550,7 +551,11 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
              * only -V sees it; under -V they are kept exact, at the 3-5%
              * that costs a paged guest. A based block's accesses fault on
              * their limits, so it keeps its flags exact, as seg16 does.) */
-            if (cpu->model >= X86_MODEL_286 && (!b->flat || b->based || (b->paged && dbt->verify)) && op_may_fault(b, &decs[i]))
+            /* (An FS or GS access in a flat block faults on that segment's
+             * checks — its slow path's interpreter does — so it counts in
+             * any flat block.) */
+            int fsgs = decs[i].ea_valid && (decs[i].seg == S_FS || decs[i].seg == S_GS);
+            if (cpu->model >= X86_MODEL_286 && (!b->flat || b->based || (b->paged && dbt->verify) || fsgs) && op_may_fault(b, &decs[i]))
                 rd |= ARITH;
             /* A store can leave the block after the op (SMC): all live out.
              * Split that from what the block itself reads — the difference
