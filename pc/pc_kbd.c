@@ -314,6 +314,7 @@ static int next_key(x86_cpu *c, int blocking) {
             case 'H': sc = 0x47; break; case 'F': sc = 0x4F; break;
             case 'P': fkey = 1; break; case 'Q': fkey = 2; break;
             case 'R': fkey = 3; break; case 'S': fkey = 4; break;
+            case 'Z': sc = 0x0F; mod = 2; break;        /* CSI Z: back-tab, Shift+Tab */
             }
         }
         if (!sc && !fkey && k == '~') {
@@ -357,12 +358,64 @@ static int next_key(x86_cpu *c, int blocking) {
     return 1;
 }
 
+/* ---- Key trace (-K FILE) ---------------------------------------------------
+ * For watching what a program does with each key: scripted keys are
+ * released one at a time, and only when the program is idle waiting for
+ * one (blocked in a BIOS read, or polling back to back with nothing
+ * else to do), so everything it meant to draw for the last key is on
+ * the screen.  Before each key, and once more when the script runs out,
+ * a frame goes to FILE:
+ *
+ *   == N cursor ROW COL shape START END      (keys delivered so far; 1-based cell)
+ *   ...the text screen, as -D writes it...
+ *   -- key XX XX ...                         (the host bytes of the key that follows; "-- end" at the end)
+ *
+ * At the end of the script the run stops (exit code 0): no Ctrl-Z is fed. */
+static int kt_idle;                              /* the guest is waiting for a key */
+static unsigned kt_keys;
+
+static void keytrace_feed(x86_cpu *c) {
+    if (!pc_kbd_buffer_empty(c) || pc_kbd_raw_pending() || (pc.irq_pending & (1 << 9))) return;
+    if (!kt_idle) return;
+    fill_pending();
+    pc_video_flush(1);
+    int row, col, s, e;
+    pc_video_cursor(&row, &col, &s, &e);
+    fprintf(pc.keytrace, "== %u cursor %d %d shape %d %d\n", kt_keys, row + 1, col + 1, s, e);
+    pc_video_dump(c, pc.keytrace);
+    if (!npending) {
+        fprintf(pc.keytrace, "-- end\n"); fclose(pc.keytrace); pc.keytrace = NULL;
+        pc.exit_requested = 1; pc.exit_code = 0; c->halted = 1;
+        return;
+    }
+    uint8_t before[16]; int nb = npending < 16 ? npending : 16;
+    memcpy(before, pending, (size_t)nb);
+    int was = npending;
+    next_key(c, 0);
+    fprintf(pc.keytrace, "-- key");
+    for (int i = 0; i < was - npending && i < nb; i++) fprintf(pc.keytrace, " %02X", before[i]);
+    fprintf(pc.keytrace, "\n"); fflush(pc.keytrace);
+    kt_keys++; kt_idle = 0;
+}
+
+/* The last frame, when the program ends by itself. */
+void pc_kbd_keytrace_exit(x86_cpu *c) {
+    if (!pc.keytrace) return;
+    int row, col, s, e;
+    pc_video_cursor(&row, &col, &s, &e);
+    fprintf(pc.keytrace, "== %u cursor %d %d shape %d %d\n", kt_keys, row + 1, col + 1, s, e);
+    pc_video_dump(c, pc.keytrace);
+    fprintf(pc.keytrace, "-- exit\n");
+    fclose(pc.keytrace); pc.keytrace = NULL;
+}
+
 /* Scripted keys (stdin not a terminal) arrive the way a person types
  * them: the next one only after the guest has asked for keyboard input
  * since the last, and at most one per 20 ms. A terminal's keys are
  * taken as they come. */
 void pc_kbd_poll(x86_cpu *c) {
     static uint64_t next_ok, next_probe, reads_at_last;
+    if (pc.keytrace) { keytrace_feed(c); return; }
     uint64_t now = pc_now_ns();
     /* next_key() probes stdin with poll(2) whenever its own buffer is
      * empty, and INT 16h status calls land here on every pass of a
@@ -394,7 +447,7 @@ void pc_kbd_poll(x86_cpu *c) {
  * idle loop the program has. Called from pc_poll. */
 void pc_kbd_idle_poll(x86_cpu *c) {
     static uint64_t deadline, reads_at_eof; static int fed_eof;
-    if (!pc.eof_seen || isatty(STDIN_FILENO)) return;
+    if (!pc.eof_seen || isatty(STDIN_FILENO) || pc.keytrace) return;
     if (!fed_eof) {
         fed_eof = 1; key_to_raw(0x1A, 0x2C);
         deadline = pc_now_ns() + 2000000000ull; reads_at_eof = pc.kbd_reads;
@@ -442,6 +495,12 @@ int pc_kbd_wait(x86_cpu *c, int can_return) {
         drain_raw_here(c);
         if (!pc_kbd_buffer_empty(c)) break;
         int hooked = can_return && pc_rd16(c, 0, 9 * 4 + 2) != PC_HLE_SEG;
+        if (pc.keytrace) {                         /* blocked on a key: the one moment a traced key is due */
+            if (!(hooked && (pc_kbd_raw_pending() || (pc.irq_pending & (1 << 9))))) { kt_idle = 1; pc_kbd_poll(c); }
+            if (c->halted) return 1;
+            if (hooked) return 0;
+            continue;
+        }
         if (pc.eof_seen) {
             /* Scripted input ran out: hand the program a Ctrl-Z once,
              * then treat further waits as "nothing more will happen". */
@@ -498,6 +557,7 @@ static void idle_check(x86_cpu *c) {
     if (c->insn_count - idle_last_insn > IDLE_GAP) idle_run = 0;
     idle_last_insn = c->insn_count;
     if (++idle_run < IDLE_RUN) return;
+    if (pc.keytrace) { kt_idle = 1; idle_run = 0; return; }   /* idle: the next poll releases a traced key */
     uint64_t w0 = pc_wall_ns();
     /* a terminal (or a pipe with more to come) can end the wait early;
      * at end of input, or on /dev/null, just sleep */

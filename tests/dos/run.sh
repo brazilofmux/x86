@@ -82,6 +82,12 @@ for mode in -j -V; do
     if [ "$(python3 tests/dos/pnghash.py tmp/text.png 2>/dev/null)" = "$(cat tests/dos/text.out)" ]; then echo "ok   text render $mode"; else echo "FAIL text render $mode"; fail=1; fi
     got=$( (printf '\033[1;5D\033[1;5C\033[1;5H\033[1;5F\033[5;5~\033[6;5~\033[1;2P\033[1;3R\033[12;5~\033[23~\033[24;2~a'; sleep 2; printf '\033') | $DM -W $mode -L 200000000 tests/dos/kbd.com 2>/dev/null | tr -d '\r')
     if [ "$got" = "$(cat tests/dos/kbd.out)" ]; then echo "ok   kbd codes $mode"; else echo "FAIL kbd codes $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
+    # -K: scripted keys go in one at a time, a frame (screen, cursor) written
+    # before each; and CSI Z is Shift+Tab (0F00)
+    kt=$(mktemp "${TMPDIR:-/tmp}/dmkt.XXXXXX")
+    got=$(printf 'ab\033[Z\033' | $DM -W $mode -L 200000000 -K "$kt" tests/dos/kbd.com 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+    got="$got$(grep -c '^== ' "$kt") $(grep '^-- ' "$kt" | tr '\n' ' ')"; rm -f "$kt"
+    if [ "$got" = "1E61 3062 0F00 011B 5 -- key 61 -- key 62 -- key 1B 5B 5A -- key 1B -- exit " ]; then echo "ok   key trace $mode"; else echo "FAIL key trace $mode"; echo "$got"; fail=1; fi
     got=$( (sleep 1; printf '\033[<35;11;2M'; sleep 0.5; printf '\033[<0;11;2M'; sleep 0.5; printf '\033[<2;21;4M'; sleep 0.5; printf '\033[<2;21;4m'; sleep 0.5; printf '\033[<0;21;4m'; sleep 0.5; printf '\033') | X86_MOUSE=1 $DM -W $mode -L 400000000 tests/dos/mouse.com 2>/dev/null | tr -d '\r')
     if [ "$got" = "$(cat tests/dos/mouse.out)" ]; then echo "ok   mouse events $mode"; else echo "FAIL mouse events $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
     # the PS/2 mouse: the 8042's aux port, then INT 15h C2h and INT 74h, fed the same reports

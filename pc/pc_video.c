@@ -493,6 +493,17 @@ void pc_video_flush(int force) {
     }
 }
 
+/* Where the display's cursor is, as a cell of the visible text, and its
+ * scan lines (an insert-mode cursor is a taller one). */
+void pc_video_cursor(int *row, int *col, int *start, int *end) {
+    int vr, vc; uint16_t pos; uint8_t s, e;
+    pc_vga_text_geometry(&vr, &vc);
+    pc_vga_get_cursor(&pos, &s, &e);
+    uint16_t rel = (uint16_t)((pos - pc_vga_start()) & 0x3FFF);
+    if (vc <= 0) vc = 80;
+    *row = rel / vc; *col = rel % vc; *start = s; *end = e;
+}
+
 /* The text the display shows: from where the CRTC's start address says
  * (INT 10h AH=05h sets it for a page; Linux's console scrolls by moving
  * it), wrapping in the 32 KB window as the display does. */

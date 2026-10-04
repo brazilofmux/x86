@@ -83,6 +83,7 @@ typedef struct pc_state {
     int boot_drive;                  /* ... this one (00h, 80h) */
     int reboot;                      /* a booted machine reset itself: POST and boot again */
     int      eof_seen;
+    FILE    *keytrace;               /* -K FILE: scripted keys one at a time, the screen written before each */
 
     /* Timer */
     uint64_t t0_ns;                  /* wall clock at boot */
@@ -176,6 +177,7 @@ void pc_video_flush(int force);                          /* tty mode painter */
 void pc_video_shutdown(void);
 void pc_video_set_hud(const char *text);
 void pc_video_dump(x86_cpu *c, FILE *f);                 /* the text buffer as 25 lines of UTF-8 */
+void pc_video_cursor(int *row, int *col, int *start, int *end);  /* the CRTC's cursor: 0-based cell, scan lines (start bit 5: hidden) */
 int  pc_video_png(x86_cpu *c, const char *path);         /* the screen: text, 13h or 16-colour; -1 if none */
 int  pc_vga_port_read(uint16_t port, uint32_t *val);     /* 1 if the port is the VGA's */
 int  pc_vga_port_write(uint16_t port, uint32_t val, int size);
@@ -190,6 +192,7 @@ int  pc_kbd_buffer_empty(x86_cpu *c);
 int  pc_kbd_peek(x86_cpu *c, uint16_t *key);             /* ascii | scancode<<8 */
 int  pc_kbd_get(x86_cpu *c, uint16_t *key);
 int  pc_kbd_wait(x86_cpu *c, int can_return);            /* a key in the buffer (1), or return to the guest first (0; can_return) */
+void pc_kbd_keytrace_exit(x86_cpu *c);                   /* -K: the frame at program exit */
 void pc_kbd_idle_poll(x86_cpu *c);                       /* DOS-level "is a key ready" polls */
 void pc_kbd_int16(x86_cpu *c, int vector);
 void pc_kbd_int9(x86_cpu *c, int vector);                /* default INT 9: latched code → BIOS buffer */
@@ -203,6 +206,7 @@ void pc_vga_rom_mode(x86_cpu *c, int mode);                /* point its ROM vari
 int  pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h);   /* RGB24, at most 640x480; -1 if not graphics */
 int  pc_vga_text_frame(x86_cpu *c, uint8_t *rgb, int maxw, int maxh, int *w, int *h, unsigned frame);   /* -1 if not text */
 void pc_vga_set_cursor_pos(uint16_t words);               /* CRTC 0E/0F, as the BIOS keeps them */
+void pc_vga_get_cursor(uint16_t *words, uint8_t *start, uint8_t *end);   /* CRTC 0E/0F and 0A/0B */
 void pc_vga_set_start(uint16_t words);                    /* CRTC 0C/0D: the displayed page */
 uint16_t pc_vga_start(void);                              /* ... where the display starts, in words */
 void pc_vga_text_geometry(int *rows, int *cols);          /* the text screen's shape, from the CRTC */

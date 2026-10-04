@@ -327,6 +327,9 @@ static void text_default(x86_cpu *c) {
 
 /* ---- what the BIOS sets as it goes (INT 10h) ------------------------------ */
 void pc_vga_set_cursor_pos(uint16_t words) { vga.crtc[0x0E] = (uint8_t)(words >> 8); vga.crtc[0x0F] = (uint8_t)words; }
+void pc_vga_get_cursor(uint16_t *words, uint8_t *start, uint8_t *end) {
+    *words = (uint16_t)(vga.crtc[0x0E] << 8 | vga.crtc[0x0F]); *start = vga.crtc[0x0A]; *end = vga.crtc[0x0B];
+}
 void pc_vga_set_start(uint16_t words)      { vga.crtc[0x0C] = (uint8_t)(words >> 8); vga.crtc[0x0D] = (uint8_t)words; }
 uint16_t pc_vga_start(void)               { return (uint16_t)(vga.crtc[0x0C] << 8 | vga.crtc[0x0D]); }
 void pc_vga_set_cursor_shape(uint8_t start, uint8_t end) { vga.crtc[0x0A] = start; vga.crtc[0x0B] = end; }

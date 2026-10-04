@@ -44,6 +44,8 @@ static void usage(const char *prog) {
     printf("  -L N        stop after N instructions\n");
     printf("  -T SECS     stop after SECS seconds of wall-clock time\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
+    printf("  -K FILE     key trace: scripted keys go in one at a time, each when the program is\n");
+    printf("              waiting for it; the text screen and cursor go to FILE before each\n");
     printf("  -G FILE     write the screen (text, mode 13h or a 16-colour mode) to FILE as a PNG on exit\n");
     printf("  -w          the window is the display: text modes and graphics, from the start\n");
     printf("  -W          no window at all (default: one opens for graphics modes if stdout is a terminal)\n");
@@ -283,7 +285,7 @@ int main(int argc, char **argv) {
     int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0, fpu = -1;
     uint64_t limit = 0;
     int mem_every = 0;          /* -M N: whole-memory -V compare every N block runs (0: the DBT default) */
-    const char *root = NULL, *prog = NULL, *dump = NULL, *gdump = NULL, *drive_a = NULL, *drive_b = NULL;
+    const char *root = NULL, *prog = NULL, *dump = NULL, *gdump = NULL, *ktrace = NULL, *drive_a = NULL, *drive_b = NULL;
     int window = -1;                         /* -w / -W; -1: a window if stdout is a terminal */
     const char *boot_img = NULL, *img_fd[2] = { 0 }, *img_hd[2] = { 0 };
     int img_ro = 0;
@@ -317,6 +319,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-L") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-T") && i + 1 < argc) g_time_limit = atof(argv[++i]);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) dump = argv[++i];
+        else if (!strcmp(argv[i], "-K") && i + 1 < argc) ktrace = argv[++i];
         else if (!strcmp(argv[i], "-G") && i + 1 < argc) gdump = argv[++i];
         else if (!strcmp(argv[i], "-w")) window = 1;
         else if (!strcmp(argv[i], "-W")) window = 0;
@@ -378,6 +381,7 @@ int main(int argc, char **argv) {
         pc_disk_install(&cpu);
         pc_cmos_init(&cpu);
         pc.debug = debug;
+        if (ktrace && !(pc.keytrace = fopen(ktrace, "w"))) { perror(ktrace); return 1; }
         pc.boot_drive = boot_drive;
         pc.swap_disk = pc_disk_swap;
         pc_disk_boot(&cpu, boot_drive);
@@ -432,6 +436,7 @@ int main(int argc, char **argv) {
         pc_disk_install(&cpu);
         pc_cmos_init(&cpu);
         pc.debug = debug;
+        if (ktrace && !(pc.keytrace = fopen(ktrace, "w"))) { perror(ktrace); return 1; }
         dos_init(&cpu, root_abs);
         if (drive_a && dos_mount(0, drive_a) < 0) return 1;
         if (drive_b && dos_mount(1, drive_b) < 0) return 1;
@@ -507,6 +512,7 @@ int main(int argc, char **argv) {
     uint64_t t1 = pc_now_ns();
 
     pc_video_flush(1);
+    pc_kbd_keytrace_exit(&cpu);
     pc_video_shutdown();
     pc_sdl_shutdown();
     pc_kbd_shutdown();
