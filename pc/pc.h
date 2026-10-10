@@ -108,6 +108,7 @@ typedef struct pc_state {
     uint8_t       ivt_service[256];  /* the vector points at its own stub (pc_set_service) */
 
     int returned;                    /* the running service popped its own frame */
+    int faulted;                     /* ...or raised a page fault on a guest buffer instead of running (pc_hle_touch) */
     int (*swap_disk)(void);          /* ESC-+ : next diskette (dos layer) */
     int exit_requested;              /* DOS asked to terminate */
     int exit_code;
@@ -140,6 +141,7 @@ void pc_native_irq_vectors(x86_cpu *c);  /* booted machines: INT 9 through the n
 void pc_kbd_trap(x86_cpu *c, int vector);   /* PC_TRAP_KBD: translate the scancode in AL */
 void pc_set_trap(int offset, pc_service_fn fn, int ret_mode);
 void pc_hle_return(x86_cpu *c, int mode); /* pop the INT frame per mode */
+int  pc_hle_touch(x86_cpu *c, uint32_t lin, uint32_t len, int write); /* a service's guest buffer: present, or #PF raised (0) */
 int  pc_poll(x86_cpu *c);                /* between blocks: keys, timer, IRQ delivery; 1 if cpu state changed */
 uint64_t pc_now_ns(void);
 uint64_t pc_wall_ns(void);            /* the host's clock, whatever pc_now_ns is */

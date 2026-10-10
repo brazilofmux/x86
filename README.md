@@ -63,8 +63,9 @@ Two ways to run things:
   - ReactOS 0.4.16, installed by its own setup from its hybrid ISO as the
     second hard disk (-boot d), to its desktop: FreeLdr, the kernel on
     the PIC HAL, its ATA port driver on the PCI machine's PIIX3 IDE
-    function (-pci), the display as a PCI function with -vbe; its kernel
-    debugger's log on COM1
+    function (-pci), the display as a PCI function with -vbe and its VESA
+    driver on our VBE through the kernel's V86 monitor, 800x600x32; its
+    kernel debugger's log on COM1
 - **As a DOS program runner** (the default): an emulated DOS (INT 21h in
   the host, a host directory as C:, a DPMI host of our own) for running a
   program headless — WordPerfect 5.1, Turbo Pascal 5.5, MS COBOL 5.0,

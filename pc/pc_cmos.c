@@ -346,6 +346,7 @@ static void phys_wr(x86_cpu *c, uint32_t p, uint8_t v) {
  * of the GDT at ES:SI (entries 2 and 3), 24-bit bases (32 on a 386). */
 static void block_move(x86_cpu *c) {
     uint32_t gdt = ((uint32_t)c->seg[S_ES].sel << 4) + x86_get_r16(c, R_SI);
+    if (!pc_hle_touch(c, gdt, 0x30, 0)) return;
     uint32_t n = (uint32_t)x86_get_r16(c, R_CX) * 2;
     uint32_t base[2];
     for (int k = 0; k < 2; k++) {
@@ -373,6 +374,7 @@ static void e820(x86_cpu *c) {
     else if (idx == 3 && pc_vbe_reserved()) { base = c->mem_size - pc_vbe_reserved(); len = pc_vbe_reserved(); type = 2; }   /* the framebuffer */
     else { x86_set_r8(c, R_AH, 0x86); c->eflags |= X86_CF; return; }
     uint32_t buf = ((uint32_t)c->seg[S_ES].sel << 4) + x86_get_r16(c, R_DI);
+    if (!pc_hle_touch(c, buf, 20, 1)) return;
     uint32_t v[5] = { base, 0, len, 0, type };
     for (int k = 0; k < 5; k++)
         for (int b = 0; b < 4; b++) x86_phys_wr8(c, buf + 4u * (uint32_t)k + (uint32_t)b, (uint8_t)(v[k] >> (8 * b)));

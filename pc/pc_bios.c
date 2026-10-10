@@ -87,6 +87,35 @@ void pc_hle_return(x86_cpu *c, int mode) {
         c->eflags = x86_flags_fixup(c, (c->eflags & ~(uint32_t)(X86_IF | X86_TF)) | (fl & (X86_IF | X86_TF)));
 }
 
+/* A service's guest buffer under paging may not be there: ReactOS's video
+ * port marks CSRSS's V86 memory "in transition" between INT 10h calls,
+ * and a real BIOS's first touch faults it back in. A service that reads
+ * or writes guest memory calls this first for the range it will touch. A
+ * page it cannot reach raises #PF at the stub itself, with the INT frame
+ * still on the stack: the guest's handler returns to the stub, and the
+ * service runs again, this time with the page in. 1 if all are present;
+ * 0 and the service must return at once, having done nothing. */
+int pc_hle_touch(x86_cpu *c, uint32_t lin, uint32_t len, int write) {
+    if (!(c->cr0 & X86_CR0_PG) || len == 0) return 1;
+    uint32_t last = (lin + len - 1) & ~0xFFFu;
+    uint8_t super = c->pg_super;
+    c->pg_super = 0;                             /* the caller's own privilege, as its instruction would */
+    c->fault_armed = 1;
+    if (_setjmp(c->fault_jb) == 0) {
+        for (uint32_t p = lin; ; p = (p & ~0xFFFu) + 0x1000) {
+            x86_lin(c, p, write);
+            if ((p & ~0xFFFu) == last) break;
+        }
+        c->fault_armed = 0;
+        c->pg_super = super;
+        return 1;
+    }
+    c->fault_armed = 0;                          /* x86_page_walk set CR2, exc and the error code */
+    c->pg_super = super;
+    pc.faulted = 1;
+    return 0;
+}
+
 /* X86_SVCPROF=1: host time and call count per (vector, AH), dumped at
  * exit. Two clock reads per service call, so it stays behind the env
  * check; the point is to find which service the guest actually lives in. */
@@ -140,6 +169,10 @@ static void hle_dispatch(x86_cpu *c, int vector) {
     }
     int mode = fn ? pc.ret_mode[vector] : HLE_RET_IRET;
     pc.returned = 0;
+    pc.faulted = 0;
+    /* Every service reads or writes the BIOS data area: under a monitor
+     * that pages it out between calls, fault it in before running. */
+    if (fn && !pc_hle_touch(c, PC_BDA_SEG << 4, 0x100, 1)) return;
     {   /* X86_SVCTRACE=<vector>: the first callers of that service (return CS:IP from the frame) */
         static int trace_vec = -2, traced;
         if (trace_vec == -2) trace_vec = getenv("X86_SVCTRACE") ? (int)strtol(getenv("X86_SVCTRACE"), NULL, 16) : -1;
@@ -164,6 +197,7 @@ static void hle_dispatch(x86_cpu *c, int vector) {
     /* A service that transferred control itself (program exit, exec,
      * INT 8 chaining to 1Ch) has already done its own return. */
     if (c->halted || pc.returned) return;
+    if (pc.faulted) { pc.faulted = 0; return; }   /* #PF pending: the frame stays, the stub runs again after it */
     pc_hle_return(c, mode);
 }
 

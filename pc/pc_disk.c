@@ -175,6 +175,7 @@ static void status(x86_cpu *c, int dl, int ah) {
 /* Move COUNT sectors at LBA between the image and linear address BUF. */
 static int transfer(x86_cpu *c, disk *d, uint64_t lba, int count, uint32_t buf, int write) {
     if (lba + (uint64_t)count > d->size / 512) return 0x04;          /* sector not found */
+    if (!pc_hle_touch(c, buf, (uint32_t)count * 512, !write)) return 0;   /* (pc.faulted: the caller returns at once) */
     uint8_t *p = d->data + lba * 512;
     size_t n = (size_t)count * 512;
     for (size_t b = 0; b < n; b++) {                     /* phys writes keep the SMC bitmap told */
@@ -211,6 +212,7 @@ static void int13(x86_cpu *c, int vector) {
         uint32_t buf = ((uint32_t)c->seg[S_ES].sel << 4) + x86_get_r16(c, R_BX);
         int err = ah == 0x04 ? (lba + (uint64_t)count > d->size / 512 ? 0x04 : 0)
                              : transfer(c, d, lba, count, buf, ah == 0x03);
+        if (pc.faulted) return;
         x86_set_r8(c, R_AL, err ? 0 : (uint8_t)count);
         if (!err) d->changed = 0;
         status(c, dl, err);
@@ -281,12 +283,14 @@ static void int13(x86_cpu *c, int vector) {
     case 0x42: case 0x43: case 0x44: {                       /* LBA read, write, verify */
         if (!d || !(dl & 0x80)) { status(c, dl, 0x01); return; }
         uint16_t si = x86_get_r16(c, R_SI), ds = c->seg[S_DS].sel;
+        if (!pc_hle_touch(c, ((uint32_t)ds << 4) + si, 16, 1)) return;   /* the packet (its count is written back) */
         int count = pc_rd16(c, ds, (uint16_t)(si + 2));
         uint32_t buf = ((uint32_t)pc_rd16(c, ds, (uint16_t)(si + 6)) << 4) + pc_rd16(c, ds, (uint16_t)(si + 4));
         uint64_t lba = pc_rd16(c, ds, (uint16_t)(si + 8)) | (uint64_t)pc_rd16(c, ds, (uint16_t)(si + 10)) << 16
                      | (uint64_t)pc_rd16(c, ds, (uint16_t)(si + 12)) << 32 | (uint64_t)pc_rd16(c, ds, (uint16_t)(si + 14)) << 48;
         int err = ah == 0x44 ? (lba + (uint64_t)count > d->size / 512 ? 0x04 : 0)
                              : transfer(c, d, lba, count, buf, ah == 0x43);
+        if (pc.faulted) return;
         if (err) pc_wr16(c, ds, (uint16_t)(si + 2), 0);
         status(c, dl, err);
         return;

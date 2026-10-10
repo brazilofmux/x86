@@ -2055,6 +2055,17 @@ int x86_step(x86_cpu *c) {
      * same linear address traps exactly as the real-mode IVT does. */
     if (c->hle && c->seg[S_CS].base == ((uint32_t)c->hle_seg << 4)) {
         c->hle(c, (int)(c->eip & 0xFF));
+        if (c->exc >= 0) {
+            /* The service faulted on a guest page (pc_hle_touch): deliver
+             * it at the stub, which the handler returns to and re-runs. */
+            int vec = c->exc;
+            c->exc = -1;
+            if (c->trace_exc) c->trace_exc(c, vec, c->exc_err);
+            c->exc_delivered = 1;
+            count_exc(c, vec);
+            x86_interrupt(c, vec, 0);
+            return c->halted ? 1 : 0;
+        }
         c->exc_delivered = 0;
         return c->halted ? 1 : 0;
     }

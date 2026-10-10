@@ -22,8 +22,12 @@
  * real card's, so no OS binds a card's driver to it), BAR 0 the
  * framebuffer (8 MB, prefetchable, at the RAM it is). Windows-family
  * systems install their VESA path on a PCI display device: ReactOS's
- * display.inf puts vgapnp.sys and framebuf.dll on PCI\CC_0300, and its
- * Root\VgaSave fallback is 640x480x16 for good.
+ * display.inf puts vgapnp.sys (its VBE miniport) and framebuf.dll on
+ * PCI\CC_0300; its Root\VgaSave fallback is 640x480x16 for good. That
+ * miniport calls here through the kernel's V86 monitor from CSRSS's
+ * address space, where the buffer's page may be paged out between calls
+ * (pc_hle_touch), and being a VBE 3.0 reader it takes the colour masks
+ * from the linear-mode fields of the mode information block.
  *
  * Functions: 00h controller information (the mode list and OEM strings
  * inside the caller's buffer), 01h mode information, 02h set mode (a
@@ -80,7 +84,10 @@ static void fail(x86_cpu *c) { x86_set_r16(c, R_AX, 0x014F); }
 static void info(x86_cpu *c) {
     uint32_t b = es_di(c);
     uint16_t seg = c->seg[S_ES].sel, off = x86_get_r16(c, R_DI);
+    if (!pc_hle_touch(c, b, 256, 1)) return;
     int v2 = x86_phys_rd8(c, b) == 'V' && x86_phys_rd8(c, b + 1) == 'B' && x86_phys_rd8(c, b + 2) == 'E' && x86_phys_rd8(c, b + 3) == '2';
+    if (pc.debug) fprintf(stderr, "[vbe] 4F00 at %04X:%04X (pmode %d vm %d), %s\n", seg, off, c->pmode, (c->eflags & X86_VM) != 0, v2 ? "VBE2" : "VBE1");
+    if (v2 && !pc_hle_touch(c, b + 256, 256, 1)) return;
     for (uint32_t i = 0; i < (v2 ? 512u : 256u); i++) wr8(c, b + i, 0);
     wr8(c, b, 'V'); wr8(c, b + 1, 'E'); wr8(c, b + 2, 'S'); wr8(c, b + 3, 'A');
     wr16(c, b + 4, 0x0300);
@@ -109,6 +116,7 @@ static void mode_info(x86_cpu *c) {
     const struct vbe_mode *m = find(x86_get_r16(c, R_CX));
     if (!m) { fail(c); return; }
     uint32_t b = es_di(c), p = pitch(m);
+    if (!pc_hle_touch(c, b, 256, 1)) return;
     for (uint32_t i = 0; i < 256; i++) wr8(c, b + i, 0);
     wr16(c, b + 0x00, 0x00FB);         /* supported, extended info, colour, graphics, not VGA, no window, linear */
     wr16(c, b + 0x10, (uint16_t)p);    /* BytesPerScanLine */
@@ -125,7 +133,7 @@ static void mode_info(x86_cpu *c) {
     static const uint8_t m16[8] = { 5, 11, 6, 5, 5, 0, 0, 0 }, m32[8] = { 8, 16, 8, 8, 8, 0, 8, 24 };
     const uint8_t *mk = m->bpp == 16 ? m16 : m->bpp == 32 ? m32 : NULL;
     if (mk) {
-        for (int k = 0; k < 8; k++) { wr8(c, b + 0x1F + (uint32_t)k, mk[k]); wr8(c, b + 0x38 + (uint32_t)k, mk[k]); }
+        for (int k = 0; k < 8; k++) { wr8(c, b + 0x1F + (uint32_t)k, mk[k]); wr8(c, b + 0x36 + (uint32_t)k, mk[k]); }   /* ...and the linear-mode copies at 36h (VBE 3.0 readers, ReactOS's vbemp, take these) */
         wr8(c, b + 0x27, m->bpp == 32 ? 0x02 : 0x00);   /* DirectColorModeInfo: reserved field usable (32) */
     }
     wr32(c, b + 0x28, lfb_base(c));    /* PhysBasePtr */
@@ -198,6 +206,7 @@ void pc_vbe_int10(x86_cpu *c) {
     case 0x09: {                               /* palette data: set (00h, 80h) or get (01h), CX entries from DX, at ES:DI (B, G, R, 0) */
         uint32_t n = x86_get_r16(c, R_CX), first = x86_get_r16(c, R_DX), a = es_di(c);
         if (first + n > 256 || (bl != 0 && bl != 1 && bl != 0x80)) { fail(c); return; }
+        if (!pc_hle_touch(c, a, n * 4, bl == 1)) return;
         for (uint32_t i = 0; i < n; i++, a += 4) {
             uint8_t rgb[3];
             if (bl == 1) {

@@ -245,12 +245,26 @@ the desktop. What ReactOS asked of the machine:
   kernel debugger polls port 60h with interrupts off, which lost every
   key after the first (the pending IRQ 1 held the latch).
 - Its display driver for a PCI display (display.inf, PCI\CC_0300) is
-  vgapnp.sys with framebuf.dll, and -vbe puts the display at 00:02.0 for
-  it; without a PCI display the Root\VgaSave fallback is 640x480x16.
-  The desktop is 640x480x16 either way for now: vgapnp's VESA probe goes
-  through videoprt's INT 10h, whose x86 emulator does not initialise on
-  this HAL and whose V86 path never issues the call here (QEMU without
-  ACPI gets 800x600x32 by the same route) — open.
+  vgapnp.sys (the VBE miniport, vbemp) with framebuf.dll, and -vbe puts
+  the display at 00:02.0 for it; without a PCI display the Root\VgaSave
+  fallback is 640x480x16. The desktop is 800x600x32. The VBE probe is
+  INT 10h from the kernel's V86 monitor (Ke386CallBios) in CSRSS's
+  address space, with the buffer at 2000:0000 in a page videoprt
+  re-protects between calls: a transition PTE, not present, that a real
+  BIOS's first touch faults back in. Our host-side services now do the
+  same — pc_hle_touch raises #PF at the stub for a guest buffer it
+  cannot reach, and the stub runs again when the handler returns. And
+  vbemp, a VBE 3.0 reader, takes the colour masks from the linear-mode
+  fields of the mode info block (36h), which were two bytes off.
+- At 16 colours (VgaSave: vga.sys with vgaddi.dll, the fallback without
+  -vbe, and the setup wizard) ReactOS draws striped box fills, garbled
+  small bitmaps, no desktop icons and a striped taskbar. That is its
+  vgaddi, not our planar VGA: the same disk image booted with /BASEVIDEO
+  on QEMU (-vga std) and on dos-monster renders the same 640x480x16
+  screen identically, dotted garbage along a dialog's bottom edge
+  included, to the pixel (the only differences are QEMU's 6-bit DAC
+  rounding, 87 for our 85). On QEMU's ISA VGA (-vga none -device
+  isa-vga) its vgaddi bugchecks outright (STOP 1E in vgaddi.dll).
 - The copy stage trips its FAT driver's assertion now and then
   (CORE-19741) and waits for a debugger: run the install again. Its
   kernel debug log, with the "ReactOS (Debug)" boot entry, is plain text
