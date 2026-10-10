@@ -228,6 +228,34 @@ root login, a C program compiled and run.
 - expect.py takes a script line starting with # for a comment: a root
   prompt's pattern is [#].
 
+ReactOS 0.4.16, installed by its own setup. tests/boot/rosinstall.sh
+boots the release ISO (disks/reactos/ReactOS-0.4.16-i386.iso, a hybrid
+image: an MBR over the ISO 9660 filesystem) as the second hard disk,
+-boot d, with a blank 2 GB first disk, drives the text-mode setup from
+its screens and the wizard blind, and the boot test takes the result to
+the desktop. What ReactOS asked of the machine:
+- Its ATA port driver (new in 0.4.16) finds IDE channels only under a PCI
+  IDE function, or a PnP BIOS's *PNP0600; the PCI machine (-pci) has the
+  channel as a PIIX3 function at 00:01.0.
+- FreeLdr asks for PCI through the real-mode PCI BIOS, INT 1Ah AH=B1h —
+  the 32-bit one behind BIOS32 was all there was, so the kernel heard of
+  no PCI bus and started no bus driver.
+- Its i8042 driver resets the mouse with both interfaces disabled in the
+  command byte and polls for the ACK, which the 8042 had held back; its
+  kernel debugger polls port 60h with interrupts off, which lost every
+  key after the first (the pending IRQ 1 held the latch).
+- Its display driver for a PCI display (display.inf, PCI\CC_0300) is
+  vgapnp.sys with framebuf.dll, and -vbe puts the display at 00:02.0 for
+  it; without a PCI display the Root\VgaSave fallback is 640x480x16.
+  The desktop is 640x480x16 either way for now: vgapnp's VESA probe goes
+  through videoprt's INT 10h, whose x86 emulator does not initialise on
+  this HAL and whose V86 path never issues the call here (QEMU without
+  ACPI gets 800x600x32 by the same route) — open.
+- The copy stage trips its FAT driver's assertion now and then
+  (CORE-19741) and waits for a debugger: run the install again. Its
+  kernel debug log, with the "ReactOS (Debug)" boot entry, is plain text
+  on -com1.
+
 FreeDOS on the network: -nic ne2000,user, a Novell NE2000 (the DP8390;
 pc/pc_ne2000.c) on the ISA bus at 300h, IRQ 3, with slirp behind it.
 The software is FreeDOS 1.3's own, from its repository's net group

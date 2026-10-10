@@ -244,6 +244,10 @@ static void bios_int1a(x86_cpu *c, int vector) {
         pc_rtc_alarm(0, 0, 0, 0);
         c->eflags &= ~X86_CF;
         break;
+    case 0xB1:                                   /* the PCI BIOS (pc_pci.c), on the PCI machine */
+        if (pc_pci_int1a(c)) break;
+        c->eflags |= X86_CF;
+        break;
     default:
         c->eflags |= X86_CF;
         break;
@@ -350,10 +354,14 @@ void pc_irq_unmask(int irq) {
 
 /* The 8042's output buffer holds one byte: a controller reply, a
  * keyboard code, or one from the auxiliary device. The mouse's next byte
- * goes in once the buffer is empty and the aux clock is on (command byte
- * bit 5 clear), with IRQ 12 if bit 1 says so. */
+ * goes in once the buffer is empty, with IRQ 12 if command byte bit 1
+ * says so. Bit 5 (the aux interface off: its clock held low) does not
+ * hold the buffer: the controller still carries out a D4h transaction
+ * and hands over the reply — ReactOS's i8042prt resets the mouse with
+ * both interfaces disabled in the command byte and polls for the ACK.
+ * What the bit stops is the mouse sending on its own (pc_ps2_poll). */
 static void aux_latch(void) {
-    if (pc.aux_full || pc.kbc_out_full || pc.irq9_busy || (pc.kbc_cmdbyte & 0x20) || !pc_ps2_pending()) return;
+    if (pc.aux_full || pc.kbc_out_full || pc.irq9_busy || !pc_ps2_pending()) return;
     pc.aux_out = pc_ps2_take();
     pc.aux_full = 1;
     if (pc.kbc_cmdbyte & 0x02) pc_irq_raise(12);
@@ -501,7 +509,13 @@ static int poll(x86_cpu *c) {
     pc_uart_poll();
     pc_net_poll(0);                              /* the network card's far end */
     aux_latch();
-    if (!(pc.irq_pending & (1 << 9)) && !pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2)
+    /* The pending IRQ 1 itself does not hold the latch: a guest that
+     * polls port 60h with interrupts off (ReactOS's kernel debugger) has
+     * taken the code, and the 8259 keeps the one edge it latched; the
+     * next code raises another, which it ignores. Holding the latch
+     * until that interrupt was taken stopped such a guest after its
+     * first key. */
+    if (!pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2)
         && !(pc.kbd_disabled & 1)                                        /* the 8042's interface (ADh) holds everything */
         && (!(pc.kbd_disabled & 2) || pc_kbd_raw_reply_pending())        /* scanning off (F5h) holds keys, not replies */
         && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
@@ -557,10 +571,15 @@ static int poll(x86_cpu *c) {
     }
 
     if (c->halted && pc.ide_due != UINT64_MAX) pc_ide_poll(1);   /* halted waiting for the disk: no instructions will pass */
-    while (c->halted && (c->eflags & X86_IF) && !pc.irq_pending) {
+    while (c->halted && (c->eflags & X86_IF) && !intr_ready(c) && !pc.exit_requested) {
         /* HLT with interrupts on: the guest is idling for the next tick —
          * or for the RTC, if its interrupt comes first (and until one of
-         * them has actually raised something). */
+         * them has actually raised something it can take: a request the
+         * 8259 masks does not wake it. ReactOS's setup halts with the
+         * keyboard's IRQ 1 masked; the first key's request ended the nap
+         * with the machine still halted, which the run loops took as a
+         * machine that had stopped — and the run ended, silently.) */
+        if (pc.stop_ns && pc_now_ns() >= pc.stop_ns) break;         /* -T: the run is over */
         uint64_t next = pc.next_tick_ns;
         int rtc_first = pc.rtc_next_ns < next;
         if (rtc_first) next = pc.rtc_next_ns;
@@ -578,10 +597,15 @@ static int poll(x86_cpu *c) {
         }
         pc_uart_poll();
         pc_net_poll(0);
-        if (pc.irq_pending) break;
+        if (intr_ready(c)) break;
         if (pc_now_ns() < next) continue;
         if (rtc_first) pc_rtc_poll(pc_now_ns());
-        else pc.irq_pending |= 1 << 8;
+        else {
+            pc.irq_pending |= 1 << 8;
+            /* masked at the 8259: the request stays latched and the PIT
+             * ticks on — the next nap is a period long, not a spin */
+            if (pic.mask & 1) pc.next_tick_ns += irq0_period_ns();
+        }
     }
     }
     if (pc.debug > 2) { static int n; if ((n++ & 1023) == 0) fprintf(stderr, "[poll] pending %X isr %X IF %d inhibit %d @%llu\n", pc.irq_pending, pc.irq_in_service, (c->eflags & X86_IF) != 0, c->int_inhibit, (unsigned long long)c->insn_count); }

@@ -17,6 +17,14 @@
  * and 32 (x:8:8:8) bits per pixel. Linear framebuffer only: no banked
  * window at A0000h (ModeAttributes says so; 4F05h fails).
  *
+ * On the PCI machine the display is also a PCI function, 00:02.0, class
+ * 03.00 (a VGA-compatible controller, vendor 1234h device 1112h: no
+ * real card's, so no OS binds a card's driver to it), BAR 0 the
+ * framebuffer (8 MB, prefetchable, at the RAM it is). Windows-family
+ * systems install their VESA path on a PCI display device: ReactOS's
+ * display.inf puts vgapnp.sys and framebuf.dll on PCI\CC_0300, and its
+ * Root\VgaSave fallback is 640x480x16 for good.
+ *
  * Functions: 00h controller information (the mode list and OEM strings
  * inside the caller's buffer), 01h mode information, 02h set mode (a
  * VGA mode number sets that mode as AH=00h does), 03h current mode, 06h
@@ -244,4 +252,25 @@ int pc_vbe_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h) {
         }
     }
     return 0;
+}
+
+/* ---- the PCI function --------------------------------------------------- */
+
+static pc_pci_dev vgapci;
+
+void pc_vbe_pci_attach(x86_cpu *c) {
+    if (!v.enabled) return;
+    pc_pci_dev *d = &vgapci;
+    memset(d, 0, sizeof *d);
+    static const uint8_t id[16] = {
+        0x34, 0x12, 0x12, 0x11,     /* vendor 1234h, device 1112h */
+        0x03, 0x00, 0x80, 0x02,     /* command: I/O, memory; status: medium DEVSEL, fast back-to-back */
+        0x00, 0x00, 0x00, 0x03,     /* revision 0; programming interface 0; class 03h (display), subclass 00h (VGA) */
+        0x00, 0x00, 0x00, 0x00,     /* header type 0, single function */
+    };
+    memcpy(d->cfg, id, sizeof id);
+    d->bar_size[0] = VRAM;
+    d->bar_fixed[0] = lfb_base(c);
+    d->cfg[0x10] = 0x08;                                 /* BAR 0: memory, prefetchable (the size's bits are written at POST) */
+    pc_pci_add(2, d);
 }

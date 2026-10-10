@@ -756,7 +756,7 @@ void x86_interrupt(x86_cpu *c, int vector, int is_sw) {
                     c->pg_probe = sp8;
                 }
             }
-            if (depth == 2) { c->exc = -1; c->halted = 1; return; }   /* triple fault */
+            if (depth == 2) { c->exc = -1; c->halted = 1; c->shutdown = 1; return; }   /* triple fault */
             vec = depth == 1 ? X86_EXC_DF : c->exc;
             err = depth == 1 ? 0 : c->exc_err;
             c->exc = -1;

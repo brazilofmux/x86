@@ -144,6 +144,7 @@ void pc_ps2_button(int button, int down) {
  * last packet has been taken and the sample period has passed. */
 void pc_ps2_poll(uint64_t now) {
     if (!ps.reporting || ps.remote || ps.wrap) return;
+    if (pc.kbc_cmdbyte & 0x20) return;           /* the aux interface is off: the device cannot send */
     if (!ps.moved && ps.buttons == ps.sent_buttons) return;
     if (pc_ps2_pending() || now < ps.next_ns) return;
     packet();

@@ -32,6 +32,17 @@
  * an ATAPI device — is aborted. With no slave, a read of its registers
  * finds 0. SRST (device control bit 2) resets both, leaving the ATA
  * signature in the task file.
+ *
+ * On the PCI machine (-pci, or a PCI card) the channel is also a PCI
+ * function, 00:01.0, an Intel 82371SB (PIIX3) IDE controller (8086:7010)
+ * in compatibility mode: the same ports and IRQ 14, the secondary channel
+ * disabled in IDETIM (configuration 42h-43h), and the bus-master
+ * registers at BAR 4 — a register set, no DMA: the drive claims no DMA
+ * modes, and the status register's interrupt bit follows INTRQ, cleared
+ * by writing it, the way drivers that always clear it expect. Operating
+ * systems whose IDE drivers find their channels only under a PCI IDE
+ * function (ReactOS 0.4.16's ATA port driver; the PnP BIOS's *PNP0600 is
+ * the other route, and there is no PnP BIOS here) need it.
  */
 #include "pc.h"
 #include <stdio.h>
@@ -73,6 +84,8 @@ static struct {
 
 #define IDE_BUSY_INSNS 10000u
 
+static uint8_t bm[16];                           /* the PCI function's bus-master registers (BAR 4) */
+
 static int sel(void) { return (ide.devhead >> 4) & 1; }
 static drive *cur(void) { return ide.present[sel()] ? &ide.d[sel()] : NULL; }
 
@@ -80,6 +93,7 @@ static void irq(void) {
     if (ide.control & 0x02) return;              /* nIEN */
     if (!ide.intrq) {
         ide.intrq = 1;
+        bm[2] |= 0x04;                           /* the PCI function's interrupt status bit */
         pc_irq_raise(14);
         if (pc.cpu) pc.cpu->jit_cur_hit = 1;     /* taken at the next boundary: translated code goes back to the run loop */
     }
@@ -426,4 +440,52 @@ void pc_ide_post(x86_cpu *c) {
     pc_wr16(c, 0, 0x76 * 4, PC_STUB_INT76);
     pc_wr16(c, 0, 0x76 * 4 + 2, PC_STUB_SEG);
     if (ide.present[0]) pc_irq_unmask(14);
+}
+
+/* ---- the PCI function --------------------------------------------------- */
+
+static pc_pci_dev piix;
+
+static int bm_read(pc_pci_dev *d, uint16_t port, int size, uint32_t *val) {
+    uint32_t off = (uint32_t)port - pc_pci_bar(d, 4);
+    if (off >= 16) return 0;
+    uint32_t v = 0;
+    for (int i = 0; i < size && off + (uint32_t)i < 16; i++) v |= (uint32_t)bm[off + (uint32_t)i] << (8 * i);
+    *val = v;
+    return 1;
+}
+static int bm_write(pc_pci_dev *d, uint16_t port, uint32_t val, int size) {
+    uint32_t off = (uint32_t)port - pc_pci_bar(d, 4);
+    if (off >= 16) return 0;
+    for (int i = 0; i < size && off + (uint32_t)i < 16; i++) {
+        uint32_t r = off + (uint32_t)i;
+        uint8_t v = (uint8_t)(val >> (8 * i));
+        switch (r & 7) {
+        case 0: bm[r] = v & 0x09; break;                             /* command: start, direction */
+        case 2: bm[r] = (uint8_t)((bm[r] & ~(v & 0x06) & ~0x60u) | (v & 0x60)); break;   /* status: interrupt and error clear on a 1; the drive-DMA-capable bits are kept */
+        case 4: case 5: case 6: case 7: bm[r] = r == 4 ? v & 0xFC : v; break;   /* the PRD table's address */
+        default: break;
+        }
+    }
+    return 1;
+}
+static void piix_reset(pc_pci_dev *d) { (void)d; memset(bm, 0, sizeof bm); }
+
+void pc_ide_pci_attach(void) {
+    pc_pci_dev *d = &piix;
+    memset(d, 0, sizeof *d);
+    static const uint8_t id[16] = {
+        0x86, 0x80, 0x10, 0x70,     /* vendor 8086h, device 7010h: 82371SB IDE */
+        0x01, 0x00, 0x80, 0x02,     /* command: I/O; status: medium DEVSEL, fast back-to-back */
+        0x00, 0x80, 0x01, 0x01,     /* revision 0; programming interface 80h (bus master, both channels compatibility mode); class 01h (storage), subclass 01h (IDE) */
+        0x00, 0x00, 0x00, 0x00,     /* header type 0, single function */
+    };
+    memcpy(d->cfg, id, sizeof id);
+    d->cfg[0x41] = 0x80;                                 /* IDETIM: primary channel decode enabled, */
+    d->cfg[0x43] = 0x00;                                 /* ... secondary not */
+    d->bar_size[4] = 16; d->bar_io[4] = 1;               /* the bus-master registers */
+    d->reset = piix_reset;
+    d->io_read = bm_read;
+    d->io_write = bm_write;
+    pc_pci_add(1, d);
 }

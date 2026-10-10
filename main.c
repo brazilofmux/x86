@@ -37,7 +37,7 @@ static void usage(const char *prog) {
            "              a NAT network behind it (libslirp: DHCP gives 10.0.2.15)\n");
     printf("  -nic ne2000[,user] a Novell NE2000 on the ISA bus instead (300h, IRQ 3)\n");
     printf("  -ro         the images are read-only: the guest may write, the files never change\n");
-    printf("  -boot a|c|IMG  boot the machine from A: or C: (IMG: -fda IMG -boot a), no HLE DOS\n");
+    printf("  -boot a|c|d|IMG  boot the machine from A:, C: or the second hard disk (IMG: -fda IMG -boot a), no HLE DOS\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
     printf("  -s          print statistics on exit\n");
     printf("  -d          trace DOS and DPMI calls (-d -d: every call, with registers)\n");
@@ -68,7 +68,7 @@ static int host_poll(x86_cpu *c) {
     int changed = pc_poll(c);
     if (g_time_limit > 0) {
         static uint64_t t0;
-        if (!t0) t0 = pc.now_ns;
+        if (!t0) { t0 = pc.now_ns; pc.stop_ns = t0 + (uint64_t)(g_time_limit * 1e9); }
         if ((double)(pc.now_ns - t0) > g_time_limit * 1e9) { c->halted = 1; return 1; }
     }
     static int rate = -1;
@@ -359,6 +359,7 @@ int main(int argc, char **argv) {
     if (boot_img) {
         if (!strcmp(boot_img, "a") || !strcmp(boot_img, "A")) boot_drive = 0x00;
         else if (!strcmp(boot_img, "c") || !strcmp(boot_img, "C")) boot_drive = 0x80;
+        else if (!strcmp(boot_img, "d") || !strcmp(boot_img, "D")) boot_drive = 0x81;    /* the second disk: an installer's medium (ReactOS's hybrid ISO as -hdb), the first one its target */
         else { img_fd[0] = boot_img; boot_drive = 0x00; }
     } else if (i >= argc && (img_fd[0] || img_hd[0])) {
         boot_drive = img_fd[0] ? 0x00 : 0x80;        /* images and no program: boot them */
@@ -505,6 +506,13 @@ int main(int argc, char **argv) {
     }
     for (;;) {
         rc = use_jit ? dbt_run(&g_dbt) : run_interp(&cpu, limit);
+        /* A run that ended on the CPU's own account — a triple fault, or
+         * HLT with interrupts off (an OS that has shut down, or crashed
+         * without a screen to say so) — says where, since nothing else will. */
+        if (rc >= 0 && cpu.halted && !pc.exit_requested && !(pc.stop_ns && pc.now_ns >= pc.stop_ns))
+            fprintf(stderr, "dos-monster: %s at %04X:%08X (insn %llu)\n",
+                    cpu.shutdown ? "triple fault" : (cpu.eflags & X86_IF) ? "halted" : "halted with interrupts off",
+                    cpu.seg[S_CS].sel, cpu.eip, (unsigned long long)cpu.insn_count);
         if (rc < 0 || !pc.reboot) break;
         pc_reboot(&cpu);                       /* the booted machine reset itself */
         if (use_jit || g_golden) { dbt_cache_invalidate_all(&g_dbt); g_dbt.shadow_stale = 1; }

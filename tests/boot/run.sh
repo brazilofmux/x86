@@ -162,6 +162,17 @@ if [ -f disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso ]; then
     then echo "ok   haiku r1/beta6 to its welcome window (vbe, 1024x768)"; else echo "FAIL haiku r1/beta6"; fail=1; fi
     rm -f tmp/boot-haiku.exp
 fi
+if [ -f disks/reactos/reactos-installed.img ]; then
+    # ReactOS 0.4.16 (tests/boot/rosinstall.sh) on the PCI machine: FreeLdr,
+    # the kernel on the PIC HAL, its ATA driver on the PIIX3 function,
+    # the desktop in 640x480x16 (about 3 minutes) — a white stroke of the
+    # "My Documents" label and the wallpaper's teal
+    cp disks/reactos/reactos-installed.img tmp/boot-ros.img
+    printf 'waitpix 12,54 255 255 255\nwaitpix 20,100 85 170 170\n' > tmp/boot-ros.exp
+    if python3 tools/expect.py -t 400 tmp/boot-ros.exp -- $DM -m 586 -mem 128 -vbe -pci -W -T 390 -hda tmp/boot-ros.img -boot c >/dev/null 2>&1
+    then echo "ok   reactos 0.4.16 to its desktop (pci, 640x480x16)"; else echo "FAIL reactos 0.4.16"; fail=1; fi
+    rm -f tmp/boot-ros.img tmp/boot-ros.exp
+fi
 if [ -f disks/linux/tc.img ]; then
     # Linux 6.12 (Tiny Core 16.2, tests/boot/tcimage.sh) on the Pentium:
     # GRUB 2 from the disk, the kernel and its initramfs, the shell, a command

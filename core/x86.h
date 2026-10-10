@@ -273,6 +273,7 @@ typedef struct x86_cpu {
      * descriptors and frames) — behind the CPU's back, so -V's shadow,
      * which has no devices, has to be resynced rather than compared. */
     uint8_t  dma_wrote;
+    uint8_t  shutdown;               /* a triple fault: the processor has shut down (halted, never to resume) */
 } x86_cpu;
 
 static inline uint64_t x86_tsc_raw(x86_cpu *c) { return c->tsc_clock ? c->tsc_clock(c) : c->insn_count; }

@@ -96,6 +96,7 @@ typedef struct pc_state {
     uint8_t  aux_full, aux_out;      /* 8042: a byte from the auxiliary device (the PS/2 mouse) in the output buffer */
     uint64_t rtc_next_ns;
     uint64_t ide_due;                /* the IDE drive is busy until this instruction count (UINT64_MAX: idle) */            /* when the RTC next has an interrupt to raise (pc_rtc_poll); ~0 for never */
+    uint64_t stop_ns;                /* -T: pc_now_ns() at which the run stops (0: never) — a halted machine's nap ends there too */
 
     /* Services by vector; NULL = plain IRET stub. */
     pc_service_fn service[256];
@@ -239,6 +240,7 @@ uint8_t *pc_disk_hd(int unit, size_t *size, int *cyls, int *heads, int *spt);   
 typedef struct pc_pci_dev {
     uint8_t  cfg[256];
     uint32_t bar_size[6];
+    uint32_t bar_fixed[6];           /* a BAR POST leaves at this base rather than assigning one (the VBE framebuffer: RAM at the top) */
     uint8_t  bar_io[6];
     uint8_t  irq;
     void (*reset)(struct pc_pci_dev *);
@@ -256,6 +258,7 @@ void pc_pci_add(int dev, pc_pci_dev *d);                  /* at device DEV, func
 uint32_t pc_pci_bar(const pc_pci_dev *d, int i);          /* BAR I's base, type bits off */
 void pc_pci_post(x86_cpu *c);
 int  pc_pci_port_read(uint16_t port, int size, uint32_t *val);
+int  pc_pci_int1a(x86_cpu *c);                            /* the real-mode PCI BIOS (AH=B1h); 0 if there is no bus */
 int  pc_pci_port_write(uint16_t port, uint32_t val, int size);
 void pc_pci_dma_read(x86_cpu *c, uint64_t phys, void *buf, uint32_t len);
 void pc_pci_dma_write(x86_cpu *c, uint64_t phys, const void *buf, uint32_t len);
@@ -269,6 +272,7 @@ int  pc_ne2000_port_write(uint16_t port, uint32_t val, int size);
 void     pc_vbe_enable(void);
 int      pc_vbe_enabled(void);
 uint32_t pc_vbe_reserved(void);           /* bytes of RAM at the top the framebuffer takes (0 without -vbe) */
+void     pc_vbe_pci_attach(x86_cpu *c);   /* the display as a PCI function, 00:02.0, its BAR 0 the framebuffer (pc_pci_post) */
 void     pc_vbe_vga_mode(void);           /* INT 10h AH=00h: the VGA's picture again */
 int      pc_vbe_active(void);
 void     pc_vbe_int10(x86_cpu *c);        /* AH=4Fh */
@@ -290,6 +294,7 @@ int  pc_uart_port_write(uint16_t port, uint32_t val, int size);
 void pc_uart_poll(void);
 void pc_uart_shutdown(void);
 void pc_ide_post(x86_cpu *c);
+void pc_ide_pci_attach(void);            /* the channel's PCI function, 00:01.0 (pc_pci_post) */
 int  pc_ide_port_read(uint16_t port, int size, uint32_t *val);
 int  pc_ide_port_write(uint16_t port, uint32_t val, int size);
 void pc_ide_poll(int now);               /* the drive's busy time over (NOW: at once, the CPU is waiting) */

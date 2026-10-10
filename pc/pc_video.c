@@ -510,7 +510,7 @@ void pc_video_cursor(int *row, int *col, int *start, int *end) {
 void pc_video_dump(x86_cpu *c, FILE *f) {
     int vr, vc;
     pc_vga_text_geometry(&vr, &vc);
-    int nr = vr < PC_ROWS ? vr : PC_ROWS, nc = vc < PC_COLS ? vc : PC_COLS;
+    int nr = vr < 64 ? vr : 64, nc = vc < PC_COLS ? vc : PC_COLS;   /* all the rows a 50-line mode (ReactOS's setup) shows */
     const uint8_t *vm = c->mem + ((uint32_t)PC_VIDEO_SEG << 4);
     uint32_t start = pc_vga_start();
 #define CELL(r, col) vm[((start + (uint32_t)((r) * vc + (col))) * 2) & 0x7FFF]
