@@ -471,6 +471,8 @@ static void ferr_irq13(x86_cpu *c) {
 static int intr_ready(x86_cpu *c) {
     (void)c;
     if (!pc.irq_pending) return 0;
+    if (pc.irq_pending & (1 << 12)) return 1;        /* the local APIC has a vector above the processor priority */
+    if (!pc_apic_extint_ok()) return 0;              /* ... and the 8259s' INTR is not wired through */
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) return 1;
     if ((pc.irq_pending & (1 << 9)) && !(pc.irq_in_service & 3) && !(pic.mask & 2)) return 1;
     uint8_t req = pic2.irr & (uint8_t)~pic2.mask;
@@ -482,6 +484,18 @@ static int intr_ready(x86_cpu *c) {
 static void intr_update(void) {
     if (pc.cpu) pc.cpu->intr_waiting = (uint8_t)intr_ready(pc.cpu);
 }
+void pc_intr_update(void) { intr_update(); }
+
+/* Memory-mapped devices: the local APIC's page, then the PCI cards' BARs. */
+static int mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val) {
+    if (pc_apic_mmio_read(phys, size, val)) return 1;
+    return pc_pci_mmio_read(c, phys, size, val);
+}
+static void mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val) {
+    if (pc_apic_mmio_write(phys, size, val)) return;
+    pc_pci_mmio_write(c, phys, size, val);
+}
+void pc_mmio_install(x86_cpu *c) { c->mmio_read = mmio_read; c->mmio_write = mmio_write; }
 
 static void deliver(x86_cpu *c, int irq) {
     int vector = pic.base + irq;
@@ -515,6 +529,7 @@ static int poll(x86_cpu *c) {
     uint64_t now = pc_now_ns();
     pc.now_ns = now;
     if (now >= pc.rtc_next_ns) pc_rtc_poll(now);        /* the RTC's next interrupt is due (IRQ 8) */
+    pc_apic_poll(now);                                   /* the local APIC's timer */
     if (c->insn_count >= pc.ide_due) pc_ide_poll(0);     /* the IDE drive has the next block, or is done */
     int deliverable = pc.irq_pending && (c->eflags & X86_IF) && !c->int_inhibit;
     if (!deliverable && !c->halted && now < pc.next_slow_ns) return 0;
@@ -597,6 +612,7 @@ static int poll(x86_cpu *c) {
         last_ns = now; last_insn = c->insn_count;
         /* (a tick raised and not yet taken: the one after it is next) */
         uint64_t due = pc.next_tick_ns > now ? pc.next_tick_ns : now + period;
+        if (pc_apic_due() < due) due = pc_apic_due();
         if (ipn > 0) {
             uint64_t ev = c->insn_count + (uint64_t)((double)(due - now) * ipn) + 1000u;
             if (pc.ide_due != UINT64_MAX && pc.ide_due < ev) ev = pc.ide_due;
@@ -617,6 +633,8 @@ static int poll(x86_cpu *c) {
         uint64_t next = pc.next_tick_ns;
         int rtc_first = pc.rtc_next_ns < next;
         if (rtc_first) next = pc.rtc_next_ns;
+        int apic_first = pc_apic_due() < next;           /* its timer, if that comes first */
+        if (apic_first) next = pc_apic_due();
         uint64_t hnow = pc_now_ns();
         /* a serial console's keys come from stdin: look every 5 ms */
         uint64_t nap = next > hnow ? next - hnow : 0;
@@ -633,7 +651,8 @@ static int poll(x86_cpu *c) {
         pc_net_poll(0);
         if (intr_ready(c)) break;
         if (pc_now_ns() < next) continue;
-        if (rtc_first) pc_rtc_poll(pc_now_ns());
+        if (apic_first) pc_apic_poll(pc_now_ns());
+        else if (rtc_first) pc_rtc_poll(pc_now_ns());
         else {
             pc.irq_pending |= 1 << 8;
             /* masked at the 8259: the request stays latched and the PIT
@@ -648,6 +667,10 @@ static int poll(x86_cpu *c) {
      * (until its EOI). A handler that never EOIs would hang a real PC;
      * we forgive it after 200 ms of wall clock. */
     if (pc.irq_in_service && now - pc.irq_service_ns > 200000000ull) { pc.irq_in_service = 0; pic2.isr = 0; }
+    /* the local APIC's own vectors first; then the 8259s', if their INTR reaches the processor */
+    int av = pc_apic_take();
+    if (av >= 0) { x86_interrupt(c, av, 0); c->halted = 0; return 1; }
+    if (!pc_apic_extint_ok()) return 0;
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) {
         pc.irq_pending &= ~(1 << 8);
         pc.ticks_delivered++;
@@ -1053,6 +1076,7 @@ static void post(x86_cpu *cpu) {
      * Channel, no extended BIOS data area; the other feature bytes 0 */
     static const uint8_t sysconf[10] = { 8, 0, 0xFC, 0x01, 0x00, 0x70, 0, 0, 0, 0 };
     for (int i = 0; i < 10; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(PC_SYSCONF_OFF + i), sysconf[i]);
+    pc_apic_mp_table(cpu);                       /* the MP floating pointer and configuration table at F000:F000 */
 
     /* BIOS data area */
     for (int i = 0; i < 0x100; i++) pc_wr8(cpu, PC_BDA_SEG, (uint16_t)i, 0);
@@ -1117,6 +1141,7 @@ void pc_reboot(x86_cpu *c) {
     pc.kbc_cmd = 0; pc.kbc_out_full = 0;
     memset(pit, 0, sizeof pit);
     pic.mask = 0xB8; pic.base = 8; pic.icw_step = 0; pic.read_isr = 0;
+    pc_apic_init(c);
     post(c);
     pc_empty_upper_memory(c);
     pc_native_irq_vectors(c);
@@ -1158,6 +1183,8 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     cpu->io_write = port_write;
     cpu->tsc_clock = tsc_clock;
     cpu->tsc_base = 0 - tsc_clock(cpu);                 /* from 0 at power-on */
+    pc_apic_init(cpu);
+    if (pc_apic_present()) pc_mmio_install(cpu);
     post(cpu);
     pc_set_trap(TRAP_RESET, reset_trap, HLE_RET_IRET);
 

@@ -90,7 +90,7 @@ typedef struct pc_state {
     int      vclock;                 /* the clock is the instruction counter (X86_GOLDEN: repeatable runs) */
     uint64_t ticks_delivered;        /* INT 8s raised so far */
     uint64_t next_tick_ns;           /* when IRQ 0 is next due, at PIT channel 0's rate */
-    int      irq_pending;            /* bitmask: 1<<8 timer, 1<<9 keyboard */
+    int      irq_pending;            /* bitmask: 1<<8 timer, 1<<9 keyboard, 1<<10 slave, 1<<11 master 3-7, 1<<12 the local APIC has a vector */
     int      irq_in_service;         /* 8259 ISR: bits set from delivery until EOI */
     uint64_t irq_service_ns;         /* when the in-service IRQ was delivered (stuck-handler guard) */
     uint8_t  aux_full, aux_out;      /* 8042: a byte from the auxiliary device (the PS/2 mouse) in the output buffer */
@@ -126,6 +126,22 @@ void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads a
 void pc_irq_raise(int irq);          /* IRQ 8-15: a request to the slave 8259 */
 void pc_irq_line(int irq, int level); /* IRQ 3-7, 9-15: a device's line into an 8259 (it takes the rising edge) */
 void pc_irq_unmask(int irq);         /* as the BIOS opens a line it has a handler for */
+void pc_intr_update(void);           /* a request, mask or in-service bit changed: recompute cpu->intr_waiting */
+void pc_mmio_install(x86_cpu *c);    /* the CPU's memory-mapped-device hooks: the APIC's page, then the PCI cards' BARs */
+
+/* pc_apic.c — the local APIC */
+void     pc_apic_off(void);          /* -noapic: a Pentium without one */
+void     pc_apic_init(x86_cpu *c);
+int      pc_apic_present(void);
+void     pc_apic_mp_table(x86_cpu *c);  /* POST: the MultiProcessor Specification tables in the ROM */
+void     pc_apic_poll(uint64_t now); /* its timer, when due */
+uint64_t pc_apic_due(void);          /* when the timer next fires (UINT64_MAX: never) */
+int      pc_apic_take(void);         /* the vector to deliver now, moved into service; -1 none */
+int      pc_apic_extint_ok(void);    /* do the 8259s' interrupts reach the processor */
+int      pc_apic_mmio_read(uint32_t phys, int size, uint32_t *val);
+int      pc_apic_mmio_write(uint32_t phys, int size, uint32_t val);
+int      pc_pci_mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val);
+void     pc_pci_mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val);
 
 /* pc_ps2.c: the PS/2 mouse on the 8042's auxiliary port */
 void pc_ps2_post(x86_cpu *c);

@@ -371,6 +371,7 @@ typedef struct {
     uint32_t (*io_read_real)(x86_cpu *, uint16_t, int);
     int (*mmio_read_real)(struct x86_cpu *, uint32_t, int, uint32_t *);
     uint64_t (*tsc_clock_real)(struct x86_cpu *);
+    int (*msr_hook_real)(struct x86_cpu *, uint32_t, int, uint64_t *);
     uint32_t *iolog;
     uint32_t iolog_n, iolog_cap, iolog_pos;
     int verify_mem_every;          /* compare guest memory every N block runs (0 = each) */

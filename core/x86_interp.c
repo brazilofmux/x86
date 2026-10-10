@@ -1914,7 +1914,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             o[1] = 0x756E6547u; o[3] = 0x49656E69u; o[2] = 0x6C65746Eu;   /* "Genu" "ineI" "ntel" */
         } else if (leaf == 1) {
             o[0] = X86_586_SIGNATURE;
-            o[3] = (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8;
+            o[3] = (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8 | (c->has_apic ? 1u << 9 : 0u);
         }
         c->r[R_AX] = o[0]; c->r[R_BX] = o[1]; c->r[R_CX] = o[2]; c->r[R_DX] = o[3];
         break;
@@ -1949,7 +1949,9 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         case 0x12: case 0x13:                                                    /* CTR0, CTR1: 40 bits */
             if (wr) c->msr_perf[msr - 0x11] = v & 0xFFFFFFFFFFull; else v = c->msr_perf[msr - 0x11];
             break;
-        default: x86_fault(c, X86_EXC_GP, 0);
+        default:
+            if (c->msr_hook && c->msr_hook(c, msr, wr, &v)) break;   /* the machine's: the APIC base */
+            x86_fault(c, X86_EXC_GP, 0);
         }
         if (!wr) { c->r[R_AX] = (uint32_t)v; c->r[R_DX] = (uint32_t)(v >> 32); }
         break;

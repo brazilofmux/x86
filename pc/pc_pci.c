@@ -93,7 +93,7 @@ static pc_pci_dev *mmio_find(uint32_t phys, int *bar, uint32_t *off) {
     }
     return NULL;
 }
-static int mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val) {
+int pc_pci_mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val) {
     (void)c;
     int bar; uint32_t off;
     pc_pci_dev *d = mmio_find(phys, &bar, &off);
@@ -101,7 +101,7 @@ static int mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val) {
     *val = d->mmio_read(d, bar, off, size);
     return 1;
 }
-static void mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val) {
+void pc_pci_mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val) {
     (void)c;
     int bar; uint32_t off;
     pc_pci_dev *d = mmio_find(phys, &bar, &off);
@@ -140,7 +140,7 @@ void pc_pci_post(x86_cpu *c) {
             for (int b = 0; b < 4; b++) cfg_write8(d, 0x10 + 4 * (unsigned)i + (unsigned)b, (uint8_t)(base >> (8 * b)));
         }
         if (d->cfg[0x3D]) cfg_write8(d, 0x3C, d->irq);
-        if (d->mmio_read) { c->mmio_read = mmio_read; c->mmio_write = mmio_write; }
+        if (d->mmio_read) pc_mmio_install(c);
     }
     for (size_t i = 0; i < sizeof pcibios; i++) pc_wr8(c, PC_STUB_SEG, (uint16_t)(PC_STUB_PCIBIOS + i), pcibios[i]);
     uint8_t sum = 0;

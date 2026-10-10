@@ -68,7 +68,7 @@ check "uart none" tests/dos/uart-none.out $DM -m 386 -j -L 2000000 tests/dos/uar
 # CMPXCHG8B, CR4 and CR4.DE, or #UD
 for mode in -i -j -V; do
     for m in 486 586; do
-        check "cpu586 -m $m $mode" tests/dos/cpu586-$m.out $DM -m $m $mode -L 1000000 tests/dos/cpu586.com
+        check "cpu586 -m $m $mode" tests/dos/cpu586-$m.out $DM -m $m $mode -noapic -L 1000000 tests/dos/cpu586.com   # (the reference is Bochs's P5 without an APIC)
     done
 done
 # The VGA text renderer (-G on a text screen: attributes, blink off, line

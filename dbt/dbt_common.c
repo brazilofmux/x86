@@ -402,6 +402,26 @@ static uint64_t shadow_tsc_clock(x86_cpu *c) {
     uint64_t lo = shadow_io_read(c, 0, 4);
     return lo | (uint64_t)shadow_io_read(c, 0, 4) << 32;
 }
+/* ... and the machine's MSRs: whether the hook took it, and a read's value */
+static int msr_record(x86_cpu *c, uint32_t msr, int write, uint64_t *v) {
+    x86_dbt *dbt = (x86_dbt *)c->dbt;
+    int r = dbt->msr_hook_real(c, msr, write, v);
+    if (dbt->iolog_n + 3 > dbt->iolog_cap) {
+        dbt->iolog_cap = dbt->iolog_cap ? dbt->iolog_cap * 2 : 4096;
+        dbt->iolog = realloc(dbt->iolog, dbt->iolog_cap * sizeof *dbt->iolog);
+    }
+    dbt->iolog[dbt->iolog_n++] = (uint32_t)r;
+    dbt->iolog[dbt->iolog_n++] = write ? 0 : (uint32_t)*v;
+    dbt->iolog[dbt->iolog_n++] = write ? 0 : (uint32_t)(*v >> 32);
+    return r;
+}
+static int shadow_msr_hook(x86_cpu *c, uint32_t msr, int write, uint64_t *v) {
+    (void)msr;
+    int r = (int)shadow_io_read(c, 0, 4);
+    uint64_t lo = shadow_io_read(c, 0, 4), hi = shadow_io_read(c, 0, 4);
+    if (!write) *v = lo | hi << 32;
+    return r;
+}
 
 /* -V: the real cpu's device reads go through dev_record, which logs what
  * the device answered; the shadow's go through dev_replay, which hands
@@ -443,6 +463,10 @@ static void dev_log_arm(x86_dbt *dbt) {
     if (cpu->mmio_read && cpu->mmio_read != mmio_record) {
         dbt->mmio_read_real = cpu->mmio_read;
         cpu->mmio_read = mmio_record;
+    }
+    if (cpu->msr_hook && cpu->msr_hook != msr_record) {
+        dbt->msr_hook_real = cpu->msr_hook;
+        cpu->msr_hook = msr_record;
     }
     dbt->iolog_n = dbt->iolog_pos = 0;
 }
@@ -488,6 +512,7 @@ static void shadow_copy_regs(x86_dbt *dbt) {
     sh->tsc_clock = cpu->tsc_clock ? shadow_tsc_clock : NULL;
     sh->mmio_read = cpu->mmio_read ? shadow_mmio_read : NULL;
     sh->mmio_write = cpu->mmio_read ? shadow_mmio_write : NULL;
+    sh->msr_hook = cpu->msr_hook ? shadow_msr_hook : NULL;
     sh->hle = NULL;
     sh->trace_exc = NULL;
     /* The shadow's HMA window must alias the same way before any copy,

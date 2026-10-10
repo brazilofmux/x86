@@ -36,7 +36,9 @@ Two ways to run things:
   13h and unchained, 16-colour planar modes), A20, and up to 257 MB of
   memory (`-mem`). The CPU is an 8086, 186, 286, 386, 486 or Pentium
   (`-m`), with an x87 on the 486 and the Pentium (and beside a 386 with
-  `-fpu`). On it:
+  `-fpu`), and the Pentium's local APIC with the MultiProcessor
+  Specification tables that announce it (the 8259s wired through LINT0;
+  no I/O APIC yet; `-noapic` for a Pentium without). On it:
   - FreeDOS 1.3 — installed by its own installer; under HIMEMX, JEMMEX
     and JEMM386
   - MS-DOS 6.22 — installed by its own Setup from diskette images; under
@@ -49,7 +51,8 @@ Two ways to run things:
     by their own Setup (WINNT from MS-DOS, the CD copied to a hard disk),
     to the desktop
   - Linux 6.12 (Tiny Core 16.2, loaded by GRUB 2 from a disk image) on the
-    Pentium, to a shell — from its initramfs, or with its root filesystem
+    Pentium, to a shell, with the local APIC's timer as its clock event
+    device — from its initramfs, or with its root filesystem
     on the IDE disk (ext2, through Linux's own pata_legacy), and on the
     network: an Intel 82545EM on a PCI bus (-nic e1000,user), DHCP, DNS and
     TCP out through a NAT (libslirp); and Purdue's Xinu, with a serial

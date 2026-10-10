@@ -231,6 +231,7 @@ typedef struct x86_cpu {
      * that before the run loop polls. 0 or past: no limit. */
     uint64_t next_event;
     uint8_t  has_fpu;
+    uint8_t  has_apic;    /* a local APIC on the chip, and enabled: CPUID leaf 1 EDX bit 9 (pc/pc_apic.c) */
     x86_fpu  fpu;
     /* FERR#: an unmasked x87 exception with CR0.NE clear; the machine
      * turns it into IRQ 13 (pc/pc_bios.c). NULL on the -V shadow. */
@@ -269,6 +270,9 @@ typedef struct x86_cpu {
      * instructions it stood still in an idle guest, and a sleep never
      * ended. NULL (the bare CPU: tools/sst and the like): instructions. */
     uint64_t (*tsc_clock)(struct x86_cpu *);
+    /* The machine's model-specific registers (the APIC base, 1Bh):
+     * RDMSR/WRMSR ask here after the CPU's own; 0 means #GP(0). */
+    int    (*msr_hook)(struct x86_cpu *, uint32_t msr, int write, uint64_t *v);
     /* A bus master wrote memory (pc_pci_dma_write: a network card's
      * descriptors and frames) — behind the CPU's back, so -V's shadow,
      * which has no devices, has to be resynced rather than compared. */

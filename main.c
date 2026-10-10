@@ -31,6 +31,7 @@ static void usage(const char *prog) {
     printf("  -com1 stdio|FILE  a 16550 serial port at COM1 (3F8h, IRQ 4): the terminal is its far end,\n");
     printf("              or FILE receives what it sends (default: no serial port)\n");
     printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
+    printf("  -noapic     a Pentium without its local APIC (default: one at FEE00000h, with MP tables)\n");
     printf("  -vbe        VESA BIOS Extensions 3.0: 640x480 to 1280x1024 at 8/16/32 bpp, a linear\n"
            "              framebuffer in the top 8 MB of RAM (needs -mem 32 or more)\n");
     printf("  -nic e1000[,user]  an Intel 82545EM network card on that bus; ,user puts\n"
@@ -327,6 +328,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-boot") && i + 1 < argc) boot_img = argv[++i];
         else if (!strcmp(argv[i], "-com1") && i + 1 < argc) { if (pc_uart_open(argv[++i]) < 0) return 1; }
         else if (!strcmp(argv[i], "-pci")) pc_pci_enable();
+        else if (!strcmp(argv[i], "-noapic")) pc_apic_off();
         else if (!strcmp(argv[i], "-vbe")) pc_vbe_enable();
         else if (!strcmp(argv[i], "-nic") && i + 1 < argc) {
             const char *n = argv[++i];
