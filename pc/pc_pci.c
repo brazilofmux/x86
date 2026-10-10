@@ -78,6 +78,20 @@ static pc_pci_dev *selected(void) {
     return pci.slot[dev];
 }
 
+/* A card's interrupt pin: INTA-D, routed to its ISA IRQ at the 8259s (as
+ * a PIIX's PIRQ router would), and wired to I/O APIC input 16 + ((slot +
+ * pin) mod 4), as PIIX boards wire them. */
+int pc_pci_card_pin(int dev) {
+    pc_pci_dev *d = dev > 0 && dev < 32 ? pci.slot[dev] : NULL;
+    return d && d->cfg[0x3D] >= 1 && d->cfg[0x3D] <= 4 ? d->cfg[0x3D] : 0;
+}
+void pc_pci_irq_line(pc_pci_dev *d, int level) {
+    int slot = 0;
+    for (int s = 1; s < 32; s++) if (pci.slot[s] == d) slot = s;
+    int pin = pc_pci_card_pin(slot);
+    pc_irq_line_to(d->irq, level, pin ? 16 + ((slot + pin - 1) & 3) : -1);
+}
+
 /* The cards' memory BARs, from the CPU's accesses above memory
  * (x86_cpu.mmio_read/mmio_write): a BAR decodes only while its card's
  * command register enables memory, as on the bus. */

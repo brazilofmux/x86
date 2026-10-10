@@ -84,7 +84,7 @@ static struct {
 static void update_irq(void) {
     int level = (R(ICR) & R(IMS)) && !(e.pci.cfg[5] & 0x04);
     if (level != e.line) TR("irq %d icr %X ims %X\n", level, R(ICR), R(IMS));
-    if (level != e.line) { e.line = level; pc_irq_line(e.pci.irq, level); }
+    if (level != e.line) { e.line = level; pc_pci_irq_line(&e.pci, level); }
 }
 
 static void phy_reset(void) {

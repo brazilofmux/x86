@@ -56,7 +56,7 @@ for d, dirs, files in os.walk(top):
 OWNERS
 "$(dirname "$MKE2FS")/debugfs" -w -f "$T/chown.cmds" "$T/p2.img" > /dev/null 2>&1
 dd if="$T/p2.img" of="$OUT" bs=512 seek=$P2 conv=notrunc 2>/dev/null
-printf 'set root=(hd0,msdos1)\nlinux /vmlinuz root=/dev/sda2 rw devtmpfs.mount=1 console=ttyS0 console=tty0 loglevel=7 noapic\nboot\n' > "$T/early.cfg"
+printf 'set root=(hd0,msdos1)\nlinux /vmlinuz root=/dev/sda2 rw devtmpfs.mount=1 console=ttyS0 console=tty0 loglevel=7\nboot\n' > "$T/early.cfg"
 "$MKIMAGE" -O i386-pc -d "$G" -o "$T/core.img" -c "$T/early.cfg" -p '(hd0,msdos1)/boot/grub' biosdisk part_msdos fat linux boot
 python3 - "$OUT" "$G/boot.img" "$T/core.img" <<'E'
 import sys

@@ -124,7 +124,8 @@ void pc_request_reset(x86_cpu *c, const char *how);   /* CPU reset: a booted mac
 void pc_reboot(x86_cpu *c);              /* after the run stopped for pc.reboot: POST, boot sector */
 void pc_empty_upper_memory(x86_cpu *c);  /* booted machines: C0000-EFFFF reads as an empty bus */
 void pc_irq_raise(int irq);          /* IRQ 8-15: a request to the slave 8259 */
-void pc_irq_line(int irq, int level); /* IRQ 3-7, 9-15: a device's line into an 8259 (it takes the rising edge) */
+void pc_irq_line(int irq, int level); /* IRQ 3-7, 9-15: a device's line into an 8259 (it takes the rising edge) and the I/O APIC's input of the same number */
+void pc_irq_line_to(int irq, int level, int input); /* ... with the line on another I/O APIC input (a PCI card's) */
 void pc_irq_unmask(int irq);         /* as the BIOS opens a line it has a handler for */
 void pc_intr_update(void);           /* a request, mask or in-service bit changed: recompute cpu->intr_waiting */
 void pc_mmio_install(x86_cpu *c);    /* the CPU's memory-mapped-device hooks: the APIC's page, then the PCI cards' BARs */
@@ -140,6 +141,10 @@ int      pc_apic_take(void);         /* the vector to deliver now, moved into se
 int      pc_apic_extint_ok(void);    /* do the 8259s' interrupts reach the processor */
 int      pc_apic_mmio_read(uint32_t phys, int size, uint32_t *val);
 int      pc_apic_mmio_write(uint32_t phys, int size, uint32_t val);
+void     pc_ioapic_set(int input, int level); /* a line's level on an I/O APIC input */
+void     pc_ioapic_edge(int input);           /* a pulse on one */
+int      pc_ioapic_mmio_read(uint32_t phys, int size, uint32_t *val);
+int      pc_ioapic_mmio_write(uint32_t phys, int size, uint32_t val);
 int      pc_pci_mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val);
 void     pc_pci_mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val);
 
@@ -273,6 +278,8 @@ typedef struct pc_pci_dev {
 void pc_pci_enable(void);
 int  pc_pci_present(void);
 void pc_pci_add(int dev, pc_pci_dev *d);                  /* at device DEV, function 0 */
+void pc_pci_irq_line(pc_pci_dev *d, int level);          /* the card's interrupt pin: its ISA IRQ at the 8259s, input 16-19 at the I/O APIC */
+int  pc_pci_card_pin(int dev);                            /* the card's interrupt pin (1-4), 0 for none or no card */
 uint32_t pc_pci_bar(const pc_pci_dev *d, int i);          /* BAR I's base, type bits off */
 void pc_pci_post(x86_cpu *c);
 int  pc_pci_port_read(uint16_t port, int size, uint32_t *val);

@@ -180,6 +180,21 @@ needed the keyboard's command replies to get through while scanning is
 off (F5h), and its console scrolls by moving the CRTC start address,
 which the text dump expect.py reads now follows.
 
+The Pentium's APICs (pc/pc_apic.c): the local APIC at FEE00000h and an
+I/O APIC at FEC00000h, announced by MP Specification 1.4 tables at
+F000:F000 (the processor, the buses, the I/O APIC's inputs: the 8259s'
+INTR as ExtINT on 0, the PIT on 2, the other ISA lines on their own
+numbers, PCI cards on 16-19, level). With them Linux goes to symmetric
+I/O mode: /proc/interrupts shows the timer on "IO-APIC 2-edge", the
+keyboard controller on 1, the disk on 14, the e1000 on 19 ("PCI->APIC
+IRQ transform: INT A -> IRQ 19"), and the local APIC's timer is its
+clock event device (clockevent0: lapic; the PIT's count stops after
+calibration). Linux without the tables enables the local APIC but
+never sets up its timer ("virtual wire mode setup with no
+configuration"), and with the tables but no I/O APIC it complains of
+"no explicit IRQ entries". The images' kernel command lines used to say
+noapic; they no longer do. -noapic makes a Pentium without either.
+
 tests/boot/tcroot.sh builds disks/linux/tcroot.img: the same kernel on a
 small FAT16 partition, and Tiny Core's userland unpacked from core.gz onto
 an ext2 partition (mke2fs -d, then debugfs making every inode root's, as

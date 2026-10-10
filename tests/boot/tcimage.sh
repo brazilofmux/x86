@@ -35,7 +35,7 @@ with open(sys.argv[1], 'wb') as f:
 E
 mformat -i "$OUT@@1048576" -t 128 -h 16 -s 63 -H 2048 -v TINYCORE ::
 mcopy -i "$OUT@@1048576" "$T/boot/vmlinuz" "$T/boot/core.gz" ::
-printf 'set root=(hd0,msdos1)\nlinux /vmlinuz console=ttyS0 console=tty0 loglevel=7 noapic\ninitrd /core.gz\nboot\n' > "$T/early.cfg"
+printf 'set root=(hd0,msdos1)\nlinux /vmlinuz console=ttyS0 console=tty0 loglevel=7\ninitrd /core.gz\nboot\n' > "$T/early.cfg"
 "$MKIMAGE" -O i386-pc -d "$G" -o "$T/core.img" -c "$T/early.cfg" -p '(hd0,msdos1)/boot/grub' biosdisk part_msdos fat linux boot
 python3 - "$OUT" "$G/boot.img" "$T/core.img" <<'E'
 import sys

@@ -424,7 +424,9 @@ static void intr_update(void);
 /* A device's level on IRQ 3-7: the master latches its rising edge in the
  * request register, and a line that falls before the request is taken
  * withdraws it. */
-void pc_irq_line(int irq, int level) {
+void pc_irq_line(int irq, int level) { pc_irq_line_to(irq, level, irq); }
+void pc_irq_line_to(int irq, int level, int input) {
+    pc_ioapic_set(input, level);
     if (irq >= 9 && irq <= 15) {                  /* the slave's: a PCI card's INTA on IRQ 11 */
         uint8_t m = (uint8_t)(1 << (irq - 8));
         if (level) {
@@ -450,6 +452,7 @@ void pc_irq_line(int irq, int level) {
 }
 void pc_irq_raise(int irq) {
     if (irq < 8 || irq > 15) return;
+    pc_ioapic_edge(irq);
     pic2.irr |= (uint8_t)(1 << (irq - 8));
     pic2_summary();
     intr_update();
@@ -488,11 +491,11 @@ void pc_intr_update(void) { intr_update(); }
 
 /* Memory-mapped devices: the local APIC's page, then the PCI cards' BARs. */
 static int mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val) {
-    if (pc_apic_mmio_read(phys, size, val)) return 1;
+    if (pc_apic_mmio_read(phys, size, val) || pc_ioapic_mmio_read(phys, size, val)) return 1;
     return pc_pci_mmio_read(c, phys, size, val);
 }
 static void mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val) {
-    if (pc_apic_mmio_write(phys, size, val)) return;
+    if (pc_apic_mmio_write(phys, size, val) || pc_ioapic_mmio_write(phys, size, val)) return;
     pc_pci_mmio_write(c, phys, size, val);
 }
 void pc_mmio_install(x86_cpu *c) { c->mmio_read = mmio_read; c->mmio_write = mmio_write; }
@@ -518,6 +521,23 @@ static void deliver(x86_cpu *c, int irq) {
 #define PC_POLL_PERIOD_NS 1000000ull        /* 1 ms: finer than anything below needs */
 
 static uint64_t irq0_period_ns(void);
+
+/* PIT channel 0's output went up: IRQ 0's edge, to the 8259 (which
+ * latches one request at most) and to I/O APIC input 2. The next tick
+ * is a period on, at the PIT's own rate. Behind by more than a period (a
+ * stall, or a host too slow for the guest's rate — -V is thirty times
+ * slower): the missed ticks are dropped, as the 8259 drops them.
+ * Delivering a backlog instead came out back-to-back at consecutive
+ * polls with no guest instruction in between, and DOOM, which waits for
+ * its tick count to EQUAL start + 30, could see it jump past and spin
+ * forever. */
+static void pit_tick(uint64_t now) {
+    uint64_t period = irq0_period_ns();
+    pc.irq_pending |= 1 << 8;
+    pc_ioapic_edge(2);
+    pc.next_tick_ns += period;
+    if (now >= pc.next_tick_ns) pc.next_tick_ns = now + period;
+}
 
 static int poll(x86_cpu *c);
 int pc_poll(x86_cpu *c) {
@@ -571,7 +591,7 @@ static int poll(x86_cpu *c) {
         uint8_t code;
         pc_kbd_raw_next(&code);
         pc.last_scancode = code;
-        if (pc.kbc_cmdbyte & 1) pc.irq_pending |= 1 << 9;   /* IRQ 1, if the command byte enables it */
+        if (pc.kbc_cmdbyte & 1) { pc.irq_pending |= 1 << 9; pc_ioapic_edge(1); }   /* IRQ 1, if the command byte enables it */
         pc.irq9_busy = 1;                        /* until the handler reads port 60h */
         last_code_ns = now;
     }
@@ -583,17 +603,7 @@ static int poll(x86_cpu *c) {
      * spent its CPU waiting for tics. */
     uint64_t period = irq0_period_ns();
     if (!pc.next_tick_ns) pc.next_tick_ns = pc.t0_ns + period;
-    if (now >= pc.next_tick_ns) {
-        /* Behind by more than one period (a stall, or a host too slow for
-         * the guest's rate — -V is thirty times slower): the missed ticks
-         * are dropped, as the 8259 would drop them, since it latches one
-         * IRQ 0 at most. Delivering the backlog instead came out
-         * back-to-back at consecutive polls with no guest instruction in
-         * between, and DOOM, which waits for its tick count to EQUAL
-         * start + 30, could see it jump past and spin forever. */
-        if (now - pc.next_tick_ns > period) pc.next_tick_ns = now;
-        pc.irq_pending |= 1 << 8;
-    }
+    if (now >= pc.next_tick_ns) pit_tick(now);
 
     /* Translated code runs up to a quantum (a million instructions)
      * between polls, and a loop chained to itself (an idle loop's jmp $)
@@ -653,12 +663,7 @@ static int poll(x86_cpu *c) {
         if (pc_now_ns() < next) continue;
         if (apic_first) pc_apic_poll(pc_now_ns());
         else if (rtc_first) pc_rtc_poll(pc_now_ns());
-        else {
-            pc.irq_pending |= 1 << 8;
-            /* masked at the 8259: the request stays latched and the PIT
-             * ticks on — the next nap is a period long, not a spin */
-            if (pic.mask & 1) pc.next_tick_ns += irq0_period_ns();
-        }
+        else pit_tick(pc_now_ns());
     }
     }
     if (pc.debug > 2) { static int n; if ((n++ & 1023) == 0) fprintf(stderr, "[poll] pending %X isr %X IF %d inhibit %d @%llu\n", pc.irq_pending, pc.irq_in_service, (c->eflags & X86_IF) != 0, c->int_inhibit, (unsigned long long)c->insn_count); }
@@ -674,7 +679,6 @@ static int poll(x86_cpu *c) {
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) {
         pc.irq_pending &= ~(1 << 8);
         pc.ticks_delivered++;
-        pc.next_tick_ns += irq0_period_ns();
         deliver(c, 0);
         return 1;
     }

@@ -10,6 +10,17 @@
  * I/O APIC yet, so devices still interrupt through the 8259s; no IPIs
  * but to self.
  *
+ * And an I/O APIC (an 82093AA at FEC00000h): 24 inputs, each with a
+ * redirection entry naming the vector, edge or level, masked or not.
+ * The ISA lines are on inputs 1-15 (IRQ 0, the PIT, on input 2 by the
+ * MP convention; input 0 carries the 8259's INTR for ExtINT), the PCI
+ * cards' INTA-D on 16-19. A level input delivers once, then holds its
+ * remote-IRR until the processor's EOI of that vector, and delivers
+ * again if the line is still up. Both or neither: -noapic.
+ *
+ * The 8259s' INTR also enters I/O APIC input 0, as ExtINT at reset, the
+ * other half of the virtual wire a BIOS sets up.
+ *
  * Registers at the base in MSR 1Bh (FEE00000h), one dword every 16
  * bytes, reached through the CPU's memory-mapped-device hook once the
  * guest has mapped the page. CPUID leaf 1 EDX bit 9 says it is there;
@@ -34,6 +45,15 @@ static struct {
     uint32_t timer_init;
     uint64_t timer_start_ns, timer_due_ns;        /* due: 0 when stopped */
 } apic;
+
+#define IOAPIC_BASE   0xFEC00000u
+#define IOAPIC_ID     1
+#define IOAPIC_INPUTS 24
+static struct {
+    uint32_t id, regsel;
+    uint64_t rte[IOAPIC_INPUTS];                  /* redirection entries: mask bit 16, trigger 15, polarity 13, dest mode 11, delivery 8-10, vector 0-7; dest 56-63 */
+    uint32_t lines, remote_irr;                   /* the inputs' levels; level entries delivered and not yet EOI'd */
+} io;
 
 void pc_apic_off(void) { apic_off = 1; }
 int  pc_apic_present(void) { return apic.present; }
@@ -62,9 +82,11 @@ static void update(void) {
     if (deliverable() >= 0) pc.irq_pending |= 1 << 12; else pc.irq_pending &= ~(1 << 12);
     pc_intr_update();
 }
-static void request(int v) {
+static void io_eoi(int vec);
+static void request(int v, int level) {
     if (v < 16) { apic.esr |= 0x40; return; }          /* received illegal vector */
     set_bit(apic.irr, v);
+    if (level) set_bit(apic.tmr, v); else clr_bit(apic.tmr, v);
     update();
     if (pc.cpu) pc.cpu->jit_cur_hit = 1;                 /* taken at the next block boundary */
 }
@@ -81,8 +103,9 @@ int pc_apic_take(void) {
 }
 /* Does the 8259s' INTR reach the processor: no APIC, or one that is
  * off, or LINT0 unmasked in ExtINT mode? */
+static int io_extint(void);
 int pc_apic_extint_ok(void) {
-    return !apic.present || !apic.hw_enabled || (!(apic.lvt[1] & LVT_MASKED) && ((apic.lvt[1] >> 8) & 7) == 7);
+    return !apic.present || !apic.hw_enabled || (!(apic.lvt[1] & LVT_MASKED) && ((apic.lvt[1] >> 8) & 7) == 7) || io_extint();
 }
 
 /* ---- Timer -------------------------------------------------------------- */
@@ -106,7 +129,7 @@ static uint32_t timer_count(uint64_t now) {
  * 8259 path does for IRQ 0. */
 void pc_apic_poll(uint64_t now) {
     if (!apic.timer_due_ns || now < apic.timer_due_ns) return;
-    if (!(apic.lvt[0] & LVT_MASKED)) request(apic.lvt[0] & 0xFF);
+    if (!(apic.lvt[0] & LVT_MASKED)) request(apic.lvt[0] & 0xFF, 0);
     if (apic.lvt[0] & LVT_PERIODIC) {
         uint64_t p = (uint64_t)apic.timer_init * tick_ns();
         apic.timer_due_ns += p;
@@ -124,7 +147,7 @@ static void icr_write(uint32_t lo) {
             || (shorthand == 0 && ((lo & 0x800) ? (dest & (apic.ldr >> 24)) != 0 : dest == apic.id || dest == 0xFF));
     if (pc.debug > 1) fprintf(stderr, "[apic] ICR %08X:%08X (mode %d, %s)\n", apic.icr_hi, lo, mode, self ? "self" : "not self");
     if (!self) return;                                   /* no other processor to hear it */
-    if (mode == 0 || mode == 1) request(vec);            /* fixed, lowest priority */
+    if (mode == 0 || mode == 1) request(vec, 0);         /* fixed, lowest priority */
     /* NMI, SMI, INIT, STARTUP to self: nothing a uniprocessor's BIOS left running does */
 }
 
@@ -168,7 +191,15 @@ int pc_apic_mmio_write(uint32_t phys, int size, uint32_t val) {
     switch (off) {
     case 0x020: apic.id = (val >> 24) & 0xF; break;
     case 0x080: apic.tpr = val & 0xFF; update(); break;
-    case 0x0B0: { int s = highest(apic.isr); if (s >= 0) clr_bit(apic.isr, s); update(); break; }
+    case 0x0B0: {                                        /* EOI: the highest in service; a level-triggered one tells the I/O APIC */
+        int s = highest(apic.isr);
+        if (s >= 0) {
+            clr_bit(apic.isr, s);
+            if (apic.tmr[s >> 5] & (1u << (s & 31))) { clr_bit(apic.tmr, s); io_eoi(s); }
+        }
+        update();
+        break;
+    }
     case 0x0D0: apic.ldr = val & 0xFF000000u; break;
     case 0x0E0: apic.dfr = val | 0x0FFFFFFFu; break;
     case 0x0F0: apic.svr = val & 0x1FF; update(); break;
@@ -216,14 +247,96 @@ void pc_apic_init(x86_cpu *c) {
     apic.lvt[1] = 0x700;
     apic.lvt[2] = 0x400;
     apic.lvt[3] = LVT_MASKED;
+    memset(&io, 0, sizeof io);
+    io.id = IOAPIC_ID;
+    for (int n = 0; n < IOAPIC_INPUTS; n++) io.rte[n] = LVT_MASKED;
+    io.rte[0] = 0x700;                              /* input 0, the 8259s' INTR, as ExtINT: the BIOS's virtual wire through the I/O APIC too */
+}
+
+/* ---- The I/O APIC -------------------------------------------------------- */
+
+static void io_deliver(int n) {
+    uint64_t e = io.rte[n];
+    int mode = (int)((e >> 8) & 7), level = (int)((e >> 15) & 1), vec = (int)(e & 0xFF);
+    if (pc.debug > 1) fprintf(stderr, "[ioapic] input %d -> vector %02X%s\n", n, vec, level ? " (level)" : "");
+    if (mode == 0 || mode == 1) request(vec, level);   /* fixed, lowest priority: the one processor */
+    else if (pc.debug) fprintf(stderr, "[ioapic] input %d: delivery mode %d, nothing to do\n", n, mode);
+}
+/* A level input: deliver while it is up and not already at the processor. */
+static void io_service(int n) {
+    uint64_t e = io.rte[n];
+    if ((e & LVT_MASKED) || !((e >> 15) & 1)) return;
+    if (((io.lines >> n) & 1) && !((io.remote_irr >> n) & 1)) { io.remote_irr |= 1u << n; io_deliver(n); }
+}
+/* A line's level on input N: an edge entry takes the rising edge, a
+ * level entry the level. */
+void pc_ioapic_set(int n, int level) {
+    if (!apic.present || n < 0 || n >= IOAPIC_INPUTS) return;
+    int was = (io.lines >> n) & 1;
+    if (level) io.lines |= 1u << n; else io.lines &= ~(1u << n);
+    uint64_t e = io.rte[n];
+    if (e & LVT_MASKED) return;
+    if ((e >> 15) & 1) io_service(n);
+    else if (level && !was) io_deliver(n);
+}
+void pc_ioapic_edge(int n) { pc_ioapic_set(n, 1); pc_ioapic_set(n, 0); }
+/* The processor's EOI of a level-triggered vector: the entries holding it
+ * let go, and deliver again if their line is still up. */
+static void io_eoi(int vec) {
+    for (int n = 0; n < IOAPIC_INPUTS; n++)
+        if (((io.remote_irr >> n) & 1) && (io.rte[n] & 0xFF) == (uint32_t)vec) { io.remote_irr &= ~(1u << n); io_service(n); }
+}
+/* Input 0 unmasked in ExtINT mode: the 8259s' vector reaches the processor this way too. */
+static int io_extint(void) { return apic.present && !(io.rte[0] & LVT_MASKED) && ((io.rte[0] >> 8) & 7) == 7; }
+
+static uint32_t io_reg_read(uint32_t r) {
+    if (r == 0 || r == 2) return io.id << 24;                     /* ID; arbitration ID */
+    if (r == 1) return 0x00170011;                                /* version 11h, 24 entries */
+    if (r >= 0x10 && r < 0x10 + 2 * IOAPIC_INPUTS) {
+        int n = (int)(r - 0x10) >> 1;
+        uint64_t e = io.rte[n];
+        if (r & 1) return (uint32_t)(e >> 32);
+        return (uint32_t)e | (((io.remote_irr >> n) & 1) ? 0x4000u : 0);   /* remote IRR; delivery status: idle */
+    }
+    return 0;
+}
+static void io_reg_write(uint32_t r, uint32_t v) {
+    if (r == 0) { io.id = (v >> 24) & 0xF; return; }
+    if (r < 0x10 || r >= 0x10 + 2 * IOAPIC_INPUTS) return;
+    int n = (int)(r - 0x10) >> 1;
+    uint64_t e = io.rte[n];
+    if (r & 1) e = (e & 0xFFFFFFFFu) | ((uint64_t)(v & 0xFF000000u) << 32);
+    else e = (e & 0xFFFFFFFF00000000ull) | (v & 0x1AFFFu);
+    io.rte[n] = e;
+    if (pc.debug > 1 && !(r & 1)) fprintf(stderr, "[ioapic] entry %d <- %05X (vector %02X%s%s)\n", n, (unsigned)(e & 0x1FFFF), (unsigned)(e & 0xFF), (e >> 15) & 1 ? ", level" : "", e & LVT_MASKED ? ", masked" : "");
+    if (!(e & LVT_MASKED)) io_service(n);                         /* an unmasked level line that is already up */
+    pc_intr_update();
+}
+int pc_ioapic_mmio_read(uint32_t phys, int size, uint32_t *val) {
+    if (!apic.present || phys - IOAPIC_BASE >= 0x1000) return 0;
+    uint32_t off = phys - IOAPIC_BASE, v = 0;
+    if (off == 0x00) v = io.regsel;
+    else if (off == 0x10) v = io_reg_read(io.regsel);
+    v >>= 8 * (phys & 3);
+    *val = size < 4 ? v & ((1u << (8 * size)) - 1) : v;
+    return 1;
+}
+int pc_ioapic_mmio_write(uint32_t phys, int size, uint32_t val) {
+    if (!apic.present || phys - IOAPIC_BASE >= 0x1000) return 0;
+    uint32_t off = phys - IOAPIC_BASE;
+    (void)size;
+    if (off == 0x00) io.regsel = val & 0xFF;
+    else if (off == 0x10) io_reg_write(io.regsel, val);
+    return 1;
 }
 
 /* ---- The MP tables ------------------------------------------------------
  * Intel MultiProcessor Specification 1.4: the floating pointer structure
  * ("_MP_") at F000:F000 in the ROM, one of the places an OS looks, and
  * the configuration table after it — this processor with its local
- * APIC, the buses, the two local interrupt lines (ExtINT into LINT0,
- * NMI into LINT1), no I/O APIC yet. Linux takes the local APIC's timer
+ * APIC, the buses, the I/O APIC and what is wired to its inputs, the
+ * two local interrupt lines (ExtINT into LINT0, NMI into LINT1). Linux
+ * takes the local APIC's timer
  * only once a table (or ACPI) has told it the APIC is part of a
  * configuration; without one it stays in "virtual wire mode with no
  * configuration" on the 8259 and the PIT. */
@@ -234,7 +347,7 @@ static int mp_put32(uint8_t *t, int n, uint32_t v) { for (int i = 0; i < 4; i++)
 static uint8_t mp_sum(const uint8_t *p, int len) { uint8_t s = 0; for (int i = 0; i < len; i++) s = (uint8_t)(s + p[i]); return s; }
 void pc_apic_mp_table(x86_cpu *c) {
     if (!apic.present) return;
-    uint8_t t[256], fps[16];
+    uint8_t t[512], fps[16];
     int n = 0, entries = 0, pci = pc_pci_present();
     memset(t, 0, sizeof t);
     n = mp_put(t, n, "PCMP", 4);
@@ -257,6 +370,22 @@ void pc_apic_mp_table(x86_cpu *c) {
     int isa = 0;
     if (pci) { t[n++] = 1; t[n++] = 0; n = mp_put(t, n, "PCI   ", 6); entries++; isa = 1; }
     t[n++] = 1; t[n++] = (uint8_t)isa; n = mp_put(t, n, "ISA   ", 6); entries++;
+    /* the I/O APIC, and its inputs: the 8259s' INTR (ExtINT) on 0, the
+     * PIT's IRQ 0 on 2, the other ISA lines on their own numbers (edge,
+     * active high, as the bus has them), each PCI card's interrupt pin
+     * on 16 + ((slot + pin) mod 4), level, active low */
+    t[n++] = 2; t[n++] = IOAPIC_ID; t[n++] = 0x11; t[n++] = 1; n = mp_put32(t, n, IOAPIC_BASE); entries++;
+    t[n++] = 3; t[n++] = 3; t[n++] = 0; t[n++] = 0; t[n++] = (uint8_t)isa; t[n++] = 0; t[n++] = IOAPIC_ID; t[n++] = 0; entries++;
+    for (int irq = 0; irq < 16; irq++) {
+        if (irq == 2) continue;
+        t[n++] = 3; t[n++] = 0; t[n++] = 0; t[n++] = 0; t[n++] = (uint8_t)isa; t[n++] = (uint8_t)irq; t[n++] = IOAPIC_ID; t[n++] = (uint8_t)(irq ? irq : 2); entries++;
+    }
+    if (pci)
+        for (int slot = 1; slot < 32; slot++) {
+            int pin = pc_pci_card_pin(slot);
+            if (!pin) continue;
+            t[n++] = 3; t[n++] = 0; t[n++] = 0x0F; t[n++] = 0; t[n++] = 0; t[n++] = (uint8_t)((slot << 2) | (pin - 1)); t[n++] = IOAPIC_ID; t[n++] = (uint8_t)(16 + ((slot + pin - 1) & 3)); entries++;
+        }
     /* the local interrupts: the 8259s' INTR as ExtINT into every processor's
      * LINT0, the NMI line into LINT1 (polarity and trigger as the bus has them) */
     t[n++] = 4; t[n++] = 3; t[n++] = 0; t[n++] = 0; t[n++] = (uint8_t)isa; t[n++] = 0; t[n++] = 0xFF; t[n++] = 0; entries++;
