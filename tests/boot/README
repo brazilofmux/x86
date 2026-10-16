@@ -195,6 +195,59 @@ configuration"), and with the tables but no I/O APIC it complains of
 "no explicit IRQ entries". The images' kernel command lines used to say
 noapic; they no longer do. -noapic makes a Pentium without either.
 
+More than one processor (-smp N, pc/pc_smp.c): the bootstrap processor
+is the main thread as before; each application processor is a host
+thread with its own x86_cpu and translator (JIT buffer, block cache,
+TLB) over the one guest memory, its own local APIC, and the machine's
+devices behind one recursive lock — port I/O, memory-mapped devices,
+the BIOS's host services and the device half of pc_poll. An AP waits
+for its STARTUP IPI on a condition variable, starts at vector:0000 in
+real mode, and when halted sleeps until an IPI, an I/O APIC routing or
+its own APIC timer; INIT sends it back to waiting. The MP table lists
+them all. Linux 6.12 (Tiny Core) brings up both ("smp: Brought up 1
+node, 2 CPUs"), spreads devices over them through the I/O APIC's
+lowest-priority delivery, and its reschedule, function-call and TLB
+shootdown IPIs flow both ways; a fork storm and parallel shell loops
+run, and in parallel: one shell loop 3 s, two at once 4 s, four 9 s.
+(Before the threads asked macOS for a performance core — the QoS hint
+in ap_thread — the second processor landed on an efficiency core and
+two loops took 7 s.) The boot suite boots it to the shell on two.
+
+What SMP changed underneath, and what it still owes:
+- Bus-locked instructions (LOCK prefix, XCHG with memory, CMPXCHG8B)
+  leave translated code for the interpreter, which does them with the
+  host's atomics on the guest byte itself (a compare-and-swap loop, an
+  exchange, an 8-byte CAS). The first version serialized them with a
+  spinlock around a plain read, compute and write, and the kernel's
+  queued spinlock deadlocked within seconds: its unlock is a plain
+  byte store from the other processor, which landed between the read
+  and the write and was put back stale. Hardware's locked cycle
+  excludes other stores entirely; the CAS loop does too.
+- A store into translated code invalidates the writer's own blocks as
+  before and queues the address for every other translator, which
+  sweeps it at its next block boundary (its run is cut short by
+  jit_cur_hit). The code bitmap's bits stay set in SMP mode, since any
+  translator may hold blocks there, at the cost of spurious sweeps on
+  pages that were once code. A translator reading a page while another
+  processor writes it is a race a few microseconds wide, accepted for
+  now. Translation itself is serialized (the backend's statics).
+- Interrupts, IPIs and invalidations reach a processor at a block
+  boundary: the quantum is 65536 instructions in SMP mode (a million
+  otherwise). That is the architectural guarantee for cross-modified
+  code only if every serializing instruction ends a block, which is
+  not yet checked.
+- Memory ordering: x86 is TSO, the ARM host is not. Stores from inside
+  a critical section may become visible after the plain store that
+  unlocks it. Nothing in the boot or the stress tests tripped on it
+  yet; the fix (acquire/release accesses, or a store barrier per
+  store) is measured work for later. An x86-64 host has none of this.
+- The kernel logs one WARNING at the second processor's bring-up, in
+  cpuid-deps clearing X86_BUG_F00F (bit 704 of the 24 feature words)
+  on a family-5 secondary; QEMU's -cpu pentium -smp 2 logs the same
+  one at the same address. The kernel's, for a dual Pentium.
+- The 586 CPU test and -V stay single-processor. -smp needs the
+  Pentium and the JIT.
+
 tests/boot/tcroot.sh builds disks/linux/tcroot.img: the same kernel on a
 small FAT16 partition, and Tiny Core's userland unpacked from core.gz onto
 an ext2 partition (mke2fs -d, then debugfs making every inode root's, as

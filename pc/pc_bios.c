@@ -161,7 +161,13 @@ static void unhandled_exception(x86_cpu *c, int vector) {
     c->halted = 1;
 }
 
+static void hle_dispatch_(x86_cpu *c, int vector);
 static void hle_dispatch(x86_cpu *c, int vector) {
+    pc_lock();
+    hle_dispatch_(c, vector);
+    pc_unlock();
+}
+static void hle_dispatch_(x86_cpu *c, int vector) {
     pc_service_fn fn = pc.service[vector];
     if (c->pmode && c->exc_delivered && vector < 0x20) {
         if (pc.pm_exception && pc.pm_exception(c, vector)) return;
@@ -472,7 +478,7 @@ static void ferr_irq13(x86_cpu *c) {
  * shadow — a request the 8259s would pass on now (the in-service
  * forgiveness aside). */
 static int intr_ready(x86_cpu *c) {
-    (void)c;
+    if (c->cpu_id) return pc_apic_pending(c);        /* an application processor: its APIC only */
     if (!pc.irq_pending) return 0;
     if (pc.irq_pending & (1 << 12)) return 1;        /* the local APIC has a vector above the processor priority */
     if (!pc_apic_extint_ok()) return 0;              /* ... and the 8259s' INTR is not wired through */
@@ -491,12 +497,15 @@ void pc_intr_update(void) { intr_update(); }
 
 /* Memory-mapped devices: the local APIC's page, then the PCI cards' BARs. */
 static int mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val) {
-    if (pc_apic_mmio_read(phys, size, val) || pc_ioapic_mmio_read(phys, size, val)) return 1;
-    return pc_pci_mmio_read(c, phys, size, val);
+    pc_lock();
+    int r = pc_apic_mmio_read(c, phys, size, val) || pc_ioapic_mmio_read(phys, size, val) || pc_pci_mmio_read(c, phys, size, val);
+    pc_unlock();
+    return r;
 }
 static void mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val) {
-    if (pc_apic_mmio_write(phys, size, val) || pc_ioapic_mmio_write(phys, size, val)) return;
-    pc_pci_mmio_write(c, phys, size, val);
+    pc_lock();
+    if (!pc_apic_mmio_write(c, phys, size, val) && !pc_ioapic_mmio_write(phys, size, val)) pc_pci_mmio_write(c, phys, size, val);
+    pc_unlock();
 }
 void pc_mmio_install(x86_cpu *c) { c->mmio_read = mmio_read; c->mmio_write = mmio_write; }
 
@@ -540,16 +549,41 @@ static void pit_tick(uint64_t now) {
 }
 
 static int poll(x86_cpu *c);
+static int poll_ap(x86_cpu *c);
 int pc_poll(x86_cpu *c) {
+    if (c->cpu_id) return poll_ap(c);
+    pc_lock();
     int r = poll(c);
     intr_update();
+    pc_unlock();
+    return r;
+}
+/* An application processor's poll: no devices to run (the bootstrap
+ * processor's thread runs them), only its APIC — its timer, and what the
+ * others sent it. Halted, it sleeps until something comes. An INIT sends
+ * it back to waiting for STARTUP (pc_smp_wait_sipi, in its thread). */
+static int poll_ap(x86_cpu *c) {
+    int r = 0;
+    pc_lock();
+    for (;;) {
+        uint64_t now = pc_now_ns();
+        pc_apic_poll(c, now);
+        if (pc_smp_take_init(c) || pc.exit_requested || pc_smp_exiting() || (pc.stop_ns && now >= pc.stop_ns)) { c->halted = 1; break; }
+        if (pc_apic_pending(c) && (c->eflags & X86_IF) && !c->int_inhibit) {
+            int v = pc_apic_take(c);
+            if (v >= 0) { x86_interrupt(c, v, 0); c->halted = 0; r = 1; break; }
+        }
+        if (!c->halted) break;
+        pc_smp_wait(c, pc_apic_due(c));
+    }
+    pc_unlock();
     return r;
 }
 static int poll(x86_cpu *c) {
     uint64_t now = pc_now_ns();
     pc.now_ns = now;
     if (now >= pc.rtc_next_ns) pc_rtc_poll(now);        /* the RTC's next interrupt is due (IRQ 8) */
-    pc_apic_poll(now);                                   /* the local APIC's timer */
+    pc_apic_poll(c, now);                                /* the local APIC's timer */
     if (c->insn_count >= pc.ide_due) pc_ide_poll(0);     /* the IDE drive has the next block, or is done */
     int deliverable = pc.irq_pending && (c->eflags & X86_IF) && !c->int_inhibit;
     if (!deliverable && !c->halted && now < pc.next_slow_ns) return 0;
@@ -591,6 +625,7 @@ static int poll(x86_cpu *c) {
         uint8_t code;
         pc_kbd_raw_next(&code);
         pc.last_scancode = code;
+        if (pc.debug > 1) fprintf(stderr, "[kbd] latch %02X @%llu\n", code, (unsigned long long)c->insn_count);
         if (pc.kbc_cmdbyte & 1) { pc.irq_pending |= 1 << 9; pc_ioapic_edge(1); }   /* IRQ 1, if the command byte enables it */
         pc.irq9_busy = 1;                        /* until the handler reads port 60h */
         last_code_ns = now;
@@ -622,7 +657,7 @@ static int poll(x86_cpu *c) {
         last_ns = now; last_insn = c->insn_count;
         /* (a tick raised and not yet taken: the one after it is next) */
         uint64_t due = pc.next_tick_ns > now ? pc.next_tick_ns : now + period;
-        if (pc_apic_due() < due) due = pc_apic_due();
+        if (pc_apic_due(c) < due) due = pc_apic_due(c);
         if (ipn > 0) {
             uint64_t ev = c->insn_count + (uint64_t)((double)(due - now) * ipn) + 1000u;
             if (pc.ide_due != UINT64_MAX && pc.ide_due < ev) ev = pc.ide_due;
@@ -643,8 +678,8 @@ static int poll(x86_cpu *c) {
         uint64_t next = pc.next_tick_ns;
         int rtc_first = pc.rtc_next_ns < next;
         if (rtc_first) next = pc.rtc_next_ns;
-        int apic_first = pc_apic_due() < next;           /* its timer, if that comes first */
-        if (apic_first) next = pc_apic_due();
+        int apic_first = pc_apic_due(c) < next;          /* its timer, if that comes first */
+        if (apic_first) next = pc_apic_due(c);
         uint64_t hnow = pc_now_ns();
         /* a serial console's keys come from stdin: look every 5 ms */
         uint64_t nap = next > hnow ? next - hnow : 0;
@@ -654,14 +689,16 @@ static int poll(x86_cpu *c) {
         if (pc_net_present() && nap > 1000000ull) nap = 1000000ull;
         if (nap) {
             uint64_t w0 = pc_wall_ns();
-            if (netwait) pc_net_poll(1); else usleep((useconds_t)(nap / 1000 + 1));
+            if (netwait) pc_net_poll(1);
+            else if (pc.ncpus > 1) pc_smp_wait(c, hnow + nap);   /* (an IPI wakes it) */
+            else usleep((useconds_t)(nap / 1000 + 1));
             pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++;
         }
         pc_uart_poll();
         pc_net_poll(0);
         if (intr_ready(c)) break;
         if (pc_now_ns() < next) continue;
-        if (apic_first) pc_apic_poll(pc_now_ns());
+        if (apic_first) pc_apic_poll(c, pc_now_ns());
         else if (rtc_first) pc_rtc_poll(pc_now_ns());
         else pit_tick(pc_now_ns());
     }
@@ -673,7 +710,7 @@ static int poll(x86_cpu *c) {
      * we forgive it after 200 ms of wall clock. */
     if (pc.irq_in_service && now - pc.irq_service_ns > 200000000ull) { pc.irq_in_service = 0; pic2.isr = 0; }
     /* the local APIC's own vectors first; then the 8259s', if their INTR reaches the processor */
-    int av = pc_apic_take();
+    int av = pc_apic_take(c);
     if (av >= 0) { x86_interrupt(c, av, 0); c->halted = 0; return 1; }
     if (!pc_apic_extint_ok()) return 0;
     if ((pc.irq_pending & (1 << 8)) && !(pc.irq_in_service & 1) && !(pic.mask & 1)) {
@@ -790,13 +827,17 @@ static uint16_t pit_now(int ch) {
 static void a20_set(x86_cpu *c, int on) {
     int was = c->a20_mask != 0xFFFFFu;
     if (pc.debug && was != on) fprintf(stderr, "[pc] A20 %s @%llu\n", on ? "on" : "off", (unsigned long long)c->insn_count);
-    x86_set_a20(c, on);
+    x86_set_a20(pc.cpus[0], on);                      /* the gate is the chipset's: the one memory, remapped once */
+    for (int i = 0; i < pc.ncpus; i++)
+        if (pc.cpus[i] != pc.cpus[0]) { pc.cpus[i]->a20_mask = pc.cpus[0]->a20_mask; pc.cpus[i]->jit_cur_hit = 1; }
 }
 static uint8_t a20_out_port(const x86_cpu *c) { return (uint8_t)(0xCD | (c->a20_mask != 0xFFFFFu ? 2 : 0)); }   /* 8042 output port: A20 in bit 1, bit 0 = no reset */
 
 static uint32_t port_read_(x86_cpu *c, uint16_t port, int size);
 static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
+    pc_lock();
     uint32_t v = port_read_(c, port, size);
+    pc_unlock();
     if (pc.debug > 1 && (port == 0x20 || port == 0x21 || port == 0xA0 || port == 0xA1))
         fprintf(stderr, "[pic] in %02X -> %02X (isr %02X/%02X irr2 %02X) @%llu\n", port, v & 0xFF, pc.irq_in_service & 0xFF, pic2.isr, pic2.irr, (unsigned long long)c->insn_count);
     return v;
@@ -855,7 +896,13 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
         return 0xFF;
     }
 }
+static void port_write_(x86_cpu *c, uint16_t port, uint32_t val, int size);
 static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
+    pc_lock();
+    port_write_(c, port, val, size);
+    pc_unlock();
+}
+static void port_write_(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     if (pc.debug > 1 && (port == 0x20 || port == 0x21 || port == 0xA0 || port == 0xA1))
         fprintf(stderr, "[pic] out %02X <- %02X (isr %02X/%02X) @%llu\n", port, val & 0xFF, pc.irq_in_service & 0xFF, pic2.isr, (unsigned long long)c->insn_count);
     if (pc_ide_port_write(port, val, size)) return;
@@ -1169,15 +1216,18 @@ void pc_reboot(x86_cpu *c) {
  * nanoseconds can be coarser than 5 ns): code times loops by it. */
 static uint64_t tsc_clock(x86_cpu *c) {
     (void)c;
-    static uint64_t last;
-    uint64_t t = pc_now_ns() / 5;
-    if (t <= last) t = last + 1;
-    return last = t;
+    static uint64_t last;                          /* one counter for all the processors (atomics: they compare readings) */
+    uint64_t t = pc_now_ns() / 5, prev = __atomic_load_n(&last, __ATOMIC_RELAXED);
+    for (;;) {
+        if (t <= prev) t = prev + 1;
+        if (__atomic_compare_exchange_n(&last, &prev, t, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return t;
+    }
 }
 
 void pc_init(x86_cpu *cpu, int tty_mode) {
     memset(&pc, 0, sizeof pc);
     pc.cpu = cpu;
+    pc.cpus[0] = cpu; pc.ncpus = 1; cpu->cpu_id = 0;
     pc.tty_mode = tty_mode;
     pc.t0_ns = pc_now_ns();
 
@@ -1206,4 +1256,22 @@ void pc_init(x86_cpu *cpu, int tty_mode) {
     pc_video_init(cpu);
     pc_kbd_init();
     cpu->eflags |= X86_IF;
+}
+
+/* An application processor (-smp): the bootstrap processor's hooks and
+ * clock, its own local APIC, and the MP table told of it. */
+void pc_init_ap(x86_cpu *ap) {
+    x86_cpu *b = pc.cpus[0];
+    if (pc.ncpus >= PC_MAX_CPUS) return;
+    ap->cpu_id = (uint8_t)pc.ncpus;
+    pc.cpus[pc.ncpus++] = ap;
+    ap->io_read = b->io_read; ap->io_write = b->io_write; ap->io_ctx = b->io_ctx;
+    ap->hle_seg = b->hle_seg; ap->hle = b->hle; ap->hle_ctx = b->hle_ctx;
+    ap->tsc_clock = b->tsc_clock; ap->tsc_base = b->tsc_base;
+    ap->intr_ready = b->intr_ready;
+    ap->mmio_read = b->mmio_read; ap->mmio_write = b->mmio_write;
+    ap->ferr_hook = b->ferr_hook;
+    ap->device_read = b->device_read; ap->device_store = b->device_store;
+    pc_apic_init(ap);
+    pc_apic_mp_table(b);
 }

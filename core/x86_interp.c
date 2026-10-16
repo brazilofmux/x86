@@ -21,6 +21,20 @@ static const uint8_t parity_even[256] = { P6(1), P6(0), P6(0), P6(1) };
 
 #define RAISE(v) do { c->exc = (v); return; } while (0)
 
+/* SMP: the instructions the bus would lock run one at a time across the
+ * processors (a spinlock; its acquire and release are the barriers an
+ * x86 LOCK implies). The lock is never held across a fault's longjmp:
+ * the callers release it after the _setjmp block either way. */
+int x86_smp;
+static int lock_word;
+static inline int insn_locked(const x86_insn *in) {
+    return in->lock || in->op == OP_CMPXCHG8B
+        || (in->op == OP_XCHG && (in->ops[0].kind == OPK_MEM || in->ops[1].kind == OPK_MEM));
+}
+static inline void atomic_lock(void)   { while (__atomic_exchange_n(&lock_word, 1, __ATOMIC_ACQUIRE)) { } }
+static inline void atomic_unlock(void) { __atomic_store_n(&lock_word, 0, __ATOMIC_RELEASE); }
+static _Thread_local int tl_locked;        /* the instruction executing is one of those */
+
 void x86_fault(x86_cpu *c, int vector, uint32_t err) {
     c->exc = vector;
     c->exc_err = err;
@@ -1096,6 +1110,138 @@ static uint32_t bt_common(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t 
 }
 
 /* ------------------------------------------------------------------------
+ * SMP: a bus-locked read-modify-write on plain RAM is done with the
+ * host's atomics on the guest byte itself — a compare-and-swap loop, an
+ * exchange, a double-word compare-and-swap — so another processor's
+ * plain store (the kernel's spin_unlock is one) lands wholly before or
+ * wholly after it, as the locked bus cycle guarantees. The serialized
+ * interpreter path (atomic_lock) was not that: a store slipping in
+ * between its read and its write was put back stale, and both
+ * processors spun on a lock nobody held. What cannot be done this way
+ * (an unaligned operand, one that straddles a page or a segment's end,
+ * device memory) stays on the serialized path. 1 if done here.
+ * --------------------------------------------------------------------- */
+static uint64_t at_load(const uint8_t *p, int size) {
+    switch (size) {
+    case 1: return __atomic_load_n((const uint8_t *)p, __ATOMIC_SEQ_CST);
+    case 2: return __atomic_load_n((const uint16_t *)p, __ATOMIC_SEQ_CST);
+    case 4: return __atomic_load_n((const uint32_t *)p, __ATOMIC_SEQ_CST);
+    default: return __atomic_load_n((const uint64_t *)p, __ATOMIC_SEQ_CST);
+    }
+}
+static int at_cas(uint8_t *p, int size, uint64_t *expected, uint64_t desired) {
+    int ok;
+    switch (size) {
+    case 1: { uint8_t e = (uint8_t)*expected; ok = __atomic_compare_exchange_n((uint8_t *)p, &e, (uint8_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; return ok; }
+    case 2: { uint16_t e = (uint16_t)*expected; ok = __atomic_compare_exchange_n((uint16_t *)p, &e, (uint16_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; return ok; }
+    case 4: { uint32_t e = (uint32_t)*expected; ok = __atomic_compare_exchange_n((uint32_t *)p, &e, (uint32_t)desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *expected = e; return ok; }
+    default: return __atomic_compare_exchange_n((uint64_t *)p, expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+}
+static uint64_t at_xchg(uint8_t *p, int size, uint64_t v) {
+    switch (size) {
+    case 1: return __atomic_exchange_n((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST);
+    case 2: return __atomic_exchange_n((uint16_t *)p, (uint16_t)v, __ATOMIC_SEQ_CST);
+    default: return __atomic_exchange_n((uint32_t *)p, (uint32_t)v, __ATOMIC_SEQ_CST);
+    }
+}
+static int exec_atomic(x86_cpu *c, const x86_insn *in, uint32_t ea) {
+    int size = in->ops[0].size, op = in->op;
+    uint32_t addr = ea, bitpos = 0;
+    switch (op) {
+    case OP_ADD: case OP_ADC: case OP_SUB: case OP_SBB: case OP_AND: case OP_OR: case OP_XOR:
+    case OP_INC: case OP_DEC: case OP_NEG: case OP_NOT: case OP_XCHG: case OP_XADD: case OP_CMPXCHG:
+    case OP_BTS: case OP_BTR: case OP_BTC: case OP_CMPXCHG8B:
+        break;
+    default:
+        return 0;
+    }
+    if (op == OP_CMPXCHG8B) size = 8;
+    if (op == OP_BTS || op == OP_BTR || op == OP_BTC) {
+        /* the bit's word, as bt_common finds it: a register offset reaches past the operand */
+        uint32_t idx = rd_op(c, in, 1, ea);
+        if (in->ops[1].kind == OPK_REG) {
+            int64_t s = (int32_t)sext(idx, size);
+            int shift = size == 4 ? 5 : size == 2 ? 4 : 3;
+            addr = (ea + (uint32_t)((s >> shift) * size)) & admask(in);
+            bitpos = (uint32_t)(s & (size * 8 - 1));
+        } else bitpos = idx & (size * 8 - 1);
+    }
+    /* where it is: one aligned piece of plain RAM, or not ours */
+    uint32_t wm = wrapmask(c, admask(in));
+    if ((addr & wm) + (uint32_t)size - 1 > wm) return 0;
+    limit_check(c, in->seg, addr, size);
+    ac_check(c, c->seg[in->seg].base, addr, size, 1);
+    uint32_t lin = c->seg[in->seg].base + (addr & wm);
+    if (lin & (uint32_t)(size - 1)) return 0;
+    uint32_t phys = x86_lin(c, lin, 1);                   /* faults as the instruction's own write would */
+    if (phys == X86_PG_BAD) return 0;
+    phys &= c->a20_mask;
+    if (phys + (uint32_t)size > c->mem_size) return 0;
+    for (int i = 0; i < size; i++) if (c->code_bitmap[phys + (uint32_t)i] & (X86_BM_DEVICE | X86_BM_EMPTY)) return 0;
+    uint8_t *p = c->mem + phys;
+    uint32_t m = size == 8 ? 0xFFFFFFFFu : szmask(size);
+    uint64_t old = at_load(p, size);
+    switch (op) {
+    case OP_XCHG: {
+        old = at_xchg(p, size, rd_op(c, in, 1, ea) & m);
+        x86_set_reg(c, in->ops[1].reg, size, (uint32_t)old);
+        break;
+    }
+    case OP_CMPXCHG: {
+        uint32_t acc = x86_get_reg(c, R_AX, size) & m, src = rd_op(c, in, 1, ea) & m;
+        uint64_t e = acc;
+        int ok = at_cas(p, size, &e, src);
+        do_sub(c, acc, (uint32_t)e, 0, size);             /* the flags of the compare with what was there */
+        if (!ok) x86_set_reg(c, R_AX, size, (uint32_t)e);
+        break;
+    }
+    case OP_CMPXCHG8B: {
+        uint64_t e = (uint64_t)c->r[R_DX] << 32 | c->r[R_AX], d = (uint64_t)c->r[R_CX] << 32 | c->r[R_BX];
+        if (at_cas(p, 8, &e, d)) c->eflags |= X86_ZF;
+        else { c->eflags &= ~X86_ZF; c->r[R_AX] = (uint32_t)e; c->r[R_DX] = (uint32_t)(e >> 32); }
+        break;
+    }
+    default: {
+        /* read-modify-write: from what is there, swap the result in; again if it moved */
+        int bt = op == OP_BTS || op == OP_BTR || op == OP_BTC;
+        uint32_t src = (op == OP_INC || op == OP_DEC || op == OP_NEG || op == OP_NOT || bt) ? 0 : rd_op(c, in, 1, ea) & m;
+        uint32_t f0 = c->eflags;
+        for (;;) {
+            uint32_t a = (uint32_t)old & m, r;
+            c->eflags = f0;
+            switch (op) {
+            case OP_ADD:  r = do_add(c, a, src, 0, size); break;
+            case OP_ADC:  r = do_add(c, a, src, f0 & X86_CF, size); break;
+            case OP_SUB:  r = do_sub(c, a, src, 0, size); break;
+            case OP_SBB:  r = do_sub(c, a, src, f0 & X86_CF, size); break;
+            case OP_AND:  r = do_logic(c, a & src, size); break;
+            case OP_OR:   r = do_logic(c, a | src, size); break;
+            case OP_XOR:  r = do_logic(c, a ^ src, size); break;
+            case OP_INC:  r = do_add(c, a, 1, 0, size); c->eflags = (c->eflags & ~X86_CF) | (f0 & X86_CF); break;
+            case OP_DEC:  r = do_sub(c, a, 1, 0, size); c->eflags = (c->eflags & ~X86_CF) | (f0 & X86_CF); break;
+            case OP_NEG:  r = do_sub(c, 0, a, 0, size); break;
+            case OP_NOT:  r = ~a; break;
+            case OP_XADD: r = do_add(c, a, src, 0, size); break;
+            default: {                                      /* BTS, BTR, BTC */
+                uint32_t bit = (a >> bitpos) & 1;
+                c->eflags = (f0 & ~X86_CF) | (bit ? X86_CF : 0);
+                r = op == OP_BTS ? a | (1u << bitpos) : op == OP_BTR ? a & ~(1u << bitpos) : a ^ (1u << bitpos);
+                break;
+            }
+            }
+            if (at_cas(p, size, &old, r & m)) break;
+        }
+        if (op == OP_XADD) x86_set_reg(c, in->ops[1].reg, size, (uint32_t)old & m);
+        break;
+    }
+    }
+    /* the store went behind x86_phys_wr8's back: the bitmap's watchers (translated code) */
+    for (int i = 0; i < size; i++) if (c->code_bitmap[phys + (uint32_t)i]) x86_store_hook(c, phys + (uint32_t)i);
+    return 1;
+}
+
+/* ------------------------------------------------------------------------
  * Execute one decoded instruction. c->eip already points past it.
  * --------------------------------------------------------------------- */
 static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
@@ -1103,6 +1249,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     int size = in->ops[0].size;
     uint32_t a, b, r;
 
+    if (tl_locked && in->ops[0].kind == OPK_MEM && exec_atomic(c, in, ea)) return;
     switch (in->op) {
     /* ---- arithmetic ------------------------------------------------ */
     case OP_ADD: case OP_ADC: case OP_SUB: case OP_SBB: case OP_CMP: {
@@ -1914,6 +2061,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             o[1] = 0x756E6547u; o[3] = 0x49656E69u; o[2] = 0x6C65746Eu;   /* "Genu" "ineI" "ntel" */
         } else if (leaf == 1) {
             o[0] = X86_586_SIGNATURE;
+            o[1] = (uint32_t)c->cpu_id << 24;           /* the initial APIC ID */
             o[3] = (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8 | (c->has_apic ? 1u << 9 : 0u);
         }
         c->r[R_AX] = o[0]; c->r[R_BX] = o[1]; c->r[R_CX] = o[2]; c->r[R_DX] = o[3];
@@ -2031,9 +2179,13 @@ static int fetch_bytes(x86_cpu *c, uint8_t *buf, int *cross_at) {
 void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
     uint32_t start_ip = c->eip - in->len;
     c->int_inhibit = 0;          /* the shadow covers one instruction, as in x86_step */
+    int locked = x86_smp && insn_locked(in);
+    tl_locked = locked;
+    if (locked) atomic_lock();
     c->fault_armed = 1;
     if (_setjmp(c->fault_jb) == 0) execute(c, in, start_ip);
     c->fault_armed = 0;
+    if (locked) atomic_unlock();
     c->pg_super = 0;             /* a fault may have left an implicit access marked */
     /* A fault (286+) or a trap-style exception restarts at the instruction
      * or continues after it, as x86_step would; the caller delivers it. */
@@ -2096,6 +2248,9 @@ int x86_step(x86_cpu *c) {
         } else {
             c->eip = is386 ? start_ip + in.len : ((start_ip + in.len) & 0xFFFF);
             c->int_inhibit = 0;
+            int locked = x86_smp && insn_locked(&in);
+            tl_locked = locked;
+            if (locked) atomic_lock();
             c->fault_armed = 1;
             if (_setjmp(c->fault_jb) == 0) {
                 /* Under paging the fetch touches, for real, the pages the
@@ -2115,6 +2270,7 @@ int x86_step(x86_cpu *c) {
                 if (in.op != OP_IRET && in.op != OP_POPF) c->eflags &= ~(uint32_t)X86_RF;
             }
             c->fault_armed = 0;
+            if (locked) atomic_unlock();
             c->pg_super = 0;                          /* a fault may have left an implicit access marked */
         }
     }

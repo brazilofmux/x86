@@ -18,6 +18,17 @@ void x86_init(x86_cpu *c, int model) {
     x86_reset(c);
 }
 
+void x86_init_ap(x86_cpu *c, const x86_cpu *bsp) {
+    memset(c, 0, sizeof(*c));
+    c->model = bsp->model;
+    c->mem = bsp->mem; c->mem_fd = bsp->mem_fd; c->code_bitmap = bsp->code_bitmap;
+    c->mem_size = bsp->mem_size; c->mem_mirrored = bsp->mem_mirrored; c->a20_mask = bsp->a20_mask;
+    c->has_fpu = bsp->has_fpu;
+    c->smc_hook = smc_hook_none;
+    c->exc = -1;
+    x86_reset(c);
+}
+
 /* A store landed on a byte the bitmap marks: device memory first (it may
  * rewrite the byte), then code the DBT has translated. */
 void x86_store_hook(x86_cpu *c, uint32_t p) {

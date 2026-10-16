@@ -67,7 +67,7 @@
 /* Nested brackets keep the buffer writable until the outermost ends: a
  * translation (bracketed by the run loop) may drop or park a page, whose
  * link repatching brackets itself. */
-extern int dbt_jit_wdepth;
+extern _Thread_local int dbt_jit_wdepth;         /* per thread, as the protection itself is (-smp: a translator per thread) */
 static inline void dbt_jit_writable_begin(void) { if (dbt_jit_wdepth++ == 0) pthread_jit_write_protect_np(0); }
 static inline void dbt_jit_writable_end(void)   { if (--dbt_jit_wdepth == 0) pthread_jit_write_protect_np(1); }
 #else
@@ -252,6 +252,10 @@ typedef struct {
      * host events (timer, keyboard) when it comes back. */
     uint64_t quantum;
     uint64_t insn_limit;           /* stop (rc 0) once insn_count passes this; 0 = never */
+    /* SMP: stores by other processors into code this translator may hold */
+    int      xinval_spin;
+    int      xinval_n, xinval_all;
+    uint32_t xinval[256];
     int    (*poll)(x86_cpu *);     /* host events between block runs; returns 1 if it changed cpu state */
 
     /* Stats */
@@ -555,6 +559,23 @@ static inline int dbt_seg16_ok(const x86_cpu *c) {
 }
 
 extern int dbt_seg16_enabled;   /* X86_NO_SEG16 clears it: segmented 16-bit PM blocks stay all-helper (A/B) */
+/* SMP (-smp): one translator per processor over the one memory. What
+ * changes: the bus-locked instructions leave translated code for the
+ * interpreter, which serializes them; a store into translated code tells
+ * every other translator (dbt_xinval_push, applied at its next block
+ * boundary); the code bitmap's bits stay set, since any of them may hold
+ * blocks there; translation itself is serialized (the backend's
+ * per-translation statics). */
+extern int dbt_smp;
+static inline int dbt_insn_locked(const x86_insn *in) {
+    return in->lock || in->op == OP_CMPXCHG8B
+        || (in->op == OP_XCHG && (in->ops[0].kind == OPK_MEM || in->ops[1].kind == OPK_MEM));
+}
+void dbt_register(x86_dbt *dbt);                 /* an SMP translator: dbt_init */
+void dbt_xinval_push(x86_cpu *from, uint32_t phys);
+void dbt_xinval_apply(x86_dbt *dbt);
+void dbt_translate_lock(void);
+void dbt_translate_unlock(void);
 
 /* 32-bit segmented protected mode (a based block: KEY_SEG16 with
  * KEY_BIG): flat-shaped code — 32-bit offsets, ESP, full EIP — through

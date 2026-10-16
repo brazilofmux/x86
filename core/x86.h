@@ -232,6 +232,7 @@ typedef struct x86_cpu {
     uint64_t next_event;
     uint8_t  has_fpu;
     uint8_t  has_apic;    /* a local APIC on the chip, and enabled: CPUID leaf 1 EDX bit 9 (pc/pc_apic.c) */
+    uint8_t  cpu_id;      /* which processor: 0 the bootstrap one; its APIC ID (pc/pc_smp.c) */
     x86_fpu  fpu;
     /* FERR#: an unmasked x87 exception with CR0.NE clear; the machine
      * turns it into IRQ 13 (pc/pc_bios.c). NULL on the -V shadow. */
@@ -487,6 +488,12 @@ _Static_assert((X86_BM_DELTA < 0 ? -X86_BM_DELTA : X86_BM_DELTA) >= (int64_t)X86
 void x86_set_mem_size(uint32_t bytes);          /* the next x86_init's memory, X86_MEM_SIZE..X86_MEM_MAX */
 int  x86_mem_alloc(x86_cpu *c);
 void x86_mem_free(x86_cpu *c);
+/* Another processor over the same memory: shares BSP's memory, bitmap
+ * and A20 state, has its own everything else. x86_free is not for it. */
+void x86_init_ap(x86_cpu *c, const x86_cpu *bsp);
+/* More than one processor runs (host threads): LOCK-prefixed instructions,
+ * XCHG with memory and CMPXCHG8B are serialized among them. */
+extern int x86_smp;
 int  x86_set_a20(x86_cpu *c, int on);
 
 /* Exceptions (vector numbers) */

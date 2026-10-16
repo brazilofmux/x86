@@ -221,7 +221,7 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
         if (!a) break;
     }
     dbt->smc_invalidations++;
-    dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
+    if (!dbt_smp) dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays (SMP: another translator's blocks may be there) */
 }
 
 static void flush_under_running_code(x86_dbt *dbt) {
@@ -259,6 +259,46 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
         return;
     }
     invalidate_for_store(dbt, phys);
+    if (dbt_smp) dbt_xinval_push(cpu, phys);
+}
+
+/* ---- SMP: the translators, and what each owes the others ------------- */
+static x86_dbt *all[16];
+static int nall;
+static int translate_spin;
+static void spin_lock(int *w)   { while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE)) { } }
+static void spin_unlock(int *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); }
+void dbt_register(x86_dbt *dbt) { if (nall < 16) all[nall++] = dbt; }
+void dbt_translate_lock(void)   { spin_lock(&translate_spin); }
+void dbt_translate_unlock(void) { spin_unlock(&translate_spin); }
+/* A store on FROM's processor hit a code-bitmap byte: the other
+ * translators sweep it at their next boundary — now, as far as their
+ * running block allows (jit_cur_hit). More than the queue holds: they
+ * flush everything. */
+void dbt_xinval_push(x86_cpu *from, uint32_t phys) {
+    for (int i = 0; i < nall; i++) {
+        x86_dbt *d = all[i];
+        if (d->cpu == from) continue;
+        spin_lock(&d->xinval_spin);
+        if (d->xinval_n < (int)(sizeof d->xinval / sizeof d->xinval[0])) d->xinval[d->xinval_n++] = phys;
+        else d->xinval_all = 1;
+        spin_unlock(&d->xinval_spin);
+        d->cpu->jit_cur_hit = 1;
+    }
+}
+void dbt_xinval_apply(x86_dbt *dbt) {
+    if (!dbt->xinval_n && !dbt->xinval_all) return;
+    uint32_t q[sizeof dbt->xinval / sizeof dbt->xinval[0]];
+    spin_lock(&dbt->xinval_spin);
+    int n = dbt->xinval_n, flush = dbt->xinval_all;
+    memcpy(q, dbt->xinval, (size_t)n * sizeof q[0]);
+    dbt->xinval_n = 0; dbt->xinval_all = 0;
+    spin_unlock(&dbt->xinval_spin);
+    if (flush) { flush_under_running_code(dbt); return; }
+    for (int i = 0; i < n; i++) {
+        if (dbt->cpu->code_bitmap[q[i]] & X86_BM_DESC) { flush_under_running_code(dbt); return; }
+        invalidate_for_store(dbt, q[i]);
+    }
 }
 
 /* Forget every translated byte and watched descriptor, keeping device
@@ -267,7 +307,8 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
 void dbt_clear_code_bits(x86_cpu *cpu) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     uint8_t *bm = cpu->code_bitmap;
-    for (uint32_t i = dbt->bm_lo; i < dbt->bm_hi; i++) bm[i] &= (uint8_t)~(X86_BM_CODE | X86_BM_DESC);
+    if (!dbt_smp)                                  /* (SMP: the bits stay, for the other translators' blocks) */
+        for (uint32_t i = dbt->bm_lo; i < dbt->bm_hi; i++) bm[i] &= (uint8_t)~(X86_BM_CODE | X86_BM_DESC);
     dbt->bm_lo = cpu->mem_size;
     dbt->bm_hi = 0;
 }

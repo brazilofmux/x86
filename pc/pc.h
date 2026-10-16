@@ -113,9 +113,28 @@ typedef struct pc_state {
     int exit_requested;              /* DOS asked to terminate */
     int exit_code;
     int debug;
+    int ncpus;                       /* the processors (-smp): cpus[0] the bootstrap one */
+    x86_cpu *cpus[8];
 } pc_state;
+#define PC_MAX_CPUS 8
 
 extern pc_state pc;
+
+/* pc_smp.c — the processors as host threads (-smp): the machine lock,
+ * sleeping and waking, INIT and STARTUP */
+void pc_smp_setup(void);
+void pc_lock(void);
+void pc_unlock(void);
+void pc_smp_wake(int cpu);
+void pc_smp_wait(x86_cpu *c, uint64_t until_ns);
+int  pc_smp_wait_sipi(x86_cpu *c);
+void pc_smp_sipi(int cpu, int vector);
+void pc_smp_init_ipi(int cpu);
+int  pc_smp_take_init(x86_cpu *c);
+int  pc_smp_running(int cpu);
+int  pc_smp_exiting(void);
+void pc_smp_exit(void);
+void pc_init_ap(x86_cpu *ap);          /* an application processor: the BSP's hooks, its own APIC, a place in pc.cpus */
 
 /* pc_bios.c */
 void pc_init(x86_cpu *cpu, int tty_mode); /* IVT, BDA, stub segment, services */
@@ -135,12 +154,15 @@ void     pc_apic_off(void);          /* -noapic: a Pentium without one */
 void     pc_apic_init(x86_cpu *c);
 int      pc_apic_present(void);
 void     pc_apic_mp_table(x86_cpu *c);  /* POST: the MultiProcessor Specification tables in the ROM */
-void     pc_apic_poll(uint64_t now); /* its timer, when due */
-uint64_t pc_apic_due(void);          /* when the timer next fires (UINT64_MAX: never) */
-int      pc_apic_take(void);         /* the vector to deliver now, moved into service; -1 none */
-int      pc_apic_extint_ok(void);    /* do the 8259s' interrupts reach the processor */
-int      pc_apic_mmio_read(uint32_t phys, int size, uint32_t *val);
-int      pc_apic_mmio_write(uint32_t phys, int size, uint32_t val);
+void     pc_apic_dump(FILE *out);         /* -s: the interrupt state at the end */
+void     pc_kbd_debug_dump(FILE *out);
+void     pc_apic_poll(x86_cpu *c, uint64_t now); /* its timer, when due */
+uint64_t pc_apic_due(x86_cpu *c);    /* when the timer next fires (UINT64_MAX: never) */
+int      pc_apic_take(x86_cpu *c);   /* the vector to deliver now, moved into service; -1 none */
+int      pc_apic_pending(x86_cpu *c); /* has it one to deliver */
+int      pc_apic_extint_ok(void);    /* do the 8259s' interrupts reach the bootstrap processor */
+int      pc_apic_mmio_read(x86_cpu *c, uint32_t phys, int size, uint32_t *val);
+int      pc_apic_mmio_write(x86_cpu *c, uint32_t phys, int size, uint32_t val);
 void     pc_ioapic_set(int input, int level); /* a line's level on an I/O APIC input */
 void     pc_ioapic_edge(int input);           /* a pulse on one */
 int      pc_ioapic_mmio_read(uint32_t phys, int size, uint32_t *val);

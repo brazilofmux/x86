@@ -38,7 +38,10 @@ Two ways to run things:
   (`-m`), with an x87 on the 486 and the Pentium (and beside a 386 with
   `-fpu`), and with the Pentium its local APIC and an I/O APIC, with
   the MultiProcessor Specification tables that announce them (`-noapic`
-  for a Pentium without). On it:
+  for a Pentium without) — and more than one Pentium (`-smp N`): each
+  application processor is a host thread with a translator of its own
+  over the one memory, brought up by the INIT and STARTUP IPIs, with
+  the machine's devices behind one lock. On it:
   - FreeDOS 1.3 — installed by its own installer; under HIMEMX, JEMMEX
     and JEMM386
   - MS-DOS 6.22 — installed by its own Setup from diskette images; under
@@ -52,7 +55,8 @@ Two ways to run things:
     to the desktop
   - Linux 6.12 (Tiny Core 16.2, loaded by GRUB 2 from a disk image) on the
     Pentium, to a shell, its devices through the I/O APIC and the local
-    APIC's timer as its clock event device — from its initramfs, or
+    APIC's timer as its clock event device, and on two Pentiums (`-smp
+    2`), scheduling across both — from its initramfs, or
     with its root filesystem
     on the IDE disk (ext2, through Linux's own pata_legacy), and on the
     network: an Intel 82545EM on a PCI bus (-nic e1000,user), DHCP, DNS and

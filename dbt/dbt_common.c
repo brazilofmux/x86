@@ -46,12 +46,14 @@ static void build_tables(x86_jit_aux *aux) {
 }
 
 int dbt_seg16_enabled = 1;
+int dbt_smp;
 int dbt_seg32_enabled = 1;
 
 int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     memset(dbt, 0, sizeof(*dbt));
     dbt->cpu = cpu;
-    dbt->quantum = 1u << 20;
+    dbt->quantum = dbt_smp ? 1u << 16 : 1u << 20;   /* SMP: the other processors' IPIs and invalidations wait for a boundary */
+    if (dbt_smp) dbt_register(dbt);
     dbt->verify_mem_every = 256;
     dbt->fb_sites = getenv("X86_FALLBACK_SITES") != NULL;
     if (getenv("X86_PMPROF")) {
@@ -594,6 +596,7 @@ static int dbt_run_loop(x86_dbt *dbt) {
         }
         if (cpu->halted) return 0;
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
+        if (dbt_smp) dbt_xinval_apply(dbt);          /* what the other processors wrote into our code */
 
         uint64_t key = dbt_cpu_key(cpu);
         /* A MOV SS / POP SS / STI helper left interrupts inhibited for
@@ -615,7 +618,9 @@ static int dbt_run_loop(x86_dbt *dbt) {
         if (!be && !inhibited) {
             dbt_jit_writable_begin();
             uint64_t tx = PH();
+            if (dbt_smp) dbt_translate_lock();
             code = dbt_translate_block(dbt, key);
+            if (dbt_smp) dbt_translate_unlock();
             if (phases) dbt->t_xlate += dbt_now_ns() - tx;
             dbt_jit_writable_end();
             dbt_cache_insert(dbt, key, code);
@@ -844,7 +849,7 @@ static void print_pmprof(x86_dbt *dbt, FILE *out) {
 }
 
 #if defined(__APPLE__) && defined(__aarch64__)
-int dbt_jit_wdepth;
+_Thread_local int dbt_jit_wdepth;
 #endif
 
 void dbt_print_stats(x86_dbt *dbt, FILE *out) {

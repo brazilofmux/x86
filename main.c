@@ -14,6 +14,10 @@
 #include <unistd.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 static void usage(const char *prog) {
     printf("Usage: %s [options] PROGRAM[.COM|.EXE] [args...]\n\n", prog);
@@ -32,6 +36,7 @@ static void usage(const char *prog) {
     printf("              or FILE receives what it sends (default: no serial port)\n");
     printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
     printf("  -noapic     a Pentium without its local APIC (default: one at FEE00000h, with MP tables)\n");
+    printf("  -smp N      N processors (Pentium, JIT): the others are host threads, started by INIT/STARTUP IPIs\n");
     printf("  -vbe        VESA BIOS Extensions 3.0: 640x480 to 1280x1024 at 8/16/32 bpp, a linear\n"
            "              framebuffer in the top 8 MB of RAM (needs -mem 32 or more)\n");
     printf("  -nic e1000[,user]  an Intel 82545EM network card on that bus; ,user puts\n"
@@ -58,6 +63,34 @@ static void usage(const char *prog) {
 }
 
 static x86_dbt g_dbt;
+/* -smp N: the application processors, each a thread with its own
+ * translator (pc/pc_smp.c has the machine side) */
+static int g_nsmp = 1;
+static x86_cpu g_ap[PC_MAX_CPUS];
+static x86_dbt g_apdbt[PC_MAX_CPUS];
+static pthread_t g_apthread[PC_MAX_CPUS];
+static int ap_poll(x86_cpu *c) { return pc_poll(c); }
+static void *ap_thread(void *arg) {
+    x86_cpu *c = arg;
+    x86_dbt *dbt = &g_apdbt[c->cpu_id];
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   /* a performance core, as the main thread gets */
+#endif
+    for (;;) {
+        int vector = pc_smp_wait_sipi(c);           /* INIT left it here; STARTUP says where to begin */
+        if (vector < 0) break;
+        x86_reset(c);
+        c->tsc_base = pc.cpus[0]->tsc_base;         /* one time-stamp counter for all of them: the kernel compares */
+        x86_load_seg(c, S_CS, (uint16_t)(vector << 8));
+        c->eip = 0;
+        c->halted = 0;
+        c->exc = -1;
+        if (pc.debug) fprintf(stderr, "[smp] processor %d starts at %04X:0000\n", c->cpu_id, vector << 8);
+        dbt_cache_invalidate_all(dbt);
+        dbt_run(dbt);                               /* until INIT, a stop, or the end */
+    }
+    return NULL;
+}
 static int g_golden;              /* X86_GOLDEN: interpreter run, every block translated and hashed */
 static int g_stats;
 static uint64_t g_last_insns, g_last_ns;
@@ -329,6 +362,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-com1") && i + 1 < argc) { if (pc_uart_open(argv[++i]) < 0) return 1; }
         else if (!strcmp(argv[i], "-pci")) pc_pci_enable();
         else if (!strcmp(argv[i], "-noapic")) pc_apic_off();
+        else if (!strcmp(argv[i], "-smp") && i + 1 < argc) { g_nsmp = atoi(argv[++i]); if (g_nsmp < 1 || g_nsmp > PC_MAX_CPUS) { fprintf(stderr, "-smp: 1 to %d processors\n", PC_MAX_CPUS); return 2; } }
         else if (!strcmp(argv[i], "-vbe")) pc_vbe_enable();
         else if (!strcmp(argv[i], "-nic") && i + 1 < argc) {
             const char *n = argv[++i];
@@ -498,6 +532,11 @@ int main(int argc, char **argv) {
     uint64_t t0 = pc_now_ns();
     g_last_ns = t0;
     int rc;
+    if (g_nsmp > 1) {
+        if (!use_jit || verify || model < X86_MODEL_586) { fprintf(stderr, "-smp: the Pentium, the JIT, no -V\n"); return 2; }
+        dbt_smp = 1; x86_smp = 1;
+        pc_smp_setup();
+    }
     if (use_jit) {
         if (dbt_init(&g_dbt, &cpu) < 0) return 1;
         g_dbt.verify = verify;
@@ -505,6 +544,17 @@ int main(int argc, char **argv) {
         g_dbt.insn_limit = limit;
         g_dbt.poll = host_poll;
         dbt_sample_start();
+    }
+    for (int i = 1; i < g_nsmp; i++) {
+        x86_cpu *ap = &g_ap[i];
+        x86_init_ap(ap, &cpu);
+        pc_init_ap(ap);
+        if (dbt_init(&g_apdbt[i], ap) < 0) return 1;
+        g_apdbt[i].poll = ap_poll;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 8u << 20);     /* the main thread's 8 MB: the translator's frames are not small */
+        if (pthread_create(&g_apthread[i], &attr, ap_thread, ap) != 0) { perror("pthread_create"); return 1; }
     }
     for (;;) {
         rc = use_jit ? dbt_run(&g_dbt) : run_interp(&cpu, limit);
@@ -520,6 +570,10 @@ int main(int argc, char **argv) {
         if (use_jit || g_golden) { dbt_cache_invalidate_all(&g_dbt); g_dbt.shadow_stale = 1; }
     }
     uint64_t t1 = pc_now_ns();
+    if (g_nsmp > 1) {
+        pc_smp_exit();
+        for (int i = 1; i < g_nsmp; i++) pthread_join(g_apthread[i], NULL);
+    }
 
     pc_video_flush(1);
     pc_kbd_keytrace_exit(&cpu);
@@ -560,6 +614,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  timer: %llu IRQ 0s, %.1f Hz average\n", (unsigned long long)pc.ticks_delivered,
                 s > 0 ? (double)pc.ticks_delivered / s : 0.0);
         if (use_jit) dbt_print_stats(&g_dbt, stderr);
+        for (int i = 1; i < g_nsmp; i++)
+            fprintf(stderr, "  processor %d: %llu insns, %llu blocks translated, %llu fallback insns\n", i,
+                    (unsigned long long)g_ap[i].insn_count, (unsigned long long)g_apdbt[i].blocks_translated,
+                    (unsigned long long)g_apdbt[i].interp_fallback_insns);
+        for (int i = 1; i < g_nsmp; i++) { fprintf(stderr, "processor %d (%s): ", i, g_ap[i].halted ? "halted" : "running"); x86_dump(&g_ap[i], stderr); }
+        if (g_nsmp > 1) { pc_apic_dump(stderr); pc_kbd_debug_dump(stderr); }
         { extern uint64_t pc_vga_stores; if (pc_vga_stores) fprintf(stderr, "  VGA planar stores:      %llu\n", (unsigned long long)pc_vga_stores); }
         pc_svcprof_dump(stderr);
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);

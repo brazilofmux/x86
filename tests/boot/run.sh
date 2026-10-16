@@ -202,6 +202,15 @@ if [ -f disks/freedos/c.img ] && [ -f disks/freedos/net/crynwr.zip ] && [ -f dis
     then echo "ok   freedos on the network: an ne2000, crynwr's packet driver, mtcp dhcp and ping"; else echo "FAIL freedos on the network (ne2000)"; fail=1; fi
     rm -rf tmp/boot-net tmp/boot-net.img tmp/boot-net.exp
 fi
+if [ -f disks/linux/tc.img ]; then
+    # ... and on two Pentiums (-smp 2): the second brought up by INIT and
+    # STARTUP IPIs on its own host thread, the kernel scheduling across both
+    cp disks/linux/tc.img tmp/boot-tcs.img
+    printf '%s\t%s\\r\n%s\t\n' 'tc@box:~\$' 'echo CPUS=$(grep -c ^processor /proc/cpuinfo)' '*CPUS=2' > tmp/boot-tcs.exp
+    if python3 tools/expect.py -t 300 tmp/boot-tcs.exp -- $DM -m 586 -mem 128 -smp 2 -W -T 290 -hda tmp/boot-tcs.img -boot c >/dev/null 2>&1
+    then echo "ok   linux 6.12 on two processors (smp)"; else echo "FAIL linux smp"; fail=1; fi
+    rm -f tmp/boot-tcs.img tmp/boot-tcs.exp
+fi
 if [ -f disks/linux/tc.img ] && $DM -nic e1000,user -h >/dev/null 2>&1; then
     # ... with the e1000 on a slirp network (a build with libslirp): Linux's
     # DHCP client gets slirp's 10.0.2.15, and slirp's gateway answers two

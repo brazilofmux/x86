@@ -438,7 +438,12 @@ void pc_kbd_poll(x86_cpu *c) {
     int polled = pc.kbd_reads >= reads_at_last + 8;
     int silent = !polled && now - last_fed >= 250000000ull;
     if (now < next_ok || !(polled || silent)) return;
-    if (next_key(c, 0)) { next_ok = now + 20000000ull; reads_at_last = pc.kbd_reads; last_fed = now; }
+    if (next_key(c, 0)) { next_ok = now + 20000000ull; reads_at_last = pc.kbd_reads; last_fed = now; if (pc.debug > 1) fprintf(stderr, "[kbd] fed a key @%llu\n", (unsigned long long)now); }
+}
+/* -s with -smp: the feed's state at the end */
+void pc_kbd_debug_dump(FILE *out) {
+    fprintf(out, "  keyboard feed: %d host bytes pending, raw queue %u..%u, kbd_reads %llu, eof %d; latch: busy %d aux_full %d disabled %X isr %X\n",
+            npending, rawq_head, rawq_tail, (unsigned long long)pc.kbd_reads, pc.eof_seen, pc.irq9_busy, pc.aux_full, pc.kbd_disabled, pc.irq_in_service);
 }
 
 /* Scripted stdin ran dry: hand the guest one Ctrl-Z, and if it is still

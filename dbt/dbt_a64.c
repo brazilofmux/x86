@@ -2769,6 +2769,7 @@ static int a64_shift_inline(const x86_insn *in) {
 
 /* Real mode and V86: the 16-bit emitters. */
 static int a64_real_inline(const x86_insn *in) {
+    if (dbt_smp && dbt_insn_locked(in)) return 0;   /* SMP: the interpreter serializes bus-locked instructions */
     switch (in->op) {
     case OP_ADD: case OP_OR: case OP_ADC: case OP_SBB: case OP_AND: case OP_SUB: case OP_XOR: case OP_CMP:
     case OP_TEST: case OP_INC: case OP_DEC: case OP_NOT: case OP_NEG:
@@ -2800,6 +2801,7 @@ static int a64_real_inline(const x86_insn *in) {
  * transfers need a 32-bit operand size (a 16-bit one truncates EIP) and
  * the LOOP family a 32-bit address size (ECX). */
 static int a64_flat_inline(const x86_insn *in, int based) {
+    if (dbt_smp && dbt_insn_locked(in)) return 0;   /* SMP: the interpreter serializes bus-locked instructions */
     /* (a based block reaches FS and GS too — Linux 2.0 addresses user
      * memory through FS — but not CS, whose readability the run-time
      * check does not test) */
@@ -2845,6 +2847,7 @@ static int a64_flat_inline(const x86_insn *in, int based) {
  * straight-line ops the emitters handle at any width (DOS/4GW's
  * dispatcher moves dwords through 16-bit segments). */
 static int a64_seg16_inline(const x86_insn *in) {
+    if (dbt_smp && dbt_insn_locked(in)) return 0;   /* SMP: the interpreter serializes bus-locked instructions */
     if (in->adsize != 2) return 0;
     if (in->ea_valid && in->seg != S_DS && in->seg != S_ES && in->seg != S_SS) return 0;
     if (in->opsize == 4) {
