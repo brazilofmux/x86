@@ -312,14 +312,57 @@ static inline void emit_tso_addsub_uxtw(emit_t *e, int sub, a64_reg_t xd, a64_re
 static inline void emit_tso_addsub_imm(emit_t *e, int sub, a64_reg_t xd, a64_reg_t xn, uint32_t imm12) {
     emit_inst(e, (sub ? 0xD1000000u : 0x91000000u) | ((imm12 & 0xFFFu) << 10) | ((uint32_t)(xn & 0x1F) << 5) | (xd & 0x1F));
 }
+/* The acquire and release forms take any misalignment within a 16-byte
+ * line (FEAT_LSE2) and fault across one, and x86 code crosses lines all
+ * the time (Haiku's did 58 million times in a boot, each a signal). So
+ * a half or a word is tested first, on bits of its address alone, no
+ * scratch register: a word crosses when its low nibble is 13..15, a
+ * half when it is 15. The common case falls through to the acquire or
+ * release form in one to four branches; a crossing access is a plain
+ * load or store with a full barrier beside it, the same ordering. */
+static inline void emit_tso_inst(emit_t *e, uint32_t inst) { emit_inst(e, inst); }
+static inline void emit_tso_access(emit_t *e, uint32_t size, int load, a64_reg_t rt, a64_reg_t xa) {
+    if (size == 0) { if (load) emit_ldapr(e, 0, rt, xa); else emit_stlr(e, 0, rt, xa); return; }
+    /* TBZ Xa, #bit, +off  (off in instructions, patched below) */
+    uint32_t tbz_at[4], ntbz = 0, beq_at = 0;
+    uint32_t a = xa & 0x1F;
+    if (size == 2) {
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36180000u | a);            /* tbz xa, #3 */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36100000u | a);            /* tbz xa, #2 */
+        emit_tso_inst(e, 0xF2400400u | (a << 5) | 31);                             /* tst xa, #3 */
+        beq_at = e->offset; emit_tso_inst(e, 0x54000000u);                         /* b.eq fast */
+    } else {
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36180000u | a);            /* tbz xa, #3 */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36100000u | a);            /* tbz xa, #2 */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36080000u | a);            /* tbz xa, #1 */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36000000u | a);            /* tbz xa, #0 */
+    }
+    /* the crossing access: plain, fenced */
+    if (load) {
+        emit_tso_inst(e, ((size & 3u) << 30) | 0x39400000u | (a << 5) | (rt & 0x1F));   /* ldr{b,h,} wt, [xa] */
+        emit_tso_inst(e, 0xD5033BBFu);                                                     /* dmb ish */
+    } else {
+        emit_tso_inst(e, 0xD5033BBFu);
+        emit_tso_inst(e, ((size & 3u) << 30) | 0x39000000u | (a << 5) | (rt & 0x1F));   /* str{b,h,} wt, [xa] */
+    }
+    uint32_t b_at = e->offset; emit_tso_inst(e, 0x14000000u);                      /* b done */
+    uint32_t fast = e->offset;
+    for (uint32_t k = 0; k < ntbz; k++) {
+        uint32_t *p = (uint32_t *)(e->buf + tbz_at[k]);
+        *p |= (((fast - tbz_at[k]) / 4) & 0x3FFFu) << 5;
+    }
+    if (beq_at) { uint32_t *p = (uint32_t *)(e->buf + beq_at); *p |= (((fast - beq_at) / 4) & 0x7FFFFu) << 5; }
+    if (load) emit_ldapr(e, size, rt, xa); else emit_stlr(e, size, rt, xa);
+    { uint32_t *p = (uint32_t *)(e->buf + b_at); *p |= ((e->offset - b_at) / 4) & 0x3FFFFFFu; }
+}
 /* An immediate-offset guest access in TSO form: size 0/1/2 bytes/half/word. */
 static inline void emit_tso_imm(emit_t *e, uint32_t size, int load, a64_reg_t rt, a64_reg_t rn, uint32_t off) {
     if (load) {
-        if (off) { emit_tso_addsub_imm(e, 0, rt, rn, off); emit_ldapr(e, size, rt, rt); }
-        else emit_ldapr(e, size, rt, rn);
+        if (off) { emit_tso_addsub_imm(e, 0, rt, rn, off); emit_tso_access(e, size, 1, rt, rt); }
+        else emit_tso_access(e, size, 1, rt, rn);
     } else {
         if (off) emit_tso_addsub_imm(e, 0, rn, rn, off);
-        emit_stlr(e, size, rt, rn);
+        emit_tso_access(e, size, 0, rt, rn);
         if (off) emit_tso_addsub_imm(e, 1, rn, rn, off);
     }
 }
@@ -409,8 +452,8 @@ static inline void emit_strh_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t
 static inline void emit_ldst_reg_uxtw(emit_t *e, uint32_t size, uint32_t opc,
                                        a64_reg_t rt, a64_reg_t rn, a64_reg_t rm) {
     if (emit_tso_base(rn) && opc <= 1) {           /* (opc 3, a sign-extending load, is only ever a code byte) */
-        if (opc == 1) { emit_tso_addsub_uxtw(e, 0, rt, rn, rm); emit_ldapr(e, size, rt, rt); }
-        else { emit_tso_addsub_uxtw(e, 0, rn, rn, rm); emit_stlr(e, size, rt, rn); emit_tso_addsub_uxtw(e, 1, rn, rn, rm); }
+        if (opc == 1) { emit_tso_addsub_uxtw(e, 0, rt, rn, rm); emit_tso_access(e, size, 1, rt, rt); }
+        else { emit_tso_addsub_uxtw(e, 0, rn, rn, rm); emit_tso_access(e, size, 0, rt, rn); emit_tso_addsub_uxtw(e, 1, rn, rn, rm); }
         return;
     }
     uint32_t inst = ((size & 3u) << 30) | ((opc & 3u) << 22) | 0x38204800u

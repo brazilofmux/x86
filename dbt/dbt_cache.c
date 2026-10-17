@@ -139,6 +139,9 @@ void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code) {
     dbt_jit_writable_end();
 }
 
+static inline void own(x86_dbt *dbt, uint32_t a);      /* SMP ownership of a code byte: below, with the translators' registry */
+static inline void disown(x86_dbt *dbt, uint32_t a);
+
 /* As dbt_mark_block_bytes, leaving out the [lo, hi) pairs in skip —
  * immediates the block reads from memory at run time. Nothing is ever
  * cleared here: a byte another translation baked in keeps its mark. */
@@ -151,7 +154,8 @@ void dbt_mark_block_bytes_except(x86_dbt *dbt, uint32_t start, uint32_t end, con
         int skipped = 0;
         for (uint32_t k = 0; k < nskip; k++)
             if (a >= skip[2 * k] && a < skip[2 * k + 1]) { skipped = 1; break; }
-        if (!skipped) bm[a] |= X86_BM_CODE;
+        if (skipped) continue;
+        if (dbt_smp) own(dbt, a); else bm[a] |= X86_BM_CODE;
     }
     if (start < dbt->bm_lo) dbt->bm_lo = start;
     if (end > dbt->bm_hi) dbt->bm_hi = end;
@@ -162,7 +166,8 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     if (bytes > dbt->max_block_bytes) dbt->max_block_bytes = bytes;
     dbt->last_block_bytes = bytes;
     uint8_t *bm = dbt->cpu->code_bitmap;    /* X86_MEM_SLACK past mem_size absorbs a block at the very top */
-    for (uint32_t a = start; a < end; a++) bm[a] |= X86_BM_CODE;
+    if (dbt_smp) for (uint32_t a = start; a < end; a++) own(dbt, a);
+    else for (uint32_t a = start; a < end; a++) bm[a] |= X86_BM_CODE;
     if (start < dbt->bm_lo) dbt->bm_lo = start;
     if (end > dbt->bm_hi) dbt->bm_hi = end;
 }
@@ -221,7 +226,8 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
         if (!a) break;
     }
     dbt->smc_invalidations++;
-    if (!dbt_smp) dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays (SMP: another translator's blocks may be there) */
+    if (!dbt_smp) dbt->cpu->code_bitmap[phys] &= (uint8_t)~X86_BM_CODE;   /* a device bit stays */
+    else disown(dbt, phys);                                               /* (SMP: the mark goes when no translator holds the byte) */
 }
 
 static void flush_under_running_code(x86_dbt *dbt) {
@@ -268,7 +274,32 @@ static int nall;
 static int translate_spin;
 static void spin_lock(int *w)   { while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE)) { } }
 static void spin_unlock(int *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); }
-void dbt_register(x86_dbt *dbt) { if (nall < 16) all[nall++] = dbt; }
+/* Who holds blocks over each guest byte: a bit per translator. The code
+ * bitmap's CODE bit is the OR of them, set by whoever marks, cleared by
+ * the last to leave — so a store into a page that was once code stops
+ * costing every processor a sweep (Haiku's boot was 25 million of them)
+ * and a store into another translator's code reaches that one only. */
+static uint8_t *owners;
+void dbt_register(x86_dbt *dbt) {
+    if (nall < 16) all[nall++] = dbt;
+    if (!owners) owners = calloc((size_t)dbt->cpu->mem_size + X86_MEM_SLACK, 1);
+}
+static inline uint8_t owner_bit(const x86_dbt *dbt) { return (uint8_t)(1u << dbt->cpu->cpu_id); }
+static inline void own(x86_dbt *dbt, uint32_t a) {
+    __atomic_fetch_or(&owners[a], owner_bit(dbt), __ATOMIC_SEQ_CST);
+    __atomic_fetch_or(&dbt->cpu->code_bitmap[a], (uint8_t)X86_BM_CODE, __ATOMIC_SEQ_CST);
+}
+/* This translator has no block over the byte any more. The mark goes
+ * when nobody has — and comes back if another translator took the byte
+ * between our leaving and our clearing (it marks after it owns). */
+static inline void disown(x86_dbt *dbt, uint32_t a) {
+    uint8_t b = owner_bit(dbt);
+    if (!(__atomic_load_n(&owners[a], __ATOMIC_SEQ_CST) & b)) return;
+    uint8_t left = (uint8_t)(__atomic_fetch_and(&owners[a], (uint8_t)~b, __ATOMIC_SEQ_CST) & ~b);
+    if (left) return;
+    __atomic_fetch_and(&dbt->cpu->code_bitmap[a], (uint8_t)~X86_BM_CODE, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&owners[a], __ATOMIC_SEQ_CST)) __atomic_fetch_or(&dbt->cpu->code_bitmap[a], (uint8_t)X86_BM_CODE, __ATOMIC_SEQ_CST);
+}
 void dbt_translate_lock(void)   { spin_lock(&translate_spin); }
 void dbt_translate_unlock(void) { spin_unlock(&translate_spin); }
 /* A store on FROM's processor hit a code-bitmap byte: the other
@@ -276,9 +307,10 @@ void dbt_translate_unlock(void) { spin_unlock(&translate_spin); }
  * running block allows (jit_cur_hit). More than the queue holds: they
  * flush everything. */
 void dbt_xinval_push(x86_cpu *from, uint32_t phys) {
+    uint8_t o = owners ? __atomic_load_n(&owners[phys], __ATOMIC_SEQ_CST) : 0xFF;
     for (int i = 0; i < nall; i++) {
         x86_dbt *d = all[i];
-        if (d->cpu == from) continue;
+        if (d->cpu == from || !(o & owner_bit(d))) continue;   /* only those with blocks over the byte */
         spin_lock(&d->xinval_spin);
         if (d->xinval_n < (int)(sizeof d->xinval / sizeof d->xinval[0])) d->xinval[d->xinval_n++] = phys;
         else d->xinval_all = 1;
@@ -307,8 +339,10 @@ void dbt_xinval_apply(x86_dbt *dbt) {
 void dbt_clear_code_bits(x86_cpu *cpu) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     uint8_t *bm = cpu->code_bitmap;
-    if (!dbt_smp)                                  /* (SMP: the bits stay, for the other translators' blocks) */
+    if (!dbt_smp)
         for (uint32_t i = dbt->bm_lo; i < dbt->bm_hi; i++) bm[i] &= (uint8_t)~(X86_BM_CODE | X86_BM_DESC);
+    else                                           /* SMP: our ownership goes; a DESC watch stays, another translator may share it */
+        for (uint32_t i = dbt->bm_lo; i < dbt->bm_hi; i++) disown(dbt, i);
     dbt->bm_lo = cpu->mem_size;
     dbt->bm_hi = 0;
 }
