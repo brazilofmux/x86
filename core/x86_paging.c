@@ -202,7 +202,23 @@ static int wp_ro(const x86_cpu *c, uint32_t both) {
     return (c->cr0 & X86_CR0_WP) && c->model >= X86_MODEL_486 && !(both & 2);
 }
 
+/* SMP: set accessed/dirty BITS in the entry at P, which read EXPECT, as
+ * the processor does — a locked update of an entry still present and
+ * unchanged. Another processor may have rewritten it since the walk read
+ * it (NT's memory manager trims a working set, turning a PTE into a
+ * transition entry, whose bits 5 and 6 are part of its protection): a
+ * blind OR there corrupts the software entry. 0: it changed, walk again. */
+static int pte_mark(x86_cpu *c, uint32_t p, uint32_t expect, uint32_t bits) {
+    p &= c->a20_mask & ~3u;
+    if (p + 3 >= c->mem_size || (expect & bits) == bits) return 1;
+    uint32_t *w = (uint32_t *)(void *)&c->mem[p];
+    if (!__atomic_compare_exchange_n(w, &expect, expect | bits, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return 0;
+    if (c->code_bitmap[p]) x86_store_hook(c, p);
+    return 1;
+}
+
 uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
+  again:;
     int user = !c->pg_super && x86_cpl(c) == 3;
     uint32_t err = (write ? 2u : 0u) | (user ? 4u : 0u);
     uint32_t pde_at = (c->cr3 & 0xFFFFF000u) | ((lin >> 20) & 0xFFCu);
@@ -236,8 +252,16 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
     /* A probe (the prefetch) looks without touching: the accessed bits
      * and the caches are the business of the access that uses the byte. */
     if (c->pg_probe) return ((pte & 0xFFFFF000u) | (lin & 0xFFF));
-    phys_or8(c, pde_at, 0x20);                            /* accessed */
-    phys_or8(c, pte_at, write ? 0x60 : 0x20);             /* accessed, dirty on a write */
+    if (x86_smp) {
+        if (big) { if (!pte_mark(c, pde_at, pde, write ? 0x60 : 0x20)) goto again; }
+        else {
+            if (!pte_mark(c, pde_at, pde, 0x20)) goto again;
+            if (!pte_mark(c, pte_at, pte, write ? 0x60 : 0x20)) goto again;
+        }
+    } else {
+        phys_or8(c, pde_at, 0x20);                        /* accessed */
+        phys_or8(c, pte_at, write ? 0x60 : 0x20);         /* accessed, dirty on a write */
+    }
     if (write) pte |= 0x40;
     struct x86_tlbe *t = &c->tlb[(lin >> 12) & 255];
     uint32_t both = pde & pte;

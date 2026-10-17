@@ -197,7 +197,9 @@ static void refresh_view(x86_cpu *c) {
 
 uint64_t pc_vga_stores;
 
-static void vga_store(x86_cpu *c, uint32_t p) {
+static void vga_store_(x86_cpu *c, uint32_t p);
+static void vga_store(x86_cpu *c, uint32_t p) { pc_lock(); vga_store_(c, p); pc_unlock(); }
+static void vga_store_(x86_cpu *c, uint32_t p) {
     uint32_t off = p - WIN;
     pc_vga_stores++;
     uint8_t v = c->mem[p];
@@ -237,7 +239,11 @@ static void vga_store(x86_cpu *c, uint32_t p) {
     c->mem[p] = vga.plane[read_plane()][off];            /* the window shows the read plane */
 }
 
-static uint8_t vga_read(x86_cpu *c, uint32_t p) {
+static uint8_t vga_read_(x86_cpu *c, uint32_t p);
+static uint8_t vga_read(x86_cpu *c, uint32_t p) {   /* (the latches are the machine's: one processor at a time) */
+    pc_lock(); uint8_t v = vga_read_(c, p); pc_unlock(); return v;
+}
+static uint8_t vga_read_(x86_cpu *c, uint32_t p) {
     (void)c;
     uint32_t off = p - WIN;
     for (int i = 0; i < 4; i++) vga.latch[i] = vga.plane[i][off];
@@ -256,25 +262,27 @@ static uint8_t vga_read(x86_cpu *c, uint32_t p) {
 /* Chain-4 stores byte A at plane A&3, offset A; the CRTC's doubleword mode
  * then fetches it back as a linear line. Switching forms carries the picture
  * across the same way the hardware would. */
+/* Every processor's view of the window (its device hooks, its fast
+ * planes, its translator's reads) follows the registers, whichever
+ * processor wrote them: with -smp the display driver runs on any of them. */
+#define EACH_CPU(cc) for (int i_ = 0; i_ < (pc.ncpus ? pc.ncpus : 1); i_++) for (x86_cpu *cc = pc.ncpus ? pc.cpus[i_] : c; cc; cc = NULL)
 static void set_planar(x86_cpu *c, int on) {
     if (on == vga.planar) return;
-    c->dev_wplane = c->dev_rplane = NULL;                /* update_fast re-derives them after the register write */
+    EACH_CPU(cc) cc->dev_wplane = cc->dev_rplane = NULL; /* update_fast re-derives them after the register write */
     uint8_t *bm = c->code_bitmap;
     if (on) {
         for (uint32_t a = 0; a < WLEN; a++) vga.plane[a & 3][a] = c->mem[WIN + a];
         for (uint32_t a = 0; a < WLEN; a++) bm[WIN + a] |= X86_BM_DEVICE;
-        c->device_store = vga_store;
-        c->device_read = vga_read;
+        EACH_CPU(cc) { cc->device_store = vga_store; cc->device_read = vga_read; }
         vga.planar = 1;
         refresh_view(c);
-        if (c->dev_hook) c->dev_hook(c);                 /* translated reads must now avoid the window */
+        EACH_CPU(cc) if (cc->dev_hook) cc->dev_hook(cc); /* translated reads must now avoid the window */
     } else {
         for (uint32_t a = 0; a < WLEN; a++) bm[WIN + a] &= (uint8_t)~X86_BM_DEVICE;
-        c->device_store = NULL;
-        c->device_read = NULL;
+        EACH_CPU(cc) { cc->device_store = NULL; cc->device_read = NULL; }
         vga.planar = 0;
         for (uint32_t a = 0; a < WLEN; a++) c->mem[WIN + a] = vga.plane[a & 3][a];
-        if (c->dev_hook) c->dev_hook(c);
+        EACH_CPU(cc) if (cc->dev_hook) cc->dev_hook(cc);
     }
 }
 
@@ -283,12 +291,11 @@ static void set_planar(x86_cpu *c, int on) {
  * one plane the map mask enables" (vga_store's fast case with a single
  * plane), with the window showing the read plane. */
 static void update_fast(x86_cpu *c) {
-    c->dev_wplane = c->dev_rplane = NULL;
+    EACH_CPU(cc) cc->dev_wplane = cc->dev_rplane = NULL;
     if (!vga.planar) return;
     uint8_t mm = vga.seq[2] & 0x0F;
     if ((vga.gc[5] & 3) == 0 && vga.gc[3] == 0 && vga.gc[1] == 0 && vga.gc[8] == 0xFF && mm && !(mm & (mm - 1))) {
-        c->dev_wplane = vga.plane[__builtin_ctz(mm)];
-        c->dev_rplane = vga.plane[read_plane()];
+        EACH_CPU(cc) { cc->dev_wplane = vga.plane[__builtin_ctz(mm)]; cc->dev_rplane = vga.plane[read_plane()]; }
     }
 }
 

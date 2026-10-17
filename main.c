@@ -543,7 +543,7 @@ int main(int argc, char **argv) {
     uint64_t t0 = pc_now_ns();
     g_last_ns = t0;
     int rc;
-    if (g_nsmp > 1) {
+    if (g_nsmp > 1 || (getenv("X86_FORCE_SMP") && use_jit)) {   /* (X86_FORCE_SMP: one processor, every SMP path on — bisection) */
         if (!use_jit || verify || model < X86_MODEL_586) { fprintf(stderr, "-smp: the Pentium, the JIT, no -V\n"); return 2; }
         dbt_smp = 1; x86_smp = 1;
         dbt_tso = getenv("X86_NO_TSO") == NULL;

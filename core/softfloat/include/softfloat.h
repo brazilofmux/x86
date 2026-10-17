@@ -51,7 +51,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "softfloat_types.h"
 
 #ifndef THREAD_LOCAL
-#define THREAD_LOCAL
+/* dos-monster: each guest processor is a host thread with an x87 of its
+ * own, so the rounding mode and the exception flags are per thread
+ * (left empty, two processors' x87 work clobbered each other's). */
+#define THREAD_LOCAL _Thread_local
 #endif
 
 /*----------------------------------------------------------------------------

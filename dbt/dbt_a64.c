@@ -2885,7 +2885,7 @@ int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
 uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
     x86_cpu *cpu = dbt->cpu;
     if (s_strict_exit < 0)
-        s_strict_exit = dbt->verify && getenv("X86_VERIFY_STRICT") != NULL;
+        s_strict_exit = (dbt->verify && getenv("X86_VERIFY_STRICT") != NULL) || getenv("X86_STALE_CHECK") != NULL;
     /* the block's shape, for every emitter below */
     s_v86 = b->v86; s_paged = b->paged; s_iopl3 = b->iopl3;
     s_flat = b->flat; s_based = b->based; s_seg16 = b->seg16; s_ss32 = b->ss32;

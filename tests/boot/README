@@ -340,6 +340,30 @@ other runs stop in different places (STOP 1E reading address 8 or 21,
 STOP D1 at EIP 8, winlogon terminated), so something still tears or
 goes stale between the processors.
 
+Bisection since (each line several boots of 150 s, Windows 2000 MP):
+- both processors translated: a crash every time, a different one each
+  boot; with a 1024-instruction quantum, the same.
+- every block entered from the run loop (no links, no inline probes)
+  with X86_STALE_CHECK comparing its guest bytes then and now: crashes,
+  and not one stale block.
+- V86 code interpreted (X86_NO_V86_JIT): crashes. TSO forms off
+  (X86_NO_TSO): crashes (one desktop in four was luck).
+- one processor with every SMP path on (X86_FORCE_SMP): the desktop,
+  three of three. Whatever it is needs two processors.
+- the first processor interpreted, or both: no crash seen, but they are
+  too slow to reach where the translated ones die.
+Real bugs this turned up and fixed, none of them the one: the VGA's
+planar hooks and fast planes followed only the boot processor (an
+application processor drawing in 16 colours bypassed the planes), and
+its latches had no lock; SoftFloat's rounding mode and exception flags
+were process globals (its THREAD_LOCAL was empty), shared by every
+processor's x87; the TSO line-crossing check used a TST that clobbered
+the host flags; the page walker's accessed and dirty bits were a blind
+OR, where the processor's is a locked update of an entry still as read
+(an OR into an entry another processor just made a transition PTE
+corrupts its protection bits). X86_LOCK_TRACE (locked instructions the
+host atomics could not do: none in a boot).
+
 tests/boot/tcroot.sh builds disks/linux/tcroot.img: the same kernel on a
 small FAT16 partition, and Tiny Core's userland unpacked from core.gz onto
 an ext2 partition (mke2fs -d, then debugfs making every inode root's, as

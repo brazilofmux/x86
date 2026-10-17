@@ -57,6 +57,7 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     memset(dbt, 0, sizeof(*dbt));
     dbt->cpu = cpu;
     dbt->quantum = dbt_smp ? 1u << 16 : 1u << 20;   /* SMP: the other processors' IPIs and invalidations wait for a boundary */
+    if (getenv("X86_QUANTUM")) dbt->quantum = (uint32_t)strtoul(getenv("X86_QUANTUM"), NULL, 0);   /* (measurement, bisection) */
     if (dbt_smp) dbt_register(dbt);
     dbt->verify_mem_every = 256;
     dbt->fb_sites = getenv("X86_FALLBACK_SITES") != NULL;
@@ -557,6 +558,63 @@ static uint64_t run_budget(const x86_dbt *dbt) {
     return q;
 }
 
+/* Debugging: X86_STALE_CHECK — every block is entered from the run loop
+ * (no links, no inline probes), and at each entry the guest bytes it was
+ * translated from are compared with what that linear range holds now.
+ * A mismatch is a translation that outlived a store: the processor, the
+ * block, the bytes then and now, once per block. */
+typedef struct stale_rec { const uint8_t *code; uint32_t lin, len; uint8_t *bytes; uint8_t reported; struct stale_rec *next; } stale_rec;
+#define STALE_HASH 65536
+static _Thread_local stale_rec *stale_tab[STALE_HASH];
+static int stale_on = -1;
+static uint32_t stale_h(const uint8_t *code) { uintptr_t v = (uintptr_t)code; return (uint32_t)((v >> 2) ^ (v >> 18)) & (STALE_HASH - 1); }
+static int stale_read(x86_cpu *c, uint32_t lin, uint32_t len, uint8_t *out) {
+    int probe = c->pg_probe; c->pg_probe = 1;
+    int ok = 1;
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t p = x86_lin(c, lin + i, 0);
+        if (p == X86_PG_BAD) { ok = 0; break; }
+        p &= c->a20_mask;
+        out[i] = p < c->mem_size ? __atomic_load_n(&c->mem[p], __ATOMIC_ACQUIRE) : 0xFF;
+    }
+    c->pg_probe = probe;
+    return ok;
+}
+static void stale_record(x86_dbt *dbt, const uint8_t *code, uint64_t key, uint32_t len) {
+    x86_cpu *c = dbt->cpu;
+    uint32_t h = stale_h(code);
+    stale_rec *r = stale_tab[h];
+    while (r && r->code != code) r = r->next;
+    if (!r) { r = calloc(1, sizeof *r); r->code = code; r->next = stale_tab[h]; stale_tab[h] = r; }
+    free(r->bytes);
+    r->lin = c->seg[S_CS].base + c->eip; r->len = len ? len : 1; r->reported = 0;
+    r->bytes = malloc(r->len);
+    if (!stale_read(c, r->lin, r->len, r->bytes)) { free(r->bytes); r->bytes = NULL; }
+    (void)key;
+}
+static void stale_check(x86_dbt *dbt, const uint8_t *code, uint64_t key) {
+    x86_cpu *c = dbt->cpu;
+    stale_rec *r = stale_tab[stale_h(code)];
+    while (r && r->code != code) r = r->next;
+    if (!r || !r->bytes || r->reported) return;
+    uint32_t lin = c->seg[S_CS].base + c->eip;
+    if (lin != r->lin) return;                       /* the same host code entered at another address (an alias): not compared */
+    uint8_t now[512]; uint32_t n = r->len < sizeof now ? r->len : (uint32_t)sizeof now;
+    if (!stale_read(c, lin, n, now)) return;
+    if (!memcmp(now, r->bytes, n)) return;
+    r->reported = 1;
+    static int nrep; if (nrep++ > 40) return;
+    uint32_t first = 0; while (first < n && now[first] == r->bytes[first]) first++;
+    fprintf(stderr, "[stale] cpu%d block %08X (key %016llX, %u bytes) at insn %llu: byte +%u was %02X, now %02X; then:",
+            c->cpu_id, lin, (unsigned long long)key, r->len, (unsigned long long)c->insn_count, first, r->bytes[first], now[first]);
+    for (uint32_t i = first; i < n && i < first + 16; i++) fprintf(stderr, " %02X", r->bytes[i]);
+    fprintf(stderr, " / now:");
+    for (uint32_t i = first; i < n && i < first + 16; i++) fprintf(stderr, " %02X", now[i]);
+    int probe = c->pg_probe; c->pg_probe = 1;
+    uint32_t phys = x86_lin(c, lin + first, 0); c->pg_probe = probe;
+    fprintf(stderr, " (phys %08X, bitmap %02X)\n", phys, phys < c->mem_size ? c->code_bitmap[phys] : 0);
+}
+
 static int dbt_run_loop(x86_dbt *dbt);
 /* A phase timestamp: a counter read with X86_PHASES, else nothing. */
 #define PH() (phases ? dbt_now_ns() : 0)
@@ -590,8 +648,9 @@ static int dbt_run_loop(x86_dbt *dbt) {
      * X86_WATCH_MEM=phys[,phys] then names every instruction that changes
      * those dwords. For a timing-dependent corruption the JIT reproduces
      * and the interpreter does not. */
-    static uint32_t ifrom_eip, ifrom_esp, wmem[2]; static int ifrom_set = -1, interp_all = 0, nwmem = 0; static unsigned interp_cpus;
+    static uint32_t ifrom_eip, ifrom_esp, wmem[2]; static int ifrom_set = -1, interp_all = 0, nwmem = 0, no_v86_jit; static unsigned interp_cpus;
     if (ifrom_set < 0) {
+        no_v86_jit = getenv("X86_NO_V86_JIT") != NULL;      /* V86 code in the interpreter (bisection) */
         /* X86_INTERP_CPU=N[,N...]: those processors run in the interpreter only (SMP bisection) */
         for (const char *e = getenv("X86_INTERP_CPU"); e && *e; ) { char *end; long n = strtol(e, &end, 10); if (end == e) break; if (n >= 0 && n < 32) interp_cpus |= 1u << n; e = *end ? end + 1 : end; }
         const char *e = getenv("X86_INTERP_FROM"), *w = getenv("X86_WATCH_MEM");
@@ -629,12 +688,15 @@ static int dbt_run_loop(x86_dbt *dbt) {
          * real-mode-shaped blocks (KEY_V86). RF lasts one instruction,
          * which the interpreter runs and clears. */
         int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF) || interp_all || cpu->trace_steps > 0 || ((interp_cpus >> cpu->cpu_id) & 1)
+                     || (no_v86_jit && (cpu->eflags & X86_VM))
                      || (dbt_interp_hi && cpu->seg[S_CS].base + cpu->eip - dbt_interp_lo <= dbt_interp_hi - dbt_interp_lo)   /* a range kept for the interpreter */
                      || x86_ac_live(cpu)                  /* 486 #AC: translated code does not check alignment */
                      || ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM)
                          && !(dbt_cpu_mode_bits(cpu) & (KEY_FLAT | KEY_SEG16)));   /* paged PM neither flat nor segmented 16-bit: the interpreter's */
         x86_block_entry *be = inhibited ? NULL : dbt_cache_lookup(dbt, key);
         uint8_t *code = be ? be->code : NULL;
+        if (stale_on < 0) stale_on = getenv("X86_STALE_CHECK") != NULL;
+        if (stale_on && code) stale_check(dbt, code, key);
         if (!be && !inhibited) {
             dbt_jit_writable_begin();
             uint64_t tx = PH();
@@ -659,6 +721,10 @@ static int dbt_run_loop(x86_dbt *dbt) {
             dbt_jit_writable_end();
             dbt_cache_insert(dbt, key, code);
             if (code) dbt->blocks_translated++;
+            if (stale_on && code) {
+                x86_block_entry *ne = dbt_cache_lookup(dbt, key);
+                stale_record(dbt, code, key, ne && ne->code == code ? dbt->span[ne - dbt->aux->cache] : dbt->last_block_bytes);
+            }
         }
 
         if (code) {

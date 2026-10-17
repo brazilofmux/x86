@@ -326,11 +326,20 @@ static inline void emit_tso_access(emit_t *e, uint32_t size, int load, a64_reg_t
     /* TBZ Xa, #bit, +off  (off in instructions, patched below) */
     uint32_t tbz_at[4], ntbz = 0, beq_at = 0;
     uint32_t a = xa & 0x1F;
-    if (size == 2) {
-        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36180000u | a);            /* tbz xa, #3 */
-        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36100000u | a);            /* tbz xa, #2 */
-        emit_tso_inst(e, 0xF2400400u | (a << 5) | 31);                             /* tst xa, #3 */
-        beq_at = e->offset; emit_tso_inst(e, 0x54000000u);                         /* b.eq fast */
+    /* Branches on address bits only: no flags. (A TST here once clobbered
+     * NZCV that translated code still held live across the access — a
+     * word access at a nibble of 12..15 changed a fused condition, and
+     * Windows 2000 on two processors died a different death each boot.) */
+    if (size == 2) {                       /* a word crosses at nibble 13..15: bits 3, 2, and 1 or 0 */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36180000u | a);            /* tbz xa, #3, fast */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36100000u | a);            /* tbz xa, #2, fast */
+        emit_tso_inst(e, 0x37080000u | (2u << 5) | a);                             /* tbnz xa, #1, slow (+2) */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36000000u | a);            /* tbz xa, #0, fast */
+    } else if (size == 3) {                /* a doubleword crosses at nibble 9..15: bit 3, and 2, 1 or 0 */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36180000u | a);            /* tbz xa, #3, fast */
+        emit_tso_inst(e, 0x37100000u | (3u << 5) | a);                             /* tbnz xa, #2, slow (+3) */
+        emit_tso_inst(e, 0x37080000u | (2u << 5) | a);                             /* tbnz xa, #1, slow (+2) */
+        tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36000000u | a);            /* tbz xa, #0, fast */
     } else {
         tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36180000u | a);            /* tbz xa, #3 */
         tbz_at[ntbz++] = e->offset; emit_tso_inst(e, 0x36100000u | a);            /* tbz xa, #2 */

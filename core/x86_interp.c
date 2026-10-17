@@ -1264,6 +1264,15 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
 
     if (tl_locked) {
         if (in->ops[0].kind == OPK_MEM && exec_atomic(c, in, ea)) return;
+        /* X86_LOCK_TRACE: the first 60 locked instructions the host's
+         * atomics could not do (misaligned, device memory, a fault) */
+        static int lt = -1; static int ltn;
+        if (lt < 0) lt = getenv("X86_LOCK_TRACE") != NULL;
+        if (lt && __atomic_fetch_add(&ltn, 1, __ATOMIC_RELAXED) < 60) {
+            char dis[160]; x86_disasm(in, dis, sizeof dis);
+            fprintf(stderr, "[lock] cpu%d fallback: %s at lin %08X, operand %08X (seg base %08X), size %d\n", c->cpu_id,
+                    dis, c->seg[S_CS].base + start_ip, ea, c->seg[in->seg].base, in->ops[0].size);
+        }
         atomic_lock(); tl_held = 1;                  /* the rest: one at a time across the processors */
     }
     switch (in->op) {
