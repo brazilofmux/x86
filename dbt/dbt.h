@@ -331,7 +331,7 @@ typedef struct {
     uint64_t refused_by_op[OP__COUNT];   /* which op ended/refused blocks */
     uint64_t fallback_by_op[OP__COUNT];  /* which op the interpreter actually ran (dynamic) */
     uint64_t fallback_by_class[6];       /* ...and where: real, V86, PM flat, PM paged not flat, PM other, inhibited */
-    struct { uint64_t key, n; } fb_site[4096];   /* X86_FALLBACK_SITES: where (mode:CS:EIP), open-addressed */
+    struct { uint64_t key, n; uint8_t bytes[16]; uint8_t big, why; } fb_site[4096];   /* X86_FALLBACK_SITES: where (mode:CS:EIP), open-addressed; the instruction and why */
     int      fb_sites;
     uint64_t helper_by_op[OP__COUNT];    /* which op helper calls ran (dynamic) — the promotion list */
     /* Where the run's time went, exactly (dbt_now_ns is a counter read):
@@ -360,6 +360,7 @@ typedef struct {
     uint8_t *smc_heat;
     uint8_t *smc_win;               /* the window (insn_count >> SMC_WINDOW_SHIFT) a byte's heat belongs to */
     uint32_t last_block_bytes;
+    uint8_t  refuse_transient;     /* the last refusal was for a code page not present: not to be cached */
     int      flush_pending;         /* A20 changed under running code: rewind the code buffer at the next translate */
 
     int trace;

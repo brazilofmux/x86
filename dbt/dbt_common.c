@@ -757,7 +757,7 @@ static int dbt_run_loop(x86_dbt *dbt) {
                 dump_block_bytes(cpu, key, "guest bytes");
             }
             dbt_jit_writable_end();
-            dbt_cache_insert(dbt, key, code);
+            if (code || !dbt->refuse_transient) dbt_cache_insert(dbt, key, code);
             if (code) dbt->blocks_translated++;
             if (stale_on && code) {
                 x86_block_entry *ne = dbt_cache_lookup(dbt, key);
@@ -903,7 +903,20 @@ static int dbt_run_loop(x86_dbt *dbt) {
             uint64_t k = ((uint64_t)(cpu->pmode ? ((cpu->eflags & X86_VM) ? 2 : 1) : 0) << 48) | ((uint64_t)cpu->seg[S_CS].sel << 32) | cpu->eip;
             uint32_t h = (uint32_t)((k ^ (k >> 29)) * 2654435761u) & 4095, tries = 0;
             while (dbt->fb_site[h].n && dbt->fb_site[h].key != k && tries++ < 4096) h = (h + 1) & 4095;
-            if (tries < 4096) { dbt->fb_site[h].key = k; dbt->fb_site[h].n++; }
+            if (tries < 4096) {
+                if (!dbt->fb_site[h].n) {
+                    for (int j = 0; j < 16; j++) dbt->fb_site[h].bytes[j] = x86_phys_rd8(cpu, cpu->seg[S_CS].base + cpu->eip + (uint32_t)j);
+                    dbt->fb_site[h].big = cpu->pmode ? (uint8_t)X86_AR_DB(cpu->seg[S_CS].attr) : 0;
+                    /* 1 interrupt shadow, 2 RF, 4 a kept range or trace, 8 #AC live, 16 paged neither flat nor seg16, 32 not translated */
+                    dbt->fb_site[h].why = (uint8_t)((cpu->int_inhibit ? 1 : 0) | ((cpu->eflags & X86_RF) ? 2 : 0)
+                        | ((interp_all || cpu->trace_steps > 0 || ((interp_cpus >> cpu->cpu_id) & 1)
+                            || (dbt_interp_hi && cpu->seg[S_CS].base + cpu->eip - dbt_interp_lo <= dbt_interp_hi - dbt_interp_lo)) ? 4 : 0)
+                        | (x86_ac_live(cpu) ? 8 : 0)
+                        | (((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM) && !(dbt_cpu_mode_bits(cpu) & (KEY_FLAT | KEY_SEG16))) ? 16 : 0));
+                    if (!dbt->fb_site[h].why) dbt->fb_site[h].why = 32;
+                }
+                dbt->fb_site[h].key = k; dbt->fb_site[h].n++;
+            }
         }
         if (!hle_step) {
             /* dynamic histogram: what did we hand to the interpreter? */
@@ -1209,15 +1222,13 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             if (best < 0) break;
             uint64_t k = dbt->fb_site[best].key;
             char buf[64] = "?";
-            if (((k >> 48) & 3) != 1) {                          /* real / V86: the bytes as they are now */
-                x86_cpu *c = dbt->cpu;
-                uint32_t lin = ((((uint32_t)(k >> 32) & 0xFFFF) << 4) + (uint32_t)(k & 0xFFFF)) & c->a20_mask;
-                uint8_t fb[16];
-                for (int j = 0; j < 16; j++) fb[j] = lin + j < c->mem_size ? c->mem[lin + j] : 0;
-                x86_dec_ctx dc = { fb, c->model, 0 }; x86_insn di;
+            {                                                     /* the bytes as they were at its first fallback */
+                x86_dec_ctx dc = { dbt->fb_site[best].bytes, dbt->cpu->model, dbt->fb_site[best].big }; x86_insn di;
                 if (x86_decode(&dc, &di)) x86_disasm(&di, buf, sizeof buf);
             }
-            fprintf(out, "\n    %s %04X:%X=%llu  %s", modes[(k >> 48) & 3], (unsigned)(k >> 32) & 0xFFFF, (unsigned)k, (unsigned long long)dbt->fb_site[best].n, buf);
+            fprintf(out, "\n    %s %04X:%X=%llu  %s  (why %02X)", modes[(k >> 48) & 3], (unsigned)(k >> 32) & 0xFFFF, (unsigned)k, (unsigned long long)dbt->fb_site[best].n, buf, dbt->fb_site[best].why);
+            for (int j = 0; j < 8; j++) fprintf(out, "%s%02X", j ? " " : "  [", dbt->fb_site[best].bytes[j]);
+            fprintf(out, "]");
             dbt->fb_site[best].n = 0;
         }
         fprintf(out, "\n");

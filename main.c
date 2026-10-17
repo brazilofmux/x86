@@ -75,7 +75,7 @@ static void *ap_thread(void *arg) {
     x86_cpu *c = arg;
     x86_dbt *dbt = &g_apdbt[c->cpu_id];
 #if defined(__APPLE__)
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   /* a performance core, as the main thread gets */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   /* a performance core, as the main thread asks too */
 #endif
     for (;;) {
         int vector = pc_smp_wait_sipi(c);           /* INIT left it here; STARTUP says where to begin */
@@ -338,6 +338,13 @@ static int run_interp(x86_cpu *c, uint64_t limit) {
 }
 
 int main(int argc, char **argv) {
+#if defined(__APPLE__)
+    /* A performance core. A process started from a background job or a
+     * script inherits a lower class, and macOS then parks the emulator on
+     * an efficiency core at half speed — one run in two, which made every
+     * timing comparison a coin toss. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     long mem_mb = 17;                  /* -mem */
     int use_jit = 1, verify = 0, strict = 0, model = X86_MODEL_286, tty = 0, debug = 0, fpu = -1;
     uint64_t limit = 0;

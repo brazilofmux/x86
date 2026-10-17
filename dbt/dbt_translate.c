@@ -417,7 +417,15 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
         int user = b->v86 || b->pg_user;
         code_page = (cpu->seg[S_CS].base + (b->flat ? cpu->eip : (cpu->eip & 0xFFFF))) & 0xFFFFF000u;
         uint32_t phys = x86_page_peek(cpu, code_page, user);
-        if (phys == X86_PG_BAD || phys + 0xFFFu >= cpu->mem_size) return 0;
+        /* Not present (yet: demand paging) — the interpreter's fetch
+         * faults it in, and the next visit translates. A refusal cached
+         * now would outlive the fault: refused sentinels are not recorded
+         * against a code page, so nothing clears them when it comes in,
+         * and every process's first touch of a busybox page left that
+         * block in the interpreter for good (a million steps a second
+         * under a Linux shell loop). */
+        if (phys == X86_PG_BAD) { dbt->refuse_transient = 1; return 0; }
+        if (phys + 0xFFFu >= cpu->mem_size) return 0;
         if (!dbt_note_code_page(dbt, code_page >> 12, phys >> 12, user, (uint8_t)((key & KEY_SPACE_MASK) >> KEY_SPACE_SHIFT))) return 0;
         if (phys != (code_page & cpu->a20_mask)) {
             if (!dbt_note_alias(dbt, code_page >> 12, phys >> 12)) return 0;
@@ -627,6 +635,7 @@ static void perf_map_note(x86_dbt *dbt, const dbt_block *b, uint64_t key, const 
 
 uint8_t *dbt_translate_block(x86_dbt *dbt, uint64_t key) {
     x86_cpu *cpu = dbt->cpu;
+    dbt->refuse_transient = 0;
 
     if (dbt->flush_pending || dbt->code_used + 65536 > CODE_BUF_SIZE || dbt->insn_used + MAX_BLOCK_INSNS > INSN_POOL_SIZE) {
         if (dbt->flush_pending) dbt->wipe_pending++;

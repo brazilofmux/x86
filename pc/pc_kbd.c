@@ -434,11 +434,17 @@ void pc_kbd_poll(x86_cpu *c) {
      * anyway. "Not polling" is fewer than the 8 reads above, not none —
      * Windows' INT 16h calls now and then, and waiting for total silence
      * stopped its keys after the first. */
-    static uint64_t last_fed;
+    /* A protected-mode kernel's own driver (Linux, NT, Haiku) has a
+     * buffer of its own and reads port 60h from its IRQ 1 handler: once
+     * it has taken every code of the last key, the next comes 5 ms on,
+     * not 250 ms (four keys a second, which was most of the time any
+     * scripted command took on them). */
+    static uint64_t last_fed, takes_at_last;
     int polled = pc.kbd_reads >= reads_at_last + 8;
+    int taken = pc.kbd_pm_takes > takes_at_last && !pc_kbd_raw_pending() && !pc.irq9_busy;
     int silent = !polled && now - last_fed >= 250000000ull;
-    if (now < next_ok || !(polled || silent)) return;
-    if (next_key(c, 0)) { next_ok = now + 20000000ull; reads_at_last = pc.kbd_reads; last_fed = now; if (pc.debug > 1) fprintf(stderr, "[kbd] fed a key @%llu\n", (unsigned long long)now); }
+    if (now < next_ok || !(polled || taken || silent)) return;
+    if (next_key(c, 0)) { next_ok = now + (taken ? 5000000ull : 20000000ull); reads_at_last = pc.kbd_reads; takes_at_last = pc.kbd_pm_takes; last_fed = now; if (pc.debug > 1) fprintf(stderr, "[kbd] fed a key @%llu\n", (unsigned long long)now); }
 }
 /* -s with -smp: the feed's state at the end */
 void pc_kbd_debug_dump(FILE *out) {

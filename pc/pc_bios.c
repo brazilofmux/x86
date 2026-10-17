@@ -876,6 +876,7 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
     case 0x60:
         if (pc.kbc_out_full) { pc.kbc_out_full = 0; aux_latch(); return pc.kbc_out; }
         if (pc.aux_full) { uint8_t b = pc.aux_out; pc.aux_full = 0; aux_latch(); return b; }
+        if (pc.irq9_busy && c->pmode && !(c->eflags & X86_VM)) pc.kbd_pm_takes++;   /* a kernel's own driver took it */
         pc.irq9_busy = 0; aux_latch(); return pc.last_scancode;
     case 0x61:
         /* bit 4 toggles with the DRAM refresh, every 15.085 us — the
