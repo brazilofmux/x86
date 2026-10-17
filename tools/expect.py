@@ -19,7 +19,7 @@ Blank lines and # comments are ignored. After each send the next step
 waits for the screen to change, so a prompt still showing is not taken
 twice. Exits 0 when every step matched (the emulator is stopped a
 second after the last send), 1 on a timeout, printing the screen for
-the post-mortem.
+the post-mortem (and with EXPECT_SHOT=FILE, the picture of it in FILE).
 -v prints each step as it matches.
 """
 import os, re, struct, subprocess, sys, tempfile, time, zlib
@@ -89,6 +89,15 @@ def main():
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
     t0 = time.time()
     deadline = t0 + timeout
+    def give_up():
+        # EXPECT_SHOT=FILE: the last picture of the screen, for the post-mortem
+        if os.environ.get("EXPECT_SHOT"):
+            try:
+                with open(scr + ".png", "rb") as src, open(os.environ["EXPECT_SHOT"], "wb") as dst: dst.write(src.read())
+            except OSError:
+                pass
+        p.kill()
+        return 1
     last_sent = None                            # the screen as it was when keys last went in
     for pat, keys, whole in steps:
         if pat == "delay":
@@ -102,8 +111,7 @@ def main():
             while pixel(scr + ".png", x, y) != want:
                 if time.time() > deadline or p.poll() is not None:
                     sys.stderr.write("expect: pixel %d,%d never became %r (is %r)\n" % (x, y, want, pixel(scr + ".png", x, y)))
-                    p.kill()
-                    return 1
+                    return give_up()
                 time.sleep(0.1)
             if verbose: sys.stderr.write("expect: [%.2fs] pixel %d,%d is %r\n" % (time.time() - t0, x, y, want))
             continue
@@ -119,8 +127,7 @@ def main():
                 break
             if time.time() > deadline or p.poll() is not None:
                 sys.stderr.write("expect: no %r; the screen:\n%s\n" % (pat.pattern, s))
-                p.kill()
-                return 1
+                return give_up()
             time.sleep(0.25)
         if verbose:
             sys.stderr.write("expect: [%.2fs] %s\n" % (time.time() - t0, pat.pattern))

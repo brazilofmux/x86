@@ -59,7 +59,7 @@ SST    = $(O)/tools/sst
 JITTEST = $(O)/tools/jittest
 MAIN_O = $(O)/main.o
 
-.PHONY: test-pm all clean test-sst test-jit test-dos test-x64enc test-hwflags test-fpu
+.PHONY: test-smp-soak test-pm all clean test-sst test-jit test-dos test-x64enc test-hwflags test-fpu
 
 all: $(TARGET) $(SST) $(JITTEST)
 
@@ -133,6 +133,11 @@ test-dos: $(TARGET)
 
 test-boot: $(TARGET)
 	DM=$(TARGET) tests/boot/run.sh
+
+# SMP soak: each SMP guest booted SOAK_N (30) times on two and four
+# processors, a pass rate per case (tests/boot/smpsoak.sh; about two hours)
+test-smp-soak: $(TARGET)
+	DM=$(TARGET) tests/boot/smpsoak.sh
 
 # dbt/emit_x64.h against objdump (tools/x64enc.c: one line per encoding)
 test-x64enc:
