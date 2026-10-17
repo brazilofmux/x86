@@ -615,6 +615,7 @@ static void stale_check(x86_dbt *dbt, const uint8_t *code, uint64_t key) {
     fprintf(stderr, " (phys %08X, bitmap %02X)\n", phys, phys < c->mem_size ? c->code_bitmap[phys] : 0);
 }
 
+void (*dbt_stop_dump)(x86_cpu *c);              /* the machine's other processors, when X86_INTERP_FROM triggers (main.c) */
 static int dbt_run_loop(x86_dbt *dbt);
 /* A phase timestamp: a counter read with X86_PHASES, else nothing. */
 #define PH() (phases ? dbt_now_ns() : 0)
@@ -885,7 +886,16 @@ static int dbt_run_loop(x86_dbt *dbt) {
         if (ifrom_set) {
             if (!interp_all && eip0 == ifrom_eip && (!ifrom_esp || cpu->r[R_SP] == ifrom_esp)) {
                 interp_all = 1;
-                fprintf(stderr, "[watch] interpreting from insn %llu at lin %08X esp %08X\n", (unsigned long long)cpu->insn_count, eip0, cpu->r[R_SP]);
+                fprintf(stderr, "[watch] cpu%d interpreting from insn %llu at lin %08X esp %08X\n", cpu->cpu_id, (unsigned long long)cpu->insn_count, eip0, cpu->r[R_SP]);
+                x86_dump(cpu, stderr);
+                fprintf(stderr, "[watch] stack:");
+                for (int k = 0; k < 24; k++) {
+                    uint32_t v = 0;
+                    for (int b = 0; b < 4; b++) v |= (uint32_t)x86_phys_rd8(cpu, cpu->seg[S_SS].base + cpu->r[R_SP] + 4 * k + b) << (8 * b);
+                    fprintf(stderr, "%s %08X", k % 8 ? "" : "\n   ", v);
+                }
+                fprintf(stderr, "\n");
+                if (dbt_stop_dump) dbt_stop_dump(cpu);
             }
             if (interp_all) {
                 wring[wring_n++ & 31] = eip0;

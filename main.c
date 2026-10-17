@@ -155,6 +155,15 @@ static void pm_trace_exc(x86_cpu *c, int vec, uint32_t err) {
  * (hex vectors, comma-separated) shows only those, and a "pm" among them
  * none raised in V86 mode — WIN386's V86 traps (#UD on ARPL, #GP on INT
  * n and I/O) otherwise use up the 50 at once. */
+/* dbt_stop_dump: every other processor's registers, as they are now */
+static void stop_dump_others(x86_cpu *c) {
+    for (int i = 0; i < pc.ncpus; i++) {
+        x86_cpu *o = pc.cpus[i];
+        if (!o || o == c) continue;
+        fprintf(stderr, "[watch] processor %d (%s) now:\n", i, o->halted ? "halted" : "running");
+        x86_dump(o, stderr);
+    }
+}
 static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
     static int n, parsed, pm_only;
     static uint32_t at_lin, at_set;                     /* "@lin": only those raised at that linear EIP */
@@ -546,6 +555,7 @@ int main(int argc, char **argv) {
     if (g_nsmp > 1 || (getenv("X86_FORCE_SMP") && use_jit)) {   /* (X86_FORCE_SMP: one processor, every SMP path on — bisection) */
         if (!use_jit || verify || model < X86_MODEL_586) { fprintf(stderr, "-smp: the Pentium, the JIT, no -V\n"); return 2; }
         dbt_smp = 1; x86_smp = 1;
+        dbt_stop_dump = stop_dump_others;
         dbt_tso = getenv("X86_NO_TSO") == NULL;
         if (dbt_tso) dbt_tso_install();
         pc_smp_setup();

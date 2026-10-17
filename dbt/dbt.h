@@ -574,6 +574,7 @@ static inline int dbt_insn_locked(const x86_insn *in) {
     return in->lock || in->op == OP_CMPXCHG8B
         || (in->op == OP_XCHG && (in->ops[0].kind == OPK_MEM || in->ops[1].kind == OPK_MEM));
 }
+extern void (*dbt_stop_dump)(x86_cpu *c);
 void dbt_register(x86_dbt *dbt);                 /* an SMP translator: dbt_init */
 void dbt_xinval_push(x86_cpu *from, uint32_t phys);
 void dbt_xinval_apply(x86_dbt *dbt);
