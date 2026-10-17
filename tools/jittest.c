@@ -296,11 +296,13 @@ static int fuzz_accept_pm(const x86_insn *in) {
     switch (in->op) {
     case OP_JMP: case OP_CALL: case OP_RET: case OP_JCC: case OP_JCXZ: case OP_LOOP: case OP_LOOPE: case OP_LOOPNE:
     case OP_JMPF: case OP_CALLF: case OP_RETF: case OP_IRET: case OP_INTO: case OP_INT: case OP_INT3:
-    case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_POPF: case OP_HLT:
+    case OP_MOVSEG: case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: case OP_HLT:
     case OP_AAM: case OP_BOUND: case OP_ENTER: case OP_UD:
         return 0;
     case OP_DIV: case OP_IDIV:
         return in->ops[0].size == 4;   /* #DE goes through the IDT to a HLT (pm_flat_setup) */
+    case OP_POPF:
+        return in->opsize == 4;      /* a random image: inline at CPL 0; RF or TF ones replayed by the interpreter, the block left */
     case OP_POP: case OP_PUSH:
         return in->ops[0].kind != OPK_SREG;
     case OP_OUT:
@@ -539,7 +541,10 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
     if (dbt_init(&dbt, &cpu) < 0) return 1;
     dbt.verify = 1;
     dbt.verify_mem_every = 1;
-    dbt.insn_limit = 1000000;
+    /* a random block that loops (POPF hands its Jcc random flags) is
+     * cut off here: the memory compare after every block made a million
+     * instructions minutes */
+    dbt.insn_limit = 20000;
     int rc = dbt_run(&dbt);
     if (verbose) dbt_print_stats(&dbt, stderr);
     if (rc != 0 || verbose) {

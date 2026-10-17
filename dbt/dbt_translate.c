@@ -223,6 +223,7 @@ static int op_may_fault(const dbt_block *b, const x86_insn *in) {
     switch (in->op) {
     case OP_PUSH: case OP_POP: case OP_CALL: case OP_RET: case OP_CALLF: case OP_RETF: case OP_JMPF:
     case OP_LEAVE: case OP_ENTER: case OP_PUSHA: case OP_POPA:   /* (the stack: no memory operand, still an access) */
+    case OP_PUSHF: case OP_POPF:                                  /* (inline POPFD, a based stack: #SS before its flags land) */
         return 1;
     case OP_INT: case OP_INT3:
         return 1;                     /* the frame carries FLAGS: all of them must be materialized */
@@ -521,7 +522,8 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
          * stepping it lets the loop see alignment checking come on (the only
          * way it can inside translated code: IRET, far transfers and MOV CR0
          * are already stepped, and a 16-bit POPF cannot reach bit 18) */
-        if (cpu->model >= X86_MODEL_486 && in->op == OP_POPF && in->opsize == 4) c = C_REFUSE;
+        if (cpu->model >= X86_MODEL_486 && in->op == OP_POPF && in->opsize == 4
+            && !(b->flat && ((b->key >> 32) & 3) == 0)) c = C_REFUSE;   /* (at CPL 0 AC checks nothing, and leaving CPL 0 is an IRET, which is stepped) */
         if (c == C_REFUSE) {
             dbt->refused_by_op[in->op]++;
             break;

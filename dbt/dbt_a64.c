@@ -116,6 +116,8 @@ static a64_reg_t emit_reg16(emit_t *e, int reg, a64_reg_t tmp);
 static void emit_set16(emit_t *e, int reg, a64_reg_t src);
 static void emit_push16(emit_t *e, a64_reg_t val);
 static void emit_pop16(emit_t *e, a64_reg_t dst);
+static void emit_push32_flat(emit_t *e, a64_reg_t val);
+static void emit_pop32_flat(emit_t *e, a64_reg_t dst);
 
 static inline uint32_t szmask(int size) { return size == 1 ? 0xFF : size == 2 ? 0xFFFF : 0xFFFFFFFFu; }
 static inline uint32_t topshift(int size) { return size == 1 ? 24 : size == 2 ? 16 : 0; }
@@ -691,6 +693,7 @@ typedef struct {
     uint32_t patch_off, back_off;
     uint32_t ip_after, n_done;
     int      ender;      /* the instruction ends the block: after the helper, leave at cpu->eip */
+    int      leave;      /* not an ender, but leave after the helper anyway (charging n_done): POPFD's RF/TF image */
     x86_insn in;
 } flat_slow_t;
 #define FLAT_SLOW_MAX 256
@@ -700,6 +703,7 @@ static const x86_insn *s_cur_insn;   /* the instruction being emitted, for its s
 static uint32_t s_dyn_imm_lin;       /* nonzero: read the current instruction's immediate from this physical address */
 static int s_cur_ender;
 static int s_in_slow_chunk;          /* emitting a flat slow-path chunk (stats tag) */
+static int s_slow_leave;             /* the next slow site leaves the block after its helper (flat_slow_t.leave) */
 
 /* Record a slow-path entry for the current instruction; the caller emits
  * the branch to it (a B.cond or CBZ/CBNZ, all imm19) right after. */
@@ -711,6 +715,7 @@ static void flat_slow_site(emit_t *e) {
     f->ip_after = s_cur_ip_after;
     f->n_done = s_cur_n_done;
     f->ender = s_cur_ender;
+    f->leave = s_slow_leave;
     f->in = *s_cur_insn;
 }
 
@@ -1835,6 +1840,63 @@ static void emit_popf16(emit_t *e, int model) {
     emit_and_w32(e, R_F, W_VAL, W_T1);
 }
 
+/* PUSHFD on the flat stack: EFLAGS with the arithmetic flags from R_F,
+ * RF and VM clear, and the bits above the model's top read as 0 —
+ * CONTRACT (interp, OP_PUSHF). It never faults outside V86 mode. */
+static void emit_pushf32_flat(emit_t *e, int model) {
+    emit_ldr_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+    uint32_t keep = (model >= X86_MODEL_586 ? 0x27FFFFu : model >= X86_MODEL_486 ? 0x7FFFFu : 0x3FFFFu) & ~(uint32_t)(X86_RF | X86_VM | ARITH);
+    emit_and_w32_imm_any(e, W_T0, W_T0, keep, W_T1);
+    emit_orr_w32(e, W_VAL, W_T0, R_F);
+    emit_push32_flat(e, W_VAL);
+}
+/* POPFD on the flat stack at CPL 0. CONTRACT (interp, OP_POPF with
+ * flags_kept at CPL 0): every bit but VM from the image, then
+ * x86_flags_fixup. An image with RF or TF set (the next instruction's
+ * debug semantics, which translated code does not keep) puts ESP back,
+ * replays it in the interpreter and leaves the block for the run loop. IF coming on with an interrupt
+ * waiting leaves the block after it, as STI does (no shadow: POPF has
+ * none). Windows 2000's spinlocks and IRQL code are "pushfd; cli; ...;
+ * popfd" — every POPFD ended its block and was stepped by the run loop. */
+static void emit_popf32_flat(emit_t *e, int model) {
+    s_slow_leave = 1;                     /* every slow path of it — the stack's too — replays it and leaves */
+    emit_pop32_flat(e, W_VAL);
+    emit_and_w32_imm_any(e, W_T0, W_VAL, X86_RF | X86_TF, W_T1);
+    uint32_t plain = emit_pos(e);
+    emit_cbz_w32(e, W_T0, 0);
+    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
+    flat_slow_site(e);                                           /* RF and TF are about the next instruction: the run loop's */
+    s_slow_leave = 0;
+    emit_cbnz_w32(e, W_T0, 0);                                   /* (W_T0 is nonzero here: always taken) */
+    emit_patch_cond19(e, plain, emit_pos(e));
+    emit_ldr_w32_imm(e, W_T2, R_CPU, OFF_EFLAGS);                /* the old flags */
+    emit_and_w32_imm_any(e, W_T0, W_T2, X86_VM, W_T1);
+    emit_and_w32_imm_any(e, W_VAL, W_VAL, ~(uint32_t)X86_VM, W_T1);
+    emit_orr_w32(e, W_VAL, W_VAL, W_T0);
+    uint32_t keep = ~0x8028u;                                    /* x86_flags_fixup: bits 3, 5 and 15 clear, bit 1 set */
+    if (model >= X86_MODEL_486) keep &= model >= X86_MODEL_586 ? 0x0027FFFFu : 0x0007FFFFu;
+    emit_and_w32_imm_any(e, W_VAL, W_VAL, keep, W_T1);
+    (void)emit_orr_w32_imm(e, W_VAL, W_VAL, X86_F1);
+    emit_str_w32_imm(e, W_VAL, R_CPU, OFF_EFLAGS);
+    emit_movz_w32(e, W_T1, ARITH, 0);
+    emit_and_w32(e, R_F, W_VAL, W_T1);
+    /* IF off before, on now, and an interrupt waits: leave after it */
+    emit_bic_w32(e, W_T0, W_VAL, W_T2);
+    uint32_t no_if = emit_pos(e);
+    emit_tbz_x64(e, W_T0, 9, 0);
+    emit_add_x64_big(e, W_T1, R_CPU, (uint32_t)OFF_INTR_WAIT);
+    emit_ldrb_imm(e, W_T1, W_T1, 0);
+    uint32_t none = emit_pos(e);
+    emit_cbz_w32(e, W_T1, 0);
+    emit_mov_w32_imm32(e, A64_W3, s_cur_ip_after);
+    emit_movz_w32(e, A64_W4, (uint16_t)s_cur_n_done, 0);
+    emit_sub_x64(e, R_CNT, R_CNT, A64_W4);
+    emit_str_w32_imm(e, A64_W3, R_CPU, OFF_EIP);
+    emit_b(e, (int32_t)s_exit_eip_off - (int32_t)emit_pos(e));
+    emit_patch_cond19(e, none, emit_pos(e));
+    emit_patch_tb14(e, no_if, emit_pos(e));
+}
+
 /* MUL and one-operand IMUL, r/m8 and r/m16. CONTRACT (interp): AX (or
  * DX:AX) = the product; all arithmetic flags cleared, then SF/ZF/PF from
  * the low half and CF = OF = the high half matters (unsigned: nonzero;
@@ -2243,8 +2305,8 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         else if (in->op == OP_CMPS || in->op == OP_SCAS) emit_rep_cmp(e, in, eager);
         else emit_rep_store(e, in);                                  /* MOVS, STOS (classify) */
         break;
-    case OP_PUSHF: emit_pushf16(e); break;
-    case OP_POPF:  emit_popf16(e, dbt->cpu->model); break;
+    case OP_PUSHF: if (s_flat) emit_pushf32_flat(e, dbt->cpu->model); else emit_pushf16(e); break;
+    case OP_POPF:  if (s_flat) emit_popf32_flat(e, dbt->cpu->model); else emit_popf16(e, dbt->cpu->model); break;
     case OP_PUSHA: emit_pusha_flat(e); break;
     case OP_POPA:  emit_popa_flat(e); break;
     case OP_OUT:   emit_out(e, in); break;
@@ -2384,6 +2446,13 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         if (in->op == OP_CLD || in->op == OP_CLI) (void)emit_and_w32_imm(e, W_T0, W_T0, ~bit);
         else (void)emit_orr_w32_imm(e, W_T0, W_T0, bit);
         emit_str_w32_imm(e, W_T0, R_CPU, OFF_EFLAGS);
+        if (in->op == OP_STI && s_flat) {
+            /* the shadow, as the helper STI raises it: "sti; hlt" must not
+             * take the interrupt before the HLT (the run loop steps the
+             * next instruction when a block leaves with it up) */
+            emit_movz_w32(e, W_T1, 1, 0);
+            emit_strb_imm(e, W_T1, R_CPU, OFF_INT_INHIBIT);
+        }
         if (in->op == OP_STI) {
             /* IF was clear and an interrupt waits for it (cpu->intr_waiting):
              * leave after the STI with its shadow up, as the helper STI
@@ -2779,7 +2848,8 @@ static void emit_flat_slow_chunks(x86_dbt *dbt, emit_t *e) {
         s_in_slow_chunk = 1;
         emit_helper_op(dbt, e, &f->in);
         s_in_slow_chunk = 0;
-        if (f->ender) {
+        if (f->leave) emit_sub_x64_imm(e, R_CNT, R_CNT, f->n_done);   /* (an ender's block is charged already) */
+        if (f->ender || f->leave) {
             if (s_v86) emit_v86_dynamic_key(e, s_mode_bits);
             else emit_pm_dynamic_key(e, dbt->cpu, s_mode_bits);
             emit_dynamic_tail(e, dbt->exit_stub_off);
@@ -2834,7 +2904,7 @@ static int a64_real_inline(const x86_insn *in) {
  * what they cover with 32-bit addressing through DS/ES/SS. Near
  * transfers need a 32-bit operand size (a 16-bit one truncates EIP) and
  * the LOOP family a 32-bit address size (ECX). */
-static int a64_flat_inline(const x86_insn *in, int based) {
+static int a64_flat_inline(const x86_insn *in, int based, int cpl) {
     if (dbt_smp && dbt_insn_locked(in)) return 0;   /* SMP: the interpreter serializes bus-locked instructions */
     /* (a based block reaches FS and GS too — Linux 2.0 addresses user
      * memory through FS — but not CS, whose readability the run-time
@@ -2850,6 +2920,15 @@ static int a64_flat_inline(const x86_insn *in, int based) {
     case OP_ADC: case OP_SBB:
     case OP_SETCC: case OP_OUT: case OP_WAIT:
         return 1;
+    case OP_CLI: case OP_STI:
+        /* At CPL 0 they cannot fault (CPL <= IOPL whatever IOPL is): a
+         * kernel's spinlocks and idle loop — NT's idle processor ran
+         * 23 million of each a second through the helper */
+        return cpl == 0;
+    case OP_PUSHF:
+        return in->opsize == 4;                  /* never faults outside V86 */
+    case OP_POPF:
+        return in->opsize == 4 && cpl == 0;      /* every bit but VM is its own there */
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:
         if (in->ops[1].kind == OPK_REG) return in->ops[0].size == 4;   /* by CL */
         return a64_shift_inline(in);
@@ -2908,7 +2987,7 @@ static int a64_seg16_inline(const x86_insn *in) {
 int dbt_arch_seg32(void) { return 1; }
 
 int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
-    if (b->flat) return a64_flat_inline(in, b->based);
+    if (b->flat) return a64_flat_inline(in, b->based, (int)((b->key >> 32) & 3));   /* CPL: the key's CS selector's RPL */
     if (b->seg16) return a64_seg16_inline(in);
     return a64_real_inline(in);
 }

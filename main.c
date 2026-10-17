@@ -660,6 +660,7 @@ int main(int argc, char **argv) {
                     (unsigned long long)g_apdbt[i].interp_fallback_insns);
         for (int i = 1; i < g_nsmp; i++) { fprintf(stderr, "processor %d (%s): ", i, g_ap[i].halted ? "halted" : "running"); x86_dump(&g_ap[i], stderr); }
         if (pc_apic_present()) pc_apic_dump(stderr);
+        pc_port_stats(stderr);
         if (g_nsmp > 1) { pc_kbd_debug_dump(stderr); fprintf(stderr, "  TSO: %s, %llu accesses across a 16-byte line done by the fault handler\n", dbt_tso ? "on" : "off", (unsigned long long)dbt_tso_faults); }
         { extern uint64_t pc_vga_stores; if (pc_vga_stores) fprintf(stderr, "  VGA planar stores:      %llu\n", (unsigned long long)pc_vga_stores); }
         pc_svcprof_dump(stderr);

@@ -147,6 +147,7 @@ void pc_irq_raise(int irq);          /* IRQ 8-15: a request to the slave 8259 */
 void pc_irq_line(int irq, int level); /* IRQ 3-7, 9-15: a device's line into an 8259 (it takes the rising edge) and the I/O APIC's input of the same number */
 void pc_irq_line_to(int irq, int level, int input); /* ... with the line on another I/O APIC input (a PCI card's) */
 void pc_irq_unmask(int irq);         /* as the BIOS opens a line it has a handler for */
+void pc_port_stats(FILE *out);         /* -s: the busiest I/O ports */
 void pc_intr_update(void);           /* a request, mask or in-service bit changed: recompute cpu->intr_waiting */
 void pc_mmio_install(x86_cpu *c);    /* the CPU's memory-mapped-device hooks: the APIC's page, then the PCI cards' BARs */
 

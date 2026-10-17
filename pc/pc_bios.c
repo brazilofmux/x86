@@ -835,8 +835,26 @@ static void a20_set(x86_cpu *c, int on) {
 static uint8_t a20_out_port(const x86_cpu *c) { return (uint8_t)(0xCD | (c->a20_mask != 0xFFFFFu ? 2 : 0)); }   /* 8042 output port: A20 in bit 1, bit 0 = no reset */
 
 static uint32_t port_read_(x86_cpu *c, uint16_t port, int size);
+/* -s: the busiest ports, in and out, per processor run (pc_port_stats) */
+static uint64_t port_hist[2][65536];
+void pc_port_stats(FILE *out) {
+    uint64_t tot = 0;
+    for (int d = 0; d < 2; d++) for (int p = 0; p < 65536; p++) tot += port_hist[d][p];
+    if (!tot) return;
+    fprintf(out, "  port accesses: %llu; busiest:", (unsigned long long)tot);
+    for (int n = 0; n < 10; n++) {
+        int bd = -1, bp = 0;
+        for (int d = 0; d < 2; d++) for (int p = 0; p < 65536; p++)
+            if (port_hist[d][p] && (bd < 0 || port_hist[d][p] > port_hist[bd][bp])) { bd = d; bp = p; }
+        if (bd < 0) break;
+        fprintf(out, " %s %X:%llu", bd ? "out" : "in", bp, (unsigned long long)port_hist[bd][bp]);
+        port_hist[bd][bp] = 0;
+    }
+    fprintf(out, "\n");
+}
 static uint32_t port_read(x86_cpu *c, uint16_t port, int size) {
     pc_lock();
+    port_hist[0][port]++;
     uint32_t v = port_read_(c, port, size);
     pc_unlock();
     if (pc.debug > 1 && (port == 0x20 || port == 0x21 || port == 0xA0 || port == 0xA1))
@@ -902,6 +920,7 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
 static void port_write_(x86_cpu *c, uint16_t port, uint32_t val, int size);
 static void port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     pc_lock();
+    port_hist[1][port]++;
     port_write_(c, port, val, size);
     pc_unlock();
 }
