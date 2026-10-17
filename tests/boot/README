@@ -262,6 +262,19 @@ descriptor flush leaves the running block only at its next edge (a
 descriptor changes no code, and the CPU rereads one only at a segment
 load), and a flat PUSH moves ESP before its store, so a store that does
 invalidate the running block finds the PUSH whole.
+
+make test-smp-soak (tests/boot/smpsoak.sh) is the check for SMP
+changes: each SMP guest booted thirty times on two and on four
+processors, a pass rate per case — Tiny Core running a fork storm,
+tools/litmus.asm and tools/qlock.asm with a clean kernel log; Windows
+2000 MP to its desktop with KeBugCheckEx trapped; Haiku to its welcome
+window. About two hours; a failure keeps its log and last screen in
+tmp/soak. Bugs that fail one boot in ten get past a handful of boots
+(78dafe5's did); thirty clean in a row would happen by chance about
+one time in twenty-five at that rate.
+First full soak (2026-10-17, 2f1917f): linux2 30/30 (5 min), linux4
+30/30 (20 min), w2k2 30/30 (7 min), w2k4 30/30 (22 min), haiku2 30/30
+(13 min), haiku4 30/30 (51 min).
 The boot suite boots it to the shell on two.
 
 What SMP changed underneath:
