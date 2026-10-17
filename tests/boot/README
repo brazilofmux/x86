@@ -291,6 +291,55 @@ reads the same tables ("Using ACPI (MADT) for SMP configuration
 information") and boots as before; its only remarks are about the
 global lock and the buttons the empty DSDT does not provide.
 
+Windows 2000 on two processors (issue #11, in progress). The installed
+system is a uniprocessor one; without reinstalling, its D: got
+ntkrnlmp.exe and halmps.dll expanded from the CD's I386 (7zz opens the
+LZX cabinets) and a boot.ini entry with /KERNEL=ntkrnlmp.exe
+/HAL=halmps.dll, then the MP copies of ntdll.dll, kernel32.dll and
+win32k.sys (I386 and DRIVER.CAB; the install's are lock-prefix patched
+for one processor, F0 to 90 at the sites in their load-config tables,
+and the MP kernel stops with UP_MP_IMAGE_MISMATCH on them). What it
+found, each fixed:
+- The MPS HAL's clock is the RTC through the I/O APIC (vector D1) and
+  its IRQL is the TPR. A TPR write or an EOI that makes an already
+  requested vector deliverable now makes translated code leave at the
+  next block boundary (pc_apic.c update), as a new request always did;
+  before, the kernel lowered IRQL to let a requested APC interrupt fire
+  and translated code ran on for up to a quantum, so an I/O completion
+  APC wrote its status block into a frame long returned from: STOP 7F,
+  EBP = 0 at a LEAVE, on one processor as on two.
+- An interpreted instruction that turns IF on with an interrupt
+  waiting (POPFD, IRET) is followed by a poll at once, not when the
+  run loop's countdown says: the HAL's KeTryToAcquireQueuedSpinLock
+  loop (pushf; cli; try; popf) had IF clear at every counted poll, its
+  IPI never landed, and the sender spun forever.
+- Aligned words and doublewords are single-copy atomic in the
+  interpreter under SMP (x86_rd/x86_wr), and page-table entries are
+  read whole with their accessed and dirty bits set atomically
+  (x86_paging.c). Byte by byte, the kernel's queued spinlock read a
+  successor link of 000000DC — the low byte of FFDFF4DC had landed —
+  and handed the lock to address DC (both processors then waited on
+  it); a torn page-table entry or an accessed-bit OR putting an old low
+  byte back over a new entry is the same class.
+- A store into a watched descriptor flushes every translator, not only
+  the writer's.
+Found with: X86_WATCH_PHYS / X86_WATCH_PAGE (physical dwords or pages
+kept off translated code's fast paths, every load and store printed
+with a sequence number, processor, EIP and value; the spin reads
+de-duplicated), X86_TRACE_CASFAIL (a failed CMPXCHG at an address
+single-steps the next 40 instructions), X86_INTERP_FROM / X86_WATCH_MEM
+and X86_WATCH_EBP under -V, X86_INTERP_CPU (a processor list kept in
+the interpreter, for bisection), X86_DUMP_BLOCK (a block's host code),
+X86_EXC_TRACE's @lin filter, and sample(1) on the host process.
+tools/qlock.asm is the kernel's queued spinlock protocol, instruction
+for instruction, as a two-processor Linux test (count 2N or HANG with
+the lock state); it passes, under contention and with gaps. Where it
+stands: the MP kernel and HAL boot to the desktop on one processor,
+and reached it once on two (with the second processor interpreted);
+other runs stop in different places (STOP 1E reading address 8 or 21,
+STOP D1 at EIP 8, winlogon terminated), so something still tears or
+goes stale between the processors.
+
 tests/boot/tcroot.sh builds disks/linux/tcroot.img: the same kernel on a
 small FAT16 partition, and Tiny Core's userland unpacked from core.gz onto
 an ext2 partition (mke2fs -d, then debugfs making every inode root's, as

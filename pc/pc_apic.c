@@ -86,11 +86,20 @@ static int deliverable(const lapic *a) {
     return v >= 0 && (uint32_t)(v & 0xF0) > (ppr(a) & 0xF0) ? v : -1;
 }
 static void update(lapic *a) {
+    int was = a->pending;
     a->pending = deliverable(a) >= 0;
     if (a->cpu == pc.cpus[0]) {
         if (a->pending) pc.irq_pending |= 1 << 12; else pc.irq_pending &= ~(1 << 12);
         pc_intr_update();
     } else a->cpu->intr_waiting = (uint8_t)a->pending;
+    /* A vector became deliverable without a new request: the TPR
+     * lowered, an EOI retired the one above it, the APIC was enabled.
+     * The processor takes it at the next instruction boundary, and the
+     * kernel's lowering of its IRQL counts on that: NT lowers to let a
+     * requested APC interrupt fire and loops until it has (a quantum
+     * later, with translated code left running, the completion APC
+     * wrote an I/O status block into a frame long gone). */
+    if (a->pending && !was) a->cpu->jit_cur_hit = 1;
 }
 static void io_eoi(int vec);
 static void request(lapic *a, int v, int level) {

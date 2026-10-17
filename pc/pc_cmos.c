@@ -146,7 +146,7 @@ static void rtc_advance(uint64_t now) {
     }
     uint8_t b = nvram[0x0B];
     int irqf = ((c & RTC_C_PF) && (b & RTC_B_PIE)) || ((c & RTC_C_AF) && (b & RTC_B_AIE)) || ((c & RTC_C_UF) && (b & RTC_B_UIE));
-    if (irqf && !(c & RTC_C_IRQF)) { c |= RTC_C_IRQF; pc_irq_raise(8); }
+    if (irqf && !(c & RTC_C_IRQF)) { c |= RTC_C_IRQF; pc_irq_raise(8); if (pc.debug > 1) fprintf(stderr, "[rtc] IRQ 8 (C=%02X B=%02X A=%02X) @%llu ns\n", c, b, nvram[0x0A], (unsigned long long)now); }
     nvram[0x0C] = c;
     rtc_schedule();
 }
@@ -277,6 +277,7 @@ static uint8_t cmos_read(uint8_t idx) {
             uint8_t v = nvram[0x0C];
             nvram[0x0C] = 0;
             rtc_schedule();
+            if (pc.debug > 1) fprintf(stderr, "[rtc] C read -> %02X @%llu ns\n", v, (unsigned long long)now);
             return v;
         }
         default: return nvram[idx];
@@ -295,6 +296,7 @@ int pc_cmos_port_write(uint16_t port, uint32_t val) {
     if (port == 0x70) { index_reg = (uint8_t)(val & 0x7F); return 1; }   /* bit 7: NMI mask */
     if (port == 0x71) {
         uint8_t i = index_reg, v = (uint8_t)val;
+        if (pc.debug > 1 && (i == 0x0A || i == 0x0B)) fprintf(stderr, "[rtc] %c <- %02X @%llu ns\n", i == 0x0A ? 'A' : 'B', v, (unsigned long long)pc_now_ns());
         if (i <= 0x0D || i == 0x32) {
             uint64_t now = pc_now_ns();
             rtc_advance(now);

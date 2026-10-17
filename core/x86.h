@@ -152,6 +152,7 @@ typedef struct x86_cpu {
     uint8_t  pg_kspace;     /* ...and of the kernel space CPL 0 code is keyed by (dbt_space_current) */
     uint32_t jit_cur_lin;   /* linear address of the block making a helper call... */
     uint32_t jit_cur_hit;   /* ...set by the SMC sweep if that block got invalidated */
+    int      trace_steps;   /* debugging: the run loop single-steps and prints this many instructions */
     uint64_t jit_flags;     /* x86-64 backend: the guest's arithmetic flags between blocks (an RFLAGS image; 64 bits: it is POPped into) */
 
     /* Descriptor tables. In real mode these sit unused; CR0.PE turns them on.
@@ -400,6 +401,15 @@ static inline void x86_phys_wr8(x86_cpu *c, uint32_t lin, uint8_t v) {
 
 /* Implicit supervisor accesses — descriptor tables, the TSS, a frame on an
  * inner stack — are supervisor to the paging unit whatever the CPL. */
+/* Debugging: X86_WATCH_PHYS=hex[,hex...] (up to 8 physical dwords): their
+ * pages are kept off translated code's fast paths, and every load and store that
+ * lands on one is printed with the processor, EIP and value — the order
+ * of two processors' writes to a word, as it happened. */
+extern int x86_nwatch;
+extern uint32_t x86_watch_phys[8];
+int x86_watch_page(uint32_t phys);
+void x86_watch_store(x86_cpu *c, uint32_t lin, uint32_t phys, int size, uint32_t v);
+void x86_watch_load(x86_cpu *c, uint32_t lin, int size, uint32_t v);
 static inline uint32_t x86_rd(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size);
 static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size, uint32_t v);
 static inline uint32_t x86_sup_rd(x86_cpu *c, uint32_t base, uint32_t off, int size) {
@@ -435,15 +445,48 @@ static inline int x86_mmio_wr(x86_cpu *c, uint32_t lin, int size, uint32_t v) {
     c->mmio_write(c, p, size, v);
     return 1;
 }
+/* SMP: a naturally aligned word or doubleword of plain RAM is one access,
+ * as the processor's is (single-copy atomic): another processor sees the
+ * old value or the new, never a half-written pointer. Byte by byte, as
+ * below, Windows 2000's queued spinlock once read a successor link of
+ * 000000DC — the low byte of FFDFF4DC landed, the rest not yet — and
+ * handed the lock to address DC. Returns the physical address when the
+ * access qualifies (aligned, no offset wrap, mapped, inside memory, not
+ * the VGA window), else ~0. */
+static inline uint32_t x86_smp_whole(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size, int write) {
+    if (!x86_smp || (size != 2 && size != 4)) return ~0u;
+    uint32_t o = off & offmask;
+    if ((o & (uint32_t)(size - 1)) || ((o + (uint32_t)size - 1) & offmask) != o + (uint32_t)size - 1) return ~0u;
+    uint32_t p = x86_lin(c, base + o, write);         /* faults as the first byte's access would */
+    if (p == X86_PG_BAD) return ~0u;
+    p &= c->a20_mask;
+    if (p + (uint32_t)size > c->mem_size) return ~0u;
+    if (!write && c->device_read && p - 0xA0000u < 0x10000u) return ~0u;
+    return p;
+}
 static inline uint32_t x86_rd(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size) {
     uint32_t v = 0;
     if (__builtin_expect(c->mmio_read != NULL, 0) && x86_mmio_rd(c, base + (off & offmask), size, &v)) return v;
-    for (int i = 0; i < size; i++)
-        v |= (uint32_t)x86_phys_rd8(c, base + ((off + i) & offmask)) << (8 * i);
+    uint32_t p = x86_smp_whole(c, base, off, offmask, size, 0);
+    if (p != ~0u) {
+        if (size == 4) v = __atomic_load_n((uint32_t *)(void *)&c->mem[p], __ATOMIC_ACQUIRE);
+        else v = __atomic_load_n((uint16_t *)(void *)&c->mem[p], __ATOMIC_ACQUIRE);
+    } else
+        for (int i = 0; i < size; i++)
+            v |= (uint32_t)x86_phys_rd8(c, base + ((off + i) & offmask)) << (8 * i);
+    if (__builtin_expect(x86_nwatch > 0, 0)) x86_watch_load(c, base + (off & offmask), size, v);
     return v;
 }
 static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offmask, int size, uint32_t v) {
     if (__builtin_expect(c->mmio_write != NULL, 0) && x86_mmio_wr(c, base + (off & offmask), size, v)) return;
+    if (__builtin_expect(x86_nwatch, 0)) x86_watch_store(c, base + (off & offmask), 0xFFFFFFFFu, size, v);
+    uint32_t p = x86_smp_whole(c, base, off, offmask, size, 1);
+    if (p != ~0u) {
+        if (size == 4) __atomic_store_n((uint32_t *)(void *)&c->mem[p], v, __ATOMIC_RELEASE);
+        else __atomic_store_n((uint16_t *)(void *)&c->mem[p], (uint16_t)v, __ATOMIC_RELEASE);
+        for (int i = 0; i < size; i++) if (c->code_bitmap[p + (uint32_t)i]) x86_store_hook(c, p + (uint32_t)i);
+        return;
+    }
     for (int i = 0; i < size; i++)
         x86_phys_wr8(c, base + ((off + i) & offmask), (uint8_t)(v >> (8 * i)));
 }

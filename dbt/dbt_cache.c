@@ -252,6 +252,10 @@ void dbt_watch_cs_desc(x86_dbt *dbt) {
 
 /* cpu->smc_hook: reached from x86_phys_wr8 (interpreter, helpers, host
  * services) whenever the bitmap byte is set. */
+static x86_dbt *all[16];
+static int nall;
+static void spin_lock(int *w);
+static void spin_unlock(int *w);
 void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     /* X86_SMC_TRACE=N: the first N stores that hit translated code, with
@@ -262,6 +266,11 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
     if (cpu->code_bitmap[phys] & X86_BM_DESC) {
         flush_under_running_code(dbt);     /* clears every CODE and DESC bit */
         dbt->desc_flushes++;
+        if (dbt_smp)                       /* the other translators baked that descriptor too */
+            for (int i = 0; i < nall; i++) if (all[i] != dbt) {
+                spin_lock(&all[i]->xinval_spin); all[i]->xinval_all = 1; spin_unlock(&all[i]->xinval_spin);
+                all[i]->cpu->jit_cur_hit = 1;
+            }
         return;
     }
     invalidate_for_store(dbt, phys);
@@ -269,8 +278,6 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
 }
 
 /* ---- SMP: the translators, and what each owes the others ------------- */
-static x86_dbt *all[16];
-static int nall;
 static int translate_spin;
 static void spin_lock(int *w)   { while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE)) { } }
 static void spin_unlock(int *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); }

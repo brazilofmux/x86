@@ -137,7 +137,7 @@ static int host_poll(x86_cpu *c) {
  * Restricted to a range for the same reason QEMU needs -dfilter: a whole boot
  * is gigabytes otherwise. */
 static uint32_t g_pmtrace_lo, g_pmtrace_hi;
-static uint64_t g_pmtrace_budget = 200000;
+static uint64_t g_pmtrace_budget = 200000;   /* X86_PMTRACE_BUDGET overrides */
 
 static uint64_t g_pmtrace_left;    /* shared budget: see pm_trace */
 
@@ -157,6 +157,7 @@ static void pm_trace_exc(x86_cpu *c, int vec, uint32_t err) {
  * n and I/O) otherwise use up the 50 at once. */
 static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
     static int n, parsed, pm_only;
+    static uint32_t at_lin, at_set;                     /* "@lin": only those raised at that linear EIP */
     static uint8_t want[32];
     if (!parsed) {
         parsed = 1;
@@ -165,19 +166,21 @@ static void exc_trace(x86_cpu *c, int vec, uint32_t err) {
         if (e && strcmp(e, "1") != 0) {
             for (const char *p = e; *p; ) {
                 if (!strncmp(p, "pm", 2)) { pm_only = 1; p += 2; if (*p) p++; continue; }   /* not from V86 mode */
+                if (*p == '@') { at_lin = (uint32_t)strtoul(p + 1, (char **)&p, 16); at_set = 1; if (*p) p++; continue; }
                 char *end; long v = strtol(p, &end, 16);
                 if (end == p) break;
                 if (v >= 0 && v < 32) { want[v] = 1; any = 1; }
-                p = *end ? end + 1 : end;
+                p = (*end && *end != '@') ? end + 1 : end;
             }
         }
         if (!any) memset(want, 1, sizeof want);
     }
     if (vec < 32 && !want[vec]) return;
     if (pm_only && (c->eflags & X86_VM)) return;
-    if (n++ >= 50) return;
     uint32_t lin = c->seg[S_CS].base + c->eip;
-    fprintf(stderr, "[exc] v=%02X err=%04X at %04X:%04X (%s) bytes before/after:", vec, err,
+    if (at_set && lin != at_lin) return;
+    if (n++ >= 50) return;
+    fprintf(stderr, "[exc] cpu%d v=%02X err=%04X at %04X:%04X (%s) bytes before/after:", c->cpu_id, vec, err,
             c->seg[S_CS].sel, c->eip, c->pmode ? "pm" : "rm");
     for (int k = -12; k < 8; k++) fprintf(stderr, "%s%02X", k == 0 ? " | " : " ", x86_phys_rd8(c, lin + (uint32_t)k));
     if (vec == 14) fprintf(stderr, " cr2=%08X", c->cr2);
@@ -223,6 +226,10 @@ static void pm_trace(x86_cpu *c) {
     fprintf(stderr, "GDT=     00000000 00000000\n");
     fprintf(stderr, "IDT=     00000000 00000000\n");
     fprintf(stderr, "CR0=%08x CR2=00000000 CR3=00000000 CR4=00000000\n", c->pmode ? 0x11u : 0x10u);
+}
+static void jit_pm_trace(x86_cpu *c) {
+    uint32_t lin = c->seg[S_CS].base + c->eip;
+    if (lin >= g_pmtrace_lo && lin <= g_pmtrace_hi) pm_trace(c);
 }
 
 /* -pmring: a ring of the last executed CS:EIP, dumped when the run stops.
@@ -528,6 +535,8 @@ int main(int argc, char **argv) {
         if (tty) pc_kbd_mouse_reporting();
     }
     if (g_pmtrace_hi) cpu.trace_exc = pm_trace_exc;
+    if (g_pmtrace_hi && getenv("X86_PMTRACE_BUDGET")) g_pmtrace_budget = strtoull(getenv("X86_PMTRACE_BUDGET"), NULL, 0);
+    if (g_pmtrace_hi && use_jit) { dbt_interp_lo = g_pmtrace_lo; dbt_interp_hi = g_pmtrace_hi; dbt_step_hook = jit_pm_trace; }   /* the range stays the interpreter's, traced */
     else if (g_pmring) cpu.trace_exc = pmring_exc;
     else if (getenv("X86_EXC_TRACE")) cpu.trace_exc = exc_trace;
 
@@ -553,6 +562,7 @@ int main(int argc, char **argv) {
         x86_cpu *ap = &g_ap[i];
         x86_init_ap(ap, &cpu);
         pc_init_ap(ap);
+        ap->trace_exc = cpu.trace_exc;
         if (dbt_init(&g_apdbt[i], ap) < 0) return 1;
         g_apdbt[i].poll = ap_poll;
         pthread_attr_t attr;
@@ -623,7 +633,8 @@ int main(int argc, char **argv) {
                     (unsigned long long)g_ap[i].insn_count, (unsigned long long)g_apdbt[i].blocks_translated,
                     (unsigned long long)g_apdbt[i].interp_fallback_insns);
         for (int i = 1; i < g_nsmp; i++) { fprintf(stderr, "processor %d (%s): ", i, g_ap[i].halted ? "halted" : "running"); x86_dump(&g_ap[i], stderr); }
-        if (g_nsmp > 1) { pc_apic_dump(stderr); pc_kbd_debug_dump(stderr); fprintf(stderr, "  TSO: %s, %llu accesses across a 16-byte line done by the fault handler\n", dbt_tso ? "on" : "off", (unsigned long long)dbt_tso_faults); }
+        if (pc_apic_present()) pc_apic_dump(stderr);
+        if (g_nsmp > 1) { pc_kbd_debug_dump(stderr); fprintf(stderr, "  TSO: %s, %llu accesses across a 16-byte line done by the fault handler\n", dbt_tso ? "on" : "off", (unsigned long long)dbt_tso_faults); }
         { extern uint64_t pc_vga_stores; if (pc_vga_stores) fprintf(stderr, "  VGA planar stores:      %llu\n", (unsigned long long)pc_vga_stores); }
         pc_svcprof_dump(stderr);
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);

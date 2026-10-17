@@ -34,7 +34,8 @@ static inline int insn_locked(const x86_insn *in) {
 static inline void atomic_lock(void)   { while (__atomic_exchange_n(&lock_word, 1, __ATOMIC_ACQUIRE)) { } }
 static inline void atomic_unlock(void) { __atomic_store_n(&lock_word, 0, __ATOMIC_RELEASE); }
 static _Thread_local int tl_locked;        /* the instruction executing is one of those */
-static _Thread_local int tl_held;          /* ... and took the serializing lock (exec_atomic could not do it) */
+static _Thread_local int tl_held;
+int x86_locked_fallback(void) { return tl_held; }   /* (the write watch's tag) */
 
 void x86_fault(x86_cpu *c, int vector, uint32_t err) {
     c->exc = vector;
@@ -1195,6 +1196,16 @@ static int exec_atomic(x86_cpu *c, const x86_insn *in, uint32_t ea) {
         int ok = at_cas(p, size, &e, src);
         do_sub(c, acc, (uint32_t)e, 0, size);             /* the flags of the compare with what was there */
         if (!ok) x86_set_reg(c, R_AX, size, (uint32_t)e);
+        /* Debugging: X86_TRACE_CASFAIL=lin — a failed CMPXCHG at that
+         * address stops translated code after it and single-steps the
+         * next 40 instructions with a trace (run loop). */
+        static long long casfail_at = -2;
+        if (casfail_at == -2) casfail_at = getenv("X86_TRACE_CASFAIL") ? (long long)strtoul(getenv("X86_TRACE_CASFAIL"), NULL, 16) : -1;
+        if (!ok && casfail_at >= 0 && c->seg[S_CS].base + c->eip - in->len == (uint32_t)casfail_at) {
+            fprintf(stderr, "[cas] cpu%d CMPXCHG at %08X failed: found %08X wanted %08X, efl %08X; tracing\n", c->cpu_id,
+                    (uint32_t)casfail_at, (uint32_t)e, acc, c->eflags);
+            c->trace_steps = 40; c->jit_cur_hit = 1;
+        }
         break;
     }
     case OP_CMPXCHG8B: {
@@ -1239,6 +1250,7 @@ static int exec_atomic(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     }
     /* the store went behind x86_phys_wr8's back: the bitmap's watchers (translated code) */
     for (int i = 0; i < size; i++) if (c->code_bitmap[phys + (uint32_t)i]) x86_store_hook(c, phys + (uint32_t)i);
+    if (__builtin_expect(x86_nwatch > 0, 0)) { uint32_t nv = 0; memcpy(&nv, c->mem + phys, size < 4 ? size : 4); x86_watch_store(c, 0, phys, size | 0x100, nv); }
     return 1;
 }
 

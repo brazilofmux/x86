@@ -48,6 +48,8 @@ static void build_tables(x86_jit_aux *aux) {
 int dbt_seg16_enabled = 1;
 int dbt_smp;
 int dbt_tso;
+uint32_t dbt_interp_lo, dbt_interp_hi;
+void (*dbt_step_hook)(x86_cpu *);
 uint64_t dbt_tso_faults;
 int dbt_seg32_enabled = 1;
 
@@ -583,6 +585,21 @@ static int dbt_run_loop(x86_dbt *dbt) {
 
     uint64_t runs = 0;
     uint32_t poll_countdown = 0;
+    /* Debug: X86_INTERP_FROM=lin[:esp] hands the run to the interpreter
+     * from the moment that instruction runs (with that ESP, if given);
+     * X86_WATCH_MEM=phys[,phys] then names every instruction that changes
+     * those dwords. For a timing-dependent corruption the JIT reproduces
+     * and the interpreter does not. */
+    static uint32_t ifrom_eip, ifrom_esp, wmem[2]; static int ifrom_set = -1, interp_all = 0, nwmem = 0; static unsigned interp_cpus;
+    if (ifrom_set < 0) {
+        /* X86_INTERP_CPU=N[,N...]: those processors run in the interpreter only (SMP bisection) */
+        for (const char *e = getenv("X86_INTERP_CPU"); e && *e; ) { char *end; long n = strtol(e, &end, 10); if (end == e) break; if (n >= 0 && n < 32) interp_cpus |= 1u << n; e = *end ? end + 1 : end; }
+        const char *e = getenv("X86_INTERP_FROM"), *w = getenv("X86_WATCH_MEM");
+        ifrom_set = e != NULL;
+        if (e) { ifrom_eip = (uint32_t)strtoul(e, NULL, 16); if (strchr(e, ':')) ifrom_esp = (uint32_t)strtoul(strchr(e, ':') + 1, NULL, 16);
+                 if (!dbt_interp_hi) { dbt_interp_lo = dbt_interp_hi = ifrom_eip; } }
+        if (w) { wmem[nwmem++] = (uint32_t)strtoul(w, NULL, 16); if (strchr(w, ',')) wmem[nwmem++] = (uint32_t)strtoul(strchr(w, ',') + 1, NULL, 16); }
+    }
     for (;;) {
         /* Host events (timer tick, keys, screen) between block runs —
          * every time the JIT hands control back after a quantum or a
@@ -611,7 +628,8 @@ static int dbt_run_loop(x86_dbt *dbt) {
          * interpreter's; V86 code, paged or not, is translated as
          * real-mode-shaped blocks (KEY_V86). RF lasts one instruction,
          * which the interpreter runs and clears. */
-        int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF)
+        int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF) || interp_all || cpu->trace_steps > 0 || ((interp_cpus >> cpu->cpu_id) & 1)
+                     || (dbt_interp_hi && cpu->seg[S_CS].base + cpu->eip - dbt_interp_lo <= dbt_interp_hi - dbt_interp_lo)   /* a range kept for the interpreter */
                      || x86_ac_live(cpu)                  /* 486 #AC: translated code does not check alignment */
                      || ((cpu->cr0 & X86_CR0_PG) && !(cpu->eflags & X86_VM)
                          && !(dbt_cpu_mode_bits(cpu) & (KEY_FLAT | KEY_SEG16)));   /* paged PM neither flat nor segmented 16-bit: the interpreter's */
@@ -624,6 +642,20 @@ static int dbt_run_loop(x86_dbt *dbt) {
             code = dbt_translate_block(dbt, key);
             if (dbt_smp) dbt_translate_unlock();
             if (phases) dbt->t_xlate += dbt_now_ns() - tx;
+            /* Debugging: X86_DUMP_BLOCK=lin[:FILE] — the host code of every
+             * block translated at that linear address goes to FILE (a
+             * .bin to disassemble: objdump -D -b binary --triple=arm64),
+             * the guest bytes to stderr. */
+            static const char *dump_spec = (const char *)1; static uint32_t dump_lin;
+            if (dump_spec == (const char *)1) { dump_spec = getenv("X86_DUMP_BLOCK"); if (dump_spec) dump_lin = (uint32_t)strtoul(dump_spec, NULL, 16); }
+            if (dump_spec && code && dbt_key_lin(key) == dump_lin) {
+                const char *fn = strchr(dump_spec, ':') ? strchr(dump_spec, ':') + 1 : "block.bin";
+                FILE *f = fopen(fn, "wb");
+                if (f) { fwrite(code, 1, (size_t)((dbt->code_buf + dbt->code_used) - code), f); fclose(f); }
+                fprintf(stderr, "[dump] cpu%d block at lin %08X key %016llX: %zu bytes of host code to %s\n", cpu->cpu_id, dump_lin,
+                        (unsigned long long)key, (size_t)((dbt->code_buf + dbt->code_used) - code), fn);
+                dump_block_bytes(cpu, key, "guest bytes");
+            }
             dbt_jit_writable_end();
             dbt_cache_insert(dbt, key, code);
             if (code) dbt->blocks_translated++;
@@ -658,9 +690,38 @@ static int dbt_run_loop(x86_dbt *dbt) {
 
                 static int vtrace = -1;
                 if (vtrace < 0) vtrace = getenv("X86_VTRACE") != NULL;
+                /* X86_WATCH_EBP=hex: the shadow's step that made EBP that
+                 * value is named, with the instructions before it. */
+                static long long watch_ebp = -2, watch_ebp2 = -1;
+                static uint32_t ring[64]; static unsigned ring_n = 0;
+                if (watch_ebp == -2) {
+                    const char *w = getenv("X86_WATCH_EBP");
+                    watch_ebp = w ? (long long)strtoul(w, NULL, 16) : -1;
+                    if (w && strchr(w, ',')) watch_ebp2 = (long long)strtoul(strchr(w, ',') + 1, NULL, 16);
+                }
                 for (uint64_t i = 0; i < jit_insns; i++) {
                     if (vtrace) { fprintf(stderr, "[shadow exc=%d armed=%d] ", dbt->shadow.exc, dbt->shadow.fault_armed); x86_dump(&dbt->shadow, stderr); }
-                    if (x86_step(&dbt->shadow) != 0) break;
+                    uint32_t ebp0 = dbt->shadow.r[R_BP], eip0 = dbt->shadow.seg[S_CS].base + dbt->shadow.eip;
+                    int rc = x86_step(&dbt->shadow);
+                    if (watch_ebp >= 0) {
+                        ring[ring_n++ & 63] = eip0;
+                        uint32_t nb = dbt->shadow.r[R_BP];
+                        if (nb != ebp0 && ((nb == (uint32_t)watch_ebp) || (watch_ebp2 >= 0 && nb == (uint32_t)watch_ebp2))
+                            && (dbt->shadow.cr0 & X86_CR0_PG) && eip0 >= 0x80000000u) {   /* a paged kernel's code only */
+                            fprintf(stderr, "[watch] EBP became %08X at insn %llu, instruction at lin %08X (ebp was %08X); last 64 lin eips:\n",
+                                    nb, (unsigned long long)dbt->shadow.insn_count, eip0, ebp0);
+                            for (unsigned k = 0; k < 64; k++) fprintf(stderr, " %08X%s", ring[(ring_n + k) & 63], (k & 7) == 7 ? "\n" : "");
+                            x86_dump(&dbt->shadow, stderr);
+                            fprintf(stderr, "[watch] stack at esp:");
+                            for (int k = 0; k < 16; k++) {
+                                uint32_t v = 0;
+                                for (int b = 0; b < 4; b++) v |= (uint32_t)x86_phys_rd8(&dbt->shadow, dbt->shadow.seg[S_SS].base + dbt->shadow.r[R_SP] + 4 * k + b) << (8 * b);
+                                fprintf(stderr, " %08X", v);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                    if (rc != 0) break;
                 }
                 dbt->verify_blocks_checked++;
                 runs++;
@@ -683,6 +744,14 @@ static int dbt_run_loop(x86_dbt *dbt) {
                 if (cpu->device_store) memcpy(dbt->shadow.mem + DEV_LO, cpu->mem + DEV_LO, DEV_HI - DEV_LO);
                 if (a20_moved) { mem_ok = 1; dbt->shadow_stale = 1; }
                 if (cpu->dma_wrote) { cpu->dma_wrote = 0; mem_ok = 1; dbt->shadow_stale = 1; }   /* a card's DMA, mid-run */
+                /* An OUT to the VGA inside the run (a map select, a plane
+                 * mask) remaps the window at A0000 without any store: only
+                 * the window differs, and it is copied. */
+                if (!mem_ok && regs_ok && memcmp(cpu->mem, dbt->shadow.mem, DEV_LO) == 0
+                    && memcmp(cpu->mem + DEV_HI, dbt->shadow.mem + DEV_HI, shadow_span(dbt) - DEV_HI) == 0) {
+                    memcpy(dbt->shadow.mem + DEV_LO, cpu->mem + DEV_LO, DEV_HI - DEV_LO);
+                    mem_ok = 1;
+                }
                 if (!regs_ok || !mem_ok) {
                     fprintf(stderr, "\n[verify] divergence after JIT run from %04X:%04X (%llu insns)\n",
                             pre.seg[S_CS].sel, pre.eip, (unsigned long long)jit_insns);
@@ -744,7 +813,43 @@ static int dbt_run_loop(x86_dbt *dbt) {
         int timed = phases || (dbt->interp_fallback_insns & 15) == 0;
         uint64_t ts = timed ? dbt_now_ns() : 0, ns = cpu->insn_count;
         int shadowed = cpu->int_inhibit != 0;
+        if (dbt_step_hook) dbt_step_hook(cpu);
+        uint32_t wv0[2] = {0, 0}, eip0 = cpu->seg[S_CS].base + cpu->eip;
+        static uint32_t wring[32]; static unsigned wring_n = 0;
+        if (ifrom_set) {
+            if (!interp_all && eip0 == ifrom_eip && (!ifrom_esp || cpu->r[R_SP] == ifrom_esp)) {
+                interp_all = 1;
+                fprintf(stderr, "[watch] interpreting from insn %llu at lin %08X esp %08X\n", (unsigned long long)cpu->insn_count, eip0, cpu->r[R_SP]);
+            }
+            if (interp_all) {
+                wring[wring_n++ & 31] = eip0;
+                for (int k = 0; k < nwmem; k++) if (wmem[k] + 4 <= cpu->mem_size) memcpy(&wv0[k], cpu->mem + wmem[k], 4);
+            }
+        }
         int rc = x86_step(cpu);
+        if (cpu->trace_steps > 0) {
+            cpu->trace_steps--;
+            fprintf(stderr, "[step] cpu%d %08X -> %08X efl %08X eax %08X ecx %08X edx %08X ebx %08X esp %08X\n", cpu->cpu_id, eip0,
+                    cpu->seg[S_CS].base + cpu->eip, cpu->eflags, cpu->r[R_AX], cpu->r[R_CX], cpu->r[R_DX], cpu->r[R_BX], cpu->r[R_SP]);
+        }
+        /* The step turned IF on with an interrupt waiting (POPFD, IRET: the
+         * interpreter's): the processor takes it before the next
+         * instruction, so the poll runs now, not when the countdown says.
+         * A loop of "pushf; cli; try; popf" whose IF is clear at every
+         * counted poll never took its IPI, and the sender spun forever. */
+        if (cpu->intr_waiting && (cpu->eflags & X86_IF) && !cpu->int_inhibit) poll_countdown = 0;
+        if (interp_all) {
+            for (int k = 0; k < nwmem; k++) {
+                uint32_t wv1 = 0;
+                if (wmem[k] + 4 <= cpu->mem_size) memcpy(&wv1, cpu->mem + wmem[k], 4);
+                if (wv1 != wv0[k]) {
+                    fprintf(stderr, "[watch] phys %08X: %08X -> %08X by insn at lin %08X (insn %llu, esp %08X ebp %08X); last 32 lin eips:\n",
+                            wmem[k], wv0[k], wv1, eip0, (unsigned long long)cpu->insn_count, cpu->r[R_SP], cpu->r[R_BP]);
+                    for (unsigned q = 0; q < 32; q++) fprintf(stderr, " %08X%s", wring[(wring_n + q) & 31], (q & 7) == 7 ? "\n" : "");
+                    x86_dump(cpu, stderr);
+                }
+            }
+        }
         if (timed) {
             uint64_t dt = dbt_now_ns() - ts;
             if ((dbt->interp_fallback_insns & 15) == 0) dbt->interp_fallback_ns += dt;   /* sampled, x16 when printed */

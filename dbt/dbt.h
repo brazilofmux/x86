@@ -578,6 +578,11 @@ void dbt_register(x86_dbt *dbt);                 /* an SMP translator: dbt_init 
 void dbt_xinval_push(x86_cpu *from, uint32_t phys);
 void dbt_xinval_apply(x86_dbt *dbt);
 void dbt_translate_lock(void);
+/* Debugging: code in [lo, hi] (linear) is never translated — the run loop
+ * steps the interpreter there — and step_hook, if set, sees the cpu
+ * before each such step (main.c's -pmtrace with the JIT). */
+extern uint32_t dbt_interp_lo, dbt_interp_hi;
+extern void (*dbt_step_hook)(x86_cpu *);
 void dbt_translate_unlock(void);
 
 /* 32-bit segmented protected mode (a based block: KEY_SEG16 with
