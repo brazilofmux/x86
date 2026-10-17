@@ -283,6 +283,12 @@ static void pmring_exc(x86_cpu *c, int vec, uint32_t err) {
     c->halted = 1;
 }
 
+/* X86_BLOCK_RING: exceptions go into the run loop's ring too */
+static void ring_exc(x86_cpu *c, int vec, uint32_t err) {
+    dbt_ring_note(c, vec, err);
+    if (getenv("X86_EXC_TRACE")) exc_trace(c, vec, err);
+}
+
 static int run_interp(x86_cpu *c, uint64_t limit) {
     uint32_t n = 0;
     uint64_t waits = pc.blocked_calls;
@@ -547,7 +553,9 @@ int main(int argc, char **argv) {
     if (g_pmtrace_hi && getenv("X86_PMTRACE_BUDGET")) g_pmtrace_budget = strtoull(getenv("X86_PMTRACE_BUDGET"), NULL, 0);
     if (g_pmtrace_hi && use_jit) { dbt_interp_lo = g_pmtrace_lo; dbt_interp_hi = g_pmtrace_hi; dbt_step_hook = jit_pm_trace; }   /* the range stays the interpreter's, traced */
     else if (g_pmring) cpu.trace_exc = pmring_exc;
+    else if (getenv("X86_BLOCK_RING")) cpu.trace_exc = ring_exc;
     else if (getenv("X86_EXC_TRACE")) cpu.trace_exc = exc_trace;
+    dbt_ring_cpus[0] = &cpu;
 
     uint64_t t0 = pc_now_ns();
     g_last_ns = t0;
@@ -573,6 +581,7 @@ int main(int argc, char **argv) {
         x86_init_ap(ap, &cpu);
         pc_init_ap(ap);
         ap->trace_exc = cpu.trace_exc;
+        if (i < 8) dbt_ring_cpus[i] = ap;
         if (dbt_init(&g_apdbt[i], ap) < 0) return 1;
         g_apdbt[i].poll = ap_poll;
         pthread_attr_t attr;

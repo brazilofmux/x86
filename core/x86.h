@@ -151,7 +151,9 @@ typedef struct x86_cpu {
     uint8_t  pg_space;      /* DBT: id of the address space CR3 names (paged block keys carry it)... */
     uint8_t  pg_kspace;     /* ...and of the kernel space CPL 0 code is keyed by (dbt_space_current) */
     uint32_t jit_cur_lin;   /* linear address of the block making a helper call... */
-    uint32_t jit_cur_hit;   /* ...set by the SMC sweep if that block got invalidated */
+    uint32_t jit_cur_hit;   /* ...set when it must leave: its block invalidated, or (from any
+                             * thread) an interrupt, IPI or invalidation for it */
+    uint32_t jit_cur_inval; /* ...set (own thread) only when that block was invalidated */
     int      trace_steps;   /* debugging: the run loop single-steps and prints this many instructions */
     uint64_t jit_flags;     /* x86-64 backend: the guest's arithmetic flags between blocks (an RFLAGS image; 64 bits: it is POPped into) */
 

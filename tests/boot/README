@@ -334,11 +334,9 @@ X86_EXC_TRACE's @lin filter, and sample(1) on the host process.
 tools/qlock.asm is the kernel's queued spinlock protocol, instruction
 for instruction, as a two-processor Linux test (count 2N or HANG with
 the lock state); it passes, under contention and with gaps. Where it
-stands: the MP kernel and HAL boot to the desktop on one processor,
-and reached it once on two (with the second processor interpreted);
-other runs stop in different places (STOP 1E reading address 8 or 21,
-STOP D1 at EIP 8, winlogon terminated), so something still tears or
-goes stale between the processors.
+stood then: the desktop on one processor, once on two, and other runs
+stopped in different places (STOP 1E reading address 8 or 21, STOP D1
+at EIP 8, winlogon terminated); the last paragraph below is the cause.
 
 Bisection since (each line several boots of 150 s, Windows 2000 MP):
 - both processors translated: a crash every time, a different one each
@@ -363,6 +361,26 @@ OR, where the processor's is a locked update of an entry still as read
 (an OR into an entry another processor just made a transition PTE
 corrupts its protection bits). X86_LOCK_TRACE (locked instructions the
 host atomics could not do: none in a boot).
+The one: X86_BLOCK_RING=FILE keeps each processor's last 8192 run-loop
+entries (CS, linear EIP, ESP, EFLAGS) and exceptions, written to
+FILE.cpuN when X86_INTERP_FROM triggers (at KeBugCheckEx, 8042A288);
+with X86_STALE_CHECK every block comes back to the loop, so the ring is
+every block. A STOP 1E in win32k read [ebp+14h] one argument off: its
+caller, "push [ebp+14h]; push [ebp+10h]; push ebx; push esi; call",
+had taken an interrupt whose frame said EIP = the PUSH ESI but whose
+ESP was from before the PUSH EBX, so PUSH EBX was lost. Translated code
+leaves a block mid-way only from a helper thunk, when jit_cur_hit is
+set, at the instruction after; the store thunk runs between a PUSH's
+store and its ESP update. On one processor only a store into the
+running block set the flag; on two, the other processor sets it at any
+moment (an APIC request now deliverable, an IPI, its stores into our
+code). jit_cur_inval now says "this block was invalidated" (set only by
+the sweeps, on the processor's own thread), and only it makes the store
+thunk leave mid-instruction; jit_cur_hit alone ends the budget, so the
+block finishes the instruction and leaves at its next edge, with the
+instruction count kept exact. Then: the desktop, seven boots of seven,
+480 to 540 MIPS where the crashing runs averaged 120. test-boot boots it
+when disks/win2k/c-mp.img and d-mp.img (the MP-prepared images) exist.
 
 tests/boot/tcroot.sh builds disks/linux/tcroot.img: the same kernel on a
 small FAT16 partition, and Tiny Core's userland unpacked from core.gz onto

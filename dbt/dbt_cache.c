@@ -198,7 +198,7 @@ static void sweep_blocks_at(x86_dbt *dbt, uint32_t lin) {
             /* The block that is executing right now (a JIT store or a helper
              * op inside it): the thunk sees this flag and leaves the block
              * before its next, now stale, instruction. */
-            if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = 1;
+            if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = dbt->cpu->jit_cur_inval = 1;
         }
     }
 }
@@ -233,7 +233,7 @@ static void invalidate_for_store(x86_dbt *dbt, uint32_t phys) {
 static void flush_under_running_code(x86_dbt *dbt) {
     dbt_cache_invalidate_all(dbt);
     dbt->flush_pending = 1;
-    dbt->cpu->jit_cur_hit = 1;
+    dbt->cpu->jit_cur_hit = dbt->cpu->jit_cur_inval = 1;
 }
 
 /* A protected-mode key names CS by selector, and the translation bakes in
@@ -453,7 +453,7 @@ static void page_evict(x86_dbt *dbt, int32_t i, int park) {
     }
     uint32_t lin = dbt->pcode[i].lin_page << 12;
     if (dbt->pblk_full) scan_evict_page(dbt, lin, dbt->pcode[i].space);
-    if ((dbt->cpu->jit_cur_lin & 0xFFFFF000u) == lin) dbt->cpu->jit_cur_hit = 1;
+    if ((dbt->cpu->jit_cur_lin & 0xFFFFF000u) == lin) dbt->cpu->jit_cur_hit = dbt->cpu->jit_cur_inval = 1;
 }
 
 /* Drop code page I's blocks, parked ones included; its alias stays listed

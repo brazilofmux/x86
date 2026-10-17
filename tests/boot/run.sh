@@ -182,6 +182,18 @@ if [ -f disks/reactos/reactos-installed.img ]; then
     then echo "ok   reactos 0.4.16 to its desktop (pci, vbe 800x600x32)"; else echo "FAIL reactos 0.4.16"; fail=1; fi
     rm -f tmp/boot-ros.img tmp/boot-ros.exp
 fi
+if [ -f disks/win2k/c-mp.img ] && [ -f disks/win2k/d-mp.img ]; then
+    # Windows 2000 on two Pentiums: the installed system (tests/boot/README)
+    # with the MP kernel and HAL from its CD (ntkrnlmp.exe, halmps.dll, a
+    # boot.ini entry) and the MP copies of ntdll, kernel32 and win32k; the
+    # MP tables, both local APICs, the I/O APIC, its RTC clock. Read-only,
+    # to the desktop (about 40 s) — its teal, then the taskbar's grey
+    printf 'waitpix 400,300 85 170 170\nwaitpix 600,466 195 199 203\n' > tmp/boot-w2k.exp
+    if python3 tools/expect.py -t 300 tmp/boot-w2k.exp -- $DM -m 586 -mem 64 -smp 2 -W -T 290 -ro \
+         -hda disks/win2k/c-mp.img -hdb disks/win2k/d-mp.img -boot c >/dev/null 2>&1
+    then echo "ok   windows 2000 on two processors (mp kernel, mps hal)"; else echo "FAIL windows 2000 smp"; fail=1; fi
+    rm -f tmp/boot-w2k.exp
+fi
 if [ -f disks/linux/tc.img ]; then
     # Linux 6.12 (Tiny Core 16.2, tests/boot/tcimage.sh) on the Pentium:
     # GRUB 2 from the disk, the kernel and its initramfs, the shell, a command

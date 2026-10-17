@@ -81,6 +81,7 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 #define OFF_JIT_CNTSAVE offsetof(x86_cpu, jit_cnt_save)
 #define OFF_JIT_CUR_LIN offsetof(x86_cpu, jit_cur_lin)
 #define OFF_JIT_CUR_HIT offsetof(x86_cpu, jit_cur_hit)
+#define OFF_JIT_CUR_INVAL offsetof(x86_cpu, jit_cur_inval)
 #define OFF_EXC         offsetof(x86_cpu, exc)
 #define OFF_CR0         offsetof(x86_cpu, cr0)
 #define OFF_FPU_SW      (offsetof(x86_cpu, fpu) + offsetof(x86_fpu, sw))
@@ -266,7 +267,7 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
         emit_stp_pre_sp(&e, A64_W29, A64_W30, -144);
         emit_stp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
         emit_str_w32_imm(&e, A64_W2, R_CPU, OFF_JIT_CUR_LIN);
-        emit_str_w32_imm(&e, A64_WZR, R_CPU, OFF_JIT_CUR_HIT);
+        emit_str_w32_imm(&e, A64_WZR, R_CPU, is_exec ? OFF_JIT_CUR_HIT : OFF_JIT_CUR_INVAL);
         if (is_exec) {
             emit_str_w32_imm(&e, A64_W3, R_CPU, OFF_EIP);
             emit_spill_pinned(&e);
@@ -313,10 +314,43 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
             emit_b(&e, (int32_t)s_fault_exit_off - (int32_t)emit_pos(&e));
             emit_patch_cond19(&e, nofault, emit_pos(&e));
         }
-        emit_ldr_w32_imm(&e, W_T1, R_CPU, OFF_JIT_CUR_HIT);
-        uint32_t cont = emit_pos(&e);
-        emit_cbnz_w32(&e, W_T1, 0);
-        emit_ret(&e);
+        uint32_t cont;
+        if (is_exec) {
+            emit_ldr_w32_imm(&e, W_T1, R_CPU, OFF_JIT_CUR_HIT);
+            cont = emit_pos(&e);
+            emit_cbnz_w32(&e, W_T1, 0);
+            emit_ret(&e);
+        } else {
+            /* A store is not always its instruction's last act (PUSH's
+             * ESP update, a CALL's jump, an INT frame's other pushes), so
+             * the thunk leaves mid-instruction only when the block under it
+             * really was invalidated. A request to leave from elsewhere —
+             * an interrupt now deliverable, an IPI, another processor's
+             * store into our code, set from any thread at any moment —
+             * ends the budget instead: the block finishes its instruction
+             * and leaves at its next edge. (Leaving here for those dropped
+             * PUSH's ESP update under Windows 2000 on two processors.)
+             * W0-W2 are free: the helper call clobbered them. */
+            emit_ldr_w32_imm(&e, A64_W0, R_CPU, OFF_JIT_CUR_INVAL);
+            cont = emit_pos(&e);
+            emit_cbnz_w32(&e, A64_W0, 0);
+            emit_ldr_w32_imm(&e, A64_W0, R_CPU, OFF_JIT_CUR_HIT);
+            uint32_t none = emit_pos(&e);
+            emit_cbz_w32(&e, A64_W0, 0);
+            emit_str_w32_imm(&e, A64_WZR, R_CPU, OFF_JIT_CUR_HIT);
+            uint32_t spent = emit_pos(&e);
+            emit_tbnz_x64(&e, R_CNT, 63, 0);
+            /* remaining R_CNT + 1 leaves the budget, and the exit stub's
+             * count (budget - remaining) stays exact */
+            emit_add_x64_imm(&e, A64_W1, R_CNT, 1);
+            emit_ldr_x64_imm(&e, A64_W2, R_CPU, OFF_JIT_BUDGET);
+            emit_sub_x64(&e, A64_W2, A64_W2, A64_W1);
+            emit_str_x64_imm(&e, A64_W2, R_CPU, OFF_JIT_BUDGET);
+            emit_mov_x64_imm64(&e, R_CNT, ~(uint64_t)0);
+            emit_patch_cond19(&e, none, emit_pos(&e));
+            emit_patch_tb14(&e, spent, emit_pos(&e));
+            emit_ret(&e);
+        }
         /* Running block invalidated: charge W4 instructions and exit at
          * ip_after — or, after a helper, wherever the interpreter left
          * EIP (a protected-mode helper can be a near jump). */

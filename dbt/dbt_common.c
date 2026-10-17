@@ -616,6 +616,37 @@ static void stale_check(x86_dbt *dbt, const uint8_t *code, uint64_t key) {
 }
 
 void (*dbt_stop_dump)(x86_cpu *c);              /* the machine's other processors, when X86_INTERP_FROM triggers (main.c) */
+/* X86_BLOCK_RING: each processor's last 256 run-loop entries (CS:EIP as a
+ * linear address, ESP, EFLAGS), printed by dbt_ring_dump — what led to an
+ * exception (with X86_STALE_CHECK every block exits to the loop). */
+#define RING_N 8192
+static struct { uint32_t lin, esp, efl, sel; } bring[8][RING_N];
+static unsigned bring_n[8];
+static int bring_on = -1;
+x86_cpu *dbt_ring_cpus[8];                      /* (main.c fills it) */
+/* An event in the ring: sel FFvv is exception vv (lin = EIP, esp, efl = error code) */
+void dbt_ring_note(x86_cpu *c, int vec, uint32_t err) {
+    if (bring_on <= 0 || c->cpu_id >= 8) return;
+    unsigned i = bring_n[c->cpu_id]++ % RING_N;
+    bring[c->cpu_id][i].sel = 0xFF00u | (unsigned)vec; bring[c->cpu_id][i].lin = c->seg[S_CS].base + c->eip;
+    bring[c->cpu_id][i].esp = c->r[R_SP]; bring[c->cpu_id][i].efl = err;
+}
+/* to X86_BLOCK_RING's file (default ring), suffixed with the processor */
+void dbt_ring_dump(x86_cpu *c) {
+    if (bring_on <= 0 || c->cpu_id >= 8) return;
+    unsigned id = (unsigned)c->cpu_id, n = bring_n[id];
+    char fn[512]; snprintf(fn, sizeof fn, "%s.cpu%u", getenv("X86_BLOCK_RING"), id);
+    FILE *f = fopen(fn, "w");
+    if (!f) return;
+    fprintf(f, "[ring] cpu%u's last %d loop entries (oldest first): cs lin esp efl; FFvv = exception vv (eip esp err)\n", id, RING_N);
+    for (unsigned k = 0; k < RING_N; k++) {
+        unsigned i = (n + k) % RING_N;
+        if (!bring[id][i].lin && !bring[id][i].esp) continue;
+        fprintf(f, "  %04X %08X %08X %08X\n", bring[id][i].sel, bring[id][i].lin, bring[id][i].esp, bring[id][i].efl);
+    }
+    fclose(f);
+    fprintf(stderr, "[ring] cpu%u to %s\n", id, fn);
+}
 static int dbt_run_loop(x86_dbt *dbt);
 /* A phase timestamp: a counter read with X86_PHASES, else nothing. */
 #define PH() (phases ? dbt_now_ns() : 0)
@@ -677,6 +708,12 @@ static int dbt_run_loop(x86_dbt *dbt) {
         if (dbt->insn_limit && cpu->insn_count >= dbt->insn_limit) return 0;
         if (dbt_smp) dbt_xinval_apply(dbt);          /* what the other processors wrote into our code */
 
+        if (bring_on < 0) bring_on = getenv("X86_BLOCK_RING") != NULL;
+        if (bring_on && cpu->cpu_id < 8) {
+            unsigned i = bring_n[cpu->cpu_id]++ % RING_N;
+            bring[cpu->cpu_id][i].sel = cpu->seg[S_CS].sel; bring[cpu->cpu_id][i].lin = cpu->seg[S_CS].base + cpu->eip;
+            bring[cpu->cpu_id][i].esp = cpu->r[R_SP]; bring[cpu->cpu_id][i].efl = cpu->eflags;
+        }
         uint64_t key = dbt_cpu_key(cpu);
         /* A MOV SS / POP SS / STI helper left interrupts inhibited for
          * one instruction and its block ended (or ran on inline, which
@@ -896,6 +933,7 @@ static int dbt_run_loop(x86_dbt *dbt) {
                 }
                 fprintf(stderr, "\n");
                 if (dbt_stop_dump) dbt_stop_dump(cpu);
+                for (int q = 0; q < 8 && dbt_ring_cpus[q]; q++) dbt_ring_dump(dbt_ring_cpus[q]);
             }
             if (interp_all) {
                 wring[wring_n++ & 31] = eip0;
