@@ -969,6 +969,13 @@ static int dbt_run_loop(x86_dbt *dbt) {
                 fprintf(stderr, "\n");
                 if (dbt_stop_dump) dbt_stop_dump(cpu);
                 for (int q = 0; q < 8 && dbt_ring_cpus[q]; q++) dbt_ring_dump(dbt_ring_cpus[q]);
+                /* X86_TRAP_MEMDUMP=FILE: physical memory as it is now, and
+                 * CR3, for reading anything afterwards (scratchpad vmem.py) */
+                const char *md = getenv("X86_TRAP_MEMDUMP");
+                if (md) {
+                    FILE *f = fopen(md, "wb");
+                    if (f) { fwrite(cpu->mem, 1, cpu->mem_size, f); fclose(f); fprintf(stderr, "[watch] memory to %s, cr3 %08X\n", md, cpu->cr3); }
+                }
             }
             if (interp_all) {
                 wring[wring_n++ & 31] = eip0;

@@ -2033,10 +2033,16 @@ static void emit_push32_flat(emit_t *e, a64_reg_t val) {
     if (s_based) { emit_stk_based(e, W_T2, 4, PG_STORE); base = X_SEGP; off = W_OFF; }
     else if (s_paged) { emit_pgflat(e, W_T2, 4, 1); base = X_SEGP; }
     else emit_flat_check_as(e, W_T2, 1);
+    /* ESP moves before the store, now that nothing can fault: a store
+     * that invalidates the running block leaves at the next instruction
+     * (the SMC thunk), which must find the PUSH whole. (PUSH ESP stores
+     * the old value: there the register itself is the value.) */
+    int early = val != R_GPR(R_SP);
+    if (early) emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
     emit_str_w32_reg_uxtw(e, val, base, off);
     emit_add_x64_w32_uxtw(e, W_T3, base, off);
     emit_smc_check_x3(e, 4);
-    emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
+    if (!early) emit_sub_w32_imm(e, R_GPR(R_SP), R_GPR(R_SP), 4);
 }
 static void emit_pop32_flat(emit_t *e, a64_reg_t dst) {
     a64_reg_t base = R_MEM, off = R_GPR(R_SP);

@@ -264,13 +264,32 @@ void dbt_smc_store(x86_cpu *cpu, uint32_t phys) {
     if (trace < 0) { const char *t = getenv("X86_SMC_TRACE"); trace = t ? atoi(t) : 0; }
     if (trace > 0) { trace--; fprintf(stderr, "[smc] store %06X from %04X:%08X\n", phys, cpu->seg[S_CS].sel, cpu->eip); }
     if (cpu->code_bitmap[phys] & X86_BM_DESC) {
-        flush_under_running_code(dbt);     /* clears every CODE and DESC bit */
+        if (getenv("X86_DESC_TRACE")) {
+            static int n; if (n++ < 2000) fprintf(stderr, "[desc] cpu%d store phys %08X from %04X:%08X esp %08X cur_lin %08X insn %llu\n", cpu->cpu_id, phys, cpu->seg[S_CS].sel, cpu->eip, cpu->r[R_SP], cpu->jit_cur_lin, (unsigned long long)cpu->insn_count);
+        }
+        flush_under_running_code(dbt);     /* clears every CODE and DESC bit (one processor) */
+        /* A descriptor changes no code: the running block need not stop
+         * inside its instruction, and must not — a PUSH whose store landed
+         * on a watched descriptor left at the next instruction with ESP
+         * not yet moved. The CPU rereads a descriptor only at a segment
+         * load anyway: leaving at the next edge is soon enough. */
+        cpu->jit_cur_inval = 0;
         dbt->desc_flushes++;
-        if (dbt_smp)                       /* the other translators baked that descriptor too */
+        if (dbt_smp) {                     /* the other translators baked that descriptor too */
             for (int i = 0; i < nall; i++) if (all[i] != dbt) {
                 spin_lock(&all[i]->xinval_spin); all[i]->xinval_all = 1; spin_unlock(&all[i]->xinval_spin);
                 all[i]->cpu->jit_cur_hit = 1;
             }
+            /* Under SMP a flush leaves DESC marks (another translator may
+             * still watch the descriptor), so a page that once held a
+             * descriptor table kept them through its reuse as a stack or a
+             * heap: every store there flushed every translator, Windows
+             * 2000's ntdll a hundred times a minute. Every translator is
+             * flushing everything now, and whichever translates under this
+             * descriptor again watches it again: this one's marks go. */
+            for (uint32_t a = phys & ~7u; a < (phys & ~7u) + 8 && a < cpu->mem_size; a++)
+                __atomic_fetch_and(&cpu->code_bitmap[a], (uint8_t)~X86_BM_DESC, __ATOMIC_SEQ_CST);
+        }
         return;
     }
     invalidate_for_store(dbt, phys);

@@ -243,8 +243,25 @@ pattern like "TWO=" matches the echoed command the moment it is typed;
 the markers are spelled so that only the output matches. Windows 2000
 MP's desktop, 33 s on one processor and 39 s on two, is mostly waiting:
 NTLDR's 5-second menu, the disk check's 2 seconds, and the HAL timing
-RTC seconds for about 3.5 s per processor. Open: three boots in about
-25 under smpbench.sh took 140 s or missed the desktop, none outside it.
+RTC seconds for about 3.5 s per processor.
+
+One boot in ten still bugchecked on two processors after that (afd.sys's
+"event in the IRP is NOT signalled", STOP A, STOP 50, winlogon killed),
+78dafe5 as much as later. The ring at KeBugCheckEx showed a driver
+resumed after each interrupt one instruction further on with ESP never
+moving: its PUSHes lost again. This time the store had landed on a
+descriptor mark. Under SMP a flush keeps DESC marks (another translator
+may still watch the descriptor), so a page that held a descriptor table
+early in the boot — NTLDR's GDT at 17000h and 19000h — kept them as
+it became a kernel stack and a user heap; each store there flushed
+every translator and, through jit_cur_inval, left the running block
+between PUSH's store and its ESP update. Now a store to a watched
+descriptor clears that descriptor's marks (every translator is
+flushing; whoever translates under it again watches it again), a
+descriptor flush leaves the running block only at its next edge (a
+descriptor changes no code, and the CPU rereads one only at a segment
+load), and a flat PUSH moves ESP before its store, so a store that does
+invalidate the running block finds the PUSH whole.
 The boot suite boots it to the shell on two.
 
 What SMP changed underneath:
