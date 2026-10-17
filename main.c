@@ -535,6 +535,8 @@ int main(int argc, char **argv) {
     if (g_nsmp > 1) {
         if (!use_jit || verify || model < X86_MODEL_586) { fprintf(stderr, "-smp: the Pentium, the JIT, no -V\n"); return 2; }
         dbt_smp = 1; x86_smp = 1;
+        dbt_tso = getenv("X86_NO_TSO") == NULL;
+        if (dbt_tso) dbt_tso_install();
         pc_smp_setup();
     }
     if (use_jit) {
@@ -619,7 +621,7 @@ int main(int argc, char **argv) {
                     (unsigned long long)g_ap[i].insn_count, (unsigned long long)g_apdbt[i].blocks_translated,
                     (unsigned long long)g_apdbt[i].interp_fallback_insns);
         for (int i = 1; i < g_nsmp; i++) { fprintf(stderr, "processor %d (%s): ", i, g_ap[i].halted ? "halted" : "running"); x86_dump(&g_ap[i], stderr); }
-        if (g_nsmp > 1) { pc_apic_dump(stderr); pc_kbd_debug_dump(stderr); }
+        if (g_nsmp > 1) { pc_apic_dump(stderr); pc_kbd_debug_dump(stderr); fprintf(stderr, "  TSO: %s, %llu accesses across a 16-byte line done by the fault handler\n", dbt_tso ? "on" : "off", (unsigned long long)dbt_tso_faults); }
         { extern uint64_t pc_vga_stores; if (pc_vga_stores) fprintf(stderr, "  VGA planar stores:      %llu\n", (unsigned long long)pc_vga_stores); }
         pc_svcprof_dump(stderr);
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);

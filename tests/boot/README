@@ -208,12 +208,19 @@ them all. Linux 6.12 (Tiny Core) brings up both ("smp: Brought up 1
 node, 2 CPUs"), spreads devices over them through the I/O APIC's
 lowest-priority delivery, and its reschedule, function-call and TLB
 shootdown IPIs flow both ways; a fork storm and parallel shell loops
-run, and in parallel: one shell loop 3 s, two at once 4 s, four 9 s.
-(Before the threads asked macOS for a performance core — the QoS hint
-in ap_thread — the second processor landed on an efficiency core and
-two loops took 7 s.) The boot suite boots it to the shell on two.
+run. Measured by the guest's own clock (date +%s around the loops):
+on two processors one shell loop 4 s, two at once 5 s, four 11 s; on
+four processors 3, 5 and 7 s. Real parallelism, well short of linear:
+the per-poll machine lock and the sticky-bitmap sweeps are the
+suspects for the speed pass. (The threads ask macOS for a performance
+core — the QoS hint in ap_thread — or an application processor lands
+on an efficiency core at half speed.) A measurement trap: an expect
+pattern like "TWO=" matches the echoed command the moment it is typed,
+so the next command was sent while the loops still ran; the markers
+are now spelled so that only the output matches. The boot suite boots
+it to the shell on two.
 
-What SMP changed underneath, and what it still owes:
+What SMP changed underneath:
 - Bus-locked instructions (LOCK prefix, XCHG with memory, CMPXCHG8B)
   leave translated code for the interpreter, which does them with the
   host's atomics on the guest byte itself (a compare-and-swap loop, an
@@ -222,7 +229,25 @@ What SMP changed underneath, and what it still owes:
   queued spinlock deadlocked within seconds: its unlock is a plain
   byte store from the other processor, which landed between the read
   and the write and was put back stale. Hardware's locked cycle
-  excludes other stores entirely; the CAS loop does too.
+  excludes other stores entirely; the CAS loop does too. The spinlock
+  remains only for what the atomics cannot do (unaligned, straddling
+  a page, device memory).
+- Memory ordering. x86 is TSO; the ARM host is not, and it showed: a
+  message-passing litmus test (tools/litmus.asm: P0 stores x then y,
+  P1 loads y then x; y=1 with x=0 is impossible on x86) saw 8, 4 and
+  9 forbidden outcomes per two million tries. In SMP mode translated
+  code's guest loads are RCpc acquire loads (LDAPR) and its stores
+  release stores (STLR), together exactly TSO, and the interpreter's
+  bytes are acquire/release too; the litmus test then saw 0, 0, 0.
+  Those forms fault across a 16-byte line (within one, FEAT_LSE2
+  allows any misalignment); a SIGBUS handler does such an access with
+  a fence and steps the PC. The boot's initramfs inflate crosses lines
+  1.4 million times; steady state hardly ever. X86_NO_TSO=1 turns the
+  forms off, for measurement.
+- Serializing instructions (CPUID, IRET, INVD, WBINVD, INVLPG, LGDT,
+  LIDT, LLDT, LTR, WRMSR, MOV to CR) end the block in SMP mode, so
+  code another processor changed is seen from the point where the
+  architecture promises it.
 - A store into translated code invalidates the writer's own blocks as
   before and queues the address for every other translator, which
   sweeps it at its next block boundary (its run is cut short by
@@ -233,14 +258,7 @@ What SMP changed underneath, and what it still owes:
   now. Translation itself is serialized (the backend's statics).
 - Interrupts, IPIs and invalidations reach a processor at a block
   boundary: the quantum is 65536 instructions in SMP mode (a million
-  otherwise). That is the architectural guarantee for cross-modified
-  code only if every serializing instruction ends a block, which is
-  not yet checked.
-- Memory ordering: x86 is TSO, the ARM host is not. Stores from inside
-  a critical section may become visible after the plain store that
-  unlocks it. Nothing in the boot or the stress tests tripped on it
-  yet; the fix (acquire/release accesses, or a store barrier per
-  store) is measured work for later. An x86-64 host has none of this.
+  otherwise).
 - The kernel logs one WARNING at the second processor's bring-up, in
   cpuid-deps clearing X86_BUG_F00F (bit 704 of the 24 feature words)
   on a family-5 secondary; QEMU's -cpu pentium -smp 2 logs the same

@@ -34,6 +34,7 @@ static inline int insn_locked(const x86_insn *in) {
 static inline void atomic_lock(void)   { while (__atomic_exchange_n(&lock_word, 1, __ATOMIC_ACQUIRE)) { } }
 static inline void atomic_unlock(void) { __atomic_store_n(&lock_word, 0, __ATOMIC_RELEASE); }
 static _Thread_local int tl_locked;        /* the instruction executing is one of those */
+static _Thread_local int tl_held;          /* ... and took the serializing lock (exec_atomic could not do it) */
 
 void x86_fault(x86_cpu *c, int vector, uint32_t err) {
     c->exc = vector;
@@ -1249,7 +1250,10 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     int size = in->ops[0].size;
     uint32_t a, b, r;
 
-    if (tl_locked && in->ops[0].kind == OPK_MEM && exec_atomic(c, in, ea)) return;
+    if (tl_locked) {
+        if (in->ops[0].kind == OPK_MEM && exec_atomic(c, in, ea)) return;
+        atomic_lock(); tl_held = 1;                  /* the rest: one at a time across the processors */
+    }
     switch (in->op) {
     /* ---- arithmetic ------------------------------------------------ */
     case OP_ADD: case OP_ADC: case OP_SUB: case OP_SBB: case OP_CMP: {
@@ -2179,13 +2183,11 @@ static int fetch_bytes(x86_cpu *c, uint8_t *buf, int *cross_at) {
 void x86_exec_decoded(x86_cpu *c, const x86_insn *in) {
     uint32_t start_ip = c->eip - in->len;
     c->int_inhibit = 0;          /* the shadow covers one instruction, as in x86_step */
-    int locked = x86_smp && insn_locked(in);
-    tl_locked = locked;
-    if (locked) atomic_lock();
+    tl_locked = x86_smp && insn_locked(in);
     c->fault_armed = 1;
     if (_setjmp(c->fault_jb) == 0) execute(c, in, start_ip);
     c->fault_armed = 0;
-    if (locked) atomic_unlock();
+    if (tl_held) { atomic_unlock(); tl_held = 0; }
     c->pg_super = 0;             /* a fault may have left an implicit access marked */
     /* A fault (286+) or a trap-style exception restarts at the instruction
      * or continues after it, as x86_step would; the caller delivers it. */
@@ -2248,9 +2250,7 @@ int x86_step(x86_cpu *c) {
         } else {
             c->eip = is386 ? start_ip + in.len : ((start_ip + in.len) & 0xFFFF);
             c->int_inhibit = 0;
-            int locked = x86_smp && insn_locked(&in);
-            tl_locked = locked;
-            if (locked) atomic_lock();
+            tl_locked = x86_smp && insn_locked(&in);
             c->fault_armed = 1;
             if (_setjmp(c->fault_jb) == 0) {
                 /* Under paging the fetch touches, for real, the pages the
@@ -2270,7 +2270,7 @@ int x86_step(x86_cpu *c) {
                 if (in.op != OP_IRET && in.op != OP_POPF) c->eflags &= ~(uint32_t)X86_RF;
             }
             c->fault_armed = 0;
-            if (locked) atomic_unlock();
+            if (tl_held) { atomic_unlock(); tl_held = 0; }
             c->pg_super = 0;                          /* a fault may have left an implicit access marked */
         }
     }

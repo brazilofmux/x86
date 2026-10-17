@@ -47,6 +47,8 @@ static void build_tables(x86_jit_aux *aux) {
 
 int dbt_seg16_enabled = 1;
 int dbt_smp;
+int dbt_tso;
+uint64_t dbt_tso_faults;
 int dbt_seg32_enabled = 1;
 
 int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
@@ -1139,4 +1141,80 @@ void dbt_sample_report(x86_dbt *dbt, FILE *out) {
 /* Windows: no SIGALRM and no ucontext; use an outside profiler (WPR, VTune). */
 void dbt_sample_start(void) { }
 void dbt_sample_report(x86_dbt *dbt, FILE *out) { (void)dbt; (void)out; }
+#endif
+
+/* ---- SMP: the acquire/release forms' one gap ----------------------------
+ * LDAPR and STLR take any misalignment within a 16-byte line (FEAT_LSE2)
+ * and fault across one, and x86 code crosses lines now and then. The
+ * fault is a SIGBUS at the instruction: this handler recognises our
+ * encodings, does the access itself with a full fence (the ordering the
+ * instruction would have given), writes the result back into the
+ * thread's registers and steps the PC. Anything else is a real crash
+ * and goes back to the default action. */
+#include <signal.h>
+#include <string.h>
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sys/ucontext.h>
+static void tso_sigbus(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = ctx;
+    (void)sig; (void)si;
+    uint64_t pc = uc->uc_mcontext->__ss.__pc;
+    uint32_t insn = *(const uint32_t *)pc;
+    uint32_t op = insn & 0x3FFFFC00u, size = insn >> 30, rt = insn & 31, rn = (insn >> 5) & 31;
+    uint64_t *x = uc->uc_mcontext->__ss.__x;    /* x0..x28 */
+    if ((op != 0x38BFC000u && op != 0x089FFC00u) || rn > 28 || size > 2) { signal(SIGBUS, SIG_DFL); return; }
+    uint8_t *addr = (uint8_t *)x[rn];
+    if (op == 0x38BFC000u) {                     /* LDAPR */
+        uint64_t v = 0;
+        memcpy(&v, addr, (size_t)1 << size);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (rt <= 28) x[rt] = v;
+    } else {                                     /* STLR */
+        uint64_t v = rt <= 28 ? x[rt] : 0;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(addr, &v, (size_t)1 << size);
+    }
+    uc->uc_mcontext->__ss.__pc = pc + 4;
+    __atomic_fetch_add(&dbt_tso_faults, 1, __ATOMIC_RELAXED);
+}
+void dbt_tso_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = tso_sigbus;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGBUS, &sa, NULL);
+}
+#elif defined(__linux__) && defined(__aarch64__)
+#include <ucontext.h>
+static void tso_sigbus(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = ctx;
+    (void)sig; (void)si;
+    uint64_t pc = uc->uc_mcontext.pc;
+    uint32_t insn = *(const uint32_t *)pc;
+    uint32_t op = insn & 0x3FFFFC00u, size = insn >> 30, rt = insn & 31, rn = (insn >> 5) & 31;
+    unsigned long long *x = uc->uc_mcontext.regs;
+    if ((op != 0x38BFC000u && op != 0x089FFC00u) || rn > 30 || size > 2) { signal(SIGBUS, SIG_DFL); return; }
+    uint8_t *addr = (uint8_t *)x[rn];
+    if (op == 0x38BFC000u) {
+        uint64_t v = 0;
+        memcpy(&v, addr, (size_t)1 << size);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (rt <= 30) x[rt] = v;
+    } else {
+        uint64_t v = rt <= 30 ? x[rt] : 0;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        memcpy(addr, &v, (size_t)1 << size);
+    }
+    uc->uc_mcontext.pc = pc + 4;
+    __atomic_fetch_add(&dbt_tso_faults, 1, __ATOMIC_RELAXED);
+}
+void dbt_tso_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = tso_sigbus;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGBUS, &sa, NULL);
+}
+#else
+void dbt_tso_install(void) { }
 #endif

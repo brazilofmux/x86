@@ -503,6 +503,12 @@ static int plan_block(x86_dbt *dbt, dbt_block *b) {
             }
         }
         if (cpu->model == X86_MODEL_286 && in->len > 10) c = C_REFUSE;   /* #GP: the interpreter's */
+        /* SMP: a serializing instruction ends the block, so that code another
+         * processor changed is seen from here on, as the architecture promises
+         * (the other translators' invalidations land at block boundaries) */
+        if (dbt_smp && (in->op == OP_CPUID || in->op == OP_IRET || in->op == OP_INVD || in->op == OP_WBINVD || in->op == OP_INVLPG
+                        || in->op == OP_LGDT || in->op == OP_LIDT || in->op == OP_LLDT || in->op == OP_LTR || in->op == OP_WRMSR
+                        || (in->op == OP_MOV && in->ops[0].kind == OPK_CR))) c = C_REFUSE;
         /* 486: POPFD can set EFLAGS.AC; ending the block with the run loop
          * stepping it lets the loop see alignment checking come on (the only
          * way it can inside translated code: IRET, far transfers and MOV CR0

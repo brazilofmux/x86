@@ -284,10 +284,51 @@ static inline void emit_mov_x64_x64(emit_t *e, a64_reg_t rd, a64_reg_t rs) {
     emit_inst(e, inst);
 }
 
+/* ---- SMP: x86's memory ordering on the ARM host ----
+ *
+ * x86 is TSO: a load passes nothing, a store passes only a later load.
+ * ARM lets stores pass stores and loads pass loads, and with a translator
+ * per processor over one memory that shows (a litmus test saw message
+ * passing fail a few times a million). With dbt_tso, guest-memory
+ * accesses are RCpc acquire loads (LDAPR) and release stores (STLR),
+ * which together are exactly TSO. Both take [Xn] alone: a load forms its
+ * address in its own destination, a store in its base and puts the base
+ * back, so no scratch register is needed at the call sites. Accesses to
+ * the cpu, the aux block, the bitmap and the host stack keep the plain
+ * forms: those are the host's, not the guest's. */
+extern int dbt_tso;
+static inline int emit_tso_base(a64_reg_t rn) {
+    return dbt_tso && rn != 19 && rn != 11 && rn != 17 && rn != 29 && rn != 31;   /* R_CPU, R_AUX, R_BMD, FP, SP */
+}
+static inline void emit_ldapr(emit_t *e, uint32_t size, a64_reg_t rt, a64_reg_t xn) {   /* LDAPR{B,H,} Wt, [Xn] */
+    emit_inst(e, ((size & 3u) << 30) | 0x38BFC000u | ((uint32_t)(xn & 0x1F) << 5) | (rt & 0x1F));
+}
+static inline void emit_stlr(emit_t *e, uint32_t size, a64_reg_t rt, a64_reg_t xn) {    /* STLR{B,H,} Wt, [Xn] */
+    emit_inst(e, ((size & 3u) << 30) | 0x089FFC00u | ((uint32_t)(xn & 0x1F) << 5) | (rt & 0x1F));
+}
+static inline void emit_tso_addsub_uxtw(emit_t *e, int sub, a64_reg_t xd, a64_reg_t xn, a64_reg_t wm) {
+    emit_inst(e, (sub ? 0xCB204000u : 0x8B204000u) | ((uint32_t)(wm & 0x1F) << 16) | ((uint32_t)(xn & 0x1F) << 5) | (xd & 0x1F));
+}
+static inline void emit_tso_addsub_imm(emit_t *e, int sub, a64_reg_t xd, a64_reg_t xn, uint32_t imm12) {
+    emit_inst(e, (sub ? 0xD1000000u : 0x91000000u) | ((imm12 & 0xFFFu) << 10) | ((uint32_t)(xn & 0x1F) << 5) | (xd & 0x1F));
+}
+/* An immediate-offset guest access in TSO form: size 0/1/2 bytes/half/word. */
+static inline void emit_tso_imm(emit_t *e, uint32_t size, int load, a64_reg_t rt, a64_reg_t rn, uint32_t off) {
+    if (load) {
+        if (off) { emit_tso_addsub_imm(e, 0, rt, rn, off); emit_ldapr(e, size, rt, rt); }
+        else emit_ldapr(e, size, rt, rn);
+    } else {
+        if (off) emit_tso_addsub_imm(e, 0, rn, rn, off);
+        emit_stlr(e, size, rt, rn);
+        if (off) emit_tso_addsub_imm(e, 1, rn, rn, off);
+    }
+}
+
 /* ---- Load/store with unsigned immediate offset ---- */
 
 /* LDR Wt, [Xn, #imm]  (offset must be 4-aligned, 0..16380) */
 static inline void emit_ldr_w32_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t byte_offset) {
+    if (emit_tso_base(rn)) { emit_tso_imm(e, 2, 1, rt, rn, byte_offset); return; }
     uint32_t scaled = byte_offset / 4u;
     uint32_t inst = 0xB9400000u | ((scaled & 0xFFFu) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
     emit_inst(e, inst);
@@ -295,6 +336,7 @@ static inline void emit_ldr_w32_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint3
 
 /* STR Wt, [Xn, #imm] */
 static inline void emit_str_w32_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t byte_offset) {
+    if (emit_tso_base(rn)) { emit_tso_imm(e, 2, 0, rt, rn, byte_offset); return; }
     uint32_t scaled = byte_offset / 4u;
     uint32_t inst = 0xB9000000u | ((scaled & 0xFFFu) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
     emit_inst(e, inst);
@@ -316,6 +358,7 @@ static inline void emit_str_x64_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint3
 
 /* LDRB Wt, [Xn, #imm] */
 static inline void emit_ldrb_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t byte_offset) {
+    if (emit_tso_base(rn)) { emit_tso_imm(e, 0, 1, rt, rn, byte_offset); return; }
     uint32_t inst = 0x39400000u | ((byte_offset & 0xFFFu) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
     emit_inst(e, inst);
 }
@@ -328,6 +371,7 @@ static inline void emit_ldrsb_w32_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uin
 
 /* LDRH Wt, [Xn, #imm]  (offset 2-aligned) */
 static inline void emit_ldrh_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t byte_offset) {
+    if (emit_tso_base(rn)) { emit_tso_imm(e, 1, 1, rt, rn, byte_offset); return; }
     uint32_t scaled = byte_offset / 2u;
     uint32_t inst = 0x79400000u | ((scaled & 0xFFFu) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
     emit_inst(e, inst);
@@ -342,12 +386,14 @@ static inline void emit_ldrsh_w32_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uin
 
 /* STRB Wt, [Xn, #imm] */
 static inline void emit_strb_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t byte_offset) {
+    if (emit_tso_base(rn)) { emit_tso_imm(e, 0, 0, rt, rn, byte_offset); return; }
     uint32_t inst = 0x39000000u | ((byte_offset & 0xFFFu) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
     emit_inst(e, inst);
 }
 
 /* STRH Wt, [Xn, #imm]  (offset 2-aligned) */
 static inline void emit_strh_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t byte_offset) {
+    if (emit_tso_base(rn)) { emit_tso_imm(e, 1, 0, rt, rn, byte_offset); return; }
     uint32_t scaled = byte_offset / 2u;
     uint32_t inst = 0x79000000u | ((scaled & 0xFFFu) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
     emit_inst(e, inst);
@@ -362,6 +408,11 @@ static inline void emit_strh_imm(emit_t *e, a64_reg_t rt, a64_reg_t rn, uint32_t
  */
 static inline void emit_ldst_reg_uxtw(emit_t *e, uint32_t size, uint32_t opc,
                                        a64_reg_t rt, a64_reg_t rn, a64_reg_t rm) {
+    if (emit_tso_base(rn) && opc <= 1) {           /* (opc 3, a sign-extending load, is only ever a code byte) */
+        if (opc == 1) { emit_tso_addsub_uxtw(e, 0, rt, rn, rm); emit_ldapr(e, size, rt, rt); }
+        else { emit_tso_addsub_uxtw(e, 0, rn, rn, rm); emit_stlr(e, size, rt, rn); emit_tso_addsub_uxtw(e, 1, rn, rn, rm); }
+        return;
+    }
     uint32_t inst = ((size & 3u) << 30) | ((opc & 3u) << 22) | 0x38204800u
                   | ((uint32_t)(rm & 0x1F) << 16)
                   | ((uint32_t)(rn & 0x1F) <<  5)

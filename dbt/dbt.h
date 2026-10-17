@@ -567,6 +567,9 @@ extern int dbt_seg16_enabled;   /* X86_NO_SEG16 clears it: segmented 16-bit PM b
  * blocks there; translation itself is serialized (the backend's
  * per-translation statics). */
 extern int dbt_smp;
+extern int dbt_tso;                              /* ... and guest accesses in x86's ordering (dbt/emit_a64.h); X86_NO_TSO=1 turns it off for a measurement */
+extern uint64_t dbt_tso_faults;                  /* accesses that crossed a 16-byte line, done by the SIGBUS handler */
+void dbt_tso_install(void);
 static inline int dbt_insn_locked(const x86_insn *in) {
     return in->lock || in->op == OP_CMPXCHG8B
         || (in->op == OP_XCHG && (in->ops[0].kind == OPK_MEM || in->ops[1].kind == OPK_MEM));

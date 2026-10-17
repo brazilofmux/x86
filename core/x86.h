@@ -379,19 +379,21 @@ static inline uint32_t x86_lin(x86_cpu *c, uint32_t lin, int write) {
 static inline int x86_ac_live(const x86_cpu *c) {
     return (c->cr0 & X86_CR0_AM) && (c->eflags & X86_AC) && c->model >= X86_MODEL_486 && x86_cpl(c) == 3;
 }
+extern int x86_smp;             /* (below) SMP: the interpreter's bytes are acquire loads and release stores, as translated code's are */
 static inline uint8_t x86_phys_rd8(x86_cpu *c, uint32_t lin) {
     uint32_t p = x86_lin(c, lin, 0);
     if (p == X86_PG_BAD) return 0xFF;
     p &= c->a20_mask;
     if (c->device_read && p - 0xA0000u < 0x10000u) return c->device_read(c, p);
-    return p < c->mem_size ? c->mem[p] : 0xFF;
+    if (p >= c->mem_size) return 0xFF;
+    return x86_smp ? __atomic_load_n(&c->mem[p], __ATOMIC_ACQUIRE) : c->mem[p];
 }
 static inline void x86_phys_wr8(x86_cpu *c, uint32_t lin, uint8_t v) {
     uint32_t p = x86_lin(c, lin, 1);
     if (p == X86_PG_BAD) return;
     p &= c->a20_mask;
     if (p < c->mem_size) {
-        c->mem[p] = v;
+        if (x86_smp) __atomic_store_n(&c->mem[p], v, __ATOMIC_RELEASE); else c->mem[p] = v;
         if (c->code_bitmap[p]) x86_store_hook(c, p);
     }
 }
