@@ -104,7 +104,7 @@ int dbt_jit_available(const x86_cpu *cpu) {
 }
 
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
-static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_port_thunk_off, s_fault_stub_off, s_fault_exit_off, s_exit_eip_off;
+static uint32_t s_exec_thunk_off, s_smc_thunk_off, s_port_thunk_off, s_tlbfill_thunk_off, s_fault_stub_off, s_fault_exit_off, s_exit_eip_off;
 
 /* model >= 386: the pinned registers hold the whole 32-bit guest register,
  * so a 16-bit write merges into bits 15:0 and anything that consumes a
@@ -383,6 +383,34 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_ldp_post_sp(&e, A64_W29, A64_W30, 96);
     emit_ret(&e);
 
+    /* ---- TLB refill thunk: BL with W1 = the linear address, W2 = the
+     * bits the inline check needs; W0 comes back 1 when the entry now
+     * serves the access (dbt_h_tlb_fill). Called mid-instruction, so
+     * every caller-saved register but W0-W2 is kept. ---- */
+    s_tlbfill_thunk_off = e.offset;
+    emit_stp_pre_sp(&e, A64_W29, A64_W30, -144);
+    emit_stp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
+    emit_stp_x64_off(&e, A64_W5, A64_W6, A64_SP, 32);
+    emit_stp_x64_off(&e, A64_W7, A64_W8, A64_SP, 48);
+    emit_stp_x64_off(&e, A64_W9, A64_W10, A64_SP, 64);
+    emit_stp_x64_off(&e, A64_W11, A64_W12, A64_SP, 80);
+    emit_stp_x64_off(&e, A64_W13, A64_W14, A64_SP, 96);
+    emit_stp_x64_off(&e, A64_W15, A64_W16, A64_SP, 112);
+    emit_str_x64_imm(&e, A64_W17, A64_SP, 128);
+    emit_mov_x64_x64(&e, A64_W0, R_CPU);
+    emit_mov_x64_imm64(&e, A64_W9, (uint64_t)(uintptr_t)dbt_h_tlb_fill);
+    emit_blr(&e, A64_W9);
+    emit_ldr_x64_imm(&e, A64_W17, A64_SP, 128);
+    emit_ldp_x64_off(&e, A64_W15, A64_W16, A64_SP, 112);
+    emit_ldp_x64_off(&e, A64_W13, A64_W14, A64_SP, 96);
+    emit_ldp_x64_off(&e, A64_W11, A64_W12, A64_SP, 80);
+    emit_ldp_x64_off(&e, A64_W9, A64_W10, A64_SP, 64);
+    emit_ldp_x64_off(&e, A64_W7, A64_W8, A64_SP, 48);
+    emit_ldp_x64_off(&e, A64_W5, A64_W6, A64_SP, 32);
+    emit_ldp_x64_off(&e, A64_W3, A64_W4, A64_SP, 16);
+    emit_ldp_post_sp(&e, A64_W29, A64_W30, 144);
+    emit_ret(&e);
+
     dbt->code_used = e.offset;
     __builtin___clear_cache((char *)dbt->code_buf, (char *)dbt->code_buf + e.offset);
 }
@@ -484,6 +512,7 @@ static void emit_limit_check32(emit_t *e, int seg, a64_reg_t off, int size);
 static void emit_ea_paged(emit_t *e, const x86_insn *in, ea_t *ea);
 static void emit_ea_seg16_paged(emit_t *e, const x86_insn *in, ea_t *ea);
 static void flat_slow_site(emit_t *e);
+static int s_slow_kind;              /* the next slow site's kind (flat_slow_t.kind; stats) */
 static int s_devread;
 static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write);
 enum { PG_READ = 0, PG_RMW = 1, PG_STORE = 2 };   /* emit_pgflat's access kinds */
@@ -525,6 +554,7 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
          * linear address, base + offset, as any flat access. Clobbers
          * W_T1, W_T3 besides. */
         int size = flat_access_size(in), wr = writes_mem_operand(in);
+        s_slow_kind = 4;
         emit_ldrh_imm(e, W_T1, R_CPU, OFF_SEG_ATTR(in->seg));
         (void)emit_and_w32_imm(e, W_T1, W_T1, wr ? 0x1E : 0x1C);
         emit_cmp_w32_imm(e, W_T1, wr ? 0x12 : 0x10);
@@ -538,6 +568,7 @@ static void emit_ea_flat(emit_t *e, const x86_insn *in, ea_t *ea) {
         emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_LIMIT(in->seg));
         emit_cmp_x64_x64(e, W_T3, W_T1);
         flat_slow_site(e);
+        s_slow_kind = 0;
         emit_b_cond(e, A64_COND_HI, 0);
         emit_ldr_w32_imm(e, W_T1, R_CPU, OFF_SEG_BASE(in->seg));
         emit_add_w32(e, W_OFF, W_T1, ea->off);
@@ -694,6 +725,10 @@ typedef struct {
     uint32_t ip_after, n_done;
     int      ender;      /* the instruction ends the block: after the helper, leave at cpu->eip */
     int      leave;      /* not an ender, but leave after the helper anyway (charging n_done): POPFD's RF/TF image */
+    int      retry;      /* a paged access's TLB check: refill (the thunk) and go back to retry_off before replaying */
+    int      kind;       /* (stats: X86_HELPER_DETAIL's tag) 0 other, 1 TLB, 2 range, 3 page cross, 4 FS/GS checks */
+    uint32_t retry_off, retry_need;
+    a64_reg_t retry_reg; /* the linear address */
     x86_insn in;
 } flat_slow_t;
 #define FLAT_SLOW_MAX 256
@@ -704,6 +739,9 @@ static uint32_t s_dyn_imm_lin;       /* nonzero: read the current instruction's 
 static int s_cur_ender;
 static int s_in_slow_chunk;          /* emitting a flat slow-path chunk (stats tag) */
 static int s_slow_leave;             /* the next slow site leaves the block after its helper (flat_slow_t.leave) */
+static int s_slow_retry;             /* the next slow site is a TLB check: flat_slow_t.retry, with these */
+static uint32_t s_retry_off, s_retry_need;
+static a64_reg_t s_retry_reg;
 
 /* Record a slow-path entry for the current instruction; the caller emits
  * the branch to it (a B.cond or CBZ/CBNZ, all imm19) right after. */
@@ -716,6 +754,9 @@ static void flat_slow_site(emit_t *e) {
     f->n_done = s_cur_n_done;
     f->ender = s_cur_ender;
     f->leave = s_slow_leave;
+    f->retry = s_slow_retry;
+    f->kind = s_slow_retry ? 1 : s_slow_kind;
+    f->retry_off = s_retry_off; f->retry_need = s_retry_need; f->retry_reg = s_retry_reg;
     f->in = *s_cur_insn;
 }
 
@@ -748,7 +789,9 @@ static void emit_flat_check_as(emit_t *e, a64_reg_t off, int store_only) {
         emit_ccmp_w32_imm(e, W_T3, 0xA, 0x4, A64_COND_EQ);
         slow = A64_COND_EQ;
     }
+    s_slow_kind = 2;
     flat_slow_site(e);
+    s_slow_kind = 0;
     emit_b_cond(e, slow, 0);
 }
 static void emit_flat_check(emit_t *e, a64_reg_t off) { emit_flat_check_as(e, off, 0); }
@@ -958,6 +1001,7 @@ static void emit_add_x64_big(emit_t *e, a64_reg_t rd, a64_reg_t rn, uint32_t imm
  * faults, sets accessed/dirty and fills the entry for next time.
  * Clobbers X0-X2, W_T1; leaves OFF and W_T2/W_T3 alone. */
 static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write) {
+    uint32_t again = emit_pos(e);
     emit_ubfx_w32(e, A64_W0, off, 12, 8);                       /* TLB index */
     emit_add_x64_big(e, A64_W2, R_CPU, (uint32_t)offsetof(x86_cpu, tlb));
     emit_lsl_x64_imm(e, A64_W0, A64_W0, 3);
@@ -965,18 +1009,24 @@ static void emit_pgflat(emit_t *e, a64_reg_t off, int size, int write) {
     emit_ldp_w32_off(e, A64_W0, A64_W1, A64_W2, 0);             /* w0 = tag, w1 = physical page */
     emit_eor_w32(e, W_T1, A64_W0, off);
     (void)emit_tst_w32_imm(e, W_T1, 0xFFFFF000u);               /* the entry is for this page */
-    flat_slow_site(e);
-    emit_b_cond(e, A64_COND_NE, 0);
     uint32_t need = X86_TLB_V | (write == PG_STORE ? X86_TLB_WMEM : X86_TLB_MEM) | (write ? X86_TLB_D : 0)
                   | (s_pg_user ? (write ? X86_TLB_UW : X86_TLB_U) : 0);
+    /* a miss, or a bit missing: the slow chunk refills by a walk and
+     * comes back here, or replays the instruction if the walk cannot */
+    s_slow_retry = 1; s_retry_off = again; s_retry_need = need; s_retry_reg = off;
+    flat_slow_site(e);
+    emit_b_cond(e, A64_COND_NE, 0);
     emit_movz_w32(e, W_T1, (uint16_t)need, 0);
     emit_bic_w32(e, W_T1, W_T1, A64_W0);                         /* a needed bit missing? */
     flat_slow_site(e);
+    s_slow_retry = 0;
     emit_cbnz_w32(e, W_T1, 0);
     if (size > 1) {
         (void)emit_and_w32_imm(e, W_T1, off, 0xFFF);
         emit_cmp_w32_imm(e, W_T1, (uint32_t)(0x1000 - size));
+        s_slow_kind = 3;
         flat_slow_site(e);
+        s_slow_kind = 0;
         emit_b_cond(e, A64_COND_HI, 0);
     }
     (void)emit_and_w32_imm(e, W_T1, off, 0xFFFFF000u);
@@ -2116,7 +2166,7 @@ static void emit_pop16(emit_t *e, a64_reg_t dst) { emit_pop_stk(e, dst, 2); }
 static void emit_helper_op(x86_dbt *dbt, emit_t *e, const x86_insn *in) {
     uint32_t idx = dbt->golden ? 0 : dbt->insn_used++;    /* (X86_GOLDEN: the index is translation order, not content) */
     dbt->insn_pool[idx] = *in;
-    dbt->insn_tag[idx] = (uint8_t)(!s_flat ? 0 : s_in_slow_chunk ? 2 : 1);
+    dbt->insn_tag[idx] = (uint8_t)(!s_flat ? 0 : s_in_slow_chunk ? 1 + s_in_slow_chunk : 1);   /* 2..6: a slow path, by kind */
     dbt->insn_lin[idx] = dbt->cpu->seg[S_CS].base + s_cur_ip_start;
     dbt->helper_insns++;
     emit_mov_x64_x64(e, A64_W0, R_CPU);
@@ -2843,9 +2893,18 @@ static void emit_flat_slow_chunks(x86_dbt *dbt, emit_t *e) {
     for (uint32_t k = 0; k < s_nfslow; k++) {
         flat_slow_t *f = &s_fslow[k];
         emit_patch_cond19(e, f->patch_off, emit_pos(e));
+        if (f->retry) {
+            emit_mov_w32_w32(e, A64_W1, f->retry_reg);
+            emit_mov_w32_imm32(e, A64_W2, f->retry_need);
+            emit_bl(e, (int32_t)s_tlbfill_thunk_off - (int32_t)emit_pos(e));
+            uint32_t replay = emit_pos(e);
+            emit_cbz_w32(e, A64_W0, 0);
+            emit_b(e, (int32_t)f->retry_off - (int32_t)emit_pos(e));
+            emit_patch_cond19(e, replay, emit_pos(e));
+        }
         s_cur_ip_after = f->ip_after;
         s_cur_n_done = f->n_done;
-        s_in_slow_chunk = 1;
+        s_in_slow_chunk = 1 + f->kind;
         emit_helper_op(dbt, e, &f->in);
         s_in_slow_chunk = 0;
         if (f->leave) emit_sub_x64_imm(e, R_CNT, R_CNT, f->n_done);   /* (an ender's block is charged already) */

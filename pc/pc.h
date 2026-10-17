@@ -252,6 +252,7 @@ void pc_kbd_int16(x86_cpu *c, int vector);
 void pc_kbd_int9(x86_cpu *c, int vector);                /* default INT 9: latched code → BIOS buffer */
 void pc_kbd_push(x86_cpu *c, uint8_t ascii, uint8_t scancode);
 int  pc_kbd_raw_pending(void);
+int  pc_kbd_incoming(void);
 int  pc_kbd_raw_reply_pending(void);                 /* a command's reply is next (goes out even with scanning off) */
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */

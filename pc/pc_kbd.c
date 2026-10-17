@@ -95,6 +95,9 @@ static void raw_enqueue(uint8_t code, uint8_t ascii) {
     rawq[rawq_tail] = (rawkey){ code, ascii }; rawq_tail = next;
 }
 int pc_kbd_raw_pending(void) { return rawq_head != rawq_tail; }
+/* Keys on their way in — host bytes not yet fed, or codes not yet
+ * latched: a halted guest naps only briefly then (pc_poll) */
+int pc_kbd_incoming(void) { return npending > 0 || rawq_head != rawq_tail; }
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii) { raw_enqueue(code, ascii); }
 /* The keyboard's answer to a command byte (FAh, ACK): ahead of any keys
  * still waiting, as the keyboard sends it straight back. */

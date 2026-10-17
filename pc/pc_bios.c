@@ -489,6 +489,30 @@ static int intr_ready(x86_cpu *c) {
     uint8_t r1 = pic.irr & (uint8_t)~pic.mask & 0xF8;
     return r1 && !(pc.irq_in_service & ((2u << __builtin_ctz(r1)) - 1));
 }
+/* The 8042: the next raw code into port 60h and IRQ 1, once the last one
+ * has been taken. The pending IRQ 1 itself does not hold the latch: a
+ * guest that polls port 60h with interrupts off (ReactOS's kernel
+ * debugger) has taken the code, and the 8259 keeps the one edge it
+ * latched; the next code raises another, which it ignores. Holding the
+ * latch until that interrupt was taken stopped such a guest after its
+ * first key. */
+static void kbd_latch(x86_cpu *c, uint64_t now) {
+    static uint64_t last_code_ns;
+    if (!pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2)
+        && !(pc.kbd_disabled & 1)                                        /* the 8042's interface (ADh) holds everything */
+        && (!(pc.kbd_disabled & 2) || pc_kbd_raw_reply_pending())        /* scanning off (F5h) holds keys, not replies */
+        && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
+        uint8_t code;
+        pc_kbd_raw_next(&code);
+        pc.last_scancode = code;
+        if (pc.debug > 1) fprintf(stderr, "[kbd] latch %02X @%llu\n", code, (unsigned long long)c->insn_count);
+        if (pc.kbc_cmdbyte & 1) { pc.irq_pending |= 1 << 9; pc_ioapic_edge(1); }   /* IRQ 1, if the command byte enables it */
+        pc.irq9_busy = 1;                        /* until the handler reads port 60h */
+        last_code_ns = now;
+        intr_update();
+    }
+}
+
 /* cpu->intr_waiting: intr_ready, kept for translated code's inline STI */
 static void intr_update(void) {
     if (pc.cpu) pc.cpu->intr_waiting = (uint8_t)intr_ready(pc.cpu);
@@ -608,29 +632,11 @@ static int poll(x86_cpu *c) {
      * the next code overwrite the latch before the BIOS's INT 9 had taken
      * the first — one key lost, the next one twice ("HHlo"). The EOI, or
      * our INT 9, says the code has been used. */
-    static uint64_t last_code_ns;
     pc_ps2_poll(now);
     pc_uart_poll();
     pc_net_poll(0);                              /* the network card's far end */
     aux_latch();
-    /* The pending IRQ 1 itself does not hold the latch: a guest that
-     * polls port 60h with interrupts off (ReactOS's kernel debugger) has
-     * taken the code, and the 8259 keeps the one edge it latched; the
-     * next code raises another, which it ignores. Holding the latch
-     * until that interrupt was taken stopped such a guest after its
-     * first key. */
-    if (!pc.irq9_busy && !pc.aux_full && !(pc.irq_in_service & 2)
-        && !(pc.kbd_disabled & 1)                                        /* the 8042's interface (ADh) holds everything */
-        && (!(pc.kbd_disabled & 2) || pc_kbd_raw_reply_pending())        /* scanning off (F5h) holds keys, not replies */
-        && pc_kbd_raw_pending() && now - last_code_ns >= 2000000ull) {
-        uint8_t code;
-        pc_kbd_raw_next(&code);
-        pc.last_scancode = code;
-        if (pc.debug > 1) fprintf(stderr, "[kbd] latch %02X @%llu\n", code, (unsigned long long)c->insn_count);
-        if (pc.kbc_cmdbyte & 1) { pc.irq_pending |= 1 << 9; pc_ioapic_edge(1); }   /* IRQ 1, if the command byte enables it */
-        pc.irq9_busy = 1;                        /* until the handler reads port 60h */
-        last_code_ns = now;
-    }
+    kbd_latch(c, now);
 
     /* IRQ 0 comes at whatever rate PIT channel 0 was programmed for — the
      * BIOS's 18.2 Hz until a program reloads it. DOOM's sound library sets
@@ -685,6 +691,12 @@ static int poll(x86_cpu *c) {
         /* a serial console's keys come from stdin: look every 5 ms */
         uint64_t nap = next > hnow ? next - hnow : 0;
         if (pc_uart_owns_stdin() && nap > 5000000ull) nap = 5000000ull;
+        /* Keys on their way in: back to pc_poll within 2 ms, which feeds
+         * the next and latches it for IRQ 1. A tickless kernel (Linux)
+         * halts until its next timer, often 50 ms off; a scripted line
+         * typed into it took one such nap a key. */
+        int kbd = pc_kbd_incoming() && !pc_uart_owns_stdin();
+        if (kbd && nap > 2000000ull) nap = 2000000ull;
         /* ... and a network's frames every millisecond, waiting in its poll() */
         int netwait = pc_net_present() && nap >= 1000000ull;
         if (pc_net_present() && nap > 1000000ull) nap = 1000000ull;
@@ -697,6 +709,7 @@ static int poll(x86_cpu *c) {
         }
         pc_uart_poll();
         pc_net_poll(0);
+        if (kbd) { pc_kbd_poll(c); kbd_latch(c, pc_now_ns()); }   /* the next key, and IRQ 1 for it */
         if (intr_ready(c)) break;
         if (pc_now_ns() < next) continue;
         if (apic_first) pc_apic_poll(c, pc_now_ns());

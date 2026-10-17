@@ -184,6 +184,28 @@ void dbt_h_post_store(x86_cpu *cpu, uint32_t arg) {
         if (cpu->code_bitmap[phys + i]) x86_store_hook(cpu, phys + i);
 }
 
+/* A paged access in translated code missed the TLB, or found its entry
+ * without a bit it needs (a store on a page not yet dirty): walk the
+ * tables as the access would — accessed and dirty bits set, the entry
+ * filled — and say whether the entry now serves it (NEED, the inline
+ * check's bits). No: a fault, a watched page or device memory, which the
+ * slow path's interpreter replays exactly. After every CR3 load (no
+ * global pages on a P54C) each page's first access came here, as a
+ * whole instruction through the interpreter. */
+uint32_t dbt_h_tlb_fill(x86_cpu *cpu, uint32_t lin, uint32_t need) {
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    if (cpu->fault_armed || !(cpu->cr0 & X86_CR0_PG)) { dbt->tlb_fill_fails++; return 0; }
+    uint32_t p = x86_page_walk(cpu, lin, (need & X86_TLB_D) != 0);
+    const struct x86_tlbe *t = &cpu->tlb[(lin >> 12) & 255];
+    if (p == X86_PG_BAD || ((t->tag ^ lin) & 0xFFFFF000u) || (t->tag & need) != need) {
+        if (getenv("X86_TLBFILL_DEBUG") && (dbt->tlb_fill_fails & 0xFFFFF) < 20)
+            fprintf(stderr, "[tlbfill] cpu%d lin %08X need %X p %08X tag %08X cpl %d eip %08X\n", cpu->cpu_id, lin, need, p, t->tag, x86_cpl(cpu), cpu->eip);
+        dbt->tlb_fill_fails++; return 0;
+    }
+    dbt->tlb_fills++;
+    return 1;
+}
+
 /* OUT from inside a block, through the port thunk (which saves only the
  * caller-saved pinned registers: no spill, no reload). Returns 0 to go
  * on with the block, 1 to leave after the instruction — the port halted
@@ -1126,6 +1148,8 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
     if (dbt->smc_hot_refusals) fprintf(out, "  SMC-hot block ends:     %llu\n", (unsigned long long)dbt->smc_hot_refusals);
     if (dbt->tlb_flushes) fprintf(out, "  TLB flushes:            %llu (code pages dropped: %llu)\n",
                                   (unsigned long long)dbt->tlb_flushes, (unsigned long long)dbt->tlb_page_drops);
+    if (dbt->tlb_fills || dbt->tlb_fill_fails)
+        fprintf(out, "  TLB refills inline:     %llu (%llu left to the interpreter)\n", (unsigned long long)dbt->tlb_fills, (unsigned long long)dbt->tlb_fill_fails);
     if (dbt->space_evictions || dbt->n_pcode)
         fprintf(out, "  code spaces evicted: %llu, kernel/user space moves %llu / %llu (code pages watched now: %u)\n"
                      "  pages parked/unparked: %llu / %llu, blocks reinstated %llu%s\n",
@@ -1148,8 +1172,9 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
          * reused after a flush carries the hits of both its tenants), so
          * the scans run to the high-water mark. */
         if (dbt->insn_used > dbt->insn_high) dbt->insn_high = dbt->insn_used;
-        uint64_t by_tag[3] = { 0, 0, 0 };
-        for (uint32_t i = 0; i < dbt->insn_high; i++) by_tag[dbt->insn_tag[i]] += dbt->insn_hits[i];
+        uint64_t by_tag[8] = { 0 };
+        for (uint32_t i = 0; i < dbt->insn_high; i++) by_tag[dbt->insn_tag[i] & 7] += dbt->insn_hits[i];
+        for (int t = 3; t < 8; t++) by_tag[2] += by_tag[t];          /* the slow paths' kinds, together */
         fprintf(out, "  helper calls from:      all-helper PM blocks %llu, helper ops in mixed blocks %llu, slow paths %llu\n",
                 (unsigned long long)by_tag[0], (unsigned long long)by_tag[1], (unsigned long long)by_tag[2]);
     }
@@ -1171,7 +1196,7 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
          * emitted from: [pm] all-helper block, [body] a helper op in a
          * block that inlines others, [slow] an inline op's out-of-line
          * path. */
-        static const char *tags[3] = { "pm", "body", "slow" };
+        static const char *tags[8] = { "pm", "body", "slow", "tlb", "rng", "pgx", "fsgs", "?" };
         uint32_t n = strtoul(getenv("X86_HELPER_DETAIL"), NULL, 0);
         if (!n) n = 40;
         fprintf(out, "  hottest helper insns:\n");
@@ -1183,7 +1208,7 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
             char buf[64];
             const x86_insn *hi = &dbt->insn_pool[best];
             int str = hi->op == OP_MOVS || hi->op == OP_CMPS || hi->op == OP_STOS || hi->op == OP_LODS || hi->op == OP_SCAS;
-            fprintf(out, "    %10u [%-4s] %06X %s%s\n", dbt->insn_hits[best], tags[dbt->insn_tag[best]],
+            fprintf(out, "    %10u [%-4s] %06X %s%s\n", dbt->insn_hits[best], tags[dbt->insn_tag[best] & 7],
                     dbt->insn_lin[best], x86_disasm(hi, buf, sizeof buf),
                     !str ? "" : hi->ops[0].size == 1 ? " (byte)" : hi->ops[0].size == 2 ? " (word)" : " (dword)");
             dbt->insn_hits[best] = 0;

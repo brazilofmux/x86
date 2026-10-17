@@ -28,7 +28,7 @@ if [ -f disks/win2k/c-mp.img ] && [ -f disks/win2k/d-mp.img ]; then
     for cpus in 1 2; do
         python3 tools/expect.py -v -t 300 tmp/smpbench.exp -- $DM -m 586 -mem 64 -smp $cpus -W -T 290 -ro \
             -hda disks/win2k/c-mp.img -hdb disks/win2k/d-mp.img -boot c 2>&1 >/dev/null \
-            | awk -v c=$cpus '/600,466/ { gsub(/[][s]/, "", $2); t = $2 } /^expect: (no|pixel)/ { why = $0 }
+            | awk -v c=$cpus '/pixel 600,466 is/ { gsub(/[][s]/, "", $2); t = $2 } /^expect: (no|pixel)/ { why = $0 }
                   END { if (t) printf "windows 2000 mp -smp %d: desktop at %5.1f s\n", c, t; else printf "windows 2000 mp -smp %d: no desktop (%s)\n", c, why }'
     done
     rm -f tmp/smpbench.exp

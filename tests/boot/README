@@ -208,17 +208,44 @@ them all. Linux 6.12 (Tiny Core) brings up both ("smp: Brought up 1
 node, 2 CPUs"), spreads devices over them through the I/O APIC's
 lowest-priority delivery, and its reschedule, function-call and TLB
 shootdown IPIs flow both ways; a fork storm and parallel shell loops
-run. Measured by the guest's own clock (date +%s around the loops):
-on two processors one shell loop 4 s, two at once 5 s, four 11 s; on
-four processors 3, 5 and 7 s. Real parallelism, well short of linear:
-the per-poll machine lock and the sticky-bitmap sweeps are the
-suspects for the speed pass. (The threads ask macOS for a performance
-core — the QoS hint in ap_thread — or an application processor lands
-on an efficiency core at half speed.) A measurement trap: an expect
-pattern like "TWO=" matches the echoed command the moment it is typed,
-so the next command was sent while the loops still ran; the markers
-are now spelled so that only the output matches. The boot suite boots
-it to the shell on two.
+run, and tests/boot/smpbench.sh times them (a busy shell loop of
+300000 iterations one, two and four at a time, host-timed from the
+prompt to the marker, typing included; then Windows 2000 MP to its
+desktop on one and two processors):
+
+                  one loop   two    four
+    -smp 1          5.4      10.5   20.6 s
+    -smp 2          5.9       5.9   12.0 s
+    -smp 4          6.5       6.2    6.4 s
+
+Linear. The speed pass (2026-10-17) that got there found no SMP cost
+worth the name; it found what made every measurement wrong:
+- typing: a scripted key went to a guest that takes keys from IRQ 1
+  (Linux, NT, Haiku) once per 250 ms, and a tickless kernel halted
+  until its next timer between keys, which the halt nap slept through
+  whole. Now a key a protected-mode kernel has read from port 60h is
+  followed by the next 5 ms on, and the halt nap is capped at 2 ms
+  while keys are on their way in, feeding and latching them itself. A
+  150-character command line typed in 36 s before, 0.3 s now.
+- a block refused because its code page was not present yet (demand
+  paging) stayed refused for good: the sentinel was never cleared once
+  the page came in. Busybox blocks ran in the interpreter.
+- the main thread did not ask macOS for a performance core and ran on
+  an efficiency core one run in two.
+Then, for paged guests in general: CLI, STI, PUSHFD and POPFD inline in
+flat code at CPL 0 (NT's idle loop and spinlocks), and a TLB miss in
+translated code refills by a page walk and retries inline instead of
+replaying the instruction in the interpreter (a P54C has no global
+pages: every CR3 load empties the TLB, 78000 a second under Windows
+2000 at boot). The threads ask macOS for a performance core (the QoS
+hint, main thread and ap_thread alike). A measurement trap: an expect
+pattern like "TWO=" matches the echoed command the moment it is typed;
+the markers are spelled so that only the output matches. Windows 2000
+MP's desktop, 33 s on one processor and 39 s on two, is mostly waiting:
+NTLDR's 5-second menu, the disk check's 2 seconds, and the HAL timing
+RTC seconds for about 3.5 s per processor. Open: three boots in about
+25 under smpbench.sh took 140 s or missed the desktop, none outside it.
+The boot suite boots it to the shell on two.
 
 What SMP changed underneath:
 - Bus-locked instructions (LOCK prefix, XCHG with memory, CMPXCHG8B)

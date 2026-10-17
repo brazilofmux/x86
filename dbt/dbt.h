@@ -267,6 +267,7 @@ typedef struct {
     uint64_t fastmem_traps;        /* x86-64: flat accesses past memory sent to their slow path by the fault handler */
     uint64_t jit_block_entries;
     uint64_t smc_invalidations;
+    uint64_t tlb_fills, tlb_fill_fails;   /* translated code's TLB misses: refilled by a walk, or left to the interpreter */
     uint64_t a20_flushes;
     /* Code pages paged blocks were translated on (V86 or flat protected
      * mode), with the physical page each mapped to then: a TLB flush
@@ -577,6 +578,7 @@ static inline int dbt_insn_locked(const x86_insn *in) {
 }
 extern void (*dbt_stop_dump)(x86_cpu *c);
 void dbt_ring_dump(x86_cpu *c);
+uint32_t dbt_h_tlb_fill(x86_cpu *c, uint32_t lin, uint32_t need);
 void dbt_ring_note(x86_cpu *c, int vec, uint32_t err);
 extern x86_cpu *dbt_ring_cpus[8];
 void dbt_register(x86_dbt *dbt);                 /* an SMP translator: dbt_init */
