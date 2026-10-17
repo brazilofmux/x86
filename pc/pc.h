@@ -155,6 +155,12 @@ void     pc_apic_init(x86_cpu *c);
 int      pc_apic_present(void);
 void     pc_apic_mp_table(x86_cpu *c);  /* POST: the MultiProcessor Specification tables in the ROM */
 void     pc_apic_dump(FILE *out);         /* -s: the interrupt state at the end */
+/* pc_acpi.c — the least ACPI that names the processors (-acpi) */
+void     pc_acpi_enable(void);
+int      pc_acpi_enabled(void);
+void     pc_acpi_tables(x86_cpu *c);       /* POST: RSDP at F000:F400, RSDT, FADT (empty DSDT, FACS), MADT */
+int      pc_acpi_port_read(uint16_t port, uint32_t *v);   /* the PM1a blocks at B000h */
+int      pc_acpi_port_write(uint16_t port, uint32_t val, int size);
 void     pc_kbd_debug_dump(FILE *out);
 void     pc_apic_poll(x86_cpu *c, uint64_t now); /* its timer, when due */
 uint64_t pc_apic_due(x86_cpu *c);    /* when the timer next fires (UINT64_MAX: never) */

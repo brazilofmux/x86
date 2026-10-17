@@ -160,6 +160,13 @@ if [ -f disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso ]; then
     if python3 tools/expect.py -t 420 tmp/boot-haiku.exp -- $DM -m 586 -mem 257 -vbe -W -T 410 -ro \
          -hda disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso -boot c >/dev/null 2>&1
     then echo "ok   haiku r1/beta6 to its welcome window (vbe, 1024x768)"; else echo "FAIL haiku r1/beta6"; fail=1; fi
+    # ... and on two processors, found through the ACPI tables (-acpi): its
+    # loader rejects every MP table, see tests/boot/README; the kernel runs
+    # on both and routes the disk's interrupt through the I/O APIC to the second
+    printf 'waitpix 60,60 51 102 152\nwaitpix 345,147 255 233 148\n' > tmp/boot-haiku.exp
+    if python3 tools/expect.py -t 420 tmp/boot-haiku.exp -- $DM -m 586 -mem 257 -vbe -smp 2 -acpi -W -T 410 -ro \
+         -hda disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso -boot c >/dev/null 2>&1
+    then echo "ok   haiku r1/beta6 on two processors (acpi, smp)"; else echo "FAIL haiku smp"; fail=1; fi
     rm -f tmp/boot-haiku.exp
 fi
 if [ -f disks/reactos/reactos-installed.img ]; then

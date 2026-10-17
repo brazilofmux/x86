@@ -49,6 +49,7 @@ void pc_smp_wait(x86_cpu *c, uint64_t until_ns) {
     uint64_t ns = until_ns > now ? until_ns - now : 0;
     if (until_ns != UINT64_MAX && ns == 0) return;
     if (ns > 10000000ull) ns = 10000000ull;
+    if (pc.ide_due != UINT64_MAX && ns > 1000000ull) ns = 1000000ull;   /* a disk command in flight: its poll is the bootstrap processor's */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_nsec += (long)(ns % 1000000000ull);

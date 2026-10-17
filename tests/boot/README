@@ -266,6 +266,31 @@ What SMP changed underneath:
 - The 586 CPU test and -V stay single-processor. -smp needs the
   Pentium and the JIT.
 
+Haiku on two processors needs -acpi. Its boot loader tries ACPI's MADT
+first and the MP tables second, and its MP parser compares the
+configuration table's signature against a byte-swapped constant
+('PCMP' where the floating pointer's is written '_PM_' to match
+memory): every specification-conformant table is "invalid config table
+signature", a bug real machines never show because they have ACPI
+(headers/private/kernel/arch/x86/arch_smp.h, still so in master). So
+pc/pc_acpi.c lays the least ACPI at F000:F400: RSDP, RSDT, a FADT with
+an empty DSDT, a FACS and PM1a blocks on a quiet I/O range (B000h),
+and the MADT with the processors, the I/O APIC, the IRQ 0 override and
+the NMI line. Off by default: an installer that sees ACPI picks its
+ACPI HAL and expects the rest (Windows 2000). With it Haiku's kernel
+says "found 2 logical cpus", uses the APIC timer and the I/O APIC, and
+routes the disk's IRQ 14 to the second processor — which found one
+more single-processor assumption: the IDE model's command deadline was
+the bootstrap processor's instruction count, polled by its thread
+alone, so a command from the other processor completed only when the
+first woke from its idle nap, and Haiku's driver had timed out. With
+more than one processor the deadline is a time, any processor's poll
+completes it, and a nap is capped while a command is in flight. The
+welcome window comes at about 70 s; the boot suite checks it. Linux
+reads the same tables ("Using ACPI (MADT) for SMP configuration
+information") and boots as before; its only remarks are about the
+global lock and the buttons the empty DSDT does not provide.
+
 tests/boot/tcroot.sh builds disks/linux/tcroot.img: the same kernel on a
 small FAT16 partition, and Tiny Core's userland unpacked from core.gz onto
 an ext2 partition (mke2fs -d, then debugfs making every inode root's, as

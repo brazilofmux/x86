@@ -568,6 +568,7 @@ static int poll_ap(x86_cpu *c) {
     for (;;) {
         uint64_t now = pc_now_ns();
         pc_apic_poll(c, now);
+        if (pc.ide_due != UINT64_MAX) pc_ide_poll(0);    /* the drive this processor may be waiting for */
         if (pc_smp_take_init(c) || pc.exit_requested || pc_smp_exiting() || (pc.stop_ns && now >= pc.stop_ns)) { c->halted = 1; break; }
         if (pc_apic_pending(c) && (c->eflags & X86_IF) && !c->int_inhibit) {
             int v = pc_apic_take(c);
@@ -851,6 +852,7 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
     if (pc_pci_port_read(port, size, &vv)) return vv;
     if (pc_vga_port_read(port, &vv)) return vv;
     if (pc_cmos_port_read(port, &vv)) return vv;
+    if (pc_acpi_port_read(port, &vv)) return vv;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
         fprintf(stderr, "[port] in %02X → %02X @%llu\n", port, port == 0x60 ? pc.last_scancode : port == 0x61 ? pit_speaker : 0x14, (unsigned long long)c->insn_count);
     switch (port) {
@@ -911,6 +913,7 @@ static void port_write_(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     if (pc_pci_port_write(port, val, size)) return;
     if (pc_vga_port_write(port, val, size)) return;
     if (pc_cmos_port_write(port, val)) return;
+    if (pc_acpi_port_write(port, val, size)) return;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61 || port == 0x20))
         fprintf(stderr, "[port] out %02X ← %02X @%llu\n", port, val & 0xFF, (unsigned long long)c->insn_count);
     switch (port) {
@@ -1128,6 +1131,7 @@ static void post(x86_cpu *cpu) {
     static const uint8_t sysconf[10] = { 8, 0, 0xFC, 0x01, 0x00, 0x70, 0, 0, 0, 0 };
     for (int i = 0; i < 10; i++) pc_wr8(cpu, PC_HLE_SEG, (uint16_t)(PC_SYSCONF_OFF + i), sysconf[i]);
     pc_apic_mp_table(cpu);                       /* the MP floating pointer and configuration table at F000:F000 */
+    pc_acpi_tables(cpu);                         /* -acpi: the RSDP at F000:F400 and its tables */
 
     /* BIOS data area */
     for (int i = 0; i < 0x100; i++) pc_wr8(cpu, PC_BDA_SEG, (uint16_t)i, 0);
@@ -1274,4 +1278,5 @@ void pc_init_ap(x86_cpu *ap) {
     ap->device_read = b->device_read; ap->device_store = b->device_store;
     pc_apic_init(ap);
     pc_apic_mp_table(b);
+    pc_acpi_tables(b);
 }

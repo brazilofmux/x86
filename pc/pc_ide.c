@@ -180,9 +180,20 @@ static void identify(const drive *d, int unit) {
 /* The drive at work: BSY until IDE_BUSY_INSNS instructions from now, then
  * (pc_ide_poll) the next block ready — DRQ — or the command done, with
  * INTRQ either way. */
+static uint64_t due_ns;                          /* SMP: the drive's deadline is a time, not one processor's instruction count */
+#define IDE_BUSY_NS 50000ull
 static void busy(int what) {
     ide.busy = what;
     ide.status = ST_BSY | ST_DSC;
+    if (pc.ncpus > 1) {
+        /* Any processor may have started the command and be waiting for
+         * the drive; every poll asks pc_ide_poll, which keeps the time.
+         * Each processor's run is cut short so that it polls soon. */
+        due_ns = pc_now_ns() + IDE_BUSY_NS;
+        pc.ide_due = 0;
+        for (int i = 0; i < pc.ncpus; i++) pc.cpus[i]->jit_cur_hit = 1;
+        return;
+    }
     pc.ide_due = (pc.cpu ? pc.cpu->insn_count : 0) + IDE_BUSY_INSNS;
     /* The run that started the command (an OUT from translated code) has
      * its budget already: back to the run loop, whose next run stops at
@@ -194,7 +205,7 @@ static void busy(int what) {
 }
 void pc_ide_poll(int now) {
     if (!ide.busy) { pc.ide_due = UINT64_MAX; return; }
-    if (!now && pc.cpu && pc.cpu->insn_count < pc.ide_due) return;
+    if (!now && (pc.ncpus > 1 ? pc_now_ns() < due_ns : pc.cpu && pc.cpu->insn_count < pc.ide_due)) return;
     int what = ide.busy;
     ide.busy = 0;
     pc.ide_due = UINT64_MAX;
