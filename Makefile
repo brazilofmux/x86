@@ -64,7 +64,7 @@ MAIN_O = $(O)/main.o
 all: $(TARGET) $(SST) $(JITTEST)
 
 $(TARGET): $(MAIN_O) $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz $(SDL_LIBS) $(SLIRP_LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz -lm $(SDL_LIBS) $(SLIRP_LIBS)
 
 # The fixed-disk BIOS in real instructions (tools/diskbios.asm), assembled
 # into a header that is checked in: a build needs NASM only after an edit
@@ -89,10 +89,10 @@ $(O)/pc/pc_sdl.o: pc/pc_sdl.c
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -MMD -MP -c -o $@ $<
 
 $(SST): $(O)/tools/sst.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz -lm
 
 $(JITTEST): $(O)/tools/jittest.o $(CORE_OBJS) $(DBT_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
 $(O)/core/softfloat/%.o: core/softfloat/%.c
 	@mkdir -p $(dir $@)
@@ -152,7 +152,7 @@ test-x64enc:
 # undefined: what the x86-64 backend has to fix up (x86-64 hosts only)
 HWFLAGS = $(O)/tools/hwflags
 $(HWFLAGS): $(O)/tools/hwflags.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 test-hwflags: $(HWFLAGS)
 	$(HWFLAGS) -m 386 -n 2000
 
