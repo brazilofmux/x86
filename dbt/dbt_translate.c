@@ -85,6 +85,10 @@ static int classify_sem(const x86_insn *in) {
         return C_INLINE;           /* a backend may test for nothing pending inline, else the helper */
     case OP_CPUID: case OP_CMPXCHG8B:
         return C_HELPER;           /* Pentium */
+    case OP_CMOVCC:
+        return C_INLINE;           /* Pentium Pro: where a backend has it (flat blocks), else the helper */
+    case OP_RDPMC:
+        return C_HELPER;           /* Pentium Pro */
     case OP_IN:
         /* In the block, through the interpreter (the port, and in
          * protected mode IOPL and the TSS bitmap, whose #GP the thunk's
@@ -296,7 +300,7 @@ static void op_flag_effects(const x86_insn *in, int cls, uint32_t *rd, uint32_t 
     case OP_PUSHF: *rd = ARITH; break;
     case OP_WAIT:  *rd = ARITH; break;          /* its slow path may fault (#NM, #MF): the frame holds the flags */
     case OP_POPF:  *wr = ARITH; break;          /* #DE / #GP: an unplanned exit whose frame holds the flags */
-    case OP_SETCC: {
+    case OP_SETCC: case OP_CMOVCC: {
         static const uint16_t need[8] = { X86_OF, X86_CF, X86_ZF, X86_CF | X86_ZF, X86_SF, X86_PF, X86_SF | X86_OF, X86_SF | X86_OF | X86_ZF };
         *rd = need[in->cond >> 1]; break;
     }

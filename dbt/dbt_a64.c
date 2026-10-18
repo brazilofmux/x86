@@ -1074,7 +1074,7 @@ static int writes_mem_operand(const x86_insn *in) {
     case OP_CMP: case OP_TEST: case OP_PUSH: case OP_CALL: case OP_JMP: case OP_CALLF: case OP_JMPF:
     case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS:
     case OP_MOVZX: case OP_MOVSX: case OP_MUL: case OP_IMUL: case OP_DIV: case OP_IDIV:
-    case OP_BT:
+    case OP_BT: case OP_CMOVCC:
         return 0;
     case OP_MOV: case OP_MOVSEG:
         return in->ops[0].kind == OPK_MEM;
@@ -2335,6 +2335,19 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, int cls, uint32
         emit_write_operand(e, in, 0, &ea, W_VAL);
         break;
     }
+    case OP_CMOVCC: {
+        /* Pentium Pro, flat blocks: the source read whatever the
+         * condition (a memory one faults the same), then one CSEL — the
+         * register's own value when the condition fails. CONTRACT
+         * (interp): 16 bits leave the upper half alone. */
+        a64_reg_t s = emit_read_operand(e, in, 1, &ea, W_SRC);
+        a64_reg_t old = emit_read_operand(e, in, 0, &ea, W_VAL);
+        int fused = nz_in.valid && !in->ea_valid ? fuse_cond(in->cond, nz_in.table, nz_in.logical) : -1;
+        a64_cond_t c = fused >= 0 ? (a64_cond_t)fused : emit_test_cond(e, in->cond);
+        emit_csel_w32(e, W_VAL, s, old, c);
+        emit_write_operand(e, in, 0, &ea, W_VAL);
+        break;
+    }
     case OP_MOVSEG:
         if (d->kind == OPK_SREG) {                                   /* MOV DS/ES, r/m16 (classify) */
             a64_reg_t v = emit_read_operand(e, in, 1, &ea, W_VAL);
@@ -2992,6 +3005,8 @@ static int a64_flat_inline(const x86_insn *in, int based, int cpl) {
         return cpl == 0;
     case OP_PUSHF:
         return in->opsize == 4;                  /* never faults outside V86 */
+    case OP_CMOVCC:
+        return 1;
     case OP_POPF:
         return in->opsize == 4 && cpl == 0;      /* every bit but VM is its own there */
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR:

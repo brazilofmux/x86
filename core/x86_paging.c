@@ -195,6 +195,26 @@ void x86_tlb_flush(x86_cpu *c) {
     for (int i = 0; i < X86_PGD_PAGES; i++) c->pgd_r[i] = c->pgd_w[i] = X86_PGD_NONE;
     if (c->tlb_hook) c->tlb_hook(c);
 }
+/* A CR3 load: with CR4.PGE (the Pentium Pro's) the entries a global PTE
+ * or 4 MB PDE made stay — a kernel's own pages, the same in every address
+ * space, no longer refilled after every process switch. The low-page
+ * delta tables are user pages: they go. */
+void x86_tlb_flush_cr3(x86_cpu *c) {
+    if (!(c->cr4 & X86_CR4_PGE)) { x86_tlb_flush(c); return; }
+    for (int i = 0; i < 256; i++) if (!(c->tlb[i].tag & X86_TLB_G)) c->tlb[i].tag = 0;
+    for (int i = 0; i < X86_PGD_PAGES; i++) c->pgd_r[i] = c->pgd_w[i] = X86_PGD_NONE;
+    if (c->tlb_hook) c->tlb_hook(c);
+}
+/* INVLPG: the page's entry, global or not (once the whole TLB: every
+ * later access re-walked, which software could not tell apart — until
+ * global pages, which a whole flush would throw away at every shootdown) */
+void x86_tlb_flush_page(x86_cpu *c, uint32_t lin) {
+    struct x86_tlbe *t = &c->tlb[(lin >> 12) & 255];
+    if (!((t->tag ^ lin) & 0xFFFFF000u)) t->tag = 0;
+    uint32_t page = lin >> 12;
+    if (page < X86_PGD_PAGES) c->pgd_r[page] = c->pgd_w[page] = X86_PGD_NONE;
+    if (c->tlb_hook) c->tlb_hook(c);
+}
 
 /* 486 WP: a read-only page (R/W clear at either level) takes no write
  * through a cached translation, supervisor or not. */
@@ -266,6 +286,7 @@ uint32_t x86_page_walk(x86_cpu *c, uint32_t lin, int write) {
     struct x86_tlbe *t = &c->tlb[(lin >> 12) & 255];
     uint32_t both = pde & pte;
     t->tag = (lin & 0xFFFFF000u) | X86_TLB_V
+           | ((c->cr4 & X86_CR4_PGE) && (pte & 0x100) ? X86_TLB_G : 0)   /* (a 4 MB page's G is its PDE's, in pte here) */
            | ((both & 4) ? X86_TLB_U : 0)
            | ((both & 4) && (both & 2) ? X86_TLB_UW : 0)
            | ((pte & 0x40) && !(wp_ro(c, pde & pte)) ? X86_TLB_D : 0)

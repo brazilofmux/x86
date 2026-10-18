@@ -1230,6 +1230,69 @@ static void arith_st(x86_cpu *c, int op, int dst, fx a, fx b, int pops) {
 
 static void ud(x86_cpu *c) { x86_fault(c, X86_EXC_UD, 0); }
 
+/* ---- Pentium Pro ----------------------------------------------------- */
+
+/* FCOMI / FUCOMI (and the popping FCOMIP, FUCOMIP): ST(0) against ST(i)
+ * into EFLAGS — ZF PF CF 000 greater, 001 less, 100 equal, 111
+ * unordered; OF SF AF cleared, C1 cleared, C0 C2 C3 untouched. The
+ * ordered form raises #IA on any NaN, the unordered one on a signalling
+ * NaN (and both on an unsupported format); unmasked, EFLAGS still read
+ * unordered (the SDM sets them from the comparison before raising it;
+ * Bochs agrees) and nothing pops. A stack underflow (#IS), masked, reads
+ * unordered. */
+static void set_comi(x86_cpu *c, uint32_t zpc) {
+    c->eflags = (c->eflags & ~(uint32_t)(X86_ZF | X86_PF | X86_CF | X86_OF | X86_SF | X86_AF)) | zpc;
+}
+static void fcomi(x86_cpu *c, int i, int quiet, int popit) {
+    if (empty(c, 0) || empty(c, i)) {
+        if (underflow(c)) return;
+        set_comi(c, X86_ZF | X86_PF | X86_CF);
+        if (popit) pop(c);
+        return;
+    }
+    fx a = st(c, 0), b = st(c, i);
+    int ka = klass(a), kb = klass(b);
+    uint16_t ex = 0;
+    set_c1(c, 0);
+    if (ka == K_UNSUP || kb == K_UNSUP || ka == K_SNAN || kb == K_SNAN || (!quiet && (ka == K_QNAN || kb == K_QNAN)))
+        ex |= SW_IE;
+    else if (!is_nan(ka) && !is_nan(kb) && (ka == K_DENORMAL || kb == K_DENORMAL))
+        ex |= SW_DE;
+    flag(c, ex);
+    if (unmasked(c, ex)) { set_comi(c, X86_ZF | X86_PF | X86_CF); return; }
+    uint32_t zpc;
+    if (ka == K_UNSUP || kb == K_UNSUP || is_nan(ka) || is_nan(kb)) zpc = X86_ZF | X86_PF | X86_CF;
+    else {
+        a = canon(a); b = canon(b);
+        uint8_t save = softfloat_exceptionFlags;
+        zpc = extF80_eq(a, b) ? X86_ZF : extF80_lt_quiet(a, b) ? X86_CF : 0;
+        softfloat_exceptionFlags = save;
+    }
+    set_comi(c, zpc);
+    if (popit) pop(c);
+}
+/* FCMOVcc ST(0), ST(i): DA C0-DF B, E, BE, U; DB C0-DF the negations.
+ * Either register empty is a stack underflow (#IS), masked: the QNaN
+ * indefinite into ST(0) whatever the condition. C1 cleared. */
+static void fcmov(x86_cpu *c, int esc, int reg, int i) {
+    if (empty(c, 0) || empty(c, i)) {
+        if (underflow(c)) return;
+        set_st(c, 0, INDEF);
+        return;
+    }
+    uint32_t f = c->eflags;
+    int t;
+    switch (reg) {
+    case 0: t = (f & X86_CF) != 0; break;
+    case 1: t = (f & X86_ZF) != 0; break;
+    case 2: t = (f & (X86_CF | X86_ZF)) != 0; break;
+    default: t = (f & X86_PF) != 0; break;
+    }
+    if (esc == 3) t = !t;
+    set_c1(c, 0);
+    if (t) set_st(c, 0, st(c, i));
+}
+
 void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip) {
     int esc = in->opcode & 7, reg = in->reg, rm = in->rm, mem = in->mod != 3;
     int os32 = in->opsize == 4;
@@ -1309,10 +1372,11 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
             || (esc == 5 && (reg == 1 || reg == 5)) || (esc == 7 && reg == 1))
             ud(c);
     } else {
+        int p6 = c->model >= X86_MODEL_686;                    /* FCMOVcc (DA, DB /0-/3), FUCOMI(P), FCOMI(P) (DB, DF /5 /6) */
         if ((esc == 1 && reg == 2 && rm) || (esc == 1 && reg == 4 && (rm == 2 || rm == 3 || rm == 6 || rm == 7))
-            || (esc == 1 && reg == 5 && rm == 7) || (esc == 2 && !(reg == 5 && rm == 1))
-            || (esc == 3) || (esc == 5 && reg >= 6) || (esc == 6 && reg == 3 && rm != 1)
-            || (esc == 7 && reg >= 5))
+            || (esc == 1 && reg == 5 && rm == 7) || (esc == 2 && !(reg == 5 && rm == 1) && !(p6 && reg < 4))
+            || (esc == 3 && !(p6 && (reg < 4 || reg == 5 || reg == 6))) || (esc == 5 && reg >= 6) || (esc == 6 && reg == 3 && rm != 1)
+            || (esc == 7 && reg >= 5 && !(p6 && reg < 7)))
             ud(c);
     }
 
@@ -1584,7 +1648,12 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
             default: ftrig(c, T_COS); return;
             }
         }
-    case 2:                                        /* DA E9: FUCOMPP */
+    case 3:                                        /* DB (P6): FCMOVNB/NE/NBE/NU, FUCOMI, FCOMI */
+        if (reg < 4) fcmov(c, 3, reg, i);
+        else fcomi(c, i, reg == 5, 0);
+        return;
+    case 2:                                        /* DA E9: FUCOMPP; (P6) FCMOVB/E/BE/U */
+        if (reg < 4) { fcmov(c, 2, reg, i); return; }
         if (empty(c, 0) || empty(c, 1)) {
             if (underflow(c)) return;
             set_cc(c, SW_C0 | SW_C2 | SW_C3); pop(c); pop(c); return;
@@ -1637,6 +1706,7 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
             set_st(c, 0, b); set_st(c, i, a);
             return;
         }
+        case 5: case 6: fcomi(c, i, reg == 5, 1); return;               /* (P6) FUCOMIP, FCOMIP */
         default: goto fstp_i;                                            /* FSTP aliases (DF D0+i, D8+i) */
         }
     }

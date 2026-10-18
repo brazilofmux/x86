@@ -325,9 +325,11 @@ static int fuzz_accept_pm(const x86_insn *in) {
 #define DE_STUB_PM (CODE_PM + 0x1000u)
 #define DATA_PM 0x400000u
 
+static int s_pm_model = X86_MODEL_386;   /* -m 686 with -P/-B: the flat fuzzes as a Pentium Pro (CMOVcc) */
+
 /* A flat 32-bit protected-mode machine: CS/DS/ES/SS base 0, limit 4G. */
 static void pm_flat_setup(x86_cpu *cpu) {
-    x86_init(cpu, X86_MODEL_386);
+    x86_init(cpu, s_pm_model);
     x86_set_a20(cpu, 1);
     cpu->pmode = 1;
     cpu->cr0 |= 1;
@@ -490,7 +492,7 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
         uint8_t tmp[16];
         x86_insn in;
         for (int k = 0; k < 16; k++) tmp[k] = (uint8_t)rnd();
-        x86_dec_ctx c2 = { tmp, X86_MODEL_386, 1 };
+        x86_dec_ctx c2 = { tmp, s_pm_model, 1 };
         if (!x86_decode(&c2, &in) || in.len > 10 || !fuzz_accept_pm(&in)) continue;
         if ((rnd() % 6) == 0) {
             static const uint8_t cc[] = { 0xE0, 0xE1, 0xE2, 0xE3 };
@@ -557,7 +559,7 @@ static int fuzz_one_pm(int len, uint64_t seed, int verbose) {
         uint32_t ip = 0; uint8_t buf[16]; x86_insn in; char d[128];
         while (ip < (uint32_t)plen) {
             memcpy(buf, prog + ip, 16);
-            x86_dec_ctx c3 = { buf, X86_MODEL_386, 1 };
+            x86_dec_ctx c3 = { buf, s_pm_model, 1 };
             if (!x86_decode(&c3, &in)) break;
             fprintf(stderr, "    %06X: %s\n", CODE_PM + ip, x86_disasm(&in, d, sizeof d));
             ip += in.len;
@@ -814,7 +816,8 @@ int main(int argc, char **argv) {
     int model = X86_MODEL_8086, prog = -1, fuzz = 0, len = 20, verify = 1, strict = 0, stats = 0, verbose = 0, pm = 0;
     uint64_t seed = 1;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-m") && i + 1 < argc) { int m = atoi(argv[++i]); model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 386 ? X86_MODEL_386 : X86_MODEL_286; }
+        if (!strcmp(argv[i], "-m") && i + 1 < argc) { int m = atoi(argv[++i]); model = m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 386 ? X86_MODEL_386 : X86_MODEL_286;
+                                                      if (m == 686) { s_pm_model = X86_MODEL_686; model = X86_MODEL_386; } }
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) prog = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) fuzz = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 0);
@@ -828,7 +831,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-X")) s_wild = 1;
         else if (!strcmp(argv[i], "-G")) pm = 2;
         else if (!strcmp(argv[i], "-B")) { pm = 1; s_based = 1; }
-        else { fprintf(stderr, "usage: %s [-m 86|186|286] [-V|-N] [-S] [-s] [-P|-B|-G] [-X] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [-m 86|186|286|686 (with -P, -B)] [-V|-N] [-S] [-s] [-P|-B|-G] [-X] -p N | -f COUNT [-r SEED] [-n LEN]\n", argv[0]); return 2; }
     }
     if (prog >= 0 && pm) return run_pm_prog(prog, stats);
     if (prog >= 0) return run_prog(prog, model, verify, strict, stats);

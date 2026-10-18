@@ -125,7 +125,8 @@ test-jit: $(JITTEST)
 	$(JITTEST) -f 2000 && $(JITTEST) -m 286 -f 2000 && $(JITTEST) -m 386 -f 2000 && \
 	$(JITTEST) -P -f 3000 && $(JITTEST) -P -f 1000 -r 100000 -n 40 && \
 	$(JITTEST) -G -f 3000 && $(JITTEST) -G -f 1000 -r 100000 -n 40 && \
-	$(JITTEST) -B -f 3000 && $(JITTEST) -B -f 1000 -r 100000 -n 40 && $(JITTEST) -B -X -f 1000
+	$(JITTEST) -B -f 3000 && $(JITTEST) -B -f 1000 -r 100000 -n 40 && $(JITTEST) -B -X -f 1000 && \
+	$(JITTEST) -m 686 -P -f 3000 && $(JITTEST) -m 686 -B -f 2000
 
 # DOS-level smoke tests (tests/dos/run.sh; uses disks/tp55 when present)
 test-dos: $(TARGET)
@@ -162,7 +163,9 @@ test-pg: $(TARGET)
 	    python3 pgrun.py c486test.asm --m486 --expect c486test.expected && \
 	    python3 pgrun.py c486test.asm --m486 --expect c486test.expected -- -V && \
 	    python3 pgrun.py c586test.asm --m586 --expect c586test.expected && \
-	    python3 pgrun.py c586test.asm --m586 --expect c586test.expected -- -V
+	    python3 pgrun.py c586test.asm --m586 --expect c586test.expected -- -V && \
+	    python3 pgrun.py c686test.asm --m686 --expect c686test.expected && \
+	    python3 pgrun.py c686test.asm --m686 --expect c686test.expected -- -V
 
 # The x87 against its transcript (tools/pmoracle/fpurun.py): the interpreter,
 # the JIT and -V

@@ -27,12 +27,22 @@ c586test.expected is Bochs's pentium model verbatim (c586test.bochs); QEMU
 differs on two lines, both leniencies of its TCG: a WRMSR to the TSC does
 not change what RDMSR/RDTSC read (T13), and an MSR that does not exist
 reads 0 instead of #GP (T15).
+c686test.expected is Bochs's p2_klamath (c686test.bochs) but for three
+lines: Bochs has no P6 event counters (WRMSR C1h is #GP there, T50, and
+RDPMC reads 0, T51, T54), where the Pentium Pro has PerfCtr0/1 at C1h and
+C2h. QEMU's pentium2 is no reference here: its FCOMI leaves OF, SF and AF
+alone, a CR3 load drops global pages (allowed, not what the parts do),
+RDPMC is #UD and a P5 counter MSR reads 0.
 
 QEMU runs with -cpu 486 (CR0.WP off, as a 386 has none) and exits through
 isa-debug-exit at port F4; dos-monster boots the image with -boot on a
 386 (a 486 with --m486, for c486test.asm) and stops at the same port.
 --m586 (c586test.asm) makes all three a Pentium: QEMU's -cpu pentium,
-Bochs's pentium model (with a bad MSR a #GP, not ignored), and ours. Exit status 0 when the transcripts agree.
+Bochs's pentium model (with a bad MSR a #GP, not ignored), and ours.
+--m686 (c686test.asm) is a Pentium Pro of ours against QEMU's pentium2 and
+Bochs's p2_klamath, the nearest either has (a Pentium II: MMX and SEP
+besides, which the test does not look at). Exit status 0 when the
+transcripts agree.
 """
 import os, subprocess, sys, tempfile
 
@@ -47,7 +57,7 @@ def build(asm):
 def qemu(img, model="386"):
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "e9.txt")
-        subprocess.run(["qemu-system-i386", "-cpu", "pentium" if model == "586" else "486",
+        subprocess.run(["qemu-system-i386", "-cpu", {"586": "pentium", "686": "pentium2"}.get(model, "486"),
                         "-drive", "file=%s,format=raw,if=floppy" % img,
                         "-display", "none", "-no-reboot",
                         "-debugcon", "file:" + out,
@@ -63,6 +73,7 @@ def bochs(img, model="386"):
     import bochscfg
     extra = ["port_e9_hack: enabled=1"]
     if model == "586": extra.append("cpu: model=pentium, ignore_bad_msrs=0")
+    if model == "686": extra.append("cpu: model=p2_klamath, ignore_bad_msrs=0")
     rc = bochscfg.write(os.path.abspath(img), extra)
     name = os.path.splitext(os.path.basename(img))[0]
     lines, on = [], False
@@ -99,12 +110,12 @@ def main():
     if "--" in args:
         i = args.index("--"); extra = args[i + 1:]; args = args[:i]
     only = "--ours-only" in args
-    model = "486" if "--m486" in args else "586" if "--m586" in args else "386"
+    model = "486" if "--m486" in args else "586" if "--m586" in args else "686" if "--m686" in args else "386"
     expect = None
     if "--expect" in args:
         i = args.index("--expect"); expect = args[i + 1]; del args[i:i + 2]
     use_bochs = "--bochs" in args or "--bochs-only" in args
-    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--bochs", "--bochs-only")]
+    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--m686", "--bochs", "--bochs-only")]
     asm = args[0] if args else os.path.join(HERE, "pgtest.asm")
     img = build(asm)
     if "--bochs-only" in sys.argv:

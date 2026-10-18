@@ -15,12 +15,14 @@
 #
 # SOAK_N runs per case (30), SOAK_CASES which ("linux2 linux4 w2k2 w2k4
 # haiku2 haiku4"), SOAK_PAR runs at once (6 / processors, at least 1: the
-# host's performance cores). A failure keeps tmp/soak/CASE-I.log (expect's
+# host's performance cores), SOAK_MODEL the processor (586; 686 for the
+# Pentium Pro). A failure keeps tmp/soak/CASE-I.log (expect's
 # post-mortem and the emulator's stderr) and CASE-I.png (the last screen).
 # Exit 1 if anything failed.
 cd "$(dirname "$0")/../.."
 DM=${DM:-./dos-monster}
 N=${SOAK_N:-30}
+M=${SOAK_MODEL:-586}
 CASES=${SOAK_CASES:-"linux2 linux4 w2k2 w2k4 haiku2 haiku4"}
 OUT=tmp/soak
 rm -rf $OUT; mkdir -p $OUT
@@ -45,15 +47,15 @@ run_one() {
     linux*)
         cp $OUT/tc-soak.img $base.img
         sed "s/@CPUS@/$cpus/" $OUT/linux.exp.in > $base.exp
-        EXPECT_SHOT=$base.png python3 tools/expect.py -t 240 $base.exp -- $DM -m 586 -mem 128 -smp $cpus -W -T 230 \
+        EXPECT_SHOT=$base.png python3 tools/expect.py -t 240 $base.exp -- $DM -m $M -mem 128 -smp $cpus -W -T 230 \
             -hda $base.img -boot c > /dev/null 2> $base.log
         r=$?; rm -f $base.img $base.exp ;;
     w2k*)
-        X86_INTERP_FROM=8042A288 EXPECT_SHOT=$base.png python3 tools/expect.py -t 240 $OUT/w2k.exp -- $DM -m 586 -mem 64 -smp $cpus -W -T 230 -ro \
+        X86_INTERP_FROM=8042A288 EXPECT_SHOT=$base.png python3 tools/expect.py -t 240 $OUT/w2k.exp -- $DM -m $M -mem 64 -smp $cpus -W -T 230 -ro \
             -hda disks/win2k/c-mp.img -hdb disks/win2k/d-mp.img -boot c > /dev/null 2> $base.log
         r=$? ;;
     haiku*)
-        EXPECT_SHOT=$base.png python3 tools/expect.py -t 420 $OUT/haiku.exp -- $DM -m 586 -mem 257 -vbe -smp $cpus -acpi -W -T 410 -ro \
+        EXPECT_SHOT=$base.png python3 tools/expect.py -t 420 $OUT/haiku.exp -- $DM -m $M -mem 257 -vbe -smp $cpus -acpi -W -T 410 -ro \
             -hda disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso -boot c > /dev/null 2> $base.log
         r=$? ;;
     esac

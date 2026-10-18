@@ -492,7 +492,7 @@ static void task_switch(x86_cpu *c, uint16_t nsel, int reason, int has_err, uint
 
     nt.attr = (uint16_t)(nt.attr | 0x02);                    /* busy, as the descriptor now says */
     c->tr = nt;
-    if (c->cr0 & X86_CR0_PG) { c->cr3 = cr3; x86_tlb_flush(c); }
+    if (c->cr0 & X86_CR0_PG) { c->cr3 = cr3; x86_tlb_flush_cr3(c); }
     if (reason == TS_CALL || reason == TS_INT) nfl |= X86_NT;
     c->eflags = x86_flags_fixup(c, nfl);
     c->eip = neip;
@@ -1462,6 +1462,12 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
     case OP_SETCC:
         wr_op(c, in, 0, ea, x86_cond(c->eflags, in->cond));
         break;
+    case OP_CMOVCC:
+        /* Pentium Pro: the source is read whatever the condition (a
+         * memory one can fault when it would not have been moved) */
+        a = rd_op(c, in, 1, ea);
+        if (x86_cond(c->eflags, in->cond)) wr_op(c, in, 0, ea, a);
+        break;
     case OP_LES: case OP_LDS: case OP_LSS: case OP_LFS: case OP_LGS: {
         static const uint8_t which[] = { S_ES, S_DS, S_SS, S_FS, S_GS };
         a = mrd(c, in, in->seg, ea, in->opsize);
@@ -1907,15 +1913,14 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         need_cpl0(c);
         c->cr0 &= ~8u;                          /* CR0.TS */
         break;
-    /* 486: the cache has nothing for INVD or WBINVD to do here, and the
-     * TLB is flushed whole for INVLPG (a superset of the one page: every
-     * later access re-walks, which software cannot tell apart). */
+    /* 486: the cache has nothing for INVD or WBINVD to do here; INVLPG
+     * drops the page's TLB entry (x86_tlb_flush_page). */
     case OP_INVD: case OP_WBINVD:
         need_cpl0(c);
         break;
     case OP_INVLPG:
         need_cpl0(c);
-        x86_tlb_flush(c);
+        x86_tlb_flush_page(c, c->seg[in->seg].base + ea);
         break;
     /* ---- descriptor tables and CR0 -------------------------------- */
     case OP_LGDT: case OP_LIDT: {
@@ -1997,12 +2002,15 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
                 c->cr2 = v;
             } else if (cr == 3) {
                 c->cr3 = v;
-                x86_tlb_flush(c);                   /* the 386 flushes its whole TLB on a CR3 load */
+                x86_tlb_flush_cr3(c);               /* the 386 flushes its whole TLB on a CR3 load; the P6 keeps global pages */
             } else if (cr == 4 && c->model >= X86_MODEL_586) {
-                if (v & ~X86_CR4_P5) x86_fault(c, X86_EXC_GP, 0);   /* reserved, VME and PVI among them */
+                if (v & ~(c->model >= X86_MODEL_686 ? X86_CR4_P6 : X86_CR4_P5)) x86_fault(c, X86_EXC_GP, 0);   /* reserved, VME, PVI and PAE among them */
                 uint32_t was = c->cr4;
                 c->cr4 = v;
-                if ((v ^ was) & X86_CR4_PSE) x86_tlb_flush(c);    /* 4 MB pages come or go */
+                static int cr4_trace = -1;                  /* X86_CR4_TRACE: every CR4 load */
+                if (cr4_trace < 0) cr4_trace = getenv("X86_CR4_TRACE") != NULL;
+                if (cr4_trace) fprintf(stderr, "[cr4] cpu%d %08X -> %08X at %04X:%08X\n", c->cpu_id, was, v, c->seg[S_CS].sel, start_ip);
+                if ((v ^ was) & (X86_CR4_PSE | X86_CR4_PGE)) x86_tlb_flush(c);    /* 4 MB pages come or go; PGE toggled flushes globals too */
             } else {
                 RAISE(X86_EXC_UD);
             }
@@ -2080,14 +2088,19 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         /* GenuineIntel, a P54C. The features are the ones built: FPU (when
          * there is one), DE, PSE, TSC, MSR, MCE, CX8 — not VME. A leaf past
          * the last is undefined on the Pentium; this one answers zeros. */
+        /* The Pentium Pro adds leaf 2, the cache and TLB descriptors: once
+         * (AL 1); 4K ITLB 32, 4M ITLB 2, 4K DTLB 64 (01 02 03); 4M DTLB 8
+         * (04), 8K L1 data and instructions (0A, 06), 256K L2 (42). */
         uint32_t leaf = c->r[R_AX], o[4] = { 0, 0, 0, 0 };   /* EAX EBX ECX EDX */
         if (leaf == 0) {
-            o[0] = 1;
+            o[0] = c->model >= X86_MODEL_686 ? 2 : 1;
             o[1] = 0x756E6547u; o[3] = 0x49656E69u; o[2] = 0x6C65746Eu;   /* "Genu" "ineI" "ntel" */
         } else if (leaf == 1) {
-            o[0] = X86_586_SIGNATURE;
+            o[0] = x86_cpu_signature(c);
             o[1] = (uint32_t)c->cpu_id << 24;           /* the initial APIC ID */
-            o[3] = (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8 | (c->has_apic ? 1u << 9 : 0u);
+            o[3] = x86_cpu_features(c);
+        } else if (leaf == 2 && c->model >= X86_MODEL_686) {
+            o[0] = 0x03020101u; o[3] = 0x06040A42u;
         }
         c->r[R_AX] = o[0]; c->r[R_BX] = o[1]; c->r[R_CX] = o[2]; c->r[R_DX] = o[3];
         break;
@@ -2106,8 +2119,23 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         uint32_t msr = c->r[R_CX];
         uint64_t v = (uint64_t)c->r[R_DX] << 32 | c->r[R_AX];
         int wr = in->op == OP_WRMSR;
+        int p6 = c->model >= X86_MODEL_686;
         switch (msr) {
         case 0x00: case 0x01: v = 0; break;                                      /* P5_MC_ADDR, P5_MC_TYPE */
+        /* The Pentium Pro's: two event counters (PerfCtr0/1, 40 bits) and
+         * their selects; EBL_CR_POWERON (read as a 66 MHz bus, no
+         * write takes); the microcode update trigger (nothing loads);
+         * DebugCtlMSR (no branch tracing: reads 0). Its P5 counters are
+         * gone (#GP below). */
+        case 0x2A: if (!p6) goto bad; if (!wr) v = 0; break;
+        case 0x79: if (!p6 || !wr) goto bad; break;
+        case 0xC1: case 0xC2: if (!p6) goto bad;
+            if (wr) c->msr_p6perf[2 + msr - 0xC1] = v & 0xFFFFFFFFFFull; else v = c->msr_p6perf[2 + msr - 0xC1];
+            break;
+        case 0x186: case 0x187: if (!p6) goto bad;
+            if (wr) c->msr_p6perf[msr - 0x186] = (uint32_t)v; else v = c->msr_p6perf[msr - 0x186];
+            break;
+        case 0x1D9: if (!p6) goto bad; if (!wr) v = 0; break;
         case 0x8B:
             /* The P6's microcode signature (IA32_BIOS_SIGN_ID): no P5
              * register, and a #GP on a P54C. Haiku writes 0, runs CPUID
@@ -2118,15 +2146,26 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             if (!wr) v = 0;
             break;
         case 0x10: if (wr) c->tsc_base = v - x86_tsc_raw(c); else v = x86_tsc(c); break;
-        case 0x11: if (wr) c->msr_perf[0] = v & 0x01FF01FFu; else v = c->msr_perf[0]; break;   /* CESR */
+        case 0x11: if (p6) goto bad; if (wr) c->msr_perf[0] = v & 0x01FF01FFu; else v = c->msr_perf[0]; break;   /* CESR */
         case 0x12: case 0x13:                                                    /* CTR0, CTR1: 40 bits */
+            if (p6) goto bad;
             if (wr) c->msr_perf[msr - 0x11] = v & 0xFFFFFFFFFFull; else v = c->msr_perf[msr - 0x11];
             break;
         default:
             if (c->msr_hook && c->msr_hook(c, msr, wr, &v)) break;   /* the machine's: the APIC base */
+        bad:
             x86_fault(c, X86_EXC_GP, 0);
         }
         if (!wr) { c->r[R_AX] = (uint32_t)v; c->r[R_DX] = (uint32_t)(v >> 32); }
+        break;
+    }
+    case OP_RDPMC: {
+        /* Pentium Pro: counter ECX (0 or 1) into EDX:EAX, 40 bits; CPL 0
+         * only unless CR4.PCE */
+        if (c->pmode && x86_cpl(c) != 0 && !(c->cr4 & X86_CR4_PCE)) x86_fault(c, X86_EXC_GP, 0);
+        if (c->r[R_CX] > 1) x86_fault(c, X86_EXC_GP, 0);
+        uint64_t v = c->msr_p6perf[2 + c->r[R_CX]];
+        c->r[R_AX] = (uint32_t)v; c->r[R_DX] = (uint32_t)(v >> 32) & 0xFF;
         break;
     }
     case OP_CMPXCHG8B: {

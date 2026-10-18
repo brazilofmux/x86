@@ -438,8 +438,8 @@ void pc_apic_mp_table(x86_cpu *c) {
      * the bootstrap one; CPUID leaf 1's signature and feature flags */
     for (int i = 0; i < pc.ncpus; i++) {
         t[n++] = 0; t[n++] = (uint8_t)la[i].id; t[n++] = 0x10; t[n++] = (uint8_t)(i == 0 ? 0x03 : 0x01);
-        n = mp_put32(t, n, X86_586_SIGNATURE);
-        n = mp_put32(t, n, (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8 | 1u << 9);
+        n = mp_put32(t, n, x86_cpu_signature(c));
+        n = mp_put32(t, n, x86_cpu_features(c) | 1u << 9);
         n += 8; entries++;
     }
     /* the buses: PCI as bus 0 when there is one, ISA after it */

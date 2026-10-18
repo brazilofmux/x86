@@ -38,6 +38,19 @@ void x86_store_hook(x86_cpu *c, uint32_t p) {
     if ((b & (X86_BM_CODE | X86_BM_DESC)) && c->smc_hook) c->smc_hook(c, p);
 }
 
+/* CPUID's identity. The Pentium (P54C): FPU when there is one, DE, PSE,
+ * TSC, MSR, MCE, CX8, the APIC when the machine has one — not VME. The
+ * Pentium Pro adds PGE and CMOV (FCMOV and FCOMI with the FPU); not PAE,
+ * MTRR, MCA or SEP (whose Pentium Pro form Linux distrusts anyway). */
+uint32_t x86_cpu_signature(const x86_cpu *c) {
+    return c->model >= X86_MODEL_686 ? X86_686_SIGNATURE : X86_586_SIGNATURE;
+}
+uint32_t x86_cpu_features(const x86_cpu *c) {
+    uint32_t f = (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8 | (c->has_apic ? 1u << 9 : 0u);
+    if (c->model >= X86_MODEL_686) f |= 1u << 13 | 1u << 15;          /* PGE, CMOV */
+    return f;
+}
+
 void x86_free(x86_cpu *c) {
     x86_mem_free(c);
 }
@@ -226,7 +239,8 @@ void x86_reset(x86_cpu *c) {
     c->cr4 = 0;
     c->tsc_base = 0 - x86_tsc_raw(c);              /* the TSC starts again from 0 */
     memset(c->msr_perf, 0, sizeof c->msr_perf);
-    if (c->model >= X86_MODEL_586) c->r[R_DX] = X86_586_SIGNATURE;
+    if (c->model >= X86_MODEL_586) c->r[R_DX] = x86_cpu_signature(c);
+    memset(c->msr_p6perf, 0, sizeof c->msr_p6perf);
     x86_fpu_reset(c);
     c->pg_super = c->pg_probe = 0;
     x86_tlb_flush(c);

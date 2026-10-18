@@ -55,11 +55,16 @@ enum {
     X86_MODEL_386  = 386,
     X86_MODEL_486  = 486,    /* no CPUID: EFLAGS.ID stays 0 */
     X86_MODEL_586  = 586,    /* a P54C Pentium: CPUID, RDTSC, CMPXCHG8B, MSRs, CR4 (PSE, TSD, DE, MCE) */
+    X86_MODEL_686  = 686,    /* a Pentium Pro: CMOVcc, FCMOVcc, FCOMI, RDPMC, global pages (CR4.PGE, PCE) */
 };
 
 /* The Pentium's identity: CPUID 1's EAX, and EDX after reset. Family 5,
  * model 2 (the P54C), stepping 12 (C0). */
 #define X86_586_SIGNATURE 0x0000052Cu
+/* The Pentium Pro's: family 6, model 1, stepping 9 (sA1/sB1) */
+#define X86_686_SIGNATURE 0x00000619u
+uint32_t x86_cpu_signature(const struct x86_cpu *c);   /* CPUID 1's EAX, the reset EDX, the MP table's */
+uint32_t x86_cpu_features(const struct x86_cpu *c);    /* CPUID 1's EDX */
 
 /* Register indexes (encoding order) */
 enum { R_AX, R_CX, R_DX, R_BX, R_SP, R_BP, R_SI, R_DI };
@@ -249,6 +254,7 @@ typedef struct x86_cpu {
     uint32_t cr4;
     uint64_t tsc_base;
     uint64_t msr_perf[3];
+    uint64_t msr_p6perf[4];  /* Pentium Pro: PerfEvtSel0/1 (186h, 187h), PerfCtr0/1 (C1h, C2h) */
     /* Would the machine interrupt the CPU now if IF were set (a request
      * the interrupt controller would pass on)? Asked by STI when it sets
      * IF: translated code takes interrupts only between blocks, and an
@@ -341,6 +347,10 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 #define X86_CR4_PSE 0x00000010u   /* a PDE with PS (bit 7) maps 4 MB */
 #define X86_CR4_MCE 0x00000040u   /* machine checks enabled (none ever happen) */
 #define X86_CR4_P5  (X86_CR4_TSD | X86_CR4_DE | X86_CR4_PSE | X86_CR4_MCE)
+/* Pentium Pro CR4 (no PAE: CPUID does not claim it, and loading it is #GP) */
+#define X86_CR4_PGE 0x00000080u   /* a PTE (or 4 MB PDE) with G (bit 8) stays in the TLB through a CR3 load */
+#define X86_CR4_PCE 0x00000100u   /* RDPMC at any CPL */
+#define X86_CR4_P6  (X86_CR4_P5 | X86_CR4_PGE | X86_CR4_PCE)
 #define X86_TLB_V   0x001u
 #define X86_TLB_U   0x002u
 #define X86_TLB_UW  0x004u
@@ -348,7 +358,10 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 #define X86_TLB_MEM 0x010u                   /* the physical page is plain RAM (not past memory, not the VGA read window): translated code may use it */
 #define X86_TLB_WMEM 0x020u                  /* ...or at least take a pure store there: plain RAM, or the VGA window, where the
                                               * store lands and the code bitmap hands it to the device (as unpaged flat code does) */
+#define X86_TLB_G   0x040u                   /* global (CR4.PGE and the entry's G bit): kept through a CR3 load */
 #define X86_PG_BAD  0xFFFFFFFFu              /* a probe's miss: reads as open bus */
+void x86_tlb_flush_cr3(struct x86_cpu *c);   /* a CR3 load: every entry but the global ones */
+void x86_tlb_flush_page(struct x86_cpu *c, uint32_t lin);   /* INVLPG: the one page, global or not */
 uint32_t x86_page_walk(struct x86_cpu *c, uint32_t lin, int write);
 void     x86_tlb_flush(struct x86_cpu *c);
 uint32_t x86_page_peek(struct x86_cpu *c, uint32_t lin, int user);   /* LIN's physical page, no side effects */

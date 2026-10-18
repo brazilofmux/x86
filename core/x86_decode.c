@@ -146,6 +146,16 @@ static const opdesc map0f[256] = {
     [0x30] = E(OP_WRMSR, F_NONE, F_NONE),    /* Pentium (gated below) */
     [0x31] = E(OP_RDTSC, F_NONE, F_NONE),
     [0x32] = E(OP_RDMSR, F_NONE, F_NONE),
+    [0x33] = E(OP_RDPMC, F_NONE, F_NONE),    /* Pentium Pro (gated below) */
+    /* 0F 40-4F: CMOVcc r, r/m (Pentium Pro, gated below) */
+    [0x40] = E(OP_CMOVCC, F_Gv, F_Ev), [0x41] = E(OP_CMOVCC, F_Gv, F_Ev),
+    [0x42] = E(OP_CMOVCC, F_Gv, F_Ev), [0x43] = E(OP_CMOVCC, F_Gv, F_Ev),
+    [0x44] = E(OP_CMOVCC, F_Gv, F_Ev), [0x45] = E(OP_CMOVCC, F_Gv, F_Ev),
+    [0x46] = E(OP_CMOVCC, F_Gv, F_Ev), [0x47] = E(OP_CMOVCC, F_Gv, F_Ev),
+    [0x48] = E(OP_CMOVCC, F_Gv, F_Ev), [0x49] = E(OP_CMOVCC, F_Gv, F_Ev),
+    [0x4A] = E(OP_CMOVCC, F_Gv, F_Ev), [0x4B] = E(OP_CMOVCC, F_Gv, F_Ev),
+    [0x4C] = E(OP_CMOVCC, F_Gv, F_Ev), [0x4D] = E(OP_CMOVCC, F_Gv, F_Ev),
+    [0x4E] = E(OP_CMOVCC, F_Gv, F_Ev), [0x4F] = E(OP_CMOVCC, F_Gv, F_Ev),
     [0x80] = E(OP_JCC, F_Jv, F_NONE), [0x81] = E(OP_JCC, F_Jv, F_NONE),
     [0x82] = E(OP_JCC, F_Jv, F_NONE), [0x83] = E(OP_JCC, F_Jv, F_NONE),
     [0x84] = E(OP_JCC, F_Jv, F_NONE), [0x85] = E(OP_JCC, F_Jv, F_NONE),
@@ -489,7 +499,7 @@ done_prefix:
     if (in->op == OP_CMPXCHG8B) in->ops[0].size = 8;
 
     /* SETCC / 0F Jcc already have cond; Jcc in the primary map too */
-    if (in->op == OP_SETCC) in->cond = in->opcode2 & 15;
+    if (in->op == OP_SETCC || in->op == OP_CMOVCC) in->cond = in->opcode2 & 15;
 
     /* The 486's additions are #UD on a 386: CMPXCHG, XADD, BSWAP, INVD,
      * WBINVD, INVLPG. CPU-detection code probes exactly these. */
@@ -509,6 +519,8 @@ done_prefix:
         default: break;
         }
     }
+    /* ... and the Pentium Pro's on a Pentium */
+    if (model < X86_MODEL_686 && (in->op == OP_CMOVCC || in->op == OP_RDPMC)) in->op = OP_UD;
     /* The hint NOPs (0F 18-1F) are the Pentium Pro's, #UD on a P54C; our
      * Pentium takes them, as QEMU's Pentium models do: Haiku's kernel,
      * built for "Pentium or better", pads its loops with 0F 1F 00 and
@@ -564,7 +576,7 @@ static const char *op_names[OP__COUNT] = {
     [OP_SLDT]="sldt",[OP_STR]="str",[OP_LLDT]="lldt",[OP_LTR]="ltr",[OP_VERR]="verr",[OP_VERW]="verw",[OP_SMSW]="smsw",[OP_LMSW]="lmsw",
     [OP_MOVCR]="mov",[OP_MOVDR]="mov",[OP_MOVTR]="mov",[OP_INT1]="int1",[OP_SETMO]="setmo",[OP_UD]="(bad)",
     [OP_INVD]="invd",[OP_WBINVD]="wbinvd",[OP_INVLPG]="invlpg",
-    [OP_CPUID]="cpuid",[OP_RDTSC]="rdtsc",[OP_RDMSR]="rdmsr",[OP_WRMSR]="wrmsr",[OP_CMPXCHG8B]="cmpxchg8b",
+    [OP_CPUID]="cpuid",[OP_RDTSC]="rdtsc",[OP_RDMSR]="rdmsr",[OP_WRMSR]="wrmsr",[OP_CMPXCHG8B]="cmpxchg8b",[OP_CMOVCC]="cmov",[OP_RDPMC]="rdpmc",
 };
 static const char *cc_names[16] = { "o","no","b","ae","e","ne","be","a","s","ns","p","np","l","ge","le","g" };
 static const char *r8n[8]  = { "al","cl","dl","bl","ah","ch","dh","bh" };
@@ -605,6 +617,7 @@ char *x86_disasm(const x86_insn *in, char *buf, size_t n) {
     char nmbuf[16];
     if (in->op == OP_JCC) { snprintf(nmbuf, sizeof nmbuf, "j%s", cc_names[in->cond]); nm = nmbuf; }
     if (in->op == OP_SETCC) { snprintf(nmbuf, sizeof nmbuf, "set%s", cc_names[in->cond]); nm = nmbuf; }
+    if (in->op == OP_CMOVCC) { snprintf(nmbuf, sizeof nmbuf, "cmov%s", cc_names[in->cond]); nm = nmbuf; }
     const char *pre = in->rep == 0xF3 ? "rep " : in->rep == 0xF2 ? "repne " : in->lock ? "lock " : "";
     if (in->ops[1].kind && in->op == OP_IMUL3)
         snprintf(buf, n, "%s%s %s, %s, 0x%x", pre, nm, a, b, in->imm2);
