@@ -736,6 +736,33 @@ static int dbt_run_loop(x86_dbt *dbt) {
             bring[cpu->cpu_id][i].sel = cpu->seg[S_CS].sel; bring[cpu->cpu_id][i].lin = cpu->seg[S_CS].base + cpu->eip;
             bring[cpu->cpu_id][i].esp = cpu->r[R_SP]; bring[cpu->cpu_id][i].efl = cpu->eflags;
         }
+        /* X86_BREAK=lin[,lin...]: log each arrival at those linear addresses (never translated there,
+         * so no chained block runs past them): registers, the stack, and what the first two stack
+         * words point to — KiUserExceptionDispatcher's exception record, a system call's arguments */
+        static int nbrk = -1; static uint32_t brk[8]; static unsigned brk_hits[8];
+        if (nbrk < 0) {
+            nbrk = 0;
+            for (const char *e = getenv("X86_BREAK"); e && *e && nbrk < 8; ) { char *end; brk[nbrk++] = (uint32_t)strtoul(e, &end, 16); e = *end ? end + 1 : end; }
+        }
+        int at_brk = 0;
+        for (int i = 0; i < nbrk; i++) if (cpu->seg[S_CS].base + cpu->eip == brk[i]) {
+            at_brk = 1;
+            if (brk_hits[i]++ < 40) {
+                uint32_t w[16], sp = cpu->r[R_SP];
+                for (int k = 0; k < 16; k++) {
+                    uint32_t l = k < 8 ? sp + 4u * (uint32_t)k : 0, pg;
+                    if (k >= 8) {   /* words 8..11: at [esp]; 12..15: at [esp+4] */
+                        l = (k < 12 ? w[0] : w[1]) + 4u * (uint32_t)((k - 8) & 3);
+                    }
+                    pg = (cpu->cr0 & 0x80000000u) ? x86_page_peek(cpu, l, 0) : (l & ~0xFFFu);
+                    w[k] = pg != X86_PG_BAD && pg + (l & 0xFFF) + 4 <= cpu->mem_size ? *(uint32_t *)(cpu->mem + pg + (l & 0xFFF)) : 0xDEADDEADu;
+                }
+                fprintf(stderr, "[brk] %08X cr3 %08X eax %08X ebx %08X ecx %08X edx %08X esi %08X edi %08X esp %08X ebp %08X\n"
+                        "      stack %08X %08X %08X %08X %08X %08X %08X %08X\n      [esp] %08X %08X %08X %08X  [esp+4] %08X %08X %08X %08X\n",
+                        brk[i], cpu->cr3, cpu->r[0], cpu->r[3], cpu->r[1], cpu->r[2], cpu->r[6], cpu->r[7], sp, cpu->r[5],
+                        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+            }
+        }
         uint64_t key = dbt_cpu_key(cpu);
         /* A MOV SS / POP SS / STI helper left interrupts inhibited for
          * one instruction and its block ended (or ran on inline, which
@@ -747,7 +774,7 @@ static int dbt_run_loop(x86_dbt *dbt) {
          * interpreter's; V86 code, paged or not, is translated as
          * real-mode-shaped blocks (KEY_V86). RF lasts one instruction,
          * which the interpreter runs and clears. */
-        int inhibited = cpu->int_inhibit != 0 || (cpu->eflags & X86_RF) || interp_all || cpu->trace_steps > 0 || ((interp_cpus >> cpu->cpu_id) & 1)
+        int inhibited = at_brk || cpu->int_inhibit != 0 || (cpu->eflags & X86_RF) || interp_all || cpu->trace_steps > 0 || ((interp_cpus >> cpu->cpu_id) & 1)
                      || (no_v86_jit && (cpu->eflags & X86_VM))
                      || (dbt_interp_hi && cpu->seg[S_CS].base + cpu->eip - dbt_interp_lo <= dbt_interp_hi - dbt_interp_lo)   /* a range kept for the interpreter */
                      || x86_ac_live(cpu)                  /* 486 #AC: translated code does not check alignment */

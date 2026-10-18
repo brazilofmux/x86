@@ -574,7 +574,46 @@ static void pit_tick(uint64_t now) {
 
 static int poll(x86_cpu *c);
 static int poll_ap(x86_cpu *c);
+/* X86_GPC: where the guest is at each poll (-s prints the top), for a
+ * stall that is not a hang */
+#define GPC_N 8192
+static struct { uint32_t pc; uint8_t cpl; uint64_t n; uint8_t code[48]; uint32_t r[8]; } gpc[GPC_N];
+static uint64_t gpc_halted, gpc_total;
+static void gpc_note(x86_cpu *c) {
+    gpc_total++;
+    if (c->halted) { gpc_halted++; return; }
+    uint32_t pc = c->seg[S_CS].base + c->eip, h = (pc * 2654435761u) >> 19;
+    for (int k = 0; k < GPC_N; k++, h = (h + 1) & (GPC_N - 1))
+        if (gpc[h].n == 0 || gpc[h].pc == pc) {
+            if (gpc[h].n == 0) {                              /* the code around it, once */
+                uint32_t pg = (c->cr0 & 0x80000000u) ? x86_page_peek(c, pc, 0) : (pc & ~0xFFFu);
+                for (int i = 0; i < 48; i++) {
+                    uint32_t l = pc - 32 + (uint32_t)i;
+                    gpc[h].code[i] = pg != X86_PG_BAD && (l & ~0xFFFu) == (pc & ~0xFFFu) && pg + (l & 0xFFF) < c->mem_size ? c->mem[pg + (l & 0xFFF)] : 0xCC;
+                }
+            }
+            for (int i = 0; i < 8; i++) gpc[h].r[i] = c->r[i];
+            gpc[h].pc = pc; gpc[h].cpl = (uint8_t)(c->seg[S_CS].sel & 3); gpc[h].n++; return;
+        }
+}
+void pc_gpc_dump(FILE *out) {
+    if (!gpc_total) return;
+    fprintf(out, "  guest pc at polls: %llu, halted %llu\n", (unsigned long long)gpc_total, (unsigned long long)gpc_halted);
+    for (int t = 0; t < 25; t++) {
+        int best = -1;
+        for (int i = 0; i < GPC_N; i++) if (gpc[i].n && (best < 0 || gpc[i].n > gpc[best].n)) best = i;
+        if (best < 0) break;
+        fprintf(out, "    %08X cpl%d %llu  eax %08X ecx %08X edx %08X ebx %08X esp %08X ebp %08X esi %08X edi %08X\n      ", gpc[best].pc, gpc[best].cpl, (unsigned long long)gpc[best].n,
+                gpc[best].r[0], gpc[best].r[1], gpc[best].r[2], gpc[best].r[3], gpc[best].r[4], gpc[best].r[5], gpc[best].r[6], gpc[best].r[7]);
+        for (int i = 0; i < 48; i++) fprintf(out, i == 32 ? "|%02X" : " %02X", gpc[best].code[i]);
+        fprintf(out, "\n");
+        gpc[best].n = 0;
+    }
+}
 int pc_poll(x86_cpu *c) {
+    static int gpc_on = -1; static double gpc_from; static time_t gpc_t0;
+    if (gpc_on < 0) { gpc_on = getenv("X86_GPC") != NULL; if (gpc_on) { gpc_from = atof(getenv("X86_GPC")); gpc_t0 = time(NULL); } }
+    if (gpc_on && !c->cpu_id && difftime(time(NULL), gpc_t0) >= gpc_from) gpc_note(c);
     if (c->cpu_id) return poll_ap(c);
     pc_lock();
     int r = poll(c);

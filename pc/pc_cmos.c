@@ -170,6 +170,20 @@ static void rtc_seed(void) {
     rtc.alarm[0] = rtc.alarm[1] = rtc.alarm[2] = 0;
 }
 
+static uint64_t reads_by_index[128];
+
+/* -s: where the clock's interrupt stands at the end */
+void pc_rtc_dump(FILE *out) {
+    uint64_t now = pc_now_ns();
+    fprintf(out, "  rtc: A %02X B %02X C %02X, periodic %lld ns, next in %lld us, periodic flag due in %lld us\n",
+            nvram[0x0A], nvram[0x0B], nvram[0x0C], (long long)pf_period_ns(),
+            pc.rtc_next_ns == UINT64_MAX ? -1LL : (long long)((int64_t)(pc.rtc_next_ns - now) / 1000),
+            (long long)((int64_t)(rtc.pf_next_ns - now) / 1000));
+    fprintf(out, "  cmos reads:");
+    for (int i = 0; i < 128; i++) if (reads_by_index[i] > 1000) fprintf(out, " %02X:%llu", i, (unsigned long long)reads_by_index[i]);
+    fprintf(out, "\n");
+}
+
 /* For the BIOS's INT 1Ah: the time and date, binary, year in full */
 void pc_rtc_get(int *h, int *m, int *sec, int *year, int *mon, int *mday) {
     rtc_advance(pc_now_ns());
@@ -294,7 +308,7 @@ static uint8_t cmos_read(uint8_t idx) {
 
 int pc_cmos_port_read(uint16_t port, uint32_t *val) {
     if (port == 0x70) { *val = 0xFF; return 1; }  /* write-only */
-    if (port == 0x71) { *val = cmos_read(index_reg); return 1; }
+    if (port == 0x71) { reads_by_index[index_reg]++; *val = cmos_read(index_reg); return 1; }
     return 0;
 }
 

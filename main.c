@@ -670,11 +670,22 @@ int main(int argc, char **argv) {
                     (unsigned long long)g_apdbt[i].interp_fallback_insns);
         for (int i = 1; i < g_nsmp; i++) { fprintf(stderr, "processor %d (%s): ", i, g_ap[i].halted ? "halted" : "running"); x86_dump(&g_ap[i], stderr); }
         if (pc_apic_present()) pc_apic_dump(stderr);
+        if (pc.booted) { pc_rtc_dump(stderr); pc_gpc_dump(stderr); }
         pc_port_stats(stderr);
         if (g_nsmp > 1) { pc_kbd_debug_dump(stderr); fprintf(stderr, "  TSO: %s, %llu accesses across a 16-byte line done by the fault handler\n", dbt_tso ? "on" : "off", (unsigned long long)dbt_tso_faults); }
         { extern uint64_t pc_vga_stores; if (pc_vga_stores) fprintf(stderr, "  VGA planar stores:      %llu\n", (unsigned long long)pc_vga_stores); }
         pc_svcprof_dump(stderr);
         fprintf(stderr, "final: "); x86_dump(&cpu, stderr);
+    }
+    {   /* X86_MEMDUMP=FILE: guest RAM to FILE, and CR3 (hex) to FILE.cr3, at exit — for walking a guest
+         * kernel's structures offline (tools/ntthreads.py) */
+        const char *md = getenv("X86_MEMDUMP");
+        if (md) {
+            FILE *f = fopen(md, "wb");
+            if (f) { fwrite(cpu.mem, 1, cpu.mem_size, f); fclose(f); }
+            char p2[1024]; snprintf(p2, sizeof p2, "%s.cr3", md);
+            if ((f = fopen(p2, "w"))) { fprintf(f, "%08X\n", cpu.cr3); fclose(f); }
+        }
     }
     if (use_jit) dbt_sample_report(&g_dbt, stderr);
     if (g_golden) dbt_golden_close(&g_dbt, stderr);
