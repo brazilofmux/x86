@@ -34,7 +34,7 @@ ifneq ($(SLIRP_CFLAGS),)
   SLIRP_CFLAGS += -DHAVE_SLIRP
 endif
 
-CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c core/x86_fpu.c
+CORE_SRCS = core/x86_decode.c core/x86_interp.c core/x86_state.c core/x86_mem.c core/x86_paging.c core/x86_fpu.c core/x86_sse.c
 # Berkeley SoftFloat 3e (core/softfloat/README): the x87's arithmetic,
 # built with upstream's options and its own warnings left alone
 SF_SRCS   = $(sort $(wildcard core/softfloat/*.c core/softfloat/8086/*.c))
@@ -104,6 +104,10 @@ $(O)/core/x86_fpu.o: core/x86_fpu.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -isystem core/softfloat/include -isystem core/softfloat/8086 -Icore \
 	    -DSOFTFLOAT_FAST_INT64 -DINLINE_LEVEL=5 -MMD -MP -c -o $@ $<
+$(O)/core/x86_sse.o: core/x86_sse.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -isystem core/softfloat/include -isystem core/softfloat/8086 -Icore \
+	    -DSOFTFLOAT_FAST_INT64 -DINLINE_LEVEL=5 -MMD -MP -c -o $@ $<
 
 $(O)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -167,7 +171,9 @@ test-pg: $(TARGET)
 	    python3 pgrun.py c686test.asm --m686 --expect c686test.expected && \
 	    python3 pgrun.py c686test.asm --m686 --expect c686test.expected -- -V && \
 	    python3 pgrun.py p2test.asm --mp2 --expect p2test.expected && \
-	    python3 pgrun.py p2test.asm --mp2 --expect p2test.expected -- -V
+	    python3 pgrun.py p2test.asm --mp2 --expect p2test.expected -- -V && \
+	    python3 pgrun.py p3test.asm --mp3 --expect p3test.expected && \
+	    python3 pgrun.py p3test.asm --mp3 --expect p3test.expected -- -V
 
 # The x87 against its transcript (tools/pmoracle/fpurun.py): the interpreter,
 # the JIT and -V

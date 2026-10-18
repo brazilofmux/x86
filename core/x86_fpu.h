@@ -33,6 +33,9 @@ typedef struct x86_fpu {
     uint16_t c1_cw;       /* RC and PC then */
     uint16_t c1_ase, c1_bse, c1_rse;
     uint64_t c1_a, c1_b, c1_r;   /* operands, and the rounded result (or stored bits) */
+    /* Pentium III: the SSE state */
+    uint64_t xmm[8][2];   /* XMM0-7, low quadword first */
+    uint32_t mxcsr;       /* 1F80h at reset: everything masked, round to nearest */
 } x86_fpu;
 
 /* CR0 bits the coprocessor interface uses */
@@ -47,6 +50,10 @@ void x86_fpu_reset(struct x86_cpu *c);          /* power-on: CW 0040h, tags all 
 void x86_fpu_finit(struct x86_cpu *c);          /* FNINIT, as the BIOS does at POST */
 void x86_fpu_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea, uint32_t start_ip);
 void x86_mmx_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);   /* Pentium II: OP_MMX */
+void x86_mmx_enter(struct x86_cpu *c);                 /* Pentium III: the x87 to MMX (TOP 0, tags valid), #MF first */
+void x86_fxsave(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);
+void x86_fxrstor(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);
+void x86_sse_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);   /* Pentium III: OP_SSE */
 void x86_fpu_wait(struct x86_cpu *c);           /* WAIT/FWAIT: report a pending unmasked exception */
 void x86_fpu_sync(struct x86_cpu *c);           /* settle an owed C1 (before SW is compared or read from outside) */
 

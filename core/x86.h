@@ -57,6 +57,7 @@ enum {
     X86_MODEL_586  = 586,    /* a P54C Pentium: CPUID, RDTSC, CMPXCHG8B, MSRs, CR4 (PSE, TSD, DE, MCE) */
     X86_MODEL_686  = 686,    /* a Pentium Pro: CMOVcc, FCMOVcc, FCOMI, RDPMC, global pages (CR4.PGE, PCE) */
     X86_MODEL_P2   = 687,    /* a Pentium II (Klamath): MMX, SYSENTER/SYSEXIT (-m p2) */
+    X86_MODEL_P3   = 688,    /* a Pentium III (Katmai): SSE, FXSAVE/FXRSTOR (-m p3) */
 };
 
 /* The Pentium's identity: CPUID 1's EAX, and EDX after reset. Family 5,
@@ -66,6 +67,8 @@ enum {
 #define X86_686_SIGNATURE 0x00000619u
 /* The Pentium II's (Klamath): family 6, model 3, stepping 4 (as Bochs's) */
 #define X86_P2_SIGNATURE  0x00000634u
+/* The Pentium III's (Katmai): family 6, model 7, stepping 3 */
+#define X86_P3_SIGNATURE  0x00000673u
 uint32_t x86_cpu_signature(const struct x86_cpu *c);   /* CPUID 1's EAX, the reset EDX, the MP table's */
 uint32_t x86_cpu_features(const struct x86_cpu *c);    /* CPUID 1's EDX */
 
@@ -355,6 +358,11 @@ void x86_store_hook(struct x86_cpu *c, uint32_t phys);
 #define X86_CR4_PGE 0x00000080u   /* a PTE (or 4 MB PDE) with G (bit 8) stays in the TLB through a CR3 load */
 #define X86_CR4_PCE 0x00000100u   /* RDPMC at any CPL */
 #define X86_CR4_P6  (X86_CR4_P5 | X86_CR4_PGE | X86_CR4_PCE)
+/* Pentium III CR4: the OS saves the SSE state (FXSAVE) and takes #XM */
+#define X86_CR4_OSFXSR     0x00000200u
+#define X86_CR4_OSXMMEXCPT 0x00000400u
+#define X86_CR4_P3  (X86_CR4_P6 | X86_CR4_OSFXSR | X86_CR4_OSXMMEXCPT)
+#define X86_EXC_XM  19                 /* SIMD floating-point exception */
 #define X86_TLB_V   0x001u
 #define X86_TLB_U   0x002u
 #define X86_TLB_UW  0x004u

@@ -89,7 +89,7 @@ static int classify_sem(const x86_insn *in) {
         return C_INLINE;           /* Pentium Pro: where a backend has it (flat blocks), else the helper */
     case OP_RDPMC:
         return C_HELPER;           /* Pentium Pro */
-    case OP_MMX:
+    case OP_MMX: case OP_SSE:
         return C_HELPER;           /* Pentium II: the interpreter's, #UD, #NM, #MF and #PF through the thunk */
     case OP_IN:
         /* In the block, through the interpreter (the port, and in

@@ -40,6 +40,16 @@ MTRR, MCA and PSE-36, which ours does not have and does not claim. QEMU
 agrees on every MMX result; besides its later CPUID, its MMX write leaves
 the exponent field alone (T72) and a pending x87 exception does not stop
 an MMX instruction with #MF (T82).
+p3test.asm (from p3gen.py) is the Pentium III's SSE: --mp3 runs ours as
+-m p3 against QEMU's pentium3 or Bochs's p3_katmai. p3test.expected is
+Bochs's (p3test.bochs) but for 17 lines: CPUID's feature word (T02: Bochs
+also claims PAT, PSE-36, PSN, VME, PAE, MTRR, MCA), and RCPPS/RCPSS/
+RSQRTPS/RSQRTSS (X00E0-X00FB): Bochs reproduces Intel's approximation
+tables (RCPPS 1.0 = 3F7FF000), ours is the exact value with its low 12
+bits cleared — both inside the architecture's 1.5 x 2^-12, which no mask
+can make agree across a power of two. QEMU is no reference for SSE: two
+NaNs propagate the second, an unmasked exception does not trap, SSE2's
+prefixes run on a Pentium III, and FXSAVE skips MXCSR without OSFXSR.
 
 QEMU runs with -cpu 486 (CR0.WP off, as a 386 has none) and exits through
 isa-debug-exit at port F4; dos-monster boots the image with -boot on a
@@ -64,7 +74,7 @@ def build(asm):
 def qemu(img, model="386"):
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "e9.txt")
-        subprocess.run(["qemu-system-i386", "-cpu", {"586": "pentium", "686": "pentium2", "p2": "pentium2"}.get(model, "486"),
+        subprocess.run(["qemu-system-i386", "-cpu", {"586": "pentium", "686": "pentium2", "p2": "pentium2", "p3": "pentium3"}.get(model, "486"),
                         "-drive", "file=%s,format=raw,if=floppy" % img,
                         "-display", "none", "-no-reboot",
                         "-debugcon", "file:" + out,
@@ -81,6 +91,7 @@ def bochs(img, model="386"):
     extra = ["port_e9_hack: enabled=1"]
     if model == "586": extra.append("cpu: model=pentium, ignore_bad_msrs=0")
     if model in ("686", "p2"): extra.append("cpu: model=p2_klamath, ignore_bad_msrs=0")
+    if model == "p3": extra.append("cpu: model=p3_katmai, ignore_bad_msrs=0")
     rc = bochscfg.write(os.path.abspath(img), extra)
     name = os.path.splitext(os.path.basename(img))[0]
     lines, on = [], False
@@ -117,12 +128,12 @@ def main():
     if "--" in args:
         i = args.index("--"); extra = args[i + 1:]; args = args[:i]
     only = "--ours-only" in args
-    model = "486" if "--m486" in args else "586" if "--m586" in args else "686" if "--m686" in args else "p2" if "--mp2" in args else "386"
+    model = "486" if "--m486" in args else "586" if "--m586" in args else "686" if "--m686" in args else "p2" if "--mp2" in args else "p3" if "--mp3" in args else "386"
     expect = None
     if "--expect" in args:
         i = args.index("--expect"); expect = args[i + 1]; del args[i:i + 2]
     use_bochs = "--bochs" in args or "--bochs-only" in args
-    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--m686", "--mp2", "--bochs", "--bochs-only")]
+    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--m686", "--mp2", "--mp3", "--bochs", "--bochs-only")]
     asm = args[0] if args else os.path.join(HERE, "pgtest.asm")
     img = build(asm)
     if "--bochs-only" in sys.argv:

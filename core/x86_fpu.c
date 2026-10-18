@@ -1072,6 +1072,7 @@ void x86_fpu_finit(x86_cpu *c) { finit(c); }
 void x86_fpu_reset(x86_cpu *c) {
     memset(&F, 0, sizeof F);
     F.cw = 0x0040;                           /* the 387 and 486 at RESET; the BIOS's FNINIT makes it 037F */
+    F.mxcsr = 0x1F80;
 }
 
 static int real_fmt(const x86_cpu *c) { return !c->pmode || (c->eflags & X86_VM); }
@@ -1788,6 +1789,35 @@ void x86_mmx_exec(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     case 0x7F:                                                         /* MOVQ mm/m64, mm */
         if (mem) wr_n(c, in, ea, 8, 8, a); else set_mm(c, in->rm, a);
         return;
+    /* ---- the Pentium III's (SSE's integer instructions on MMX registers) */
+    case 0xC5:                                                         /* PEXTRW r32, mm, Ib */
+        if (mem) ud(c);
+        c->r[d] = (uint32_t)lane_u(mm(c, in->rm), in->ops[1].imm & 3, 16);
+        return;
+    case 0xD7: {                                                       /* PMOVMSKB r32, mm */
+        if (mem) ud(c);
+        uint64_t v = mm(c, in->rm); uint32_t m = 0;
+        for (int i = 0; i < 8; i++) m |= (uint32_t)((v >> (8 * i + 7)) & 1) << i;
+        c->r[d] = m;
+        return;
+    }
+    case 0xC4: {                                                       /* PINSRW mm, r32/m16, Ib */
+        uint64_t w = mem ? rd_n(c, in, ea, 2, 2) : (c->r[in->rm] & 0xFFFF);
+        set_mm(c, d, put(a, in->ops[1].imm & 3, 16, w));
+        return;
+    }
+    case 0xE7:                                                         /* MOVNTQ m64, mm */
+        if (!mem) ud(c);
+        wr_n(c, in, ea, 8, 8, a);
+        return;
+    case 0xF7: {                                                       /* MASKMOVQ mm, mm: the bytes the mask's sign bits pick, to [EDI] */
+        if (mem) ud(c);
+        uint64_t mk_ = mm(c, in->rm);
+        uint32_t di = in->adsize == 4 ? c->r[R_DI] : (c->r[R_DI] & 0xFFFF);
+        for (int i = 0; i < 8; i++)
+            if ((mk_ >> (8 * i + 7)) & 1) { uint8_t byte = (uint8_t)(a >> (8 * i)); x86_fpu_mwr(c, in, di + (uint32_t)i, 1, 1, &byte); }
+        return;
+    }
     case 0x71: case 0x72: case 0x73: {                                 /* the shifts by Ib */
         if (mem) ud(c);
         int bits = op == 0x71 ? 16 : op == 0x72 ? 32 : 64, kind;
@@ -1807,6 +1837,35 @@ void x86_mmx_exec(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     else b = mm(c, in->rm);
     switch (op) {
     case 0x6F: r = b; break;                                           /* MOVQ mm, mm/m64 */
+    case 0x70:                                                         /* PSHUFW mm, mm/m64, Ib */
+        for (int i = 0; i < 4; i++) r = put(r, i, 16, lane_u(b, (in->ops[1].imm >> (2 * i)) & 3, 16));
+        break;
+    case 0xDA: case 0xDE:                                              /* PMINUB, PMAXUB */
+        for (int i = 0; i < 8; i++) {
+            uint64_t x = lane_u(a, i, 8), y = lane_u(b, i, 8);
+            r = put(r, i, 8, (op == 0xDA) == (x < y) ? x : y);
+        }
+        break;
+    case 0xEA: case 0xEE:                                              /* PMINSW, PMAXSW */
+        for (int i = 0; i < 4; i++) {
+            int64_t x = lane_s(a, i, 16), y = lane_s(b, i, 16);
+            r = put(r, i, 16, (uint64_t)((op == 0xEA) == (x < y) ? x : y));
+        }
+        break;
+    case 0xE0: case 0xE3: {                                            /* PAVGB, PAVGW: rounded up */
+        int bits = op == 0xE0 ? 8 : 16;
+        for (int i = 0; i < 64 / bits; i++) r = put(r, i, bits, (lane_u(a, i, bits) + lane_u(b, i, bits) + 1) >> 1);
+        break;
+    }
+    case 0xE4:                                                         /* PMULHUW */
+        for (int i = 0; i < 4; i++) r = put(r, i, 16, (lane_u(a, i, 16) * lane_u(b, i, 16)) >> 16);
+        break;
+    case 0xF6: {                                                       /* PSADBW: the sum into the low word */
+        uint64_t s = 0;
+        for (int i = 0; i < 8; i++) { int64_t x = (int64_t)lane_u(a, i, 8) - (int64_t)lane_u(b, i, 8); s += (uint64_t)(x < 0 ? -x : x); }
+        r = s;
+        break;
+    }
     case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: { /* PUNPCKL/H BW WD DQ */
         int bits = 8 << ((op & 3) == 0 ? 0 : (op & 3) == 1 ? 1 : 2), hi = op >= 0x68, n = 32 / bits;
         for (int i = 0; i < n; i++) {
@@ -1873,4 +1932,86 @@ void x86_mmx_exec(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     default: ud(c); return;
     }
     set_mm(c, d, r);
+}
+
+/* ---- FXSAVE / FXRSTOR, the MMX transition (Pentium III) ------------- */
+
+/* What an MMX instruction does to the x87 before it runs, for the SSE
+ * instructions that use MMX registers (CVTPI2PS, CVTPS2PI, CVTTPS2PI). */
+void x86_mmx_enter(x86_cpu *c) {
+    pending(c);
+    F.empty = 0;
+    set_top(c, 0);
+}
+
+/* The 512-byte image, 16-aligned (#GP otherwise): FCW, FSW, the abridged
+ * tag byte (1: not empty, per physical register), FOP, FIP, FCS, FDP,
+ * FDS, MXCSR, MXCSR_MASK, ST(0)-ST(7) at 32 (16 bytes each, stack
+ * order), XMM0-7 at 160. With CR4.OSFXSR clear XMM0-7 are neither saved
+ * nor restored (MXCSR still is: Bochs's Katmai). Bytes 288-511 are not
+ * touched. FXSAVE does not
+ * reinitialise the x87, unlike FSAVE. */
+#define FX_MXCSR_MASK 0x0000FFBFu       /* MXCSR's writable bits: no DAZ on a Pentium III */
+static int fx_aligned(x86_cpu *c, const x86_insn *in, uint32_t ea) {
+    return ((c->seg[in->seg].base + ea) & 15) == 0;
+}
+void x86_fxsave(x86_cpu *c, const x86_insn *in, uint32_t ea) {
+    if (!fx_aligned(c, in, ea)) x86_fault(c, X86_EXC_GP, 0);
+    x86_fpu_sync(c);
+    uint8_t b[288];
+    memset(b, 0, sizeof b);
+    int sse = (c->cr4 & X86_CR4_OSFXSR) != 0;
+    put16(b, F.cw); put16(b + 2, F.sw);
+    b[4] = (uint8_t)~F.empty;
+    put16(b + 6, (uint16_t)(F.fop & 0x7FF));
+    put32(b + 8, F.fip); put16(b + 12, F.fcs);
+    put32(b + 16, F.fdp); put16(b + 20, F.fds);
+    put32(b + 24, F.mxcsr); put32(b + 28, FX_MXCSR_MASK);
+    for (int i = 0; i < 8; i++) {
+        int p = phys(c, i);
+        uint64_t s = F.sig[p];
+        for (int j = 0; j < 8; j++) b[32 + 16 * i + j] = (uint8_t)(s >> (8 * j));
+        put16(b + 32 + 16 * i + 8, F.sexp[p]);
+    }
+    int n = 160;
+    if (sse) {
+        for (int i = 0; i < 8; i++)
+            for (int j = 0; j < 16; j++) b[160 + 16 * i + j] = (uint8_t)(F.xmm[i][j >> 3] >> (8 * (j & 7)));
+        n = 288;
+    }
+    if (c->cr0 & X86_CR0_PG) {                                     /* both pages writable before a byte lands */
+        uint32_t lo = c->seg[in->seg].base + ea, hi = lo + (uint32_t)n - 1;
+        (void)x86_lin(c, lo, 1);
+        if ((lo ^ hi) & 0xFFFFF000u) (void)x86_lin(c, hi & 0xFFFFF000u, 1);
+    }
+    x86_fpu_mwr(c, in, ea, n, 16, b);
+}
+void x86_fxrstor(x86_cpu *c, const x86_insn *in, uint32_t ea) {
+    if (!fx_aligned(c, in, ea)) x86_fault(c, X86_EXC_GP, 0);
+    int sse = (c->cr4 & X86_CR4_OSFXSR) != 0;
+    uint8_t b[288];
+    x86_fpu_mrd(c, in, ea, sse ? 288 : 160, 16, b);
+    if (get32(b + 24) & ~FX_MXCSR_MASK) x86_fault(c, X86_EXC_GP, 0);
+    F.cw = get16(b); F.sw = get16(b + 2);
+    F.empty = (uint8_t)~b[4];
+    F.fop = (uint16_t)(get16(b + 6) & 0x7FF);
+    F.fip = get32(b + 8); F.fcs = get16(b + 12);
+    F.fdp = get32(b + 16); F.fds = get16(b + 20);
+    F.c1_kind = 0;
+    for (int i = 0; i < 8; i++) {
+        int p = phys(c, i);
+        uint64_t s = 0;
+        for (int j = 7; j >= 0; j--) s = (s << 8) | b[32 + 16 * i + j];
+        F.sig[p] = s; F.sexp[p] = get16(b + 32 + 16 * i + 8);
+    }
+    F.mxcsr = get32(b + 24);
+    if (sse) {
+        for (int i = 0; i < 8; i++)
+            for (int k = 0; k < 2; k++) {
+                uint64_t v = 0;
+                for (int j = 7; j >= 0; j--) v = (v << 8) | b[160 + 16 * i + 8 * k + j];
+                F.xmm[i][k] = v;
+            }
+    }
+    es_update(c);
 }

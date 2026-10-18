@@ -55,6 +55,15 @@ typedef struct { uint8_t op, d, s, grp; } opdesc;
 #define G(grp, d, s)     { OP_UD, d, s, grp }
 #define X()              { OP_UD, F_NONE, F_NONE, G_NONE }
 
+/* MMX opcodes the Pentium III added (SSE's integer instructions) */
+int x86_mmx_is_p3(uint8_t op2) {
+    switch (op2) {
+    case 0x70: case 0xC4: case 0xC5: case 0xD7: case 0xDA: case 0xDE: case 0xE0: case 0xE3: case 0xE4:
+    case 0xE7: case 0xEA: case 0xEE: case 0xF6: case 0xF7: return 1;
+    default: return 0;
+    }
+}
+
 static const opdesc primary[256] = {
     /* 00 */ E(OP_ADD, F_Eb, F_Gb), E(OP_ADD, F_Ev, F_Gv), E(OP_ADD, F_Gb, F_Eb), E(OP_ADD, F_Gv, F_Ev),
              E(OP_ADD, F_AL, F_Ib), E(OP_ADD, F_eAX, F_Iv), E(OP_PUSH, F_Sop, F_NONE), E(OP_POP, F_Sop, F_NONE),
@@ -167,6 +176,25 @@ static const opdesc map0f[256] = {
     [0xFC] = E(OP_MMX, F_Ed, F_NONE), [0xFD] = E(OP_MMX, F_Ed, F_NONE), [0xFE] = E(OP_MMX, F_Ed, F_NONE),
     [0x71] = E(OP_MMX, F_Ed, F_Ib), [0x72] = E(OP_MMX, F_Ed, F_Ib), [0x73] = E(OP_MMX, F_Ed, F_Ib),
     [0x77] = E(OP_MMX, F_NONE, F_NONE), [0x34] = E(OP_SYSENTER, F_NONE, F_NONE), [0x35] = E(OP_SYSEXIT, F_NONE, F_NONE),
+    /* SSE and its MMX additions (Pentium III, gated below): the prefix
+     * (none, F3; 66 and F2 are SSE2's) picks the instruction */
+    [0x10] = E(OP_SSE, F_Ed, F_NONE), [0x11] = E(OP_SSE, F_Ed, F_NONE), [0x12] = E(OP_SSE, F_Ed, F_NONE),
+    [0x13] = E(OP_SSE, F_Ed, F_NONE), [0x14] = E(OP_SSE, F_Ed, F_NONE), [0x15] = E(OP_SSE, F_Ed, F_NONE),
+    [0x16] = E(OP_SSE, F_Ed, F_NONE), [0x17] = E(OP_SSE, F_Ed, F_NONE), [0x28] = E(OP_SSE, F_Ed, F_NONE),
+    [0x29] = E(OP_SSE, F_Ed, F_NONE), [0x2A] = E(OP_SSE, F_Ed, F_NONE), [0x2B] = E(OP_SSE, F_Ed, F_NONE),
+    [0x2C] = E(OP_SSE, F_Ed, F_NONE), [0x2D] = E(OP_SSE, F_Ed, F_NONE), [0x2E] = E(OP_SSE, F_Ed, F_NONE),
+    [0x2F] = E(OP_SSE, F_Ed, F_NONE), [0x50] = E(OP_SSE, F_Ed, F_NONE), [0x51] = E(OP_SSE, F_Ed, F_NONE),
+    [0x52] = E(OP_SSE, F_Ed, F_NONE), [0x53] = E(OP_SSE, F_Ed, F_NONE), [0x54] = E(OP_SSE, F_Ed, F_NONE),
+    [0x55] = E(OP_SSE, F_Ed, F_NONE), [0x56] = E(OP_SSE, F_Ed, F_NONE), [0x57] = E(OP_SSE, F_Ed, F_NONE),
+    [0x58] = E(OP_SSE, F_Ed, F_NONE), [0x59] = E(OP_SSE, F_Ed, F_NONE), [0x5A] = E(OP_SSE, F_Ed, F_NONE),
+    [0x5B] = E(OP_SSE, F_Ed, F_NONE), [0x5C] = E(OP_SSE, F_Ed, F_NONE), [0x5D] = E(OP_SSE, F_Ed, F_NONE),
+    [0x5E] = E(OP_SSE, F_Ed, F_NONE), [0x5F] = E(OP_SSE, F_Ed, F_NONE), [0xAE] = E(OP_SSE, F_Ed, F_NONE),
+    [0xC2] = E(OP_SSE, F_Ed, F_Ib), [0xC6] = E(OP_SSE, F_Ed, F_Ib), [0xD7] = E(OP_MMX, F_Ed, F_NONE),
+    [0xDA] = E(OP_MMX, F_Ed, F_NONE), [0xDE] = E(OP_MMX, F_Ed, F_NONE), [0xE0] = E(OP_MMX, F_Ed, F_NONE),
+    [0xE3] = E(OP_MMX, F_Ed, F_NONE), [0xE4] = E(OP_MMX, F_Ed, F_NONE), [0xE7] = E(OP_MMX, F_Ed, F_NONE),
+    [0xEA] = E(OP_MMX, F_Ed, F_NONE), [0xEE] = E(OP_MMX, F_Ed, F_NONE), [0xF6] = E(OP_MMX, F_Ed, F_NONE),
+    [0xF7] = E(OP_MMX, F_Ed, F_NONE), [0x70] = E(OP_MMX, F_Ed, F_Ib), [0xC4] = E(OP_MMX, F_Ed, F_Ib),
+    [0xC5] = E(OP_MMX, F_Ed, F_Ib),
     /* 0F 40-4F: CMOVcc r, r/m (Pentium Pro, gated below) */
     [0x40] = E(OP_CMOVCC, F_Gv, F_Ev), [0x41] = E(OP_CMOVCC, F_Gv, F_Ev),
     [0x42] = E(OP_CMOVCC, F_Gv, F_Ev), [0x43] = E(OP_CMOVCC, F_Gv, F_Ev),
@@ -407,7 +435,7 @@ int x86_decode(const x86_dec_ctx *ctx, x86_insn *in) {
         case 0x3E: in->seg_override = in->seg = S_DS; break;
         case 0x64: if (model < X86_MODEL_386) goto done_prefix; in->seg_override = in->seg = S_FS; break;
         case 0x65: if (model < X86_MODEL_386) goto done_prefix; in->seg_override = in->seg = S_GS; break;
-        case 0x66: if (model < X86_MODEL_386) goto done_prefix; op32 = !ctx->def32; break;
+        case 0x66: if (model < X86_MODEL_386) goto done_prefix; op32 = !ctx->def32; in->p66 = 1; break;
         case 0x67: if (model < X86_MODEL_386) goto done_prefix; ad32 = !ctx->def32; break;
         case 0xF0: in->lock = 1; break;
         case 0xF1: if (model > X86_MODEL_8086) goto done_prefix; in->lock = 1; break; /* 8086: LOCK alias */
@@ -544,8 +572,11 @@ done_prefix:
     /* ... and the Pentium II's. An MMX memory operand is a quadword, but
      * for MOVD's doubleword and the low unpacks' (60-62: m32). */
     if (model < X86_MODEL_P2 && (in->op == OP_MMX || in->op == OP_SYSENTER || in->op == OP_SYSEXIT)) in->op = OP_UD;
+    /* ... and the Pentium III's: SSE, and MMX's new instructions */
+    if (model < X86_MODEL_P3 && (in->op == OP_SSE || (in->op == OP_MMX && x86_mmx_is_p3(in->opcode2)))) in->op = OP_UD;
     if (in->op == OP_MMX && in->ops[0].kind == OPK_MEM)
-        in->ops[0].size = (in->opcode2 == 0x6E || in->opcode2 == 0x7E || in->opcode2 <= 0x62) ? 4 : 8;
+        in->ops[0].size = in->opcode2 == 0xC4 ? 2 : (in->opcode2 == 0x6E || in->opcode2 == 0x7E || in->opcode2 <= 0x62) ? 4 : 8;
+    if (in->op == OP_SSE && in->ops[0].kind == OPK_MEM) in->ops[0].size = 16;   /* (x86_sse_exec knows each one's) */
     /* The hint NOPs (0F 18-1F) are the Pentium Pro's, #UD on a P54C; our
      * Pentium takes them, as QEMU's Pentium models do: Haiku's kernel,
      * built for "Pentium or better", pads its loops with 0F 1F 00 and
@@ -601,7 +632,7 @@ static const char *op_names[OP__COUNT] = {
     [OP_SLDT]="sldt",[OP_STR]="str",[OP_LLDT]="lldt",[OP_LTR]="ltr",[OP_VERR]="verr",[OP_VERW]="verw",[OP_SMSW]="smsw",[OP_LMSW]="lmsw",
     [OP_MOVCR]="mov",[OP_MOVDR]="mov",[OP_MOVTR]="mov",[OP_INT1]="int1",[OP_SETMO]="setmo",[OP_UD]="(bad)",
     [OP_INVD]="invd",[OP_WBINVD]="wbinvd",[OP_INVLPG]="invlpg",
-    [OP_CPUID]="cpuid",[OP_RDTSC]="rdtsc",[OP_RDMSR]="rdmsr",[OP_WRMSR]="wrmsr",[OP_CMPXCHG8B]="cmpxchg8b",[OP_CMOVCC]="cmov",[OP_RDPMC]="rdpmc",[OP_MMX]="mmx",[OP_SYSENTER]="sysenter",[OP_SYSEXIT]="sysexit",
+    [OP_CPUID]="cpuid",[OP_RDTSC]="rdtsc",[OP_RDMSR]="rdmsr",[OP_WRMSR]="wrmsr",[OP_CMPXCHG8B]="cmpxchg8b",[OP_CMOVCC]="cmov",[OP_RDPMC]="rdpmc",[OP_MMX]="mmx",[OP_SYSENTER]="sysenter",[OP_SYSEXIT]="sysexit",[OP_SSE]="sse",
 };
 static const char *cc_names[16] = { "o","no","b","ae","e","ne","be","a","s","ns","p","np","l","ge","le","g" };
 static const char *r8n[8]  = { "al","cl","dl","bl","ah","ch","dh","bh" };

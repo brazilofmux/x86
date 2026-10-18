@@ -50,6 +50,7 @@ enum x86_op {
     OP_CPUID, OP_RDTSC, OP_RDMSR, OP_WRMSR, OP_CMPXCHG8B,   /* Pentium */
     OP_CMOVCC, OP_RDPMC,                                    /* Pentium Pro (FCMOVcc, FCOMI: OP_ESC) */
     OP_MMX, OP_SYSENTER, OP_SYSEXIT,                        /* Pentium II (OP_MMX: x86_mmx_exec by opcode2) */
+    OP_SSE,                                                 /* Pentium III (x86_sse_exec by opcode2 and prefix) */
     OP__COUNT
 };
 
@@ -96,6 +97,7 @@ typedef struct x86_insn {
     uint8_t  seg_override; /* S_NONE if no override prefix */
     uint8_t  rep;        /* 0, 0xF3 (REP/REPE), 0xF2 (REPNE) */
     uint8_t  lock;
+    uint8_t  p66;        /* a 66 prefix was there (SSE: F2/F3, then 66, select the instruction) */
 
     /* Effective address: base + index*scale + disp. base/index are
      * register indexes or -1. Real mode SP/BP defaults to SS, else DS. */
@@ -141,5 +143,7 @@ static inline int x86_cond(uint32_t f, int cc) {
     }
     return r ^ (cc & 1);
 }
+
+int x86_mmx_is_p3(uint8_t opcode2);   /* an MMX opcode the Pentium III added */
 
 #endif /* X86_DECODE_H */

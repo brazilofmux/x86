@@ -1904,6 +1904,10 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         if (c->cr0 & X86_CR0_TS) RAISE(X86_EXC_NM);
         x86_mmx_exec(c, in, ea);
         break;
+    case OP_SSE:
+        /* Pentium III: its own #UD/#NM rules, which FXSAVE's and SFENCE's differ from */
+        x86_sse_exec(c, in, ea);
+        break;
     case OP_SYSENTER: case OP_SYSEXIT: {
         /* Pentium II: to CPL 0 at SYSENTER_EIP with SYSENTER_ESP, or back
          * to CPL 3 at EDX with ECX, through flat segments the MSR's
@@ -2035,7 +2039,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
                 c->cr3 = v;
                 x86_tlb_flush_cr3(c);               /* the 386 flushes its whole TLB on a CR3 load; the P6 keeps global pages */
             } else if (cr == 4 && c->model >= X86_MODEL_586) {
-                if (v & ~(c->model >= X86_MODEL_686 ? X86_CR4_P6 : X86_CR4_P5)) x86_fault(c, X86_EXC_GP, 0);   /* reserved, VME, PVI and PAE among them */
+                if (v & ~(c->model >= X86_MODEL_P3 ? X86_CR4_P3 : c->model >= X86_MODEL_686 ? X86_CR4_P6 : X86_CR4_P5)) x86_fault(c, X86_EXC_GP, 0);   /* reserved, VME, PVI and PAE among them */
                 uint32_t was = c->cr4;
                 c->cr4 = v;
                 static int cr4_trace = -1;                  /* X86_CR4_TRACE: every CR4 load */
@@ -2132,7 +2136,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             o[3] = x86_cpu_features(c);
         } else if (leaf == 2 && c->model >= X86_MODEL_686) {
             o[0] = 0x03020101u;
-            o[3] = c->model >= X86_MODEL_P2 ? 0x0C040843u : 0x06040A42u;   /* the Pentium II: 16K L1s (0C, 08), 512K L2 (43) */
+            o[3] = c->model >= X86_MODEL_P2 ? 0x0C040843u : 0x06040A42u;   /* the Pentium II and III: 16K L1s (0C, 08), 512K L2 (43) */
         }
         c->r[R_AX] = o[0]; c->r[R_BX] = o[1]; c->r[R_CX] = o[2]; c->r[R_DX] = o[3];
         break;
@@ -2160,6 +2164,7 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
          * DebugCtlMSR (no branch tracing: reads 0). Its P5 counters are
          * gone (#GP below). */
         case 0x2A: if (!p6) goto bad; if (!wr) v = 0; break;
+        case 0x17: if (!p6 || wr) goto bad; v = 0; break;               /* IA32_PLATFORM_ID: platform 0 (Windows' update.sys reads it) */
         case 0x79: if (!p6 || !wr) goto bad; break;
         case 0xC1: case 0xC2: if (!p6) goto bad;
             if (wr) c->msr_p6perf[2 + msr - 0xC1] = v & 0xFFFFFFFFFFull; else v = c->msr_p6perf[2 + msr - 0xC1];
@@ -2189,8 +2194,13 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             break;
         default:
             if (c->msr_hook && c->msr_hook(c, msr, wr, &v)) break;   /* the machine's: the APIC base */
-        bad:
+        bad: {
+            static int msr_trace = -1;                        /* X86_MSR_TRACE: every MSR that is #GP here */
+            if (msr_trace < 0) msr_trace = getenv("X86_MSR_TRACE") != NULL;
+            if (msr_trace) fprintf(stderr, "[msr] cpu%d %s %08X (%08X:%08X) at %04X:%08X: #GP\n", c->cpu_id, wr ? "wrmsr" : "rdmsr",
+                                   msr, (uint32_t)(v >> 32), (uint32_t)v, c->seg[S_CS].sel, start_ip);
             x86_fault(c, X86_EXC_GP, 0);
+        }
         }
         if (!wr) { c->r[R_AX] = (uint32_t)v; c->r[R_DX] = (uint32_t)(v >> 32); }
         break;
