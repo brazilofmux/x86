@@ -202,6 +202,7 @@ void pc_rtc_poll(uint64_t now);           /* run it to NOW: its flags, and IRQ 8
 void pc_rtc_get(int *h, int *m, int *sec, int *year, int *mon, int *mday);
 void pc_rtc_set_time(int h, int m, int sec);
 void pc_rtc_set_date(int year, int mon, int mday);
+extern int pc_rtc_start_date[3];      /* -date: the clock starts on this year, month, day (0: today) */
 void pc_rtc_pie(int on);                  /* the periodic interrupt (INT 15h AH=83h) */
 void pc_rtc_alarm(int on, uint8_t h, uint8_t m, uint8_t sec);   /* INT 1Ah AH=06h/07h, BCD */
 int  pc_rtc_alarm_on(void);
