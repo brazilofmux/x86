@@ -537,7 +537,6 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
 #define X86_LOW_SIZE  0x110000u
 #define X86_EXT_SIZE  0x1000000u                     /* the default and least: 16 MB */
 #define X86_MEM_SIZE  (X86_LOW_SIZE + X86_EXT_SIZE)
-#define X86_MEM_MAX   (0x10000000u + 0x100000u)      /* 257 MB: 256 MB of extended memory, and the first 1 MB */
 #define X86_MEM_SLACK 0x10000u
 /* The code bitmap sits at this fixed distance from guest memory when the
  * mirrored layout is in use (x86_mem.c: one reservation holds both), so
@@ -553,8 +552,12 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
  * the bitmap above the memory and the explicit checks. */
 #if defined(_WIN32)
 #define X86_BM_DELTA  ((int64_t)0x20000000)
+#define X86_MEM_MAX   (0x10000000u + 0x100000u)      /* 257 MB: 256 MB of extended memory, and the first 1 MB */
 #else
-#define X86_BM_DELTA  (-(int64_t)0x20000000)
+/* 2 GB below: the farthest a signed disp32 reaches (x86-64's [host + delta]; AArch64 keeps the
+ * distance in X17), so memory may be all but 2 GB — 2047 MB, short of the slack */
+#define X86_BM_DELTA  (-(int64_t)0x80000000)
+#define X86_MEM_MAX   0x7FF00000u                    /* 2047 MB */
 #endif
 #define X86_FLAT_SPAN (0x100000000ull + 0x20000u)     /* memory + slack + guard: past every 32-bit offset and a straddle */
 _Static_assert((X86_BM_DELTA < 0 ? -X86_BM_DELTA : X86_BM_DELTA) >= (int64_t)X86_MEM_MAX + X86_MEM_SLACK,

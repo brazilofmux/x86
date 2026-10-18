@@ -31,7 +31,7 @@ static void usage(const char *prog) {
     printf("              (default 286; DPMI clients need 386)\n");
     printf("  -fpu, -nofpu  a 387 beside a 386, or a 486SX (default: a 486 or a Pentium has its FPU, nothing earlier does)\n");
     printf("  -date D     the clock starts on D (YYYY-MM-DD) at today's time (default: today)\n");
-    printf("  -mem N      N MB of memory, 17 to 257 (default 17: the first 1 MB and 16 MB above it)\n");
+    printf("  -mem N      N MB of memory, 17 to %u (default 17: the first 1 MB and 16 MB above it)\n", X86_MEM_MAX >> 20);
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
     printf("  -fda IMG    diskette image as drive 00h (also -fdb); -hda IMG fixed disk 80h (also -hdb)\n");
@@ -381,7 +381,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "-mem") && i + 1 < argc) {
             long mb = atol(argv[++i]);
-            if (mb < 17 || mb > 257) { fprintf(stderr, "-mem: 17 to 257 (MB)\n"); return 1; }
+            if (mb < 17 || mb > (long)(X86_MEM_MAX >> 20)) { fprintf(stderr, "-mem: 17 to %u (MB)\n", X86_MEM_MAX >> 20); return 1; }
             x86_set_mem_size((uint32_t)mb << 20);
             mem_mb = mb;
         }
