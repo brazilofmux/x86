@@ -50,10 +50,13 @@ void x86_fpu_reset(struct x86_cpu *c);          /* power-on: CW 0040h, tags all 
 void x86_fpu_finit(struct x86_cpu *c);          /* FNINIT, as the BIOS does at POST */
 void x86_fpu_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea, uint32_t start_ip);
 void x86_mmx_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);   /* Pentium II: OP_MMX */
+int  x86_mmx_alu(uint8_t op, uint64_t a, uint64_t b, uint64_t *r);   /* the lane-wise MMX ops on 64 bits; 0: not one */
+uint64_t x86_mmx_shift(uint64_t a, uint64_t count, int bits, int kind);   /* 0 left, 1 logical right, 2 arithmetic right */
 void x86_mmx_enter(struct x86_cpu *c);                 /* Pentium III: the x87 to MMX (TOP 0, tags valid), #MF first */
 void x86_fxsave(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);
 void x86_fxrstor(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);
 void x86_sse_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);   /* Pentium III: OP_SSE */
+uint32_t x86_mxcsr_mask(const struct x86_cpu *c);      /* MXCSR's writable bits (FXSAVE's MXCSR_MASK) */
 void x86_fpu_wait(struct x86_cpu *c);           /* WAIT/FWAIT: report a pending unmasked exception */
 void x86_fpu_sync(struct x86_cpu *c);           /* settle an owed C1 (before SW is compared or read from outside) */
 

@@ -66,14 +66,16 @@ SF=7), so even the flag tables carry over.
 
 ### Guest Environment
 
-- **CPU**: 8086 → Pentium III (`-m 486`: AC, BSWAP/XADD/CMPXCHG, INVLPG,
+- **CPU**: 8086 → Pentium 4 (`-m 486`: AC, BSWAP/XADD/CMPXCHG, INVLPG,
   CR0.WP, #AC; `-m 586`, a P54C: EFLAGS.ID, CPUID, RDTSC, CMPXCHG8B, the
   P5 MSRs, CR4 with PSE/TSD/DE/MCE — no VME yet; `-m 686`, a Pentium Pro:
   CMOVcc, FCMOVcc, FCOMI, RDPMC, global pages, checked by `c686test`
   against Bochs; `-m p2`, a Pentium II (Klamath): MMX on the x87's
   registers, SYSENTER/SYSEXIT, checked by `p2test` against Bochs; `-m p3`,
   a Pentium III (Katmai): SSE on SoftFloat's binary32 under MXCSR,
-  FXSAVE/FXRSTOR, `core/x86_sse.c`, checked by `p3test` against Bochs). The x87 (`core/x86_fpu.c`) is a 486DX's, or a 387 beside a 386
+  FXSAVE/FXRSTOR, `core/x86_sse.c`, checked by `p3test` against Bochs;
+  `-m p4`, a Pentium 4 (Willamette): SSE2 — binary64, the 128-bit integer
+  forms, DAZ, CLFLUSH and the fences — checked by `p4test` against Bochs). The x87 (`core/x86_fpu.c`) is a 486DX's, or a 387 beside a 386
   with `-fpu`: Berkeley SoftFloat 3e's 80-bit arithmetic (vendored in
   `core/softfloat/`) inside an x87 of our own, checked against Bochs and
   QEMU (`make test-fpu`), transcendentals against mpmath.

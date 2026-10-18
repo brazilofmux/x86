@@ -161,10 +161,13 @@ out = [head, """
         mov dword [cur_mx], 0x3F80
         call run_table
         mov dword [cur_mx], 0x5F80
+        mov esi, rc_stubs
         call run_table
         mov dword [cur_mx], 0x7F80
+        mov esi, rc_stubs
         call run_table
         mov dword [cur_mx], 0x9F80
+        mov esi, rc_stubs
         call run_table
         mov dword [cur_mx], 0x1F80
         mov esi, mmx_stubs                  ; the MMX additions: Q<n> mm0

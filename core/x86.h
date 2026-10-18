@@ -58,6 +58,7 @@ enum {
     X86_MODEL_686  = 686,    /* a Pentium Pro: CMOVcc, FCMOVcc, FCOMI, RDPMC, global pages (CR4.PGE, PCE) */
     X86_MODEL_P2   = 687,    /* a Pentium II (Klamath): MMX, SYSENTER/SYSEXIT (-m p2) */
     X86_MODEL_P3   = 688,    /* a Pentium III (Katmai): SSE, FXSAVE/FXRSTOR (-m p3) */
+    X86_MODEL_P4   = 689,    /* a Pentium 4 (Willamette): SSE2, CLFLUSH (-m p4) */
 };
 
 /* The Pentium's identity: CPUID 1's EAX, and EDX after reset. Family 5,
@@ -69,6 +70,8 @@ enum {
 #define X86_P2_SIGNATURE  0x00000634u
 /* The Pentium III's (Katmai): family 6, model 7, stepping 3 */
 #define X86_P3_SIGNATURE  0x00000673u
+/* The Pentium 4's (Willamette): family 15, model 1, stepping 2 */
+#define X86_P4_SIGNATURE  0x00000F12u
 uint32_t x86_cpu_signature(const struct x86_cpu *c);   /* CPUID 1's EAX, the reset EDX, the MP table's */
 uint32_t x86_cpu_features(const struct x86_cpu *c);    /* CPUID 1's EDX */
 

@@ -1759,7 +1759,7 @@ static uint64_t addsub(uint64_t a, uint64_t b, int bits, int sub, int sat) {
 }
 /* shifts by a count: past the lane, a logical shift leaves 0 and an
  * arithmetic one the sign */
-static uint64_t shift(uint64_t a, uint64_t count, int bits, int kind) {   /* 0 left, 1 logical right, 2 arithmetic right */
+uint64_t x86_mmx_shift(uint64_t a, uint64_t count, int bits, int kind) {   /* 0 left, 1 logical right, 2 arithmetic right */
     uint64_t r = 0;
     for (int i = 0; i < 64 / bits; i++) {
         uint64_t x = lane_u(a, i, bits), v;
@@ -1769,6 +1769,110 @@ static uint64_t shift(uint64_t a, uint64_t count, int bits, int kind) {   /* 0 l
         r = put(r, i, bits, v);
     }
     return r;
+}
+
+/* The lane-wise MMX operations, on 64 bits: mm op mm/m64 into *R; 0 if OP
+ * is not one of them. SSE2's 128-bit forms run each half through it
+ * (x86_sse.c), the shifts with the one count. */
+int x86_mmx_alu(uint8_t op, uint64_t a, uint64_t b, uint64_t *out) {
+    uint64_t r = 0;
+    switch (op) {
+    case 0xDA: case 0xDE:                                              /* PMINUB, PMAXUB */
+        for (int i = 0; i < 8; i++) {
+            uint64_t x = lane_u(a, i, 8), y = lane_u(b, i, 8);
+            r = put(r, i, 8, (op == 0xDA) == (x < y) ? x : y);
+        }
+        break;
+    case 0xEA: case 0xEE:                                              /* PMINSW, PMAXSW */
+        for (int i = 0; i < 4; i++) {
+            int64_t x = lane_s(a, i, 16), y = lane_s(b, i, 16);
+            r = put(r, i, 16, (uint64_t)((op == 0xEA) == (x < y) ? x : y));
+        }
+        break;
+    case 0xE0: case 0xE3: {                                            /* PAVGB, PAVGW: rounded up */
+        int bits = op == 0xE0 ? 8 : 16;
+        for (int i = 0; i < 64 / bits; i++) r = put(r, i, bits, (lane_u(a, i, bits) + lane_u(b, i, bits) + 1) >> 1);
+        break;
+    }
+    case 0xE4:                                                         /* PMULHUW */
+        for (int i = 0; i < 4; i++) r = put(r, i, 16, (lane_u(a, i, 16) * lane_u(b, i, 16)) >> 16);
+        break;
+    case 0xF6: {                                                       /* PSADBW: the sum into the low word */
+        uint64_t s = 0;
+        for (int i = 0; i < 8; i++) { int64_t x = (int64_t)lane_u(a, i, 8) - (int64_t)lane_u(b, i, 8); s += (uint64_t)(x < 0 ? -x : x); }
+        r = s;
+        break;
+    }
+    case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: { /* PUNPCKL/H BW WD DQ */
+        int bits = 8 << ((op & 3) == 0 ? 0 : (op & 3) == 1 ? 1 : 2), hi = op >= 0x68, n = 32 / bits;
+        for (int i = 0; i < n; i++) {
+            r = put(r, 2 * i, bits, lane_u(a, i + (hi ? n : 0), bits));
+            r = put(r, 2 * i + 1, bits, lane_u(b, i + (hi ? n : 0), bits));
+        }
+        break;
+    }
+    case 0x63: case 0x67: case 0x6B: {                                 /* PACKSSWB, PACKUSWB, PACKSSDW */
+        int bits = op == 0x6B ? 32 : 16, half = bits / 2, n = 64 / bits;
+        for (int i = 0; i < n; i++) {
+            int64_t x = lane_s(a, i, bits), y = lane_s(b, i, bits);
+            r = put(r, i, half, (uint64_t)(op == 0x67 ? sat_u(x, half) : sat_s(x, half)));
+            r = put(r, i + n, half, (uint64_t)(op == 0x67 ? sat_u(y, half) : sat_s(y, half)));
+        }
+        break;
+    }
+    case 0x64: case 0x65: case 0x66: case 0x74: case 0x75: case 0x76: {   /* PCMPGT, PCMPEQ */
+        int bits = 8 << (op & 3);
+        for (int i = 0; i < 64 / bits; i++) {
+            int t = op >= 0x74 ? lane_u(a, i, bits) == lane_u(b, i, bits) : lane_s(a, i, bits) > lane_s(b, i, bits);
+            r = put(r, i, bits, t ? ~UINT64_C(0) : 0);
+        }
+        break;
+    }
+    case 0xD1: r = x86_mmx_shift(a, b, 16, 1); break;                          /* PSRLW */
+    case 0xD2: r = x86_mmx_shift(a, b, 32, 1); break;
+    case 0xD3: r = x86_mmx_shift(a, b, 64, 1); break;
+    case 0xE1: r = x86_mmx_shift(a, b, 16, 2); break;                          /* PSRAW */
+    case 0xE2: r = x86_mmx_shift(a, b, 32, 2); break;
+    case 0xF1: r = x86_mmx_shift(a, b, 16, 0); break;                          /* PSLLW */
+    case 0xF2: r = x86_mmx_shift(a, b, 32, 0); break;
+    case 0xF3: r = x86_mmx_shift(a, b, 64, 0); break;
+    case 0xD5: case 0xE5:                                              /* PMULLW, PMULHW */
+        for (int i = 0; i < 4; i++) {
+            int32_t p = (int32_t)(lane_s(a, i, 16) * lane_s(b, i, 16));
+            r = put(r, i, 16, (uint32_t)(op == 0xD5 ? p : p >> 16));
+        }
+        break;
+    case 0xF5:                                                         /* PMADDWD */
+        for (int i = 0; i < 2; i++) {
+            uint32_t s = (uint32_t)(lane_s(a, 2 * i, 16) * lane_s(b, 2 * i, 16)) + (uint32_t)(lane_s(a, 2 * i + 1, 16) * lane_s(b, 2 * i + 1, 16));
+            r = put(r, i, 32, s);
+        }
+        break;
+    case 0xDB: r = a & b; break;                                       /* PAND */
+    case 0xDF: r = ~a & b; break;                                      /* PANDN */
+    case 0xEB: r = a | b; break;                                       /* POR */
+    case 0xEF: r = a ^ b; break;                                       /* PXOR */
+    case 0xD8: r = addsub(a, b, 8, 1, 2); break;                       /* PSUBUSB */
+    case 0xD9: r = addsub(a, b, 16, 1, 2); break;
+    case 0xDC: r = addsub(a, b, 8, 0, 2); break;                       /* PADDUSB */
+    case 0xDD: r = addsub(a, b, 16, 0, 2); break;
+    case 0xE8: r = addsub(a, b, 8, 1, 1); break;                       /* PSUBSB */
+    case 0xE9: r = addsub(a, b, 16, 1, 1); break;
+    case 0xEC: r = addsub(a, b, 8, 0, 1); break;                       /* PADDSB */
+    case 0xED: r = addsub(a, b, 16, 0, 1); break;
+    case 0xF8: r = addsub(a, b, 8, 1, 0); break;                       /* PSUBB */
+    case 0xF9: r = addsub(a, b, 16, 1, 0); break;
+    case 0xFA: r = addsub(a, b, 32, 1, 0); break;
+    case 0xFC: r = addsub(a, b, 8, 0, 0); break;                       /* PADDB */
+    case 0xFD: r = addsub(a, b, 16, 0, 0); break;
+    case 0xFE: r = addsub(a, b, 32, 0, 0); break;
+    case 0xD4: r = a + b; break;                                       /* PADDQ (Pentium 4) */
+    case 0xFB: r = a - b; break;                                       /* PSUBQ */
+    case 0xF4: r = (a & 0xFFFFFFFFu) * (b & 0xFFFFFFFFu); break;       /* PMULUDQ */
+    default: return 0;
+    }
+    *out = r;
+    return 1;
 }
 
 void x86_mmx_exec(x86_cpu *c, const x86_insn *in, uint32_t ea) {
@@ -1827,7 +1931,7 @@ void x86_mmx_exec(x86_cpu *c, const x86_insn *in, uint32_t ea) {
         case 6: kind = 0; break;
         default: ud(c); return;
         }
-        set_mm(c, in->rm, shift(mm(c, in->rm), in->ops[1].imm & 0xFF, bits, kind));
+        set_mm(c, in->rm, x86_mmx_shift(mm(c, in->rm), in->ops[1].imm & 0xFF, bits, kind));
         return;
     }
     default: break;
@@ -1840,96 +1944,9 @@ void x86_mmx_exec(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     case 0x70:                                                         /* PSHUFW mm, mm/m64, Ib */
         for (int i = 0; i < 4; i++) r = put(r, i, 16, lane_u(b, (in->ops[1].imm >> (2 * i)) & 3, 16));
         break;
-    case 0xDA: case 0xDE:                                              /* PMINUB, PMAXUB */
-        for (int i = 0; i < 8; i++) {
-            uint64_t x = lane_u(a, i, 8), y = lane_u(b, i, 8);
-            r = put(r, i, 8, (op == 0xDA) == (x < y) ? x : y);
-        }
+    default:
+        if (!x86_mmx_alu(op, a, b, &r)) { ud(c); return; }
         break;
-    case 0xEA: case 0xEE:                                              /* PMINSW, PMAXSW */
-        for (int i = 0; i < 4; i++) {
-            int64_t x = lane_s(a, i, 16), y = lane_s(b, i, 16);
-            r = put(r, i, 16, (uint64_t)((op == 0xEA) == (x < y) ? x : y));
-        }
-        break;
-    case 0xE0: case 0xE3: {                                            /* PAVGB, PAVGW: rounded up */
-        int bits = op == 0xE0 ? 8 : 16;
-        for (int i = 0; i < 64 / bits; i++) r = put(r, i, bits, (lane_u(a, i, bits) + lane_u(b, i, bits) + 1) >> 1);
-        break;
-    }
-    case 0xE4:                                                         /* PMULHUW */
-        for (int i = 0; i < 4; i++) r = put(r, i, 16, (lane_u(a, i, 16) * lane_u(b, i, 16)) >> 16);
-        break;
-    case 0xF6: {                                                       /* PSADBW: the sum into the low word */
-        uint64_t s = 0;
-        for (int i = 0; i < 8; i++) { int64_t x = (int64_t)lane_u(a, i, 8) - (int64_t)lane_u(b, i, 8); s += (uint64_t)(x < 0 ? -x : x); }
-        r = s;
-        break;
-    }
-    case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: { /* PUNPCKL/H BW WD DQ */
-        int bits = 8 << ((op & 3) == 0 ? 0 : (op & 3) == 1 ? 1 : 2), hi = op >= 0x68, n = 32 / bits;
-        for (int i = 0; i < n; i++) {
-            r = put(r, 2 * i, bits, lane_u(a, i + (hi ? n : 0), bits));
-            r = put(r, 2 * i + 1, bits, lane_u(b, i + (hi ? n : 0), bits));
-        }
-        break;
-    }
-    case 0x63: case 0x67: case 0x6B: {                                 /* PACKSSWB, PACKUSWB, PACKSSDW */
-        int bits = op == 0x6B ? 32 : 16, half = bits / 2, n = 64 / bits;
-        for (int i = 0; i < n; i++) {
-            int64_t x = lane_s(a, i, bits), y = lane_s(b, i, bits);
-            r = put(r, i, half, (uint64_t)(op == 0x67 ? sat_u(x, half) : sat_s(x, half)));
-            r = put(r, i + n, half, (uint64_t)(op == 0x67 ? sat_u(y, half) : sat_s(y, half)));
-        }
-        break;
-    }
-    case 0x64: case 0x65: case 0x66: case 0x74: case 0x75: case 0x76: {   /* PCMPGT, PCMPEQ */
-        int bits = 8 << (op & 3);
-        for (int i = 0; i < 64 / bits; i++) {
-            int t = op >= 0x74 ? lane_u(a, i, bits) == lane_u(b, i, bits) : lane_s(a, i, bits) > lane_s(b, i, bits);
-            r = put(r, i, bits, t ? ~UINT64_C(0) : 0);
-        }
-        break;
-    }
-    case 0xD1: r = shift(a, b, 16, 1); break;                          /* PSRLW */
-    case 0xD2: r = shift(a, b, 32, 1); break;
-    case 0xD3: r = shift(a, b, 64, 1); break;
-    case 0xE1: r = shift(a, b, 16, 2); break;                          /* PSRAW */
-    case 0xE2: r = shift(a, b, 32, 2); break;
-    case 0xF1: r = shift(a, b, 16, 0); break;                          /* PSLLW */
-    case 0xF2: r = shift(a, b, 32, 0); break;
-    case 0xF3: r = shift(a, b, 64, 0); break;
-    case 0xD5: case 0xE5:                                              /* PMULLW, PMULHW */
-        for (int i = 0; i < 4; i++) {
-            int32_t p = (int32_t)(lane_s(a, i, 16) * lane_s(b, i, 16));
-            r = put(r, i, 16, (uint32_t)(op == 0xD5 ? p : p >> 16));
-        }
-        break;
-    case 0xF5:                                                         /* PMADDWD */
-        for (int i = 0; i < 2; i++) {
-            uint32_t s = (uint32_t)(lane_s(a, 2 * i, 16) * lane_s(b, 2 * i, 16)) + (uint32_t)(lane_s(a, 2 * i + 1, 16) * lane_s(b, 2 * i + 1, 16));
-            r = put(r, i, 32, s);
-        }
-        break;
-    case 0xDB: r = a & b; break;                                       /* PAND */
-    case 0xDF: r = ~a & b; break;                                      /* PANDN */
-    case 0xEB: r = a | b; break;                                       /* POR */
-    case 0xEF: r = a ^ b; break;                                       /* PXOR */
-    case 0xD8: r = addsub(a, b, 8, 1, 2); break;                       /* PSUBUSB */
-    case 0xD9: r = addsub(a, b, 16, 1, 2); break;
-    case 0xDC: r = addsub(a, b, 8, 0, 2); break;                       /* PADDUSB */
-    case 0xDD: r = addsub(a, b, 16, 0, 2); break;
-    case 0xE8: r = addsub(a, b, 8, 1, 1); break;                       /* PSUBSB */
-    case 0xE9: r = addsub(a, b, 16, 1, 1); break;
-    case 0xEC: r = addsub(a, b, 8, 0, 1); break;                       /* PADDSB */
-    case 0xED: r = addsub(a, b, 16, 0, 1); break;
-    case 0xF8: r = addsub(a, b, 8, 1, 0); break;                       /* PSUBB */
-    case 0xF9: r = addsub(a, b, 16, 1, 0); break;
-    case 0xFA: r = addsub(a, b, 32, 1, 0); break;
-    case 0xFC: r = addsub(a, b, 8, 0, 0); break;                       /* PADDB */
-    case 0xFD: r = addsub(a, b, 16, 0, 0); break;
-    case 0xFE: r = addsub(a, b, 32, 0, 0); break;
-    default: ud(c); return;
     }
     set_mm(c, d, r);
 }
@@ -1951,7 +1968,6 @@ void x86_mmx_enter(x86_cpu *c) {
  * nor restored (MXCSR still is: Bochs's Katmai). Bytes 288-511 are not
  * touched. FXSAVE does not
  * reinitialise the x87, unlike FSAVE. */
-#define FX_MXCSR_MASK 0x0000FFBFu       /* MXCSR's writable bits: no DAZ on a Pentium III */
 static int fx_aligned(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     return ((c->seg[in->seg].base + ea) & 15) == 0;
 }
@@ -1966,7 +1982,7 @@ void x86_fxsave(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     put16(b + 6, (uint16_t)(F.fop & 0x7FF));
     put32(b + 8, F.fip); put16(b + 12, F.fcs);
     put32(b + 16, F.fdp); put16(b + 20, F.fds);
-    put32(b + 24, F.mxcsr); put32(b + 28, FX_MXCSR_MASK);
+    put32(b + 24, F.mxcsr); put32(b + 28, x86_mxcsr_mask(c));
     for (int i = 0; i < 8; i++) {
         int p = phys(c, i);
         uint64_t s = F.sig[p];
@@ -1991,7 +2007,7 @@ void x86_fxrstor(x86_cpu *c, const x86_insn *in, uint32_t ea) {
     int sse = (c->cr4 & X86_CR4_OSFXSR) != 0;
     uint8_t b[288];
     x86_fpu_mrd(c, in, ea, sse ? 288 : 160, 16, b);
-    if (get32(b + 24) & ~FX_MXCSR_MASK) x86_fault(c, X86_EXC_GP, 0);
+    if (get32(b + 24) & ~x86_mxcsr_mask(c)) x86_fault(c, X86_EXC_GP, 0);
     F.cw = get16(b); F.sw = get16(b + 2);
     F.empty = (uint8_t)~b[4];
     F.fop = (uint16_t)(get16(b + 6) & 0x7FF);

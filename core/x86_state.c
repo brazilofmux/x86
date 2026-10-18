@@ -44,13 +44,14 @@ void x86_store_hook(x86_cpu *c, uint32_t p) {
  * MTRR, MCA or SEP (whose Pentium Pro form Linux distrusts anyway). The
  * Pentium II adds SEP (SYSENTER, SYSEXIT) and MMX. */
 uint32_t x86_cpu_signature(const x86_cpu *c) {
-    return c->model >= X86_MODEL_P3 ? X86_P3_SIGNATURE : c->model >= X86_MODEL_P2 ? X86_P2_SIGNATURE : c->model >= X86_MODEL_686 ? X86_686_SIGNATURE : X86_586_SIGNATURE;
+    return c->model >= X86_MODEL_P4 ? X86_P4_SIGNATURE : c->model >= X86_MODEL_P3 ? X86_P3_SIGNATURE : c->model >= X86_MODEL_P2 ? X86_P2_SIGNATURE : c->model >= X86_MODEL_686 ? X86_686_SIGNATURE : X86_586_SIGNATURE;
 }
 uint32_t x86_cpu_features(const x86_cpu *c) {
     uint32_t f = (c->has_fpu ? 1u : 0u) | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 5 | 1u << 7 | 1u << 8 | (c->has_apic ? 1u << 9 : 0u);
     if (c->model >= X86_MODEL_686) f |= 1u << 13 | 1u << 15;          /* PGE, CMOV */
     if (c->model >= X86_MODEL_P2) f |= 1u << 11 | 1u << 23;           /* SEP, MMX */
     if (c->model >= X86_MODEL_P3) f |= 1u << 24 | 1u << 25;           /* FXSR, SSE */
+    if (c->model >= X86_MODEL_P4) f |= 1u << 19 | 1u << 26;           /* CLFSH, SSE2 */
     return f;
 }
 

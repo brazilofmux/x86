@@ -2133,7 +2133,10 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         } else if (leaf == 1) {
             o[0] = x86_cpu_signature(c);
             o[1] = (uint32_t)c->cpu_id << 24;           /* the initial APIC ID */
+            if (c->model >= X86_MODEL_P4) o[1] |= 8u << 8;   /* CLFLUSH: 64-byte lines */
             o[3] = x86_cpu_features(c);
+        } else if (leaf == 2 && c->model >= X86_MODEL_P4) {
+            o[0] = 0x665B5001u; o[3] = 0x007A7040u;   /* Willamette's: trace cache, 8K L1 data, 256K L2, TLBs (Bochs's) */
         } else if (leaf == 2 && c->model >= X86_MODEL_686) {
             o[0] = 0x03020101u;
             o[3] = c->model >= X86_MODEL_P2 ? 0x0C040843u : 0x06040A42u;   /* the Pentium II and III: 16K L1s (0C, 08), 512K L2 (43) */

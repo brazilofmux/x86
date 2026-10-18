@@ -176,6 +176,10 @@ static const opdesc map0f[256] = {
     [0xFC] = E(OP_MMX, F_Ed, F_NONE), [0xFD] = E(OP_MMX, F_Ed, F_NONE), [0xFE] = E(OP_MMX, F_Ed, F_NONE),
     [0x71] = E(OP_MMX, F_Ed, F_Ib), [0x72] = E(OP_MMX, F_Ed, F_Ib), [0x73] = E(OP_MMX, F_Ed, F_Ib),
     [0x77] = E(OP_MMX, F_NONE, F_NONE), [0x34] = E(OP_SYSENTER, F_NONE, F_NONE), [0x35] = E(OP_SYSEXIT, F_NONE, F_NONE),
+    /* SSE2's new opcodes (Pentium 4, gated below) */
+    [0xC3] = E(OP_SSE, F_Ed, F_NONE), [0xD6] = E(OP_SSE, F_Ed, F_NONE), [0xE6] = E(OP_SSE, F_Ed, F_NONE),
+    [0x6C] = E(OP_SSE, F_Ed, F_NONE), [0x6D] = E(OP_SSE, F_Ed, F_NONE),
+    [0xD4] = E(OP_MMX, F_Ed, F_NONE), [0xFB] = E(OP_MMX, F_Ed, F_NONE), [0xF4] = E(OP_MMX, F_Ed, F_NONE),
     /* SSE and its MMX additions (Pentium III, gated below): the prefix
      * (none, F3; 66 and F2 are SSE2's) picks the instruction */
     [0x10] = E(OP_SSE, F_Ed, F_NONE), [0x11] = E(OP_SSE, F_Ed, F_NONE), [0x12] = E(OP_SSE, F_Ed, F_NONE),
@@ -574,6 +578,13 @@ done_prefix:
     if (model < X86_MODEL_P2 && (in->op == OP_MMX || in->op == OP_SYSENTER || in->op == OP_SYSEXIT)) in->op = OP_UD;
     /* ... and the Pentium III's: SSE, and MMX's new instructions */
     if (model < X86_MODEL_P3 && (in->op == OP_SSE || (in->op == OP_MMX && x86_mmx_is_p3(in->opcode2)))) in->op = OP_UD;
+    /* ... and the Pentium 4's: its new opcodes; and with it an MMX opcode
+     * under 66, F2 or F3 is SSE2's (the 128-bit integer forms, MOVQ2DQ...) */
+    if ((in->op == OP_SSE || in->op == OP_MMX) && model < X86_MODEL_P4
+        && (in->opcode2 == 0xC3 || in->opcode2 == 0xD6 || in->opcode2 == 0xE6 || in->opcode2 == 0x6C || in->opcode2 == 0x6D
+            || in->opcode2 == 0xD4 || in->opcode2 == 0xFB || in->opcode2 == 0xF4))
+        in->op = OP_UD;
+    if (in->op == OP_MMX && model >= X86_MODEL_P4 && (in->p66 || in->rep)) in->op = OP_SSE;
     if (in->op == OP_MMX && in->ops[0].kind == OPK_MEM)
         in->ops[0].size = in->opcode2 == 0xC4 ? 2 : (in->opcode2 == 0x6E || in->opcode2 == 0x7E || in->opcode2 <= 0x62) ? 4 : 8;
     if (in->op == OP_SSE && in->ops[0].kind == OPK_MEM) in->ops[0].size = 16;   /* (x86_sse_exec knows each one's) */

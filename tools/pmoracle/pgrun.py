@@ -3,7 +3,7 @@
 follow it) under QEMU and under dos-monster and diff what each wrote to
 port E9.
 
-    python3 pgrun.py [image.asm] [--ours-only] [--m486 | --m586] [--expect FILE | --bochs | --bochs-only] [-- extra dos-monster args]
+    python3 pgrun.py [image.asm] [--ours-only] [--m486 | --m586 | --m686 | --mp2 | --mp3 | --mp4] [--expect FILE | --bochs | --bochs-only] [-- extra dos-monster args]
 
 --bochs runs Bochs as the reference instead of QEMU (bochscfg.py fits the
 checked-in bochsrc to the host); --bochs-only prints its transcript, which
@@ -50,6 +50,14 @@ bits cleared — both inside the architecture's 1.5 x 2^-12, which no mask
 can make agree across a power of two. QEMU is no reference for SSE: two
 NaNs propagate the second, an unmasked exception does not trap, SSE2's
 prefixes run on a Pentium III, and FXSAVE skips MXCSR without OSFXSR.
+p4test.asm (from p4gen.py, which borrows p3gen.py's frame) is the Pentium
+4's SSE2: --mp4 runs ours as -m p4 against Bochs's p4_willamette (or
+QEMU's pentium4). Double-precision arithmetic, compares and conversions
+under every rounding mode, FTZ and DAZ; the 128-bit integer forms; MMX's
+PADDQ/PSUBQ/PMULUDQ; CLFLUSH, the fences, MXCSR_MASK. p4test.expected is
+Bochs's (p4test.bochs) but for CPUID's feature word (T02: Bochs's
+Willamette also claims VME, PAE, MTRR, MCA, PAT, PSE-36, DS, ACPI and SS,
+which ours does not have and does not claim).
 
 QEMU runs with -cpu 486 (CR0.WP off, as a 386 has none) and exits through
 isa-debug-exit at port F4; dos-monster boots the image with -boot on a
@@ -74,7 +82,7 @@ def build(asm):
 def qemu(img, model="386"):
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "e9.txt")
-        subprocess.run(["qemu-system-i386", "-cpu", {"586": "pentium", "686": "pentium2", "p2": "pentium2", "p3": "pentium3"}.get(model, "486"),
+        subprocess.run(["qemu-system-i386", "-cpu", {"586": "pentium", "686": "pentium2", "p2": "pentium2", "p3": "pentium3", "p4": "pentium4"}.get(model, "486"),
                         "-drive", "file=%s,format=raw,if=floppy" % img,
                         "-display", "none", "-no-reboot",
                         "-debugcon", "file:" + out,
@@ -92,6 +100,7 @@ def bochs(img, model="386"):
     if model == "586": extra.append("cpu: model=pentium, ignore_bad_msrs=0")
     if model in ("686", "p2"): extra.append("cpu: model=p2_klamath, ignore_bad_msrs=0")
     if model == "p3": extra.append("cpu: model=p3_katmai, ignore_bad_msrs=0")
+    if model == "p4": extra.append("cpu: model=p4_willamette, ignore_bad_msrs=0")
     rc = bochscfg.write(os.path.abspath(img), extra)
     name = os.path.splitext(os.path.basename(img))[0]
     lines, on = [], False
@@ -128,12 +137,12 @@ def main():
     if "--" in args:
         i = args.index("--"); extra = args[i + 1:]; args = args[:i]
     only = "--ours-only" in args
-    model = "486" if "--m486" in args else "586" if "--m586" in args else "686" if "--m686" in args else "p2" if "--mp2" in args else "p3" if "--mp3" in args else "386"
+    model = "486" if "--m486" in args else "586" if "--m586" in args else "686" if "--m686" in args else "p2" if "--mp2" in args else "p3" if "--mp3" in args else "p4" if "--mp4" in args else "386"
     expect = None
     if "--expect" in args:
         i = args.index("--expect"); expect = args[i + 1]; del args[i:i + 2]
     use_bochs = "--bochs" in args or "--bochs-only" in args
-    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--m686", "--mp2", "--mp3", "--bochs", "--bochs-only")]
+    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--m686", "--mp2", "--mp3", "--mp4", "--bochs", "--bochs-only")]
     asm = args[0] if args else os.path.join(HERE, "pgtest.asm")
     img = build(asm)
     if "--bochs-only" in sys.argv:
