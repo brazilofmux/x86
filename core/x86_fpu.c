@@ -1711,3 +1711,166 @@ void x86_fpu_exec(x86_cpu *c, const x86_insn *in, uint32_t ea, uint32_t start_ip
         }
     }
 }
+
+/* ---- MMX (Pentium II) ------------------------------------------------- */
+
+/* The eight MMX registers are the x87's physical R0-R7: MMn is Rn's
+ * significand. Every MMX instruction but EMMS leaves TOP 0 and every tag
+ * valid; a write sets the exponent field to all ones. The condition
+ * codes and the last-instruction pointers are not the x87's to keep here.
+ * CR0.EM (#UD) and CR0.TS (#NM) are the caller's (x86_interp.c); a
+ * pending x87 exception is #MF, as for a waiting instruction. */
+static inline uint64_t mm(const x86_cpu *c, int n) { return F.sig[n & 7]; }
+static inline void set_mm(x86_cpu *c, int n, uint64_t v) { F.sig[n & 7] = v; F.sexp[n & 7] = 0xFFFF; }
+
+static inline int64_t sat_s(int64_t v, int bits) {
+    int64_t hi = (INT64_C(1) << (bits - 1)) - 1, lo = -hi - 1;
+    return v > hi ? hi : v < lo ? lo : v;
+}
+static inline int64_t sat_u(int64_t v, int bits) {
+    int64_t hi = (INT64_C(1) << bits) - 1;
+    return v > hi ? hi : v < 0 ? 0 : v;
+}
+static inline int64_t lane_s(uint64_t v, int i, int bits) {   /* signed lane i */
+    return (int64_t)(v << (64 - bits * (i + 1))) >> (64 - bits);
+}
+static inline uint64_t lane_u(uint64_t v, int i, int bits) {
+    return bits == 64 ? v : (v >> (bits * i)) & ((UINT64_C(1) << bits) - 1);
+}
+static inline uint64_t put(uint64_t r, int i, int bits, uint64_t x) {
+    if (bits == 64) return x;
+    uint64_t m = ((UINT64_C(1) << bits) - 1) << (bits * i);
+    return (r & ~m) | ((x << (bits * i)) & m);
+}
+
+/* lane-wise add / subtract: wrap, signed saturate, unsigned saturate */
+static uint64_t addsub(uint64_t a, uint64_t b, int bits, int sub, int sat) {
+    uint64_t r = 0;
+    for (int i = 0; i < 64 / bits; i++) {
+        int64_t x, y, v;
+        if (sat == 2) { x = (int64_t)lane_u(a, i, bits); y = (int64_t)lane_u(b, i, bits); }
+        else { x = lane_s(a, i, bits); y = lane_s(b, i, bits); }
+        v = sub ? x - y : x + y;
+        if (sat == 1) v = sat_s(v, bits); else if (sat == 2) v = sat_u(v, bits);
+        r = put(r, i, bits, (uint64_t)v);
+    }
+    return r;
+}
+/* shifts by a count: past the lane, a logical shift leaves 0 and an
+ * arithmetic one the sign */
+static uint64_t shift(uint64_t a, uint64_t count, int bits, int kind) {   /* 0 left, 1 logical right, 2 arithmetic right */
+    uint64_t r = 0;
+    for (int i = 0; i < 64 / bits; i++) {
+        uint64_t x = lane_u(a, i, bits), v;
+        if (kind == 2) v = (uint64_t)(lane_s(a, i, bits) >> (count >= (uint64_t)bits ? bits - 1 : (int)count));
+        else if (count >= (uint64_t)bits) v = 0;
+        else v = kind == 0 ? x << count : x >> count;
+        r = put(r, i, bits, v);
+    }
+    return r;
+}
+
+void x86_mmx_exec(x86_cpu *c, const x86_insn *in, uint32_t ea) {
+    pending(c);
+    uint8_t op = in->opcode2;
+    if (op == 0x77) { F.empty = 0xFF; return; }                        /* EMMS */
+    F.empty = 0;
+    set_top(c, 0);
+    int d = in->reg, mem = in->mod != 3;
+    uint64_t a = mm(c, d), b = 0, r = 0;
+    switch (op) {
+    case 0x6E:                                                         /* MOVD mm, r/m32 */
+        set_mm(c, d, mem ? rd_n(c, in, ea, 4, 4) : c->r[in->rm]);
+        return;
+    case 0x7E:                                                         /* MOVD r/m32, mm */
+        if (mem) wr_n(c, in, ea, 4, 4, (uint32_t)a); else c->r[in->rm] = (uint32_t)a;
+        return;
+    case 0x7F:                                                         /* MOVQ mm/m64, mm */
+        if (mem) wr_n(c, in, ea, 8, 8, a); else set_mm(c, in->rm, a);
+        return;
+    case 0x71: case 0x72: case 0x73: {                                 /* the shifts by Ib */
+        if (mem) ud(c);
+        int bits = op == 0x71 ? 16 : op == 0x72 ? 32 : 64, kind;
+        switch (in->reg) {
+        case 2: kind = 1; break;
+        case 4: if (op == 0x73) { ud(c); return; } kind = 2; break;
+        case 6: kind = 0; break;
+        default: ud(c); return;
+        }
+        set_mm(c, in->rm, shift(mm(c, in->rm), in->ops[1].imm & 0xFF, bits, kind));
+        return;
+    }
+    default: break;
+    }
+    /* the rest: mm op= mm/m64 (m32 for the low unpacks) */
+    if (mem) b = op <= 0x62 ? rd_n(c, in, ea, 4, 4) : rd_n(c, in, ea, 8, 8);
+    else b = mm(c, in->rm);
+    switch (op) {
+    case 0x6F: r = b; break;                                           /* MOVQ mm, mm/m64 */
+    case 0x60: case 0x61: case 0x62: case 0x68: case 0x69: case 0x6A: { /* PUNPCKL/H BW WD DQ */
+        int bits = 8 << ((op & 3) == 0 ? 0 : (op & 3) == 1 ? 1 : 2), hi = op >= 0x68, n = 32 / bits;
+        for (int i = 0; i < n; i++) {
+            r = put(r, 2 * i, bits, lane_u(a, i + (hi ? n : 0), bits));
+            r = put(r, 2 * i + 1, bits, lane_u(b, i + (hi ? n : 0), bits));
+        }
+        break;
+    }
+    case 0x63: case 0x67: case 0x6B: {                                 /* PACKSSWB, PACKUSWB, PACKSSDW */
+        int bits = op == 0x6B ? 32 : 16, half = bits / 2, n = 64 / bits;
+        for (int i = 0; i < n; i++) {
+            int64_t x = lane_s(a, i, bits), y = lane_s(b, i, bits);
+            r = put(r, i, half, (uint64_t)(op == 0x67 ? sat_u(x, half) : sat_s(x, half)));
+            r = put(r, i + n, half, (uint64_t)(op == 0x67 ? sat_u(y, half) : sat_s(y, half)));
+        }
+        break;
+    }
+    case 0x64: case 0x65: case 0x66: case 0x74: case 0x75: case 0x76: {   /* PCMPGT, PCMPEQ */
+        int bits = 8 << (op & 3);
+        for (int i = 0; i < 64 / bits; i++) {
+            int t = op >= 0x74 ? lane_u(a, i, bits) == lane_u(b, i, bits) : lane_s(a, i, bits) > lane_s(b, i, bits);
+            r = put(r, i, bits, t ? ~UINT64_C(0) : 0);
+        }
+        break;
+    }
+    case 0xD1: r = shift(a, b, 16, 1); break;                          /* PSRLW */
+    case 0xD2: r = shift(a, b, 32, 1); break;
+    case 0xD3: r = shift(a, b, 64, 1); break;
+    case 0xE1: r = shift(a, b, 16, 2); break;                          /* PSRAW */
+    case 0xE2: r = shift(a, b, 32, 2); break;
+    case 0xF1: r = shift(a, b, 16, 0); break;                          /* PSLLW */
+    case 0xF2: r = shift(a, b, 32, 0); break;
+    case 0xF3: r = shift(a, b, 64, 0); break;
+    case 0xD5: case 0xE5:                                              /* PMULLW, PMULHW */
+        for (int i = 0; i < 4; i++) {
+            int32_t p = (int32_t)(lane_s(a, i, 16) * lane_s(b, i, 16));
+            r = put(r, i, 16, (uint32_t)(op == 0xD5 ? p : p >> 16));
+        }
+        break;
+    case 0xF5:                                                         /* PMADDWD */
+        for (int i = 0; i < 2; i++) {
+            uint32_t s = (uint32_t)(lane_s(a, 2 * i, 16) * lane_s(b, 2 * i, 16)) + (uint32_t)(lane_s(a, 2 * i + 1, 16) * lane_s(b, 2 * i + 1, 16));
+            r = put(r, i, 32, s);
+        }
+        break;
+    case 0xDB: r = a & b; break;                                       /* PAND */
+    case 0xDF: r = ~a & b; break;                                      /* PANDN */
+    case 0xEB: r = a | b; break;                                       /* POR */
+    case 0xEF: r = a ^ b; break;                                       /* PXOR */
+    case 0xD8: r = addsub(a, b, 8, 1, 2); break;                       /* PSUBUSB */
+    case 0xD9: r = addsub(a, b, 16, 1, 2); break;
+    case 0xDC: r = addsub(a, b, 8, 0, 2); break;                       /* PADDUSB */
+    case 0xDD: r = addsub(a, b, 16, 0, 2); break;
+    case 0xE8: r = addsub(a, b, 8, 1, 1); break;                       /* PSUBSB */
+    case 0xE9: r = addsub(a, b, 16, 1, 1); break;
+    case 0xEC: r = addsub(a, b, 8, 0, 1); break;                       /* PADDSB */
+    case 0xED: r = addsub(a, b, 16, 0, 1); break;
+    case 0xF8: r = addsub(a, b, 8, 1, 0); break;                       /* PSUBB */
+    case 0xF9: r = addsub(a, b, 16, 1, 0); break;
+    case 0xFA: r = addsub(a, b, 32, 1, 0); break;
+    case 0xFC: r = addsub(a, b, 8, 0, 0); break;                       /* PADDB */
+    case 0xFD: r = addsub(a, b, 16, 0, 0); break;
+    case 0xFE: r = addsub(a, b, 32, 0, 0); break;
+    default: ud(c); return;
+    }
+    set_mm(c, d, r);
+}

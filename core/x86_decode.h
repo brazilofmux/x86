@@ -49,6 +49,7 @@ enum x86_op {
     OP_INVD, OP_WBINVD, OP_INVLPG,   /* 486: cache and TLB maintenance */
     OP_CPUID, OP_RDTSC, OP_RDMSR, OP_WRMSR, OP_CMPXCHG8B,   /* Pentium */
     OP_CMOVCC, OP_RDPMC,                                    /* Pentium Pro (FCMOVcc, FCOMI: OP_ESC) */
+    OP_MMX, OP_SYSENTER, OP_SYSEXIT,                        /* Pentium II (OP_MMX: x86_mmx_exec by opcode2) */
     OP__COUNT
 };
 

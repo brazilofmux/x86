@@ -66,11 +66,12 @@ SF=7), so even the flag tables carry over.
 
 ### Guest Environment
 
-- **CPU**: 8086 → Pentium Pro (`-m 486`: AC, BSWAP/XADD/CMPXCHG, INVLPG,
+- **CPU**: 8086 → Pentium II (`-m 486`: AC, BSWAP/XADD/CMPXCHG, INVLPG,
   CR0.WP, #AC; `-m 586`, a P54C: EFLAGS.ID, CPUID, RDTSC, CMPXCHG8B, the
   P5 MSRs, CR4 with PSE/TSD/DE/MCE — no VME yet; `-m 686`, a Pentium Pro:
   CMOVcc, FCMOVcc, FCOMI, RDPMC, global pages, checked by `c686test`
-  against Bochs). The x87 (`core/x86_fpu.c`) is a 486DX's, or a 387 beside a 386
+  against Bochs; `-m p2`, a Pentium II (Klamath): MMX on the x87's
+  registers, SYSENTER/SYSEXIT, checked by `p2test` against Bochs). The x87 (`core/x86_fpu.c`) is a 486DX's, or a 387 beside a 386
   with `-fpu`: Berkeley SoftFloat 3e's 80-bit arithmetic (vendored in
   `core/softfloat/`) inside an x87 of our own, checked against Bochs and
   QEMU (`make test-fpu`), transcendentals against mpmath.

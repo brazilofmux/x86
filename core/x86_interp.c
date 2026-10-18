@@ -1897,6 +1897,37 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
          * the 286 limit-checks a word (measured). */
         if (in->ops[0].kind == OPK_MEM) (void)mrd(c, in, in->seg, ea, c->model >= X86_MODEL_286 ? 2 : 1);
         break;
+    case OP_MMX:
+        /* Pentium II: CR0.EM is #UD for MMX (not #NM, as for the x87:
+         * nothing emulates it), CR0.TS #NM */
+        if (c->cr0 & X86_CR0_EM) RAISE(X86_EXC_UD);
+        if (c->cr0 & X86_CR0_TS) RAISE(X86_EXC_NM);
+        x86_mmx_exec(c, in, ea);
+        break;
+    case OP_SYSENTER: case OP_SYSEXIT: {
+        /* Pentium II: to CPL 0 at SYSENTER_EIP with SYSENTER_ESP, or back
+         * to CPL 3 at EDX with ECX, through flat segments the MSR's
+         * selector names (CS, CS+8 / CS+16, CS+24) — loaded as they are,
+         * not read from the GDT. #GP(0) in real mode, with no selector
+         * set, or for SYSEXIT anywhere but CPL 0. */
+        int enter = in->op == OP_SYSENTER;
+        uint16_t cs = (uint16_t)c->msr_sysenter[0];
+        if (!c->pmode || !(cs & 0xFFFC) || (!enter && x86_cpl(c) != 0)) x86_fault(c, X86_EXC_GP, 0);
+        int dpl = enter ? 0 : 3;
+        uint16_t csel = enter ? (uint16_t)(cs & 0xFFFC) : (uint16_t)((cs + 16) | 3);
+        uint16_t ssel = enter ? (uint16_t)((cs + 8) & 0xFFFC) : (uint16_t)((cs + 24) | 3);
+        if (enter) c->eflags &= ~(uint32_t)(X86_VM | X86_IF | X86_RF);
+        x86_seg *s = &c->seg[S_CS];
+        s->sel = csel; s->base = 0; s->limit = 0xFFFFFFFFu; s->big = 1; s->usable = 1;
+        s->attr = (uint16_t)(0x0B | 0x10 | (dpl << 5) | 0x80 | 0x400 | 0x800);   /* code, read, accessed; P; D; G */
+        s = &c->seg[S_SS];
+        s->sel = ssel; s->base = 0; s->limit = 0xFFFFFFFFu; s->big = 1; s->usable = 1;
+        s->attr = (uint16_t)(0x03 | 0x10 | (dpl << 5) | 0x80 | 0x400 | 0x800);   /* data, write, accessed; P; B; G */
+        c->pe_window = 0;
+        if (enter) { c->r[R_SP] = c->msr_sysenter[1]; c->eip = c->msr_sysenter[2]; }
+        else { c->r[R_SP] = c->r[R_CX]; c->eip = c->r[R_DX]; }
+        break;
+    }
     case OP_HLT:
         need_cpl0(c);
         c->halted = 1;
@@ -2100,7 +2131,8 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             o[1] = (uint32_t)c->cpu_id << 24;           /* the initial APIC ID */
             o[3] = x86_cpu_features(c);
         } else if (leaf == 2 && c->model >= X86_MODEL_686) {
-            o[0] = 0x03020101u; o[3] = 0x06040A42u;
+            o[0] = 0x03020101u;
+            o[3] = c->model >= X86_MODEL_P2 ? 0x0C040843u : 0x06040A42u;   /* the Pentium II: 16K L1s (0C, 08), 512K L2 (43) */
         }
         c->r[R_AX] = o[0]; c->r[R_BX] = o[1]; c->r[R_CX] = o[2]; c->r[R_DX] = o[3];
         break;
@@ -2136,6 +2168,10 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
             if (wr) c->msr_p6perf[msr - 0x186] = (uint32_t)v; else v = c->msr_p6perf[msr - 0x186];
             break;
         case 0x1D9: if (!p6) goto bad; if (!wr) v = 0; break;
+        case 0x174: case 0x175: case 0x176:                              /* Pentium II: SYSENTER_CS, _ESP, _EIP */
+            if (c->model < X86_MODEL_P2) goto bad;
+            if (wr) c->msr_sysenter[msr - 0x174] = (uint32_t)v; else v = c->msr_sysenter[msr - 0x174];
+            break;
         case 0x8B:
             /* The P6's microcode signature (IA32_BIOS_SIGN_ID): no P5
              * register, and a #GP on a P54C. Haiku writes 0, runs CPUID

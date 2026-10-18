@@ -165,7 +165,9 @@ test-pg: $(TARGET)
 	    python3 pgrun.py c586test.asm --m586 --expect c586test.expected && \
 	    python3 pgrun.py c586test.asm --m586 --expect c586test.expected -- -V && \
 	    python3 pgrun.py c686test.asm --m686 --expect c686test.expected && \
-	    python3 pgrun.py c686test.asm --m686 --expect c686test.expected -- -V
+	    python3 pgrun.py c686test.asm --m686 --expect c686test.expected -- -V && \
+	    python3 pgrun.py p2test.asm --mp2 --expect p2test.expected && \
+	    python3 pgrun.py p2test.asm --mp2 --expect p2test.expected -- -V
 
 # The x87 against its transcript (tools/pmoracle/fpurun.py): the interpreter,
 # the JIT and -V

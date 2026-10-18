@@ -46,6 +46,7 @@ typedef struct x86_fpu {
 void x86_fpu_reset(struct x86_cpu *c);          /* power-on: CW 0040h, tags all valid +0 */
 void x86_fpu_finit(struct x86_cpu *c);          /* FNINIT, as the BIOS does at POST */
 void x86_fpu_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea, uint32_t start_ip);
+void x86_mmx_exec(struct x86_cpu *c, const struct x86_insn *in, uint32_t ea);   /* Pentium II: OP_MMX */
 void x86_fpu_wait(struct x86_cpu *c);           /* WAIT/FWAIT: report a pending unmasked exception */
 void x86_fpu_sync(struct x86_cpu *c);           /* settle an owed C1 (before SW is compared or read from outside) */
 

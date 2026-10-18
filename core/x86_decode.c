@@ -147,6 +147,26 @@ static const opdesc map0f[256] = {
     [0x31] = E(OP_RDTSC, F_NONE, F_NONE),
     [0x32] = E(OP_RDMSR, F_NONE, F_NONE),
     [0x33] = E(OP_RDPMC, F_NONE, F_NONE),    /* Pentium Pro (gated below) */
+    /* MMX (Pentium II, gated below): the reg field an MMX register, r/m one
+     * or memory (MOVD: a general register); 71-73 the shifts by Ib */
+    [0x60] = E(OP_MMX, F_Ed, F_NONE), [0x61] = E(OP_MMX, F_Ed, F_NONE), [0x62] = E(OP_MMX, F_Ed, F_NONE),
+    [0x63] = E(OP_MMX, F_Ed, F_NONE), [0x64] = E(OP_MMX, F_Ed, F_NONE), [0x65] = E(OP_MMX, F_Ed, F_NONE),
+    [0x66] = E(OP_MMX, F_Ed, F_NONE), [0x67] = E(OP_MMX, F_Ed, F_NONE), [0x68] = E(OP_MMX, F_Ed, F_NONE),
+    [0x69] = E(OP_MMX, F_Ed, F_NONE), [0x6A] = E(OP_MMX, F_Ed, F_NONE), [0x6B] = E(OP_MMX, F_Ed, F_NONE),
+    [0x6E] = E(OP_MMX, F_Ed, F_NONE), [0x6F] = E(OP_MMX, F_Ed, F_NONE), [0x74] = E(OP_MMX, F_Ed, F_NONE),
+    [0x75] = E(OP_MMX, F_Ed, F_NONE), [0x76] = E(OP_MMX, F_Ed, F_NONE), [0x7E] = E(OP_MMX, F_Ed, F_NONE),
+    [0x7F] = E(OP_MMX, F_Ed, F_NONE), [0xD1] = E(OP_MMX, F_Ed, F_NONE), [0xD2] = E(OP_MMX, F_Ed, F_NONE),
+    [0xD3] = E(OP_MMX, F_Ed, F_NONE), [0xD5] = E(OP_MMX, F_Ed, F_NONE), [0xD8] = E(OP_MMX, F_Ed, F_NONE),
+    [0xD9] = E(OP_MMX, F_Ed, F_NONE), [0xDB] = E(OP_MMX, F_Ed, F_NONE), [0xDC] = E(OP_MMX, F_Ed, F_NONE),
+    [0xDD] = E(OP_MMX, F_Ed, F_NONE), [0xDF] = E(OP_MMX, F_Ed, F_NONE), [0xE1] = E(OP_MMX, F_Ed, F_NONE),
+    [0xE2] = E(OP_MMX, F_Ed, F_NONE), [0xE5] = E(OP_MMX, F_Ed, F_NONE), [0xE8] = E(OP_MMX, F_Ed, F_NONE),
+    [0xE9] = E(OP_MMX, F_Ed, F_NONE), [0xEB] = E(OP_MMX, F_Ed, F_NONE), [0xEC] = E(OP_MMX, F_Ed, F_NONE),
+    [0xED] = E(OP_MMX, F_Ed, F_NONE), [0xEF] = E(OP_MMX, F_Ed, F_NONE), [0xF1] = E(OP_MMX, F_Ed, F_NONE),
+    [0xF2] = E(OP_MMX, F_Ed, F_NONE), [0xF3] = E(OP_MMX, F_Ed, F_NONE), [0xF5] = E(OP_MMX, F_Ed, F_NONE),
+    [0xF8] = E(OP_MMX, F_Ed, F_NONE), [0xF9] = E(OP_MMX, F_Ed, F_NONE), [0xFA] = E(OP_MMX, F_Ed, F_NONE),
+    [0xFC] = E(OP_MMX, F_Ed, F_NONE), [0xFD] = E(OP_MMX, F_Ed, F_NONE), [0xFE] = E(OP_MMX, F_Ed, F_NONE),
+    [0x71] = E(OP_MMX, F_Ed, F_Ib), [0x72] = E(OP_MMX, F_Ed, F_Ib), [0x73] = E(OP_MMX, F_Ed, F_Ib),
+    [0x77] = E(OP_MMX, F_NONE, F_NONE), [0x34] = E(OP_SYSENTER, F_NONE, F_NONE), [0x35] = E(OP_SYSEXIT, F_NONE, F_NONE),
     /* 0F 40-4F: CMOVcc r, r/m (Pentium Pro, gated below) */
     [0x40] = E(OP_CMOVCC, F_Gv, F_Ev), [0x41] = E(OP_CMOVCC, F_Gv, F_Ev),
     [0x42] = E(OP_CMOVCC, F_Gv, F_Ev), [0x43] = E(OP_CMOVCC, F_Gv, F_Ev),
@@ -521,6 +541,11 @@ done_prefix:
     }
     /* ... and the Pentium Pro's on a Pentium */
     if (model < X86_MODEL_686 && (in->op == OP_CMOVCC || in->op == OP_RDPMC)) in->op = OP_UD;
+    /* ... and the Pentium II's. An MMX memory operand is a quadword, but
+     * for MOVD's doubleword and the low unpacks' (60-62: m32). */
+    if (model < X86_MODEL_P2 && (in->op == OP_MMX || in->op == OP_SYSENTER || in->op == OP_SYSEXIT)) in->op = OP_UD;
+    if (in->op == OP_MMX && in->ops[0].kind == OPK_MEM)
+        in->ops[0].size = (in->opcode2 == 0x6E || in->opcode2 == 0x7E || in->opcode2 <= 0x62) ? 4 : 8;
     /* The hint NOPs (0F 18-1F) are the Pentium Pro's, #UD on a P54C; our
      * Pentium takes them, as QEMU's Pentium models do: Haiku's kernel,
      * built for "Pentium or better", pads its loops with 0F 1F 00 and
@@ -576,7 +601,7 @@ static const char *op_names[OP__COUNT] = {
     [OP_SLDT]="sldt",[OP_STR]="str",[OP_LLDT]="lldt",[OP_LTR]="ltr",[OP_VERR]="verr",[OP_VERW]="verw",[OP_SMSW]="smsw",[OP_LMSW]="lmsw",
     [OP_MOVCR]="mov",[OP_MOVDR]="mov",[OP_MOVTR]="mov",[OP_INT1]="int1",[OP_SETMO]="setmo",[OP_UD]="(bad)",
     [OP_INVD]="invd",[OP_WBINVD]="wbinvd",[OP_INVLPG]="invlpg",
-    [OP_CPUID]="cpuid",[OP_RDTSC]="rdtsc",[OP_RDMSR]="rdmsr",[OP_WRMSR]="wrmsr",[OP_CMPXCHG8B]="cmpxchg8b",[OP_CMOVCC]="cmov",[OP_RDPMC]="rdpmc",
+    [OP_CPUID]="cpuid",[OP_RDTSC]="rdtsc",[OP_RDMSR]="rdmsr",[OP_WRMSR]="wrmsr",[OP_CMPXCHG8B]="cmpxchg8b",[OP_CMOVCC]="cmov",[OP_RDPMC]="rdpmc",[OP_MMX]="mmx",[OP_SYSENTER]="sysenter",[OP_SYSEXIT]="sysexit",
 };
 static const char *cc_names[16] = { "o","no","b","ae","e","ne","be","a","s","ns","p","np","l","ge","le","g" };
 static const char *r8n[8]  = { "al","cl","dl","bl","ah","ch","dh","bh" };

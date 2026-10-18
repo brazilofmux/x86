@@ -33,6 +33,13 @@ RDPMC reads 0, T51, T54), where the Pentium Pro has PerfCtr0/1 at C1h and
 C2h. QEMU's pentium2 is no reference here: its FCOMI leaves OF, SF and AF
 alone, a CR3 load drops global pages (allowed, not what the parts do),
 RDPMC is #UD and a P5 counter MSR reads 0.
+p2test.asm (from p2gen.py) is the Pentium II: --mp2 runs ours as -m p2
+against the same two. p2test.expected is Bochs's p2_klamath verbatim but
+for CPUID's feature word (T02): Bochs's Klamath also claims VME, PAE,
+MTRR, MCA and PSE-36, which ours does not have and does not claim. QEMU
+agrees on every MMX result; besides its later CPUID, its MMX write leaves
+the exponent field alone (T72) and a pending x87 exception does not stop
+an MMX instruction with #MF (T82).
 
 QEMU runs with -cpu 486 (CR0.WP off, as a 386 has none) and exits through
 isa-debug-exit at port F4; dos-monster boots the image with -boot on a
@@ -57,7 +64,7 @@ def build(asm):
 def qemu(img, model="386"):
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "e9.txt")
-        subprocess.run(["qemu-system-i386", "-cpu", {"586": "pentium", "686": "pentium2"}.get(model, "486"),
+        subprocess.run(["qemu-system-i386", "-cpu", {"586": "pentium", "686": "pentium2", "p2": "pentium2"}.get(model, "486"),
                         "-drive", "file=%s,format=raw,if=floppy" % img,
                         "-display", "none", "-no-reboot",
                         "-debugcon", "file:" + out,
@@ -73,7 +80,7 @@ def bochs(img, model="386"):
     import bochscfg
     extra = ["port_e9_hack: enabled=1"]
     if model == "586": extra.append("cpu: model=pentium, ignore_bad_msrs=0")
-    if model == "686": extra.append("cpu: model=p2_klamath, ignore_bad_msrs=0")
+    if model in ("686", "p2"): extra.append("cpu: model=p2_klamath, ignore_bad_msrs=0")
     rc = bochscfg.write(os.path.abspath(img), extra)
     name = os.path.splitext(os.path.basename(img))[0]
     lines, on = [], False
@@ -110,12 +117,12 @@ def main():
     if "--" in args:
         i = args.index("--"); extra = args[i + 1:]; args = args[:i]
     only = "--ours-only" in args
-    model = "486" if "--m486" in args else "586" if "--m586" in args else "686" if "--m686" in args else "386"
+    model = "486" if "--m486" in args else "586" if "--m586" in args else "686" if "--m686" in args else "p2" if "--mp2" in args else "386"
     expect = None
     if "--expect" in args:
         i = args.index("--expect"); expect = args[i + 1]; del args[i:i + 2]
     use_bochs = "--bochs" in args or "--bochs-only" in args
-    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--m686", "--bochs", "--bochs-only")]
+    args = [a for a in args if a not in ("--ours-only", "--m486", "--m586", "--m686", "--mp2", "--bochs", "--bochs-only")]
     asm = args[0] if args else os.path.join(HERE, "pgtest.asm")
     img = build(asm)
     if "--bochs-only" in sys.argv:

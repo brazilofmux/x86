@@ -56,6 +56,7 @@ enum {
     X86_MODEL_486  = 486,    /* no CPUID: EFLAGS.ID stays 0 */
     X86_MODEL_586  = 586,    /* a P54C Pentium: CPUID, RDTSC, CMPXCHG8B, MSRs, CR4 (PSE, TSD, DE, MCE) */
     X86_MODEL_686  = 686,    /* a Pentium Pro: CMOVcc, FCMOVcc, FCOMI, RDPMC, global pages (CR4.PGE, PCE) */
+    X86_MODEL_P2   = 687,    /* a Pentium II (Klamath): MMX, SYSENTER/SYSEXIT (-m p2) */
 };
 
 /* The Pentium's identity: CPUID 1's EAX, and EDX after reset. Family 5,
@@ -63,6 +64,8 @@ enum {
 #define X86_586_SIGNATURE 0x0000052Cu
 /* The Pentium Pro's: family 6, model 1, stepping 9 (sA1/sB1) */
 #define X86_686_SIGNATURE 0x00000619u
+/* The Pentium II's (Klamath): family 6, model 3, stepping 4 (as Bochs's) */
+#define X86_P2_SIGNATURE  0x00000634u
 uint32_t x86_cpu_signature(const struct x86_cpu *c);   /* CPUID 1's EAX, the reset EDX, the MP table's */
 uint32_t x86_cpu_features(const struct x86_cpu *c);    /* CPUID 1's EDX */
 
@@ -255,6 +258,7 @@ typedef struct x86_cpu {
     uint64_t tsc_base;
     uint64_t msr_perf[3];
     uint64_t msr_p6perf[4];  /* Pentium Pro: PerfEvtSel0/1 (186h, 187h), PerfCtr0/1 (C1h, C2h) */
+    uint32_t msr_sysenter[3];   /* Pentium II: SYSENTER_CS, _ESP, _EIP (174h-176h) */
     /* Would the machine interrupt the CPU now if IF were set (a request
      * the interrupt controller would pass on)? Asked by STI when it sets
      * IF: translated code takes interrupts only between blocks, and an
