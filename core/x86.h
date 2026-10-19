@@ -265,6 +265,7 @@ typedef struct x86_cpu {
     uint64_t msr_perf[3];
     uint64_t msr_p6perf[4];  /* Pentium Pro: PerfEvtSel0/1 (186h, 187h), PerfCtr0/1 (C1h, C2h) */
     uint32_t msr_sysenter[3];   /* Pentium II: SYSENTER_CS, _ESP, _EIP (174h-176h) */
+    uint32_t msr_misc_enable;   /* Pentium 4: IA32_MISC_ENABLE (1A0h) */
     /* Would the machine interrupt the CPU now if IF were set (a request
      * the interrupt controller would pass on)? Asked by STI when it sets
      * IF: translated code takes interrupts only between blocks, and an

@@ -246,6 +246,7 @@ void x86_reset(x86_cpu *c) {
     if (c->model >= X86_MODEL_586) c->r[R_DX] = x86_cpu_signature(c);
     memset(c->msr_p6perf, 0, sizeof c->msr_p6perf);
     memset(c->msr_sysenter, 0, sizeof c->msr_sysenter);
+    c->msr_misc_enable = 0x1801;   /* fast strings on; BTS (11) and PEBS (12) unavailable; no performance monitoring (7) */
     x86_fpu_reset(c);
     c->pg_super = c->pg_probe = 0;
     x86_tlb_flush(c);

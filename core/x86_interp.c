@@ -2189,6 +2189,14 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
              * go nowhere, reads say 0, no microcode update loaded. */
             if (!wr) v = 0;
             break;
+        case 0x1A0:                                                      /* Pentium 4: IA32_MISC_ENABLE */
+            /* Linux's early_init_intel reads and rewrites it on every
+             * family-15 part (to clear "limit CPUID"), and an unchecked
+             * #GP there is an error in the log. What is written stays;
+             * nothing it says changes how we run. */
+            if (c->model < X86_MODEL_P4) goto bad;
+            if (wr) c->msr_misc_enable = (uint32_t)v; else v = c->msr_misc_enable;
+            break;
         case 0x10: if (wr) c->tsc_base = v - x86_tsc_raw(c); else v = x86_tsc(c); break;
         case 0x11: if (p6) goto bad; if (wr) c->msr_perf[0] = v & 0x01FF01FFu; else v = c->msr_perf[0]; break;   /* CESR */
         case 0x12: case 0x13:                                                    /* CTR0, CTR1: 40 bits */
