@@ -352,6 +352,12 @@ typedef struct {
     uint32_t *pm_hits;                  /* per 16-byte line of linear memory */
     uint32_t max_block_bytes;
     uint32_t bm_lo, bm_hi;         /* bitmap range holding CODE/DESC marks: [lo, hi) */
+    /* The pages inside it that hold any: a wipe clears those, not the
+     * whole range — a paged OS scatters code over all of memory, and
+     * with 2 GB the range was most of it, byte by byte, every wipe. */
+#define DBT_BM_PAGES ((X86_MEM_MAX + X86_MEM_SLACK) >> 12)
+    uint8_t  bm_pg[DBT_BM_PAGES];
+    uint32_t bm_pgs[DBT_BM_PAGES], n_bm_pgs;
     /* SMC heat: how often a store to each guest byte has invalidated
      * translated code (saturating). A byte at SMC_VOLATILE or above is
      * patched data living in an instruction — an immediate that code

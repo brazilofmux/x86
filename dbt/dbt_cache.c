@@ -139,6 +139,15 @@ void dbt_links_repatch(x86_dbt *dbt, uint64_t key, uint8_t *code) {
     dbt_jit_writable_end();
 }
 
+/* [start, end) now holds CODE/DESC marks: widen the range, list its pages. */
+static inline void bm_note(x86_dbt *dbt, uint32_t start, uint32_t end) {
+    if (end <= start) return;
+    if (start < dbt->bm_lo) dbt->bm_lo = start;
+    if (end > dbt->bm_hi) dbt->bm_hi = end;
+    for (uint32_t p = start >> 12; p <= (end - 1) >> 12 && p < DBT_BM_PAGES; p++)
+        if (!dbt->bm_pg[p]) { dbt->bm_pg[p] = 1; dbt->bm_pgs[dbt->n_bm_pgs++] = p; }
+}
+
 static inline void own(x86_dbt *dbt, uint32_t a);      /* SMP ownership of a code byte: below, with the translators' registry */
 static inline void disown(x86_dbt *dbt, uint32_t a);
 
@@ -157,8 +166,7 @@ void dbt_mark_block_bytes_except(x86_dbt *dbt, uint32_t start, uint32_t end, con
         if (skipped) continue;
         if (dbt_smp) own(dbt, a); else bm[a] |= X86_BM_CODE;
     }
-    if (start < dbt->bm_lo) dbt->bm_lo = start;
-    if (end > dbt->bm_hi) dbt->bm_hi = end;
+    bm_note(dbt, start, end);
 }
 
 void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
@@ -168,8 +176,7 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     uint8_t *bm = dbt->cpu->code_bitmap;    /* X86_MEM_SLACK past mem_size absorbs a block at the very top */
     if (dbt_smp) for (uint32_t a = start; a < end; a++) own(dbt, a);
     else for (uint32_t a = start; a < end; a++) bm[a] |= X86_BM_CODE;
-    if (start < dbt->bm_lo) dbt->bm_lo = start;
-    if (end > dbt->bm_hi) dbt->bm_hi = end;
+    bm_note(dbt, start, end);
 }
 
 /* A store landed on a byte some cached block covers. Invalidate every
@@ -246,8 +253,7 @@ void dbt_watch_cs_desc(x86_dbt *dbt) {
     uint32_t at = ((sel & 4) ? cpu->ldtr.base : cpu->gdtr.base) + (sel & 0xFFF8u);
     if (at >= cpu->mem_size - 8) return;
     for (uint32_t i = 0; i < 8; i++) cpu->code_bitmap[at + i] |= X86_BM_DESC;
-    if (at < dbt->bm_lo) dbt->bm_lo = at;
-    if (at + 8 > dbt->bm_hi) dbt->bm_hi = at + 8;
+    bm_note(dbt, at, at + 8);
 }
 
 /* cpu->smc_hook: reached from x86_phys_wr8 (interpreter, helpers, host
@@ -365,10 +371,18 @@ void dbt_xinval_apply(x86_dbt *dbt) {
 void dbt_clear_code_bits(x86_cpu *cpu) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     uint8_t *bm = cpu->code_bitmap;
-    if (!dbt_smp)
-        for (uint32_t i = dbt->bm_lo; i < dbt->bm_hi; i++) bm[i] &= (uint8_t)~(X86_BM_CODE | X86_BM_DESC);
-    else                                           /* SMP: our ownership goes; a DESC watch stays, another translator may share it */
-        for (uint32_t i = dbt->bm_lo; i < dbt->bm_hi; i++) disown(dbt, i);
+    for (uint32_t k = 0; k < dbt->n_bm_pgs; k++) {
+        uint32_t p = dbt->bm_pgs[k];
+        uint32_t lo = p << 12, hi = lo + 4096;
+        if (lo < dbt->bm_lo) lo = dbt->bm_lo;
+        if (hi > dbt->bm_hi) hi = dbt->bm_hi;
+        if (!dbt_smp)
+            for (uint32_t i = lo; i < hi; i++) bm[i] &= (uint8_t)~(X86_BM_CODE | X86_BM_DESC);
+        else                                       /* SMP: our ownership goes; a DESC watch stays, another translator may share it */
+            for (uint32_t i = lo; i < hi; i++) disown(dbt, i);
+        dbt->bm_pg[p] = 0;
+    }
+    dbt->n_bm_pgs = 0;
     dbt->bm_lo = cpu->mem_size;
     dbt->bm_hi = 0;
 }
