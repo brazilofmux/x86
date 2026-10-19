@@ -179,6 +179,17 @@ static uint8_t ascii_for(SDL_Keycode k, uint16_t mod) {
 }
 
 static void key(const SDL_KeyboardEvent *e, int down) {
+    /* Cmd-V (Ctrl-V stays the guest's): paste. Its V never reaches the
+     * guest, make or break. */
+    static int pasting;
+    if (e->keysym.sym == SDLK_v && (down ? (e->keysym.mod & KMOD_GUI) != 0 : pasting)) {
+        if (down && !e->repeat) {
+            char *t = SDL_GetClipboardText();
+            if (t) { pc_kbd_paste(t); SDL_free(t); }
+        }
+        pasting = down;
+        return;
+    }
     uint16_t code = set1(e->keysym.scancode);
     if (!code) return;
     uint8_t c8 = (uint8_t)(code & 0x7F);

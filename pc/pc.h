@@ -259,6 +259,7 @@ int  pc_kbd_incoming(void);
 int  pc_kbd_raw_reply_pending(void);                 /* a command's reply is next (goes out even with scanning off) */
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */
+void pc_kbd_paste(const char *text);                      /* Cmd-V: the clipboard, typed in key by key */
 void pc_vga_rom(x86_cpu *c);                               /* POST: the native mode-set code and its tables */
 void pc_vga_rom_mode(x86_cpu *c, int mode);                /* point its ROM variables at MODE's table */
 int  pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h);   /* RGB24, at most 640x480; -1 if not graphics */

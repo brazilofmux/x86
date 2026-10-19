@@ -24,6 +24,10 @@ static struct termios saved_tio;
 static int raw_active;
 static uint8_t pending[1024];                    /* big enough that a scripted burst of escape sequences is not split mid-sequence */
 static int npending;
+/* Text pasted into the window (Cmd-V): typed in one key at a time, paced
+ * as scripted keys are (pc_kbd_poll), behind anything already pending. */
+static char *paste;
+static size_t npaste, paste_at;
 
 /* Scancodes for ASCII 0x20..0x7E (US layout, unshifted key). */
 static const uint8_t sc_ascii[95] = {
@@ -97,7 +101,7 @@ static void raw_enqueue(uint8_t code, uint8_t ascii) {
 int pc_kbd_raw_pending(void) { return rawq_head != rawq_tail; }
 /* Keys on their way in — host bytes not yet fed, or codes not yet
  * latched: a halted guest naps only briefly then (pc_poll) */
-int pc_kbd_incoming(void) { return npending > 0 || rawq_head != rawq_tail; }
+int pc_kbd_incoming(void) { return npending > 0 || paste_at < npaste || rawq_head != rawq_tail; }
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii) { raw_enqueue(code, ascii); }
 /* The keyboard's answer to a command byte (FAh, ACK): ahead of any keys
  * still waiting, as the keyboard sends it straight back. */
@@ -268,6 +272,10 @@ static void fill_pending(void) {
 /* Translate one key from the pending bytes; returns 0 if none. */
 static int next_key(x86_cpu *c, int blocking) {
     if (pc_uart_owns_stdin()) return 0;          /* stdin is COM1's (-com1 stdio): keys come from the window */
+    if (!npending && paste_at < npaste) {           /* one key of a paste: the raw drain below must not take it all at once */
+        pending[npending++] = (uint8_t)paste[paste_at++];
+        if (paste_at == npaste) { free(paste); paste = NULL; npaste = paste_at = 0; }
+    }
     if (!npending) { if (blocking || host_readable(0)) fill_pending(); }
     if (!npending) return 0;
     uint8_t b = pending[0];
@@ -361,6 +369,26 @@ static int next_key(x86_cpu *c, int blocking) {
     return 1;
 }
 
+/* Cmd-V in the window: the clipboard's text, as typed keys. Line ends
+ * (CR, LF, CRLF) become Enter; tabs stay; other control characters and
+ * anything outside ASCII (no US key makes it) are dropped. */
+void pc_kbd_paste(const char *text) {
+    size_t n = strlen(text);
+    char *buf = malloc(npaste - paste_at + n + 1);
+    if (!buf) return;
+    size_t k = npaste - paste_at;
+    if (k) memcpy(buf, paste + paste_at, k);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch == '\r') { buf[k++] = '\r'; if (i + 1 < n && text[i + 1] == '\n') i++; }
+        else if (ch == '\n') buf[k++] = '\r';
+        else if (ch == '\t' || (ch >= 0x20 && ch < 0x7F)) buf[k++] = (char)ch;
+    }
+    free(paste);
+    paste = buf; npaste = k; paste_at = 0;
+    if (!npaste) { free(paste); paste = NULL; }
+}
+
 /* ---- Key trace (-K FILE) ---------------------------------------------------
  * For watching what a program does with each key: scripted keys are
  * released one at a time, and only when the program is idle waiting for
@@ -429,7 +457,7 @@ void pc_kbd_poll(x86_cpu *c) {
         if (now < next_probe) return;
         next_probe = now + 1000000ull;                    /* 1 kHz is plenty for a keyboard */
     }
-    if (raw_active) { while (next_key(c, 0)) { } return; }
+    if (raw_active && paste_at == npaste) { while (next_key(c, 0)) { } return; }
     /* "Idle-polling" = several keyboard queries since the last key; a
      * single poll is often a flush, and a key fed then is lost. */
     /* A program that takes its keys from IRQ 1 and port 60h (DOOM,
@@ -530,7 +558,7 @@ int pc_kbd_wait(x86_cpu *c, int can_return) {
         /* Waiting on the host, not emulating: charged separately so it
           * is not mistaken for the cost of running the service. */
         uint64_t w0 = pc_wall_ns();
-        int ready = host_readable(hooked ? 10 : 50);
+        int ready = paste_at < npaste || host_readable(hooked ? 10 : 50);
         pc.blocked_ns += pc_wall_ns() - w0;
         pc.blocked_calls++;
         if (ready) pc_kbd_poll(c);
