@@ -205,6 +205,7 @@ void pc_rtc_set_date(int year, int mon, int mday);
 void pc_rtc_dump(FILE *out);
 void pc_gpc_dump(FILE *out);
 extern int pc_rtc_start_date[3];      /* -date: the clock starts on this year, month, day (0: today) */
+extern int pc_rtc_utc;                /* -utc: the clock keeps UTC, not the host's local time */
 void pc_rtc_pie(int on);                  /* the periodic interrupt (INT 15h AH=83h) */
 void pc_rtc_alarm(int on, uint8_t h, uint8_t m, uint8_t sec);   /* INT 1Ah AH=06h/07h, BCD */
 int  pc_rtc_alarm_on(void);

@@ -31,6 +31,7 @@ static void usage(const char *prog) {
     printf("              (default 286; DPMI clients need 386)\n");
     printf("  -fpu, -nofpu  a 387 beside a 386, or a 486SX (default: a 486 or a Pentium has its FPU, nothing earlier does)\n");
     printf("  -date D     the clock starts on D (YYYY-MM-DD) at today's time (default: today)\n");
+    printf("  -utc        the clock keeps UTC, as Linux expects (default: the host's local time, for DOS/Windows)\n");
     printf("  -mem N      N MB of memory, 17 to %u (default 17: the first 1 MB and 16 MB above it)\n", X86_MEM_MAX >> 20);
     printf("  -C DIR      host directory to mount as C:\\ (default: PROGRAM's directory)\n");
     printf("  -A DIRS     mount A: (also -B); DIR1:DIR2:... is a diskette sequence, ESC-+ swaps\n");
@@ -376,6 +377,7 @@ int main(int argc, char **argv) {
             model = m == 689 ? X86_MODEL_P4 : m == 688 ? X86_MODEL_P3 : m == 687 ? X86_MODEL_P2 : m == 86 ? X86_MODEL_8086 : m == 186 ? X86_MODEL_186 : m == 286 ? X86_MODEL_286
                   : m == 486 ? X86_MODEL_486 : m == 586 ? X86_MODEL_586 : m == 686 ? X86_MODEL_686 : X86_MODEL_386;
         }
+        else if (!strcmp(argv[i], "-utc")) pc_rtc_utc = 1;
         else if (!strcmp(argv[i], "-date") && i + 1 < argc) {
             int *d = pc_rtc_start_date;
             if (sscanf(argv[++i], "%d-%d-%d", &d[0], &d[1], &d[2]) != 3 || d[0] < 1980 || d[0] > 2099 || d[1] < 1 || d[1] > 12 || d[2] < 1 || d[2] > 31) {

@@ -153,14 +153,23 @@ static void rtc_advance(uint64_t now) {
 void pc_rtc_poll(uint64_t now) { rtc_advance(now); }
 
 int pc_rtc_start_date[3];
+int pc_rtc_utc;
+
+/* The host's time as the clock keeps it: local, as DOS and Windows
+ * expect, or UTC (-utc), as Linux and the other Unixes do — Debian read
+ * our local time as UTC and booted six hours behind until NTP stepped it. */
+static void host_tm(struct tm *tm) {
+    time_t t = time(NULL);
+    if (pc_rtc_utc) gmtime_r(&t, tm); else localtime_r(&t, tm);
+}
 
 static void rtc_seed(void) {
-    time_t t = time(NULL);
     struct tm tm;
-    localtime_r(&t, &tm);
+    host_tm(&tm);
     if (pc_rtc_start_date[0]) {     /* -date: today's time on another day (XP's catalogs fail after 2020) */
         tm.tm_year = pc_rtc_start_date[0] - 1900; tm.tm_mon = pc_rtc_start_date[1] - 1; tm.tm_mday = pc_rtc_start_date[2];
-        tm.tm_isdst = -1; mktime(&tm);              /* the weekday */
+        tm.tm_isdst = -1;
+        if (pc_rtc_utc) timegm(&tm); else mktime(&tm);   /* the weekday */
     }
     rtc.sec = tm.tm_sec > 59 ? 59 : tm.tm_sec; rtc.min = tm.tm_min; rtc.hour = tm.tm_hour;
     rtc.wday = tm.tm_wday + 1; rtc.mday = tm.tm_mday; rtc.mon = tm.tm_mon + 1; rtc.year = tm.tm_year + 1900;
@@ -261,9 +270,8 @@ void pc_cmos_init(x86_cpu *c) {
     /* POST sets the BIOS tick count from the clock, which is where DOS
      * takes the time of day from (it was 00:00 at every boot) */
     if (pc.booted) {
-        time_t t = time(NULL);
         struct tm tm;
-        localtime_r(&t, &tm);
+        host_tm(&tm);
         uint32_t secs = (uint32_t)(tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
         uint32_t ticks = (uint32_t)((uint64_t)secs * 1193182u / 65536u);
         pc_wr16(c, PC_BDA_SEG, 0x6C, (uint16_t)ticks);
