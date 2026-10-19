@@ -330,8 +330,13 @@ int  pc_ne2000_port_read(uint16_t port, int size, uint32_t *val);
 int  pc_ne2000_port_write(uint16_t port, uint32_t val, int size);
 /* pc_vbe.c: VESA BIOS Extensions 3.0, a linear framebuffer at the top of RAM (-vbe) */
 void     pc_vbe_enable(void);
+void     pc_vbe_dispi(void);              /* -dispi: the Bochs/QEMU display (PCI 1234:1111, ports 1CEh/1CFh) */
+int      pc_vbe_port_read(uint16_t port, int size, uint32_t *val);
+int      pc_vbe_port_write(x86_cpu *c, uint16_t port, uint32_t val, int size);
+#define  PC_FRAME_MAX_W 1920                /* the largest picture (a -dispi mode); the buffers the frame goes into */
+#define  PC_FRAME_MAX_H 1200
 int      pc_vbe_enabled(void);
-uint32_t pc_vbe_reserved(void);           /* bytes of RAM at the top the framebuffer takes (0 without -vbe) */
+uint32_t pc_vbe_reserved(uint32_t mem_size);   /* bytes of RAM at the top the framebuffer takes (0 without -vbe) */
 void     pc_vbe_pci_attach(x86_cpu *c);   /* the display as a PCI function, 00:02.0, its BAR 0 the framebuffer (pc_pci_post) */
 void     pc_vbe_vga_mode(void);           /* INT 10h AH=00h: the VGA's picture again */
 int      pc_vbe_active(void);

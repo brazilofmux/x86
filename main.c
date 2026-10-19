@@ -43,6 +43,8 @@ static void usage(const char *prog) {
     printf("  -acpi       ACPI tables naming the processors and the I/O APIC (RSDP, RSDT, FADT, MADT) — what Haiku needs for SMP\n");
     printf("  -vbe        VESA BIOS Extensions 3.0: 640x480 to 1280x1024 at 8/16/32 bpp, a linear\n"
            "              framebuffer in the top 8 MB of RAM (needs -mem 32 or more)\n");
+    printf("  -dispi      -vbe on the display Bochs and QEMU emulate (PCI 1234:1111, DISPI registers\n"
+           "              at 1CEh/1CFh, 16 MB): Linux's bochs-drm sets modes up to 1920x1080 itself\n");
     printf("  -nic e1000[,user]  an Intel 82545EM network card on that bus; ,user puts\n"
            "              a NAT network behind it (libslirp: DHCP gives 10.0.2.15)\n");
     printf("  -nic ne2000[,user] a Novell NE2000 on the ISA bus instead (300h, IRQ 3)\n");
@@ -406,6 +408,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-acpi")) pc_acpi_enable();
         else if (!strcmp(argv[i], "-smp") && i + 1 < argc) { g_nsmp = atoi(argv[++i]); if (g_nsmp < 1 || g_nsmp > PC_MAX_CPUS) { fprintf(stderr, "-smp: 1 to %d processors\n", PC_MAX_CPUS); return 2; } }
         else if (!strcmp(argv[i], "-vbe")) pc_vbe_enable();
+        else if (!strcmp(argv[i], "-dispi")) pc_vbe_dispi();
         else if (!strcmp(argv[i], "-nic") && i + 1 < argc) {
             const char *n = argv[++i];
             const char *comma = strchr(n, ',');
@@ -431,7 +434,7 @@ int main(int argc, char **argv) {
         }
         else { fprintf(stderr, "unknown option %s\n", argv[i]); usage(argv[0]); return 2; }
     }
-    if (pc_vbe_enabled() && mem_mb < 32) { fprintf(stderr, "-vbe: its 8 MB framebuffer comes off the top of RAM: -mem 32 or more\n"); return 2; }
+    if (pc_vbe_enabled() && mem_mb < 32) { fprintf(stderr, "-vbe: its framebuffer (8 MB, -dispi 16) comes off the top of RAM: -mem 32 or more\n"); return 2; }
     x86_cpu cpu;
     int boot_drive = -1;
     if (boot_img) {

@@ -921,6 +921,7 @@ static uint32_t port_read_(x86_cpu *c, uint16_t port, int size) {
     if (pc_ne2000_port_read(port, size, &vv)) return vv;
     if (pc_pci_port_read(port, size, &vv)) return vv;
     if (pc_vga_port_read(port, &vv)) return vv;
+    if (pc_vbe_port_read(port, size, &vv)) return vv;
     if (pc_cmos_port_read(port, &vv)) return vv;
     if (pc_acpi_port_read(port, &vv)) return vv;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61))
@@ -984,6 +985,7 @@ static void port_write_(x86_cpu *c, uint16_t port, uint32_t val, int size) {
     if (pc_ne2000_port_write(port, val, size)) return;
     if (pc_pci_port_write(port, val, size)) return;
     if (pc_vga_port_write(port, val, size)) return;
+    if (pc_vbe_port_write(c, port, val, size)) return;
     if (pc_cmos_port_write(port, val)) return;
     if (pc_acpi_port_write(port, val, size)) return;
     if (pc.debug > 1 && (port == 0x60 || port == 0x64 || port == 0x61 || port == 0x20))

@@ -6,7 +6,7 @@
  * driver. Without -vbe, AH=4Fh fails as on a plain VGA (the machine the
  * DOS, Windows and NT suites boot stays one).
  *
- * The framebuffer is the top 8 MB of guest RAM, reported to the system
+ * The framebuffer is the top 8 MB of guest RAM (aligned to 8 MB), reported to the system
  * as not RAM (pc_cmos.c: mem_top, and a reserved E820 range): the guest's
  * pixels are ordinary memory to translated code — its stores take the
  * fast path — and the display reads them straight from there.
@@ -35,12 +35,20 @@
  * logical scan line length (get; set only to what the mode has), 07h
  * display start (panning, page flips), 08h DAC width (6 bits, fixed),
  * 09h palette data. Everything else is AX=014Fh, "not supported".
+ *
+ * -dispi: the display is instead the one Bochs and QEMU emulate (their
+ * "std VGA"), vendor 1234h device 1111h, with its VBE_DISPI registers
+ * at ports 1CEh (index) and 1CFh (data) and 16 MB of video memory — what
+ * Linux's bochs-drm binds to, a KMS driver that sets any resolution up
+ * to 1920x1080 itself. The registers are the one truth either way: a
+ * mode set through INT 10h writes them as the Bochs VBE BIOS does, and
+ * the picture is always drawn from them.
  */
 #include "pc.h"
 #include <stdio.h>
 #include <string.h>
 
-#define VRAM (8u << 20)
+#define VRAM (v.dispi ? 16u << 20 : 8u << 20)
 
 static const struct vbe_mode { uint16_t num, w, h; uint8_t bpp; } modes[] = {
     { 0x101,  640, 480,  8 }, { 0x111,  640, 480, 16 }, { 0x112,  640, 480, 32 },
@@ -50,19 +58,106 @@ static const struct vbe_mode { uint16_t num, w, h; uint8_t bpp; } modes[] = {
 };
 #define NMODES (sizeof modes / sizeof modes[0])
 
+/* The VBE_DISPI registers (Bochs's vgabios, QEMU's hw/display/vga.c) */
+enum { DI_ID, DI_XRES, DI_YRES, DI_BPP, DI_ENABLE, DI_BANK, DI_VIRT_W, DI_VIRT_H, DI_XOFF, DI_YOFF, DI_VMEM64K, DI_N };
+#define DE_ENABLED   0x01
+#define DE_GETCAPS   0x02
+#define DE_LFB       0x40
+#define DE_NOCLEAR   0x80
+#define DISPI_MAX_W  1920
+#define DISPI_MAX_H  1200
+
 static struct {
-    int enabled;
-    const struct vbe_mode *m;          /* the VBE mode set, or NULL: the VGA's */
+    int enabled, dispi;
+    const struct vbe_mode *m;          /* the VBE mode set through INT 10h, or NULL */
     int lfb;                           /* set with bit 14 */
-    uint32_t start;                    /* display start, bytes into the framebuffer */
-} v;
+    uint16_t idx, r[DI_N];             /* r[DI_ENABLE] & DE_ENABLED: a VBE picture, drawn from r[] */
+} v = { .r = { [DI_ID] = 0xB0C5 } };
 
 void pc_vbe_enable(void) { v.enabled = 1; }
+void pc_vbe_dispi(void) { v.enabled = v.dispi = 1; }
 int  pc_vbe_enabled(void) { return v.enabled; }
-uint32_t pc_vbe_reserved(void) { return v.enabled ? VRAM : 0; }
-static uint32_t lfb_base(const x86_cpu *c) { return c->mem_size - VRAM; }
-void pc_vbe_vga_mode(void) { v.m = NULL; v.start = 0; }   /* INT 10h AH=00h: the VGA again */
-int  pc_vbe_active(void) { return v.m != NULL; }
+/* The framebuffer: the highest VRAM-aligned VRAM bytes of RAM, since it
+ * is also a PCI BAR, which is aligned to its size — at mem_size - VRAM
+ * with -mem 2047 the BAR said 15 MB lower than the buffer was (the VBE
+ * BIOS's PhysBasePtr was right, so only a driver reading the BAR, Linux's
+ * bochs-drm, drew off it). Everything from there up is reserved. */
+static uint32_t lfb_at(uint32_t mem_size) { return (mem_size - VRAM) & ~(VRAM - 1); }
+uint32_t pc_vbe_reserved(uint32_t mem_size) { return v.enabled ? mem_size - lfb_at(mem_size) : 0; }
+static uint32_t lfb_base(const x86_cpu *c) { return lfb_at(c->mem_size); }
+void pc_vbe_vga_mode(void) { v.m = NULL; v.r[DI_ENABLE] = 0; }   /* INT 10h AH=00h: the VGA again */
+int  pc_vbe_active(void) { return (v.r[DI_ENABLE] & DE_ENABLED) != 0; }
+
+static uint32_t bytespp(void) { return v.r[DI_BPP] == 15 ? 2 : v.r[DI_BPP] / 8u; }
+static uint32_t dpitch(void) { return v.r[DI_VIRT_W] * bytespp(); }
+static uint32_t dstart(void) { return v.r[DI_YOFF] * dpitch() + v.r[DI_XOFF] * bytespp(); }
+
+/* ENABLE written: on, the virtual screen at least the visible one, and
+ * the memory cleared unless asked not to (QEMU's vbe_update_vgaregs and
+ * friends; the VGA's own registers it reprograms we have no use for). */
+static void dispi_enable(x86_cpu *c, uint16_t val) {
+    int was = v.r[DI_ENABLE] & DE_ENABLED;
+    v.r[DI_ENABLE] = val;
+    if (!(val & DE_ENABLED) || was) return;
+    if (v.r[DI_BPP] == 0) v.r[DI_BPP] = 8;
+    if (v.r[DI_VIRT_W] < v.r[DI_XRES]) v.r[DI_VIRT_W] = v.r[DI_XRES];
+    if (dpitch()) v.r[DI_VIRT_H] = (uint16_t)(VRAM / dpitch() > 0xFFFF ? 0xFFFF : VRAM / dpitch());
+    v.r[DI_XOFF] = v.r[DI_YOFF] = 0;
+    if (!(val & DE_NOCLEAR)) memset(c->mem + lfb_base(c), 0, VRAM);
+}
+
+static void dispi_write(x86_cpu *c, int i, uint16_t val) {
+    if (pc.debug > 1) fprintf(stderr, "[dispi] %X <- %04X\n", i, val);
+    switch (i) {
+    case DI_ID: if ((val & 0xFFF0) == 0xB0C0 && val <= 0xB0C5) v.r[DI_ID] = val; return;
+    case DI_XRES: case DI_YRES: case DI_BPP:
+        if (v.r[DI_ENABLE] & DE_ENABLED) return;       /* fixed while enabled */
+        if (i == DI_XRES && (val > DISPI_MAX_W || (val & 7))) return;
+        if (i == DI_YRES && val > DISPI_MAX_H) return;
+        if (i == DI_BPP && val != 8 && val != 15 && val != 16 && val != 24 && val != 32) return;
+        v.r[i] = val;
+        return;
+    case DI_ENABLE: v.m = NULL; dispi_enable(c, val); return;
+    case DI_BANK: v.r[i] = 0; return;                    /* LFB only: no banked window */
+    case DI_VIRT_W:
+        if (val < v.r[DI_XRES] || (uint32_t)val * bytespp() * v.r[DI_YRES] > VRAM) return;
+        v.r[i] = val;
+        if (dpitch()) v.r[DI_VIRT_H] = (uint16_t)(VRAM / dpitch() > 0xFFFF ? 0xFFFF : VRAM / dpitch());
+        return;
+    case DI_XOFF: case DI_YOFF: {
+        uint16_t keep = v.r[i];
+        v.r[i] = val;
+        if (dstart() + dpitch() * v.r[DI_YRES] > VRAM) v.r[i] = keep;   /* the picture would leave video memory */
+        return;
+    }
+    default: return;                                     /* VIRT_H follows VIRT_W; VMEM64K reads only */
+    }
+}
+
+static uint16_t dispi_read(int i) {
+    if (v.r[DI_ENABLE] & DE_GETCAPS) {                  /* the maxima instead */
+        if (i == DI_XRES) return DISPI_MAX_W;
+        if (i == DI_YRES) return DISPI_MAX_H;
+        if (i == DI_BPP) return 32;
+    }
+    if (i == DI_VMEM64K) return (uint16_t)(VRAM >> 16);
+    return i < DI_N ? v.r[i] : 0;
+}
+
+int pc_vbe_port_read(uint16_t port, int size, uint32_t *val) {
+    if (!v.dispi || (port != 0x1CE && port != 0x1CF && port != 0x1D0)) return 0;
+    uint16_t w = port == 0x1CE ? v.idx : dispi_read(v.idx);
+    *val = size == 1 ? (uint8_t)w : w;
+    return 1;
+}
+
+int pc_vbe_port_write(x86_cpu *c, uint16_t port, uint32_t val, int size) {
+    if (!v.dispi || (port != 0x1CE && port != 0x1CF && port != 0x1D0)) return 0;
+    (void)size;
+    if (port == 0x1CE) v.idx = (uint16_t)val;
+    else dispi_write(c, v.idx, (uint16_t)val);
+    return 1;
+}
 
 static const struct vbe_mode *find(uint16_t num) {
     for (size_t i = 0; i < NMODES; i++) if (modes[i].num == (num & 0x1FF)) return &modes[i];
@@ -156,10 +251,13 @@ static void set_mode(x86_cpu *c) {
     }
     const struct vbe_mode *m = find(bx);
     if (!m) { fail(c); return; }
+    /* as the Bochs VBE BIOS programs the DISPI registers */
+    v.r[DI_ENABLE] = 0;
+    v.r[DI_BPP] = m->bpp; v.r[DI_XRES] = m->w; v.r[DI_YRES] = m->h;
+    v.r[DI_BANK] = 0; v.r[DI_VIRT_W] = 0;
+    dispi_enable(c, (uint16_t)(DE_ENABLED | DE_LFB | (bx & 0x8000 ? DE_NOCLEAR : 0)));
     v.m = m;
     v.lfb = (bx & 0x4000) != 0;
-    v.start = 0;
-    if (!(bx & 0x8000)) memset(c->mem + lfb_base(c), 0, VRAM);
     if (pc.debug) fprintf(stderr, "[vbe] mode %03X: %ux%u, %u bpp, framebuffer at %08X\n", m->num, m->w, m->h, m->bpp, lfb_base(c));
     ok(c);
 }
@@ -190,11 +288,11 @@ void pc_vbe_int10(x86_cpu *c) {
             uint32_t x = x86_get_r16(c, R_CX), y = x86_get_r16(c, R_DX);
             uint32_t s = y * pitch(v.m) + x * (v.m->bpp / 8);
             if (s + pitch(v.m) * v.m->h > VRAM) { x86_set_r16(c, R_AX, 0x024F); return; }
-            v.start = s;
+            v.r[DI_XOFF] = (uint16_t)x; v.r[DI_YOFF] = (uint16_t)y;
         } else if (bl == 0x01) {
             x86_set_r16(c, R_BX, 0);
-            x86_set_r16(c, R_CX, (uint16_t)((v.start % pitch(v.m)) / (v.m->bpp / 8)));
-            x86_set_r16(c, R_DX, (uint16_t)(v.start / pitch(v.m)));
+            x86_set_r16(c, R_CX, v.r[DI_XOFF]);
+            x86_set_r16(c, R_DX, v.r[DI_YOFF]);
         } else { fail(c); return; }
         ok(c);
         return;
@@ -227,37 +325,41 @@ void pc_vbe_int10(x86_cpu *c) {
 }
 
 /* The picture of a VBE mode as RGB24 rows, from the display start: 8 bpp
- * through the DAC, 16 as 5:6:5, 32 as x:8:8:8. 0, or -1 if no VBE mode is
- * set. RGB holds at least 1280x1024. */
+ * through the DAC, 15 as 5:5:5, 16 as 5:6:5, 24 as 8:8:8, 32 as x:8:8:8.
+ * 0, or -1 if no VBE mode is set. RGB holds PC_FRAME_MAX_W x _H. */
 int pc_vbe_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h) {
-    const struct vbe_mode *m = v.m;
-    if (!m) return -1;
-    *w = m->w; *h = m->h;
-    const uint8_t *fb = c->mem + lfb_base(c) + v.start;
-    uint32_t p = pitch(m);
-    if (m->bpp == 8) {
+    if (!(v.r[DI_ENABLE] & DE_ENABLED)) return -1;
+    int W = v.r[DI_XRES], H = v.r[DI_YRES], bpp = v.r[DI_BPP];
+    uint32_t p = dpitch(), st = dstart();
+    if (!W || !H || st + p * (uint32_t)(H - 1) + (uint32_t)W * bytespp() > VRAM) return -1;
+    *w = W; *h = H;
+    const uint8_t *fb = c->mem + lfb_base(c) + st;
+    if (bpp == 8) {
         uint8_t lut[256][3];
         for (int i = 0; i < 256; i++) {
             uint8_t d[3]; pc_vga_get_dac(i, d);
             for (int k = 0; k < 3; k++) lut[i][k] = (uint8_t)((d[k] << 2) | (d[k] >> 4));
         }
-        for (int y = 0; y < m->h; y++)
-            for (int x = 0; x < m->w; x++) memcpy(rgb + ((size_t)y * m->w + (size_t)x) * 3, lut[fb[(size_t)y * p + (size_t)x]], 3);
-    } else if (m->bpp == 16) {
-        for (int y = 0; y < m->h; y++) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) memcpy(rgb + ((size_t)y * W + (size_t)x) * 3, lut[fb[(size_t)y * p + (size_t)x]], 3);
+    } else if (bpp == 15 || bpp == 16) {
+        int gb = bpp == 16 ? 6 : 5;
+        for (int y = 0; y < H; y++) {
             const uint8_t *row = fb + (size_t)y * p;
-            uint8_t *o = rgb + (size_t)y * m->w * 3;
-            for (int x = 0; x < m->w; x++, o += 3) {
+            uint8_t *o = rgb + (size_t)y * W * 3;
+            for (int x = 0; x < W; x++, o += 3) {
                 uint16_t px = (uint16_t)(row[2 * x] | row[2 * x + 1] << 8);
-                uint8_t r = (uint8_t)(px >> 11), g = (uint8_t)((px >> 5) & 63), bl = (uint8_t)(px & 31);
-                o[0] = (uint8_t)((r << 3) | (r >> 2)); o[1] = (uint8_t)((g << 2) | (g >> 4)); o[2] = (uint8_t)((bl << 3) | (bl >> 2));
+                uint8_t r = (uint8_t)((px >> (5 + gb)) & 31), g = (uint8_t)((px >> 5) & ((1 << gb) - 1)), bl = (uint8_t)(px & 31);
+                o[0] = (uint8_t)((r << 3) | (r >> 2)); o[2] = (uint8_t)((bl << 3) | (bl >> 2));
+                o[1] = gb == 6 ? (uint8_t)((g << 2) | (g >> 4)) : (uint8_t)((g << 3) | (g >> 2));
             }
         }
     } else {
-        for (int y = 0; y < m->h; y++) {
+        int n = bpp == 24 ? 3 : 4;
+        for (int y = 0; y < H; y++) {
             const uint8_t *row = fb + (size_t)y * p;
-            uint8_t *o = rgb + (size_t)y * m->w * 3;
-            for (int x = 0; x < m->w; x++, o += 3) { o[0] = row[4 * x + 2]; o[1] = row[4 * x + 1]; o[2] = row[4 * x]; }
+            uint8_t *o = rgb + (size_t)y * W * 3;
+            for (int x = 0; x < W; x++, o += 3) { o[0] = row[n * x + 2]; o[1] = row[n * x + 1]; o[2] = row[n * x]; }
         }
     }
     return 0;
@@ -272,12 +374,13 @@ void pc_vbe_pci_attach(x86_cpu *c) {
     pc_pci_dev *d = &vgapci;
     memset(d, 0, sizeof *d);
     static const uint8_t id[16] = {
-        0x34, 0x12, 0x12, 0x11,     /* vendor 1234h, device 1112h */
+        0x34, 0x12, 0x12, 0x11,     /* vendor 1234h, device 1112h (-dispi: 1111h, below) */
         0x03, 0x00, 0x80, 0x02,     /* command: I/O, memory; status: medium DEVSEL, fast back-to-back */
         0x00, 0x00, 0x00, 0x03,     /* revision 0; programming interface 0; class 03h (display), subclass 00h (VGA) */
         0x00, 0x00, 0x00, 0x00,     /* header type 0, single function */
     };
     memcpy(d->cfg, id, sizeof id);
+    if (v.dispi) d->cfg[2] = 0x11;                       /* Bochs/QEMU's: bochs-drm's */
     d->bar_size[0] = VRAM;
     d->bar_fixed[0] = lfb_base(c);
     d->cfg[0x10] = 0x08;                                 /* BAR 0: memory, prefetchable (the size's bits are written at POST) */

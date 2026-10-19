@@ -222,7 +222,7 @@ static int draw_text(x86_cpu *c) {
 
 void pc_sdl_poll(x86_cpu *c, uint64_t now) {
     if (!allowed) return;
-    static uint8_t rgb[1280 * 1024 * 3];        /* the largest picture: a VBE mode's */
+    static uint8_t rgb[PC_FRAME_MAX_W * PC_FRAME_MAX_H * 3];   /* the largest picture: a VBE mode's */
     static int gw = 320, gh = 200;
     if (now >= next_frame_ns) {
         next_frame_ns = now + FRAME_NS;

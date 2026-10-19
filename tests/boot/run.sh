@@ -151,6 +151,19 @@ if [ -f "$G/vbe.mod" ] && command -v i686-elf-grub-mkimage >/dev/null; then
     then echo "ok   vesa bios extensions: grub lists the modes, draws at 1024x768x32"; else echo "FAIL vesa bios extensions (grub videotest)"; fail=1; fi
     rm -f tmp/boot-vbe.cfg tmp/boot-vbe.core tmp/boot-vbe.flp tmp/boot-vbe.exp
 fi
+if [ -f "$G/video_bochs.mod" ] && command -v i686-elf-grub-mkimage >/dev/null; then
+    # The Bochs/QEMU display (-dispi): GRUB 2's own driver for it (no vbe
+    # module in this image) finds PCI 1234:1111, sets 1280x1024x32 through
+    # the DISPI registers and draws its test pattern; the red square, and
+    # a pixel only a 1280x1024 picture has, are the proof
+    printf 'insmod video_bochs\nset gfxmode=1280x1024x32\nvideotest\n' > tmp/boot-dispi.cfg
+    i686-elf-grub-mkimage -O i386-pc -d "$G" -o tmp/boot-dispi.core -c tmp/boot-dispi.cfg -p '(fd0)' biosdisk video_bochs video videotest
+    cat "$G/boot.img" tmp/boot-dispi.core > tmp/boot-dispi.flp && truncate -s 1474560 tmp/boot-dispi.flp
+    printf 'waitpix 50,50 255 0 0\nwaitpix 1250,1000 0 0 0\n' > tmp/boot-dispi.exp
+    if python3 tools/expect.py -t 40 tmp/boot-dispi.exp -- $DM -m 586 -mem 64 -pci -dispi -W -T 35 -fda tmp/boot-dispi.flp -boot a >/dev/null 2>&1
+    then echo "ok   bochs display (-dispi): grub's bochs driver draws at 1280x1024x32"; else echo "FAIL bochs display (grub video_bochs)"; fail=1; fi
+    rm -f tmp/boot-dispi.cfg tmp/boot-dispi.core tmp/boot-dispi.flp tmp/boot-dispi.exp
+fi
 if [ -f disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso ]; then
     # Haiku R1/beta6 (32-bit, x86_gcc2h), its anyboot image as the hard
     # disk, read-only: the boot loader through VBE at 1024x768, the kernel,

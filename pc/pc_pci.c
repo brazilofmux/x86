@@ -192,6 +192,7 @@ int pc_pci_port_write(uint16_t port, uint32_t val, int size) {
     if (port >= 0xCFC && port <= 0xCFF) {
         pc_pci_dev *d = selected();
         unsigned reg = (pci.addr & 0xFC) + (port & 3u);
+        if (pc.debug > 1 && d) fprintf(stderr, "[pci] %02X:%02X.%u cfg %02X <- %0*X\n", (pci.addr >> 16) & 0xFF, (pci.addr >> 11) & 0x1F, (pci.addr >> 8) & 7, reg, 2 * size, val);
         if (d) for (int i = 0; i < size; i++) cfg_write8(d, reg + (unsigned)i, (uint8_t)(val >> (8 * i)));
         return 1;
     }
