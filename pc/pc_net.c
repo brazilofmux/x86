@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 #define RXQ 256
 
@@ -143,6 +144,10 @@ int pc_net_open(const char *spec) {
     cfg.vhostname = "dos-monster";
     slirp = slirp_new(&cfg, &cb, NULL);
     if (!slirp) { fprintf(stderr, "-nic: slirp_new failed\n"); return -1; }
+    /* a forwarded connection the host side has already closed: libslirp's
+     * write to it must fail with EPIPE, not kill the emulator (ssh probing
+     * the port while the guest's sshd was still starting did) */
+    signal(SIGPIPE, SIG_IGN);
     for (const char *o = strchr(spec, ','); o; o = strchr(o + 1, ',')) {
         unsigned hp, gp;
         struct in_addr lo, guest;
