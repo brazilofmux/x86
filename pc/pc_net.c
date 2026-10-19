@@ -112,8 +112,12 @@ static int get_revents(int idx, void *opaque) {
          | (r & POLLERR ? SLIRP_POLL_ERR : 0) | (r & POLLHUP ? SLIRP_POLL_HUP : 0);
 }
 
+/* SPEC: "user", then any number of ",fwd=HOST:GUEST" — a TCP port on the
+ * host's loopback (only: nothing outside this machine reaches the guest)
+ * forwarded to that port of the guest's DHCP address, 10.0.2.15:
+ * "user,fwd=2222:22" is ssh -p 2222 into the guest. */
 int pc_net_open(const char *spec) {
-    if (strcmp(spec, "user")) { fprintf(stderr, "-nic: the network behind the card is 'user' (slirp)\n"); return -1; }
+    if (strncmp(spec, "user", 4) || (spec[4] && spec[4] != ',')) { fprintf(stderr, "-nic: the network behind the card is 'user' (slirp)\n"); return -1; }
     static const SlirpCb cb = {
         .send_packet = send_packet, .guest_error = guest_error, .clock_get_ns = clock_get_ns,
         .timer_new = timer_new, .timer_free = timer_free, .timer_mod = timer_mod,
@@ -139,6 +143,16 @@ int pc_net_open(const char *spec) {
     cfg.vhostname = "dos-monster";
     slirp = slirp_new(&cfg, &cb, NULL);
     if (!slirp) { fprintf(stderr, "-nic: slirp_new failed\n"); return -1; }
+    for (const char *o = strchr(spec, ','); o; o = strchr(o + 1, ',')) {
+        unsigned hp, gp;
+        struct in_addr lo, guest;
+        if (sscanf(o, ",fwd=%u:%u", &hp, &gp) != 2 || !hp || hp > 65535 || !gp || gp > 65535) {
+            fprintf(stderr, "-nic: after 'user', only ,fwd=HOSTPORT:GUESTPORT (TCP, host loopback to the guest)\n");
+            return -1;
+        }
+        inet_aton("127.0.0.1", &lo); inet_aton("10.0.2.15", &guest);
+        if (slirp_add_hostfwd(slirp, 0, lo, (int)hp, guest, (int)gp) < 0) { fprintf(stderr, "-nic: cannot listen on 127.0.0.1:%u\n", hp); return -1; }
+    }
     net.present = 1;
     return 0;
 }

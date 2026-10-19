@@ -46,6 +46,7 @@ static void usage(const char *prog) {
     printf("  -nic e1000[,user]  an Intel 82545EM network card on that bus; ,user puts\n"
            "              a NAT network behind it (libslirp: DHCP gives 10.0.2.15)\n");
     printf("  -nic ne2000[,user] a Novell NE2000 on the ISA bus instead (300h, IRQ 3)\n");
+    printf("              ...,user,fwd=H:G  host TCP port H (127.0.0.1 only) to the guest's port G; repeatable\n");
     printf("  -ro         the images are read-only: the guest may write, the files never change\n");
     printf("  -boot a|c|d|IMG  boot the machine from A:, C: or the second hard disk (IMG: -fda IMG -boot a), no HLE DOS\n");
     printf("  -t          full-screen terminal: paint the text buffer (default: echo console output)\n");
