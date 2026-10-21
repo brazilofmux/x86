@@ -162,6 +162,78 @@ int usleep(useconds_t us) {
 
 struct tm *localtime_r(const time_t *t, struct tm *out) { return localtime_s(out, t) ? NULL : out; }
 struct tm *gmtime_r(const time_t *t, struct tm *out) { return gmtime_s(out, t) ? NULL : out; }
+time_t timegm(struct tm *tm) { return _mkgmtime(tm); }
+
+/* ---- threads: the subset pc/pc_smp.c and main.c call ---- */
+int pthread_mutexattr_init(pthread_mutexattr_t *a) { a->type = PTHREAD_MUTEX_NORMAL; return 0; }
+int pthread_mutexattr_settype(pthread_mutexattr_t *a, int type) { a->type = type; return 0; }
+int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a) {
+    (void)a;                                          /* a critical section reenters */
+    CRITICAL_SECTION *cs = malloc(sizeof *cs);
+    if (!cs) { errno = ENOMEM; return -1; }
+    InitializeCriticalSection(cs);
+    m->cs = cs;
+    return 0;
+}
+int pthread_mutex_lock(pthread_mutex_t *m) { EnterCriticalSection(m->cs); return 0; }
+int pthread_mutex_unlock(pthread_mutex_t *m) { LeaveCriticalSection(m->cs); return 0; }
+
+int pthread_cond_init(pthread_cond_t *c, const pthread_condattr_t *a) {
+    (void)a;
+    CONDITION_VARIABLE *cv = malloc(sizeof *cv);
+    if (!cv) { errno = ENOMEM; return -1; }
+    InitializeConditionVariable(cv);
+    c->cv = cv;
+    return 0;
+}
+int pthread_cond_signal(pthread_cond_t *c) { WakeConditionVariable(c->cv); return 0; }
+int pthread_cond_broadcast(pthread_cond_t *c) { WakeAllConditionVariable(c->cv); return 0; }
+int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
+    return SleepConditionVariableCS(c->cv, m->cs, INFINITE) ? 0 : -1;
+}
+/* abs is CLOCK_REALTIME, as pc_smp_wait computes it. The timeout is in
+ * milliseconds; round up so a short wait does not return early. */
+int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *abs) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+    int64_t ns = ((int64_t)abs->tv_sec - (int64_t)now.tv_sec) * 1000000000LL
+               + ((int64_t)abs->tv_nsec - (int64_t)now.tv_nsec);
+    if (ns <= 0) return ETIMEDOUT;
+    uint64_t ms = ((uint64_t)ns + 999999ull) / 1000000ull;
+    if (ms > 0xFFFFFFFEull) ms = 0xFFFFFFFEull;       /* INFINITE is the untimed wait */
+    if (SleepConditionVariableCS(c->cv, m->cs, (DWORD)ms)) return 0;
+    return GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : -1;
+}
+
+struct win_thr { void *(*fn)(void *); void *arg; };
+static unsigned __stdcall win_thr_main(void *p) {
+    struct win_thr *t = p;
+    void *(*fn)(void *) = t->fn;
+    void *arg = t->arg;
+    free(t);
+    fn(arg);
+    return 0;
+}
+int pthread_attr_init(pthread_attr_t *a) { a->stacksize = 0; return 0; }
+int pthread_attr_setstacksize(pthread_attr_t *a, size_t stack) {
+    a->stacksize = stack > 0xFFFFFFFFu ? 0 : (unsigned)stack;
+    return 0;
+}
+int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
+    struct win_thr *s = malloc(sizeof *s);
+    if (!s) { errno = ENOMEM; return -1; }
+    s->fn = fn; s->arg = arg;
+    uintptr_t h = _beginthreadex(NULL, a ? a->stacksize : 0, win_thr_main, s, 0, NULL);
+    if (!h) { int e = errno ? errno : EAGAIN; free(s); errno = e; return -1; }
+    *t = (pthread_t)h;
+    return 0;
+}
+int pthread_join(pthread_t t, void **ret) {
+    if (WaitForSingleObject((HANDLE)t, INFINITE) != WAIT_OBJECT_0) { errno = EINVAL; return -1; }
+    CloseHandle((HANDLE)t);
+    if (ret) *ret = NULL;
+    return 0;
+}
 
 /* ---- memory mappings ---- */
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off) {

@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include <errno.h>
 #include <io.h>
@@ -41,6 +42,82 @@ typedef int mode_t;
 static __inline int __builtin_ctz(unsigned x) { unsigned long i; _BitScanForward(&i, x); return (int)i; }
 static __inline int __builtin_clz(unsigned x) { unsigned long i; _BitScanReverse(&i, x); return 31 - (int)i; }
 static __inline int __builtin_popcount(unsigned x) { return (int)__popcnt(x); }
+static __inline double __builtin_sqrt(double x) { return sqrt(x); }
+
+/* gcc's __atomic_* , which the SMP paths use. On x64 a plain load is an
+ * acquire and a plain store a release; sequential consistency adds a
+ * fence, and a read-modify-write is an Interlocked op. */
+#define __ATOMIC_RELAXED 0
+#define __ATOMIC_CONSUME 1
+#define __ATOMIC_ACQUIRE 2
+#define __ATOMIC_RELEASE 3
+#define __ATOMIC_ACQ_REL 4
+#define __ATOMIC_SEQ_CST 5
+static __inline void win_fence(int order) {
+    _ReadWriteBarrier();
+    if (order == __ATOMIC_SEQ_CST) _mm_mfence();
+}
+static __inline uint8_t  win_load8 (const volatile uint8_t  *p, int o) { uint8_t  v = *p; if (o != __ATOMIC_RELAXED) win_fence(o); return v; }
+static __inline uint16_t win_load16(const volatile uint16_t *p, int o) { uint16_t v = *p; if (o != __ATOMIC_RELAXED) win_fence(o); return v; }
+static __inline uint32_t win_load32(const volatile uint32_t *p, int o) { uint32_t v = *p; if (o != __ATOMIC_RELAXED) win_fence(o); return v; }
+static __inline uint64_t win_load64(const volatile uint64_t *p, int o) { uint64_t v = *p; if (o != __ATOMIC_RELAXED) win_fence(o); return v; }
+static __inline void win_store8 (volatile uint8_t  *p, uint8_t  v, int o) { if (o != __ATOMIC_RELAXED) win_fence(o == __ATOMIC_SEQ_CST ? __ATOMIC_RELEASE : o); *p = v; if (o == __ATOMIC_SEQ_CST) _mm_mfence(); }
+static __inline void win_store16(volatile uint16_t *p, uint16_t v, int o) { if (o != __ATOMIC_RELAXED) win_fence(o == __ATOMIC_SEQ_CST ? __ATOMIC_RELEASE : o); *p = v; if (o == __ATOMIC_SEQ_CST) _mm_mfence(); }
+static __inline void win_store32(volatile uint32_t *p, uint32_t v, int o) { if (o != __ATOMIC_RELAXED) win_fence(o == __ATOMIC_SEQ_CST ? __ATOMIC_RELEASE : o); *p = v; if (o == __ATOMIC_SEQ_CST) _mm_mfence(); }
+static __inline void win_store64(volatile uint64_t *p, uint64_t v, int o) { if (o != __ATOMIC_RELAXED) win_fence(o == __ATOMIC_SEQ_CST ? __ATOMIC_RELEASE : o); *p = v; if (o == __ATOMIC_SEQ_CST) _mm_mfence(); }
+static __inline uint8_t  win_xchg8 (volatile uint8_t  *p, uint8_t  v) { return (uint8_t)_InterlockedExchange8((char volatile *)p, (char)v); }
+static __inline uint16_t win_xchg16(volatile uint16_t *p, uint16_t v) { return (uint16_t)_InterlockedExchange16((short volatile *)p, (short)v); }
+static __inline uint32_t win_xchg32(volatile uint32_t *p, uint32_t v) { return (uint32_t)_InterlockedExchange((long volatile *)p, (long)v); }
+static __inline uint64_t win_xchg64(volatile uint64_t *p, uint64_t v) { return (uint64_t)_InterlockedExchange64((long long volatile *)p, (long long)v); }
+static __inline int win_cas8 (volatile uint8_t  *p, uint8_t  *e, uint8_t  d) { uint8_t  o = (uint8_t)_InterlockedCompareExchange8((char volatile *)p, (char)d, (char)*e); if (o == *e) return 1; *e = o; return 0; }
+static __inline int win_cas16(volatile uint16_t *p, uint16_t *e, uint16_t d) { uint16_t o = (uint16_t)_InterlockedCompareExchange16((short volatile *)p, (short)d, (short)*e); if (o == *e) return 1; *e = o; return 0; }
+static __inline int win_cas32(volatile uint32_t *p, uint32_t *e, uint32_t d) { uint32_t o = (uint32_t)_InterlockedCompareExchange((long volatile *)p, (long)d, (long)*e); if (o == *e) return 1; *e = o; return 0; }
+static __inline int win_cas64(volatile uint64_t *p, uint64_t *e, uint64_t d) { uint64_t o = (uint64_t)_InterlockedCompareExchange64((long long volatile *)p, (long long)d, (long long)*e); if (o == *e) return 1; *e = o; return 0; }
+static __inline uint8_t  win_or8 (volatile uint8_t  *p, uint8_t  v) { return (uint8_t)_InterlockedOr8((char volatile *)p, (char)v); }
+static __inline uint16_t win_or16(volatile uint16_t *p, uint16_t v) { return (uint16_t)_InterlockedOr16((short volatile *)p, (short)v); }
+static __inline uint32_t win_or32(volatile uint32_t *p, uint32_t v) { return (uint32_t)_InterlockedOr((long volatile *)p, (long)v); }
+static __inline uint64_t win_or64(volatile uint64_t *p, uint64_t v) { return (uint64_t)_InterlockedOr64((long long volatile *)p, (long long)v); }
+static __inline uint8_t  win_and8 (volatile uint8_t  *p, uint8_t  v) { return (uint8_t)_InterlockedAnd8((char volatile *)p, (char)v); }
+static __inline uint16_t win_and16(volatile uint16_t *p, uint16_t v) { return (uint16_t)_InterlockedAnd16((short volatile *)p, (short)v); }
+static __inline uint32_t win_and32(volatile uint32_t *p, uint32_t v) { return (uint32_t)_InterlockedAnd((long volatile *)p, (long)v); }
+static __inline uint64_t win_and64(volatile uint64_t *p, uint64_t v) { return (uint64_t)_InterlockedAnd64((long long volatile *)p, (long long)v); }
+static __inline uint32_t win_add32(volatile uint32_t *p, uint32_t v) { return (uint32_t)_InterlockedExchangeAdd((long volatile *)p, (long)v); }
+static __inline uint64_t win_add64(volatile uint64_t *p, uint64_t v) { return (uint64_t)_InterlockedExchangeAdd64((long long volatile *)p, (long long)v); }
+#define __atomic_load_n(p, o) ( \
+    sizeof(*(p)) == 1 ? win_load8 ((const volatile uint8_t  *)(const void *)(p), (o)) : \
+    sizeof(*(p)) == 2 ? win_load16((const volatile uint16_t *)(const void *)(p), (o)) : \
+    sizeof(*(p)) == 4 ? win_load32((const volatile uint32_t *)(const void *)(p), (o)) : \
+                        win_load64((const volatile uint64_t *)(const void *)(p), (o)))
+#define __atomic_store_n(p, v, o) do { \
+    if (sizeof(*(p)) == 1) win_store8 ((volatile uint8_t  *)(void *)(p), (uint8_t)(v), (o)); \
+    else if (sizeof(*(p)) == 2) win_store16((volatile uint16_t *)(void *)(p), (uint16_t)(v), (o)); \
+    else if (sizeof(*(p)) == 4) win_store32((volatile uint32_t *)(void *)(p), (uint32_t)(v), (o)); \
+    else win_store64((volatile uint64_t *)(void *)(p), (uint64_t)(v), (o)); \
+} while (0)
+#define __atomic_exchange_n(p, v, o) ( (void)(o), \
+    sizeof(*(p)) == 1 ? win_xchg8 ((volatile uint8_t  *)(void *)(p), (uint8_t)(v)) : \
+    sizeof(*(p)) == 2 ? win_xchg16((volatile uint16_t *)(void *)(p), (uint16_t)(v)) : \
+    sizeof(*(p)) == 4 ? win_xchg32((volatile uint32_t *)(void *)(p), (uint32_t)(v)) : \
+                        win_xchg64((volatile uint64_t *)(void *)(p), (uint64_t)(v)))
+#define __atomic_compare_exchange_n(p, e, d, weak, so, fo) ( (void)(weak), (void)(so), (void)(fo), \
+    sizeof(*(p)) == 1 ? win_cas8 ((volatile uint8_t  *)(void *)(p), (uint8_t  *)(void *)(e), (uint8_t)(d)) : \
+    sizeof(*(p)) == 2 ? win_cas16((volatile uint16_t *)(void *)(p), (uint16_t *)(void *)(e), (uint16_t)(d)) : \
+    sizeof(*(p)) == 4 ? win_cas32((volatile uint32_t *)(void *)(p), (uint32_t *)(void *)(e), (uint32_t)(d)) : \
+                        win_cas64((volatile uint64_t *)(void *)(p), (uint64_t *)(void *)(e), (uint64_t)(d)))
+#define __atomic_fetch_or(p, v, o) ( (void)(o), \
+    sizeof(*(p)) == 1 ? win_or8 ((volatile uint8_t  *)(void *)(p), (uint8_t)(v)) : \
+    sizeof(*(p)) == 2 ? win_or16((volatile uint16_t *)(void *)(p), (uint16_t)(v)) : \
+    sizeof(*(p)) == 4 ? win_or32((volatile uint32_t *)(void *)(p), (uint32_t)(v)) : \
+                        win_or64((volatile uint64_t *)(void *)(p), (uint64_t)(v)))
+#define __atomic_fetch_and(p, v, o) ( (void)(o), \
+    sizeof(*(p)) == 1 ? win_and8 ((volatile uint8_t  *)(void *)(p), (uint8_t)(v)) : \
+    sizeof(*(p)) == 2 ? win_and16((volatile uint16_t *)(void *)(p), (uint16_t)(v)) : \
+    sizeof(*(p)) == 4 ? win_and32((volatile uint32_t *)(void *)(p), (uint32_t)(v)) : \
+                        win_and64((volatile uint64_t *)(void *)(p), (uint64_t)(v)))
+#define __atomic_fetch_add(p, v, o) ( (void)(o), \
+    sizeof(*(p)) == 4 ? win_add32((volatile uint32_t *)(void *)(p), (uint32_t)(v)) : \
+                        win_add64((volatile uint64_t *)(void *)(p), (uint64_t)(v)))
+#define __atomic_thread_fence(o) do { if ((o) != __ATOMIC_RELAXED) win_fence(o); } while (0)
 #define _longjmp longjmp
 #define strcasecmp  _stricmp
 #define strncasecmp _strnicmp
@@ -93,6 +170,7 @@ int clock_gettime(int clk, struct timespec *ts);
 int usleep(useconds_t us);
 struct tm *localtime_r(const time_t *t, struct tm *out);
 struct tm *gmtime_r(const time_t *t, struct tm *out);
+time_t timegm(struct tm *tm);             /* -utc with -date: the weekday in UTC */
 
 /* ---- memory mappings: anonymous and whole-file, no MAP_FIXED ---- */
 #define PROT_NONE  0
@@ -153,6 +231,31 @@ static __inline int __get_cpuid_count(unsigned leaf, unsigned sub, unsigned *a, 
     *a = (unsigned)r[0]; *b = (unsigned)r[1]; *c = (unsigned)r[2]; *d = (unsigned)r[3];
     return 1;
 }
+
+/* ---- the threads pc_smp.c and main.c use. A mutex is a critical
+ * section, which reenters, so it is the recursive mutex SMP asks for. ---- */
+typedef struct { void *cs; } pthread_mutex_t;
+typedef struct { void *cv; } pthread_cond_t;
+typedef uintptr_t pthread_t;
+typedef struct { int type; } pthread_mutexattr_t;
+typedef struct { int unused; } pthread_condattr_t;
+typedef struct { unsigned stacksize; } pthread_attr_t;
+#define PTHREAD_MUTEX_NORMAL    0
+#define PTHREAD_MUTEX_RECURSIVE 1
+int pthread_mutexattr_init(pthread_mutexattr_t *a);
+int pthread_mutexattr_settype(pthread_mutexattr_t *a, int type);
+int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a);
+int pthread_mutex_lock(pthread_mutex_t *m);
+int pthread_mutex_unlock(pthread_mutex_t *m);
+int pthread_cond_init(pthread_cond_t *c, const pthread_condattr_t *a);
+int pthread_cond_signal(pthread_cond_t *c);
+int pthread_cond_broadcast(pthread_cond_t *c);
+int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m);
+int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *abs);
+int pthread_attr_init(pthread_attr_t *a);
+int pthread_attr_setstacksize(pthread_attr_t *a, size_t stack);
+int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg);
+int pthread_join(pthread_t t, void **ret);
 
 #endif /* _WIN32 */
 #endif
