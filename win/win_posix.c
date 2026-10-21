@@ -7,6 +7,7 @@
 #include "posix.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dbghelp.h>
 #include <stdarg.h>
 
 /* The UCRT's default for a bad argument (close(-1), a stale fd) is to end
@@ -15,9 +16,50 @@ static void quiet_invalid_parameter(const wchar_t *e, const wchar_t *f, const wc
     (void)e; (void)f; (void)file; (void)line; (void)r;
 }
 
+/* A crash the process does not handle itself: what and where, and the
+ * stack, symbolized from the .pdb beside the .exe — Windows has no core
+ * file to hand to a debugger, and no debugger may be installed. Frames
+ * in translated code have no unwind data, so the walk can stop there. */
+static LONG WINAPI crash_report(EXCEPTION_POINTERS *ep) {
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    fflush(stdout);
+    fprintf(stderr, "\ndos-monster: exception %08lX at %p", (unsigned long)er->ExceptionCode, er->ExceptionAddress);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+        fprintf(stderr, " (%s %p)", er->ExceptionInformation[0] == 1 ? "writing" : er->ExceptionInformation[0] == 8 ? "executing" : "reading",
+                (void *)er->ExceptionInformation[1]);
+    fprintf(stderr, "\n");
+    HANDLE proc = GetCurrentProcess(), thr = GetCurrentThread();
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    SymInitialize(proc, NULL, TRUE);
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 f = { 0 };
+    f.AddrPC.Offset = ctx.Rip;    f.AddrPC.Mode = AddrModeFlat;
+    f.AddrFrame.Offset = ctx.Rbp; f.AddrFrame.Mode = AddrModeFlat;
+    f.AddrStack.Offset = ctx.Rsp; f.AddrStack.Mode = AddrModeFlat;
+    for (int i = 0; i < 40; i++) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, thr, &f, &ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) break;
+        if (!f.AddrPC.Offset) break;
+        union { SYMBOL_INFO s; char buf[sizeof(SYMBOL_INFO) + 256]; } u;
+        memset(&u, 0, sizeof u);
+        u.s.SizeOfStruct = sizeof(SYMBOL_INFO); u.s.MaxNameLen = 255;
+        DWORD64 disp = 0; DWORD ldisp = 0;
+        IMAGEHLP_LINE64 ln = { sizeof ln };
+        if (SymFromAddr(proc, f.AddrPC.Offset, &disp, &u.s)) {
+            if (SymGetLineFromAddr64(proc, f.AddrPC.Offset, &ldisp, &ln))
+                fprintf(stderr, "  #%-2d %s+0x%llx  %s:%lu\n", i, u.s.Name, (unsigned long long)disp, ln.FileName, (unsigned long)ln.LineNumber);
+            else fprintf(stderr, "  #%-2d %s+0x%llx\n", i, u.s.Name, (unsigned long long)disp);
+        } else fprintf(stderr, "  #%-2d %p\n", i, (void *)f.AddrPC.Offset);
+    }
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 /* ---- startup: binary std streams, a VT console, UTF-8 ---- */
 static void win_posix_init(void) {
     _set_invalid_parameter_handler(quiet_invalid_parameter);
+    SetUnhandledExceptionFilter(crash_report);
     _setmode(0, _O_BINARY); _setmode(1, _O_BINARY); _setmode(2, _O_BINARY);
     DWORD m;
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);

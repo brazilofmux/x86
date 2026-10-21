@@ -23,7 +23,7 @@ FPU_CFLAGS = /Icore\softfloat\include /Icore\softfloat\8086 /Icore -DSOFTFLOAT_F
 LDFLAGS = /nologo /DEBUG /INCREMENTAL:NO binmode.obj
 SYSLIBS = user32.lib gdi32.lib winmm.lib imm32.lib ole32.lib oleaut32.lib version.lib uuid.lib \
           advapi32.lib setupapi.lib shell32.lib cfgmgr32.lib
-LIBS    = $(VCPKG)\lib\zs.lib
+LIBS    = $(VCPKG)\lib\zs.lib dbghelp.lib
 
 CORE_OBJS = $(O)\core\x86_decode.obj $(O)\core\x86_interp.obj $(O)\core\x86_state.obj \
             $(O)\core\x86_mem.obj $(O)\core\x86_paging.obj $(O)\core\x86_fpu.obj $(O)\core\x86_sse.obj \
@@ -94,4 +94,7 @@ test-jit: $(JITTEST)
 
 clean:
 	@for %d in (core dbt pc dos win tools softfloat\8086 softfloat) do @if exist $(O)\%d rmdir /s /q $(O)\%d
-	@del /q $(O)\*.obj $(O)\*.exe $(O)\*.pdb $(O)\*.lib $(O)\tools\*.exe 2>nul
+	-@del /q $(O)\*.obj 2>nul
+	-@del /q $(O)\*.exe 2>nul
+	-@del /q $(O)\*.pdb 2>nul
+	-@del /q $(O)\*.lib 2>nul

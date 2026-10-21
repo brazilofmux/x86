@@ -322,9 +322,17 @@ static void sse_int(x86_cpu *c, const x86_insn *in, uint32_t ea, int pf) {
         uint64_t *y = F.xmm[s & 7];
         int bits = op == 0x71 ? 16 : op == 0x72 ? 32 : 64, kind, n = im & 0xFF;
         if (op == 0x73 && (in->reg == 3 || in->reg == 7)) {            /* PSRLDQ, PSLLDQ: bytes, the whole register */
-            unsigned __int128 v = ((unsigned __int128)y[1] << 64) | y[0];
-            v = n > 15 ? 0 : in->reg == 3 ? v >> (8 * n) : v << (8 * n);
-            y[0] = (uint64_t)v; y[1] = (uint64_t)(v >> 64);
+            uint64_t lo = y[0], hi = y[1];                             /* (as two halves: MSVC has no __int128) */
+            int sh = 8 * n;
+            if (n > 15) lo = hi = 0;
+            else if (in->reg == 3) {
+                if (sh >= 64) { lo = hi >> (sh - 64); hi = 0; }
+                else if (sh) { lo = (lo >> sh) | (hi << (64 - sh)); hi >>= sh; }
+            } else {
+                if (sh >= 64) { hi = lo << (sh - 64); lo = 0; }
+                else if (sh) { hi = (hi << sh) | (lo >> (64 - sh)); lo <<= sh; }
+            }
+            y[0] = lo; y[1] = hi;
             return;
         }
         switch (in->reg) {

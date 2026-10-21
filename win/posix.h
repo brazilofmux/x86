@@ -42,7 +42,7 @@ typedef int mode_t;
 static __inline int __builtin_ctz(unsigned x) { unsigned long i; _BitScanForward(&i, x); return (int)i; }
 static __inline int __builtin_clz(unsigned x) { unsigned long i; _BitScanReverse(&i, x); return 31 - (int)i; }
 static __inline int __builtin_popcount(unsigned x) { return (int)__popcnt(x); }
-static __inline double __builtin_sqrt(double x) { return sqrt(x); }
+/* __builtin_sqrt: MSVC has it, as an intrinsic */
 
 /* gcc's __atomic_* , which the SMP paths use. On x64 a plain load is an
  * acquire and a plain store a release; sequential consistency adds a
@@ -216,6 +216,7 @@ struct pollfd { int fd; short events, revents; };
 #define POLLERR  0x8
 #define POLLHUP  0x10
 #define POLLNVAL 0x20
+#define poll win_poll                      /* not to collide with a static poll() of our own (pc_bios.c) */
 int poll(struct pollfd *p, unsigned n, int timeout_ms);
 
 struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
