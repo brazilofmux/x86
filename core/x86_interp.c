@@ -2359,9 +2359,12 @@ int x86_step(x86_cpu *c) {
         volatile int first_bad = fetch_bytes(c, buf, &cross_at);   /* (read only before any longjmp) */
         x86_dec_ctx ctx = { buf, c->model, c->seg[S_CS].big };
         if (!x86_decode(&ctx, &in)) {
-            /* > 15 bytes of prefixes: the 8086 just keeps going; 386 #GP.
-             * Treat as #UD-ish for now. */
-            c->exc = X86_EXC_UD;
+            /* The bytes do not fit in 15. A 286 or later raises #GP(0)
+             * (a decoded 286 instruction past 10 bytes is #GP too). An
+             * 8086 or 186 has no length limit: the 186 delivers #UD, and
+             * an 8086 stops the step, below. */
+            if (c->model >= X86_MODEL_286) { c->exc = X86_EXC_GP; c->exc_err = 0; }
+            else c->exc = X86_EXC_UD;
         } else if (is386 && start_ip + in.len - 1 > c->seg[S_CS].limit) {
             c->exc = X86_EXC_GP;                      /* instruction straddles the code limit */
         } else {
