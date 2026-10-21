@@ -92,6 +92,111 @@ int posix_isatty(int fd) {
     return GetConsoleMode((HANDLE)_get_osfhandle(fd), &m) ? 1 : 0;
 }
 
+/* ---- the environment, cached ---- */
+#undef getenv
+static SRWLOCK env_lock = SRWLOCK_INIT;
+static struct { char *name, *value; } env_cache[256];
+static unsigned env_n;
+
+char *win_getenv(const char *name) {
+    AcquireSRWLockShared(&env_lock);
+    for (unsigned i = 0; i < env_n; i++)
+        if (!strcmp(env_cache[i].name, name)) { char *v = env_cache[i].value; ReleaseSRWLockShared(&env_lock); return v; }
+    ReleaseSRWLockShared(&env_lock);
+    AcquireSRWLockExclusive(&env_lock);
+    const char *v = getenv(name);
+    char *copy = v ? _strdup(v) : NULL;
+    if (env_n < sizeof env_cache / sizeof env_cache[0]) {
+        env_cache[env_n].name = _strdup(name);
+        env_cache[env_n].value = copy;
+        env_n++;
+    }
+    ReleaseSRWLockExclusive(&env_lock);
+    return copy;
+}
+
+int setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite && win_getenv(name)) return 0;
+    if (_putenv_s(name, value)) return -1;
+    AcquireSRWLockExclusive(&env_lock);
+    for (unsigned i = 0; i < env_n; i++)
+        if (!strcmp(env_cache[i].name, name)) { env_cache[i].value = _strdup(value); break; }   /* (the old copy may still be held: kept) */
+    ReleaseSRWLockExclusive(&env_lock);
+    return 0;
+}
+
+/* ---- X86_SAMPLE: a PC sampler ---- */
+static struct {
+    HANDLE target, thread;
+    volatile LONG stop;
+    long us;
+    double after_s;
+    uintptr_t *buf;
+    uint32_t max;
+    volatile uint32_t *n;
+} smp;
+
+static DWORD WINAPI sampler(void *arg) {
+    (void)arg;
+    if (smp.after_s > 0) Sleep((DWORD)(smp.after_s * 1000));
+    while (!smp.stop) {
+        usleep((useconds_t)smp.us);
+        if (SuspendThread(smp.target) == (DWORD)-1) break;
+        CONTEXT ctx;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(smp.target, &ctx)) {
+            uint32_t k = *smp.n;
+            if (k < smp.max) { smp.buf[k] = (uintptr_t)ctx.Rip; *smp.n = k + 1; }
+        }
+        ResumeThread(smp.target);
+    }
+    return 0;
+}
+
+int win_sampler_start(long us, double after_s, uintptr_t *buf, uint32_t max, volatile uint32_t *n) {
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &smp.target,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) return -1;
+    smp.us = us; smp.after_s = after_s; smp.buf = buf; smp.max = max; smp.n = n; smp.stop = 0;
+    smp.thread = CreateThread(NULL, 0, sampler, NULL, 0, NULL);
+    if (smp.thread) SetThreadPriority(smp.thread, THREAD_PRIORITY_TIME_CRITICAL);
+    return smp.thread ? 0 : -1;
+}
+
+void win_sampler_stop(void) {
+    if (!smp.thread) return;
+    InterlockedExchange(&smp.stop, 1);
+    WaitForSingleObject(smp.thread, INFINITE);
+    CloseHandle(smp.thread); smp.thread = NULL;
+}
+
+const char *win_symbol_name(uintptr_t pc) {
+    static int sym_ready;
+    static struct { DWORD64 addr; char *name; } *names;
+    static unsigned nnames, capnames;
+    HANDLE proc = GetCurrentProcess();
+    if (!sym_ready) {
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymInitialize(proc, NULL, TRUE);
+        sym_ready = 1;
+    }
+    union { SYMBOL_INFO s; char buf[sizeof(SYMBOL_INFO) + 256]; } u;
+    memset(&u, 0, sizeof u);
+    u.s.SizeOfStruct = sizeof(SYMBOL_INFO); u.s.MaxNameLen = 255;
+    DWORD64 disp = 0;
+    if (!SymFromAddr(proc, pc, &disp, &u.s)) return "(unknown)";
+    for (unsigned i = 0; i < nnames; i++) if (names[i].addr == u.s.Address) return names[i].name;
+    if (nnames == capnames) {
+        unsigned cap = capnames ? capnames * 2 : 256;
+        void *p = realloc(names, cap * sizeof *names);
+        if (!p) return "(unknown)";
+        names = p; capnames = cap;
+    }
+    names[nnames].addr = u.s.Address;
+    names[nnames].name = _strdup(u.s.Name);
+    return names[nnames++].name;
+}
+
 /* ---- files ---- */
 #undef open
 static uint8_t fd_acc[4096];              /* each fd's O_ACCMODE, for fcntl(F_GETFL) */
@@ -182,10 +287,12 @@ int clock_gettime(int clk, struct timespec *ts) {
     return 0;
 }
 
-/* Sleep() is 15.6 ms coarse; a high-resolution waitable timer is not. */
+/* Sleep() is 15.6 ms coarse; a high-resolution waitable timer is not.
+ * One per thread: guest processors and the sampler sleep at once, and a
+ * shared timer re-armed by one cuts or stretches the other's wait. */
 int usleep(useconds_t us) {
-    static HANDLE timer;
-    static int tried;
+    static _Thread_local HANDLE timer;
+    static _Thread_local int tried;
     if (!tried) {
         tried = 1;
         timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);

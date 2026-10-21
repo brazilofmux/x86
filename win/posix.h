@@ -154,10 +154,19 @@ char *realpath(const char *path, char *resolved);
 #define isatty posix_isatty               /* the UCRT's says yes to NUL */
 int posix_isatty(int fd);
 
-static __inline int setenv(const char *name, const char *value, int overwrite) {
-    if (!overwrite && getenv(name)) return 0;
-    return _putenv_s(name, value) ? -1 : 0;
-}
+/* getenv, cached: the UCRT's locks and walks the whole environment, and
+ * the translator asks after its X86_* switches per instruction it plans
+ * (30% of a Linux boot's host time). One lookup per name until setenv. */
+#define getenv win_getenv
+char *win_getenv(const char *name);
+int setenv(const char *name, const char *value, int overwrite);
+
+/* X86_SAMPLE on Windows (dbt_common.c): a thread samples the calling
+ * thread's RIP every US microseconds into buf; symbols come from DbgHelp,
+ * one interned string per function, so equal names are equal pointers. */
+int win_sampler_start(long us, double after_s, uintptr_t *buf, uint32_t max, volatile uint32_t *n);
+void win_sampler_stop(void);
+const char *win_symbol_name(uintptr_t pc);
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1

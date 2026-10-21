@@ -1328,9 +1328,10 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
  * profiler, every US microseconds (from SECONDS in, if given)
  * ---------------------------------------------------------------------- */
 #define SAMPLE_MAX (1u << 20)
-#if !defined(_WIN32)
 static uintptr_t *s_samples;
 static volatile uint32_t s_nsamples;
+
+#if !defined(_WIN32)
 
 static void on_sample(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)si;
@@ -1369,6 +1370,30 @@ void dbt_sample_start(void) {
     struct itimerval it = { { 0, (int)us }, { (time_t)after, (int)((after - (double)(long)after) * 1e6) + (after > 0 ? 0 : (int)us) } };
     setitimer(ITIMER_REAL, &it, NULL);
 }
+static void sample_stop(void) {
+    struct itimerval off = { { 0, 0 }, { 0, 0 } };
+    setitimer(ITIMER_REAL, &off, NULL);
+}
+static const char *sample_name(uintptr_t pc) {
+    Dl_info di;
+    return (dladdr((void *)pc, &di) && di.dli_sname) ? di.dli_sname : "(unknown)";
+}
+#else
+/* Windows: no SIGALRM; a thread suspends the main one every US
+ * microseconds and reads its RIP (win_posix.c). */
+void dbt_sample_start(void) {
+    const char *e = getenv("X86_SAMPLE");
+    if (!e) return;
+    char *at;
+    long us = strtol(e, &at, 0);
+    if (us <= 0) us = 100;
+    double after = *at == '@' ? atof(at + 1) : 0;
+    s_samples = calloc(SAMPLE_MAX, sizeof(uintptr_t));
+    if (s_samples) win_sampler_start(us, after, s_samples, SAMPLE_MAX, &s_nsamples);
+}
+static void sample_stop(void) { win_sampler_stop(); }
+static const char *sample_name(uintptr_t pc) { return win_symbol_name(pc); }
+#endif
 
 typedef struct { uint32_t off; uint64_t key; } blk_ent_t;
 static int cmp_blk(const void *a, const void *b) {
@@ -1383,8 +1408,7 @@ static int cmp_hot(const void *a, const void *b) {
 
 void dbt_sample_report(x86_dbt *dbt, FILE *out) {
     if (!s_samples || !s_nsamples) return;
-    struct itimerval off = { { 0, 0 }, { 0, 0 } };
-    setitimer(ITIMER_REAL, &off, NULL);
+    sample_stop();
     uint32_t n = s_nsamples;
     /* the translated blocks still in the cache, by code offset */
     blk_ent_t *b = malloc(sizeof(blk_ent_t) * BLOCK_CACHE_SIZE);
@@ -1408,8 +1432,7 @@ void dbt_sample_report(x86_dbt *dbt, FILE *out) {
             if (!nb || lo == 0 || (b[0].off > o)) name = "(trampoline, exit stub, thunks)";
             else key = b[lo - 1].key, name = "block";
         } else {
-            Dl_info di;
-            name = (dladdr((void *)pc, &di) && di.dli_sname) ? di.dli_sname : "(unknown)";
+            name = sample_name(pc);
         }
         uint32_t j;
         for (j = 0; j < nh; j++) if (h[j].name == name && h[j].key == key) break;
@@ -1426,11 +1449,6 @@ void dbt_sample_report(x86_dbt *dbt, FILE *out) {
     }
     free(h); free(b);
 }
-#else
-/* Windows: no SIGALRM and no ucontext; use an outside profiler (WPR, VTune). */
-void dbt_sample_start(void) { }
-void dbt_sample_report(x86_dbt *dbt, FILE *out) { (void)dbt; (void)out; }
-#endif
 
 /* ---- SMP: the acquire/release forms' one gap ----------------------------
  * LDAPR and STLR take any misalignment within a 16-byte line (FEAT_LSE2)
