@@ -205,7 +205,9 @@ into every file and maps it onto Win32. The terminal is the Windows
 console with its VT sequences on, so `-t` works in Windows Terminal or a
 console window; under mintty (Git Bash) stdout is a pipe, not a
 terminal, so use `-w` for the window there. A list of diskettes (`-A`,
-`-fda`) is separated by `;` rather than `:`.
+`-fda`) is separated by `;` rather than `:`. Paste into the window is
+Ctrl+Shift+V (Cmd-V on the Mac; Win+V is Windows' own). A crash prints
+the exception and a symbolized stack from the `.pdb` beside the `.exe`.
 
 ## Running
 

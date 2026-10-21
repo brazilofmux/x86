@@ -180,9 +180,15 @@ static uint8_t ascii_for(SDL_Keycode k, uint16_t mod) {
 
 static void key(const SDL_KeyboardEvent *e, int down) {
     /* Cmd-V (Ctrl-V stays the guest's): paste. Its V never reaches the
-     * guest, make or break. */
+     * guest, make or break. On Windows, Win+V is the system's clipboard
+     * history and never arrives: Ctrl+Shift+V, as in Windows Terminal. */
     static int pasting;
-    if (e->keysym.sym == SDLK_v && (down ? (e->keysym.mod & KMOD_GUI) != 0 : pasting)) {
+#if defined(_WIN32)
+    int paste_mod = (e->keysym.mod & KMOD_CTRL) && (e->keysym.mod & KMOD_SHIFT);
+#else
+    int paste_mod = (e->keysym.mod & KMOD_GUI) != 0;
+#endif
+    if (e->keysym.sym == SDLK_v && (down ? paste_mod : pasting)) {
         if (down && !e->repeat) {
             char *t = SDL_GetClipboardText();
             if (t) { pc_kbd_paste(t); SDL_free(t); }

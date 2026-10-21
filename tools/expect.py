@@ -86,6 +86,8 @@ def main():
         steps.append((re.compile(pat), keys.encode().decode("unicode_escape").encode("latin-1"), whole))
     scr = os.path.join(tempfile.mkdtemp(), "screen.txt")
     env = dict(os.environ, X86_SCREEN=scr, X86_SCREEN_PNG=scr + ".png")
+    if "/" in cmd[0] or os.sep in cmd[0]:
+        cmd[0] = os.path.abspath(cmd[0])            # (Windows' CreateProcess resolves no relative a/b path)
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
     t0 = time.time()
     deadline = t0 + timeout
