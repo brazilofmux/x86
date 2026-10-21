@@ -161,6 +161,11 @@ int posix_isatty(int fd);
 char *win_getenv(const char *name);
 int setenv(const char *name, const char *value, int overwrite);
 
+/* The x86-64 backend's fastmem (dbt_x64.c): FN is asked about every access
+ * violation — the faulting PC, the address, RFLAGS — and returns 1 with
+ * *rip set to resume there, or 0 to let the fault go on. */
+int win_fault_handler(int (*fn)(uint64_t pc, const uint8_t *addr, uint64_t efl, uint64_t *rip));
+
 /* X86_SAMPLE on Windows (dbt_common.c): a thread samples the calling
  * thread's RIP every US microseconds into buf; symbols come from DbgHelp,
  * one interned string per function, so equal names are equal pointers. */
@@ -220,12 +225,12 @@ struct termios { tcflag_t c_iflag, c_oflag, c_cflag, c_lflag; unsigned char c_cc
 int tcgetattr(int fd, struct termios *t);
 int tcsetattr(int fd, int how, const struct termios *t);
 
+#define pollfd win_pollfd                  /* Winsock has its own (pc_net.c takes that one) */
 struct pollfd { int fd; short events, revents; };
 #define POLLIN   0x1
 #define POLLERR  0x8
 #define POLLHUP  0x10
 #define POLLNVAL 0x20
-#define poll win_poll                      /* not to collide with a static poll() of our own (pc_bios.c) */
 int poll(struct pollfd *p, unsigned n, int timeout_ms);
 
 struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };

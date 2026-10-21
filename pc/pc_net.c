@@ -59,9 +59,30 @@ void pc_net_rx_drain(void) {
 }
 
 #ifdef HAVE_SLIRP
+#if defined(_WIN32)
+/* Winsock: its own pollfd and POLL* (the shim's stand in for stdin's),
+ * WSAPoll for poll, and no inet_aton */
+#undef pollfd
+#undef poll
+#undef POLLIN
+#undef POLLERR
+#undef POLLHUP
+#undef POLLNVAL
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <libslirp.h>
+typedef ULONG nfds_t;
+static int net_poll(struct pollfd *f, nfds_t n, int timeout_ms) {
+    if (!n) { if (timeout_ms > 0) Sleep((DWORD)timeout_ms); return 0; }   /* (WSAPoll refuses an empty set) */
+    return WSAPoll(f, n, timeout_ms);
+}
+#define poll net_poll                                   /* (the shim's poll() is stdin's) */
+static int inet_aton(const char *s, struct in_addr *a) { return inet_pton(AF_INET, s, a) == 1; }
+#else
 #include <libslirp.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#endif
 
 static Slirp *slirp;
 
@@ -97,7 +118,12 @@ static struct pollfd fds[FDS];
 static int nfds;
 
 static int to_poll(int ev) {
+#if defined(_WIN32)
+    /* WSAPoll fails the whole call on POLLPRI; urgent data comes as POLLIN there */
+    return (ev & (SLIRP_POLL_IN | SLIRP_POLL_PRI) ? POLLIN : 0) | (ev & SLIRP_POLL_OUT ? POLLOUT : 0);
+#else
     return (ev & SLIRP_POLL_IN ? POLLIN : 0) | (ev & SLIRP_POLL_OUT ? POLLOUT : 0) | (ev & SLIRP_POLL_PRI ? POLLPRI : 0);
+#endif
 }
 static int add_poll(slirp_os_socket fd, int events, void *opaque) {
     (void)opaque;
@@ -147,7 +173,9 @@ int pc_net_open(const char *spec) {
     /* a forwarded connection the host side has already closed: libslirp's
      * write to it must fail with EPIPE, not kill the emulator (ssh probing
      * the port while the guest's sshd was still starting did) */
-    signal(SIGPIPE, SIG_IGN);
+#ifdef SIGPIPE
+    signal(SIGPIPE, SIG_IGN);                            /* (Windows has none: a closed socket's send just fails) */
+#endif
     for (const char *o = strchr(spec, ','); o; o = strchr(o + 1, ',')) {
         unsigned hp, gp;
         struct in_addr lo, guest;

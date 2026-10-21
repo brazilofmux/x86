@@ -34,8 +34,7 @@ Two ways to run things:
   PS/2 mouse, an MC146818 real-time clock, an IDE (ATA) controller with
   an AT disk BIOS that drives it in real instructions, a VGA (text, mode
   13h and unchained, 16-colour planar modes), A20, and up to 2047 MB of
-  memory (`-mem`; 257 MB on Windows, where the code bitmap sits above
-  guest memory). The CPU is an 8086, 186, 286, 386, 486, Pentium,
+  memory (`-mem`). The CPU is an 8086, 186, 286, 386, 486, Pentium,
   Pentium Pro, Pentium II, Pentium III or Pentium 4 (`-m`), with an x87
   from the 486 on (and beside a 386 with `-fpu`), MMX from the Pentium II,
   SSE on the Pentium III and SSE2 on the Pentium 4, and with the Pentium
@@ -198,8 +197,11 @@ compiler) and nmake, from an "x64 Native Tools Command Prompt":
     nmake /f Makefile.win               # build-win\dos-monster.exe, tools\sst.exe, tools\jittest.exe
     nmake /f Makefile.win test-jit
 
-vcpkg (Visual Studio's own will do) brings SDL2 and zlib as static
-libraries (`vcpkg.json`), so the one .exe is all there is to copy. The
+vcpkg (Visual Studio's own will do) brings SDL2, zlib and libslirp
+(with glib: the first install takes about an hour) as static libraries
+(`vcpkg.json`), so the one .exe is all there is to copy; a build without
+libslirp leaves `-nic` unplugged, as on POSIX. The x86-64 backend's
+fastmem is a vectored exception handler here (a signal on Linux). The
 POSIX the sources use comes from `win/`: `win/posix.h` is force-included
 into every file and maps it onto Win32. The terminal is the Windows
 console with its VT sequences on, so `-t` works in Windows Terminal or a

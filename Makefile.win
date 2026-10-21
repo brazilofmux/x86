@@ -25,6 +25,15 @@ SYSLIBS = user32.lib gdi32.lib winmm.lib imm32.lib ole32.lib oleaut32.lib versio
           advapi32.lib setupapi.lib shell32.lib cfgmgr32.lib
 LIBS    = $(VCPKG)\lib\zs.lib dbghelp.lib
 
+# The network behind -nic ...,user: libslirp (and its glib), when vcpkg
+# has built it; without it the card is there with its cable unplugged,
+# as on a POSIX host without the library.
+!IF EXIST($(VCPKG)\lib\slirp.lib)
+SLIRP_CFLAGS = -DHAVE_SLIRP -DLIBSLIRP_STATIC /I$(VCPKG)\include\slirp
+SLIRP_LIBS   = $(VCPKG)\lib\slirp.lib $(VCPKG)\lib\glib-2.0.lib $(VCPKG)\lib\intl.lib $(VCPKG)\lib\iconv.lib \
+               $(VCPKG)\lib\charset.lib $(VCPKG)\lib\pcre2-8.lib ws2_32.lib iphlpapi.lib
+!ENDIF
+
 CORE_OBJS = $(O)\core\x86_decode.obj $(O)\core\x86_interp.obj $(O)\core\x86_state.obj \
             $(O)\core\x86_mem.obj $(O)\core\x86_paging.obj $(O)\core\x86_fpu.obj $(O)\core\x86_sse.obj \
             $(O)\win\win_posix.obj
@@ -52,7 +61,10 @@ $(O)\softfloat.lib: core\softfloat\*.c core\softfloat\8086\*.c
 	lib /nologo /OUT:$@ $(O)\softfloat\*.obj $(O)\softfloat\8086\*.obj
 
 $(TARGET): $(O)\main.obj $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS) $(O)\softfloat.lib
-	link $(LDFLAGS) /OUT:$@ $** $(LIBS) $(VCPKG)\lib\SDL2-static.lib $(SYSLIBS)
+	link $(LDFLAGS) /OUT:$@ $** $(LIBS) $(VCPKG)\lib\SDL2-static.lib $(SLIRP_LIBS) $(SYSLIBS)
+
+$(O)\pc\pc_net.obj: pc\pc_net.c
+	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) /c /Fo$@ pc\pc_net.c
 
 $(SST): $(O)\tools\sst.obj $(CORE_OBJS) $(O)\softfloat.lib
 	link $(LDFLAGS) /OUT:$@ $** $(LIBS)

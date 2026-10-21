@@ -3,7 +3,8 @@
   "version-string": "0",
   "dependencies": [
     "zlib",
-    "sdl2"
+    "sdl2",
+    "libslirp"
   ],
   "builtin-baseline": "8e89ad1130ff5c31ca1ff673842c645519a221ad"
 }

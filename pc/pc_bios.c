@@ -572,7 +572,7 @@ static void pit_tick(uint64_t now) {
     if (now >= pc.next_tick_ns) pc.next_tick_ns = now + period;
 }
 
-static int poll(x86_cpu *c);
+static int poll_bsp(x86_cpu *c);
 static int poll_ap(x86_cpu *c);
 /* X86_GPC: where the guest is at each poll (-s prints the top), for a
  * stall that is not a hang */
@@ -616,7 +616,7 @@ int pc_poll(x86_cpu *c) {
     if (gpc_on && !c->cpu_id && difftime(time(NULL), gpc_t0) >= gpc_from) gpc_note(c);
     if (c->cpu_id) return poll_ap(c);
     pc_lock();
-    int r = poll(c);
+    int r = poll_bsp(c);
     intr_update();
     pc_unlock();
     return r;
@@ -643,7 +643,7 @@ static int poll_ap(x86_cpu *c) {
     pc_unlock();
     return r;
 }
-static int poll(x86_cpu *c) {
+static int poll_bsp(x86_cpu *c) {
     uint64_t now = pc_now_ns();
     pc.now_ns = now;
     if (now >= pc.rtc_next_ns) pc_rtc_poll(now);        /* the RTC's next interrupt is due (IRQ 8) */
