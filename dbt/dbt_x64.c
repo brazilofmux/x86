@@ -81,6 +81,8 @@
 #define X64_FASTMEM 1                 /* flat accesses guarded by the page fault, not a compare (see below) */
 #include <signal.h>
 #include <ucontext.h>
+#elif defined(_WIN64)
+#define X64_FASTMEM 1                 /* ...by a vectored exception handler there (win_posix.c) */
 #endif
 
 /* The C calling convention the thunks and the trampoline speak: System V,
@@ -663,7 +665,7 @@ static void slow_site(emit_t *e, int cc) {
 }
 
 /* ----------------------------------------------------------------------
- * Fastmem (Linux x86-64). A flat, unpaged access carries no range check:
+ * Fastmem (x86-64 Linux and Windows). A flat, unpaged access carries no range check:
  * the reservation above guest memory is FFh read-only slack and then no
  * access at all up to X86_FLAT_SPAN (x86.h), so an offset past memory
  * faults. The instruction's host code, from its first check to its
@@ -680,9 +682,27 @@ static int s_trap_ok;         /* ...and this instruction may */
 static int s_load_nosave;     /* ...and is a plain load: no check clobbers RFLAGS, so no save first */
 
 typedef struct { uint32_t start, end, chunk, rf; } trap_ent_t;
-static trap_ent_t *s_traps;
-static uint32_t s_ntraps, s_captraps;
-static x86_dbt *s_trap_dbt;
+/* One trap table per translator: -smp runs a translator per processor,
+ * each with its own code buffer, and a fault is looked up in the table of
+ * the buffer it came from. A table is written only by its own translator
+ * (on its own thread, under the translate lock) and read by its own
+ * thread's faults, which never come while it translates. */
+#define TRAPSETS 64
+static struct trapset { x86_dbt *dbt; trap_ent_t *t; uint32_t n, cap; } s_trapsets[TRAPSETS];
+static volatile uint32_t s_ntrapsets;
+static struct trapset *trapset_for(x86_dbt *dbt) {
+    for (uint32_t i = 0; i < s_ntrapsets; i++) if (s_trapsets[i].dbt == dbt) return &s_trapsets[i];
+    /* a new translator: a free slot, or (jittest makes thousands, one at a
+     * time) the oldest one's — a machine's processors all start at once */
+    static uint32_t recycle;
+    struct trapset *ts;
+    if (s_ntrapsets < TRAPSETS) ts = &s_trapsets[s_ntrapsets];
+    else ts = &s_trapsets[recycle++ % TRAPSETS];
+    ts->dbt = NULL; ts->n = 0;
+    ts->dbt = dbt;
+    if (s_ntrapsets < TRAPSETS) s_ntrapsets++;
+    return ts;
+}
 
 static void trap_site(emit_t *e) {
     if (s_nslow >= SLOW_MAX) { fprintf(stderr, "dbt: slow-path table overflow\n"); abort(); }
@@ -699,35 +719,49 @@ static void trap_site(emit_t *e) {
     t->rf_at = s_rf & ARITH;
 }
 
-static void trap_add(uint32_t start, uint32_t end, uint32_t chunk, uint32_t rf) {
-    if (s_ntraps == s_captraps) {
-        uint32_t cap = s_captraps ? s_captraps * 2 : 65536;
-        trap_ent_t *n = realloc(s_traps, cap * sizeof *n);
+static void trap_add(x86_dbt *dbt, uint32_t start, uint32_t end, uint32_t chunk, uint32_t rf) {
+    struct trapset *ts = trapset_for(dbt);
+    if (ts->n == ts->cap) {
+        uint32_t cap = ts->cap ? ts->cap * 2 : 65536;
+        trap_ent_t *n = realloc(ts->t, cap * sizeof *n);
         if (!n) { fprintf(stderr, "dbt: trap table\n"); abort(); }
-        s_traps = n; s_captraps = cap;
+        ts->t = n; ts->cap = cap;
     }
-    s_traps[s_ntraps++] = (trap_ent_t){ start, end, chunk, rf };
+    ts->t[ts->n++] = (trap_ent_t){ start, end, chunk, rf };
 }
 
 #if defined(X64_FASTMEM)
+/* A fault at host PC in translated code, touching ADDR: if it is a
+ * fastmem access, the guest flags RFLAGS held are merged into the slot
+ * and *RIP becomes its slow-path chunk (1); otherwise 0, not ours. */
+static int trap_redirect(uint64_t pc, const uint8_t *a, uint64_t efl, uint64_t *rip) {
+    for (uint32_t i = 0; i < s_ntrapsets; i++) {
+        const struct trapset *ts = &s_trapsets[i];
+        x86_dbt *d = ts->dbt;
+        if (!d || !d->code_buf || pc < (uint64_t)(uintptr_t)d->code_buf || pc >= (uint64_t)(uintptr_t)(d->code_buf + d->code_used)) continue;
+        uint32_t off = (uint32_t)(pc - (uint64_t)(uintptr_t)d->code_buf), lo = 0, hi = ts->n;
+        while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (ts->t[mid].start <= off) lo = mid + 1; else hi = mid; }
+        const x86_cpu *c = d->cpu;
+        if (lo && off < ts->t[lo - 1].end && c && a >= c->mem + X86_BM_DELTA && a < c->mem + X86_FLAT_SPAN) {
+            const trap_ent_t *t = &ts->t[lo - 1];
+            d->cpu->jit_flags = (d->cpu->jit_flags & ~(uint64_t)t->rf) | (efl & t->rf);
+            d->fastmem_traps++;
+            *rip = (uint64_t)(uintptr_t)(d->code_buf + t->chunk);
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+#endif
+#if defined(X64_FASTMEM) && !defined(_WIN64)
 static void trap_handler(int sig, siginfo_t *si, void *ctx) {
     (void)sig;
     ucontext_t *uc = ctx;
-    x86_dbt *d = s_trap_dbt;
-    uint64_t pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
-    if (d && d->code_buf && pc >= (uint64_t)(uintptr_t)d->code_buf && pc < (uint64_t)(uintptr_t)(d->code_buf + d->code_used)) {
-        uint32_t off = (uint32_t)(pc - (uint64_t)(uintptr_t)d->code_buf), lo = 0, hi = s_ntraps;
-        while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (s_traps[mid].start <= off) lo = mid + 1; else hi = mid; }
-        const x86_cpu *c = d->cpu;
-        const uint8_t *a = si->si_addr;
-        if (lo && off < s_traps[lo - 1].end && c && a >= c->mem + X86_BM_DELTA && a < c->mem + X86_FLAT_SPAN) {
-            const trap_ent_t *t = &s_traps[lo - 1];
-            uint64_t efl = (uint64_t)uc->uc_mcontext.gregs[REG_EFL];
-            d->cpu->jit_flags = (d->cpu->jit_flags & ~(uint64_t)t->rf) | (efl & t->rf);
-            d->fastmem_traps++;
-            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)(d->code_buf + t->chunk);
-            return;
-        }
+    uint64_t rip;
+    if (trap_redirect((uint64_t)uc->uc_mcontext.gregs[REG_RIP], si->si_addr, (uint64_t)uc->uc_mcontext.gregs[REG_EFL], &rip)) {
+        uc->uc_mcontext.gregs[REG_RIP] = (greg_t)rip;
+        return;
     }
     /* not ours: the default action, on the same fault again */
     struct sigaction sa;
@@ -738,19 +772,22 @@ static void trap_handler(int sig, siginfo_t *si, void *ctx) {
 #endif
 
 static void fastmem_init(x86_dbt *dbt) {
-    s_ntraps = 0;
-    s_trap_dbt = dbt;
+    trapset_for(dbt)->n = 0;
     s_fastmem = 0;
 #if defined(X64_FASTMEM)
     if (!dbt->cpu || !dbt->cpu->mem_mirrored || getenv("X86_NO_FASTMEM") || X86_BM_DELTA >= 0) return;
     static int installed;
     if (!installed) {
+#if defined(_WIN64)
+        if (win_fault_handler(trap_redirect) != 0) return;
+#else
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
         sa.sa_sigaction = trap_handler;
         sa.sa_flags = SA_SIGINFO;
         sigemptyset(&sa.sa_mask);
         if (sigaction(SIGSEGV, &sa, NULL) != 0) return;
+#endif
         installed = 1;
     }
     s_fastmem = 1;
@@ -767,7 +804,7 @@ static void emit_slow_chunks(x86_dbt *dbt, emit_t *e) {
         if (!s->back_off) { fprintf(stderr, "dbt: slow site without a rejoin (op %u)\n", s->op_i); abort(); }
         uint32_t chunk = emit_pos(e), j = k;
         for (; j < s_nslow && s_slow[j].op_i == s->op_i; j++) {
-            if (s_slow[j].trap) trap_add(s_slow[j].start, s_slow[j].back_off, chunk, s_slow[j].rf_at);
+            if (s_slow[j].trap) trap_add(dbt, s_slow[j].start, s_slow[j].back_off, chunk, s_slow[j].rf_at);
             else emit_patch_rel32(e, s_slow[j].patch_off, chunk);
         }
         s_cur_ip_after = s->ip_after;

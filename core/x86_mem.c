@@ -18,10 +18,10 @@
  * reservation, so the check is also `[host_addr + X86_BM_DELTA]`.
  *
  * Both regions carry X86_MEM_SLACK readable bytes past the end so a
- * decode at the top never faults. On POSIX hosts the bitmap is below the
- * memory, and the memory's slack is read-only and FFh — what the
- * interpreter reads past mem_size — with nothing mapped after it up to
- * X86_FLAT_SPAN (x86.h), so a flat access past the memory faults.
+ * decode at the top never faults. The bitmap is below the memory, and
+ * the memory's slack is read-only and FFh — what the interpreter reads
+ * past mem_size — with nothing mapped after it up to X86_FLAT_SPAN
+ * (x86.h), so a flat access past the memory faults.
  */
 #include "x86.h"
 #include <stdio.h>
@@ -118,16 +118,23 @@ static int alloc_mirrored(x86_cpu *c) {
     if (!h) return -1;
     c->mem_fd = (int)(intptr_t)h;
 
-    /* one reservation: memory at 0, the bitmap at X86_BM_DELTA */
-    size_t region = (size_t)c->mem_size + X86_MEM_SLACK, total = X86_BM_DELTA + region;
-    c->mem = p_VirtualAlloc2(GetCurrentProcess(), NULL, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                             PAGE_NOACCESS, NULL, 0);
-    if (!c->mem) return -1;
-    resv_end = c->mem + total;
-    c->code_bitmap = c->mem + X86_BM_DELTA;
-    if (map_region(c, c->mem, 0, 0) < 0) return -1;
-    if (carve(c->mem + region, X86_BM_DELTA - region) < 0) return -1;     /* the gap stays a placeholder */
+    /* one reservation: the bitmap at its start, the memory X86_BM_DELTA
+     * after it, and nothing on to the memory's X86_FLAT_SPAN — an uncarved
+     * placeholder is no access at all, which is what fastmem needs */
+    size_t below = (size_t)-X86_BM_DELTA, region = (size_t)c->mem_size + X86_MEM_SLACK, total = below + X86_FLAT_SPAN;
+    uint8_t *r = p_VirtualAlloc2(GetCurrentProcess(), NULL, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                 PAGE_NOACCESS, NULL, 0);
+    if (!r) return -1;
+    resv_end = r + total;
+    c->code_bitmap = r;
+    c->mem = r + below;
     if (map_region(c, c->code_bitmap, c->mem_size, 0) < 0) return -1;
+    if (carve(r + region, below - region) < 0) return -1;     /* the gap stays a placeholder */
+    if (map_region(c, c->mem, 0, 0) < 0) return -1;
+    /* the memory's slack: FFh, as the interpreter reads past mem_size, and read-only */
+    DWORD old;
+    memset(c->mem + c->mem_size, 0xFF, X86_MEM_SLACK);
+    if (!VirtualProtect(c->mem + c->mem_size, X86_MEM_SLACK, PAGE_READONLY, &old)) return -1;
     c->mem_mirrored = 1;
     return 0;
 }
@@ -135,7 +142,7 @@ static int alloc_mirrored(x86_cpu *c) {
 /* Every view, the slack and the placeholders left, then the section. */
 static void free_mirrored(x86_cpu *c) {
     if (c->mem) {
-        uint8_t *a = c->mem, *end = c->mem + X86_BM_DELTA + (size_t)c->mem_size + X86_MEM_SLACK;
+        uint8_t *a = c->mem + X86_BM_DELTA, *end = c->mem + X86_FLAT_SPAN;
         MEMORY_BASIC_INFORMATION mi;
         while (a < end && VirtualQuery(a, &mi, sizeof mi)) {
             if (mi.State == MEM_FREE) { a = (uint8_t *)mi.BaseAddress + mi.RegionSize; continue; }

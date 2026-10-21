@@ -92,6 +92,25 @@ int posix_isatty(int fd) {
     return GetConsoleMode((HANDLE)_get_osfhandle(fd), &m) ? 1 : 0;
 }
 
+/* ---- fastmem's fault: a vectored handler, first in line ---- */
+static int (*fault_fn)(uint64_t pc, const uint8_t *addr, uint64_t efl, uint64_t *rip);
+
+static LONG WINAPI fault_veh(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || !fault_fn)
+        return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT *cx = ep->ContextRecord;
+    uint64_t rip;
+    if (!fault_fn(cx->Rip, (const uint8_t *)er->ExceptionInformation[1], cx->EFlags, &rip)) return EXCEPTION_CONTINUE_SEARCH;
+    cx->Rip = rip;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+int win_fault_handler(int (*fn)(uint64_t pc, const uint8_t *addr, uint64_t efl, uint64_t *rip)) {
+    fault_fn = fn;
+    return AddVectoredExceptionHandler(1, fault_veh) ? 0 : -1;
+}
+
 /* ---- the environment, cached ---- */
 #undef getenv
 static SRWLOCK env_lock = SRWLOCK_INIT;

@@ -544,22 +544,17 @@ static inline void x86_wr(x86_cpu *c, uint32_t base, uint32_t off, uint32_t offm
  * translated code reaches a store's bitmap byte as [host_addr + delta]
  * with no register; disp32-reachable, and clear of the memory's span.
  *
- * On POSIX hosts it lies BELOW the memory, and above the memory the
- * reservation runs on to X86_FLAT_SPAN: 64 KB of read-only slack filled
- * with FFh (the interpreter's open bus past mem_size), then no access at
- * all, so any 32-bit flat offset lands either in memory, in the slack,
- * or on a page that faults. The x86-64 backend's flat accesses rely on
- * that fault instead of a range check (dbt_x64.c, fastmem). Windows keeps
- * the bitmap above the memory and the explicit checks. */
-#if defined(_WIN32)
-#define X86_BM_DELTA  ((int64_t)0x20000000)
-#define X86_MEM_MAX   (0x10000000u + 0x100000u)      /* 257 MB: 256 MB of extended memory, and the first 1 MB */
-#else
+ * It lies BELOW the memory, and above the memory the reservation runs on
+ * to X86_FLAT_SPAN: 64 KB of read-only slack filled with FFh (the
+ * interpreter's open bus past mem_size), then no access at all, so any
+ * 32-bit flat offset lands either in memory, in the slack, or on a page
+ * that faults. The x86-64 backend's flat accesses rely on that fault
+ * instead of a range check (dbt_x64.c, fastmem) — a signal on Linux, a
+ * vectored exception handler on Windows. */
 /* 2 GB below: the farthest a signed disp32 reaches (x86-64's [host + delta]; AArch64 keeps the
  * distance in X17), so memory may be all but 2 GB — 2047 MB, short of the slack */
 #define X86_BM_DELTA  (-(int64_t)0x80000000)
 #define X86_MEM_MAX   0x7FF00000u                    /* 2047 MB */
-#endif
 #define X86_FLAT_SPAN (0x100000000ull + 0x20000u)     /* memory + slack + guard: past every 32-bit offset and a straddle */
 _Static_assert((X86_BM_DELTA < 0 ? -X86_BM_DELTA : X86_BM_DELTA) >= (int64_t)X86_MEM_MAX + X86_MEM_SLACK,
                "the bitmap must lie clear of guest memory");
