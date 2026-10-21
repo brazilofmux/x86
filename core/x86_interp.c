@@ -1600,6 +1600,9 @@ static void execute(x86_cpu *c, const x86_insn *in, uint32_t start_ip) {
         uint32_t m = in->opsize == 2 ? 0xFFFF : 0xFFFFFFFFu;
         m &= ~flags_kept(c, x86_cpl(c));
         c->eflags = x86_flags_fixup(c, (c->eflags & ~m) | (a & m));
+        /* RF or TF up: the next instruction's debug semantics are the run
+         * loop's, so translated code calling this as a helper leaves */
+        if (c->eflags & (X86_RF | X86_TF)) c->jit_cur_hit = 1;
         break;
     }
     case OP_ENTER: {
