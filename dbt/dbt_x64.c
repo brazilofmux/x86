@@ -1489,9 +1489,20 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
  * both, that code stays the interpreter's on this backend, as before. */
 int dbt_arch_seg32(void) { return 1; }
 
+/* X86_X64_HELPERS (everything through the helper) and X86_X64_NOPAGED
+ * (paged blocks through it), for bisection: read once — asked per
+ * instruction planned, getenv was 30% of a Linux boot on Windows. */
+static int s_env_helpers = -1, s_env_nopaged = -1;
+static void env_switches(void) {
+    if (s_env_helpers >= 0) return;
+    s_env_helpers = getenv("X86_X64_HELPERS") != NULL;
+    s_env_nopaged = getenv("X86_X64_NOPAGED") != NULL;
+}
+
 int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
-    if (getenv("X86_X64_HELPERS")) return 0;
-    if (b->paged && getenv("X86_X64_NOPAGED")) return 0;
+    env_switches();
+    if (s_env_helpers) return 0;
+    if (b->paged && s_env_nopaged) return 0;
     if (b->v86) return inline_ok_v86(b, in);
     if (b->flat) return inline_ok_flat(b, in);
     if (b->seg16) return inline_ok_seg16(b, in);
@@ -2915,7 +2926,8 @@ uint8_t *dbt_arch_emit_block(x86_dbt *dbt, const dbt_block *b) {
     /* what this backend emits inline so far: real-mode-shaped blocks
      * (real mode, segmented 16-bit PM) and flat ones, without paging;
      * everything else is helpers, and transfers end them */
-    int inl = !b->all_helper && !getenv("X86_X64_HELPERS");
+    env_switches();
+    int inl = !b->all_helper && !s_env_helpers;
 
     emit_t e = { .buf = dbt->code_buf, .offset = dbt->code_used, .capacity = CODE_BUF_SIZE };
     uint8_t *entry = dbt->code_buf + e.offset;
