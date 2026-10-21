@@ -121,6 +121,7 @@ static inline int R_GPR(int i) { return i == R_SP ? X64_R12 : i; }
 #define OFF_SEG_BASE(i) ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, base)))
 #define OFF_SEG_LIMIT(i) ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, limit)))
 #define OFF_SEG_BIG(i)  ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, big)))
+#define OFF_SEG_ATTR(i) ((int32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (i) + offsetof(x86_seg, attr)))
 _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and attr share one dword store");
 #define OFF_EXC         ((int32_t)offsetof(x86_cpu, exc))
 #define OFF_EXC_ERR     ((int32_t)offsetof(x86_cpu, exc_err))
@@ -143,7 +144,7 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 #define M(base, disp) x64_m((base), (disp))
 
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
-static uint32_t s_exec_thunk_off, s_post_thunk_off, s_port_thunk_off, s_exit_eip_off;
+static uint32_t s_exec_thunk_off, s_post_thunk_off, s_port_thunk_off, s_tlbfill_thunk_off, s_exit_eip_off;
 
 /* -V strict mode: every block returns to dbt_run (no links, no probe). */
 static int s_strict_exit = -1;
@@ -157,11 +158,15 @@ static int s_paged;           /* under paging: each access translated — V86 th
 static int s_pg_user;         /* ...at CPL 3: the entry must allow user access */
 static int s_skip_smc;        /* the current store looks at its bitmap bytes after landing (emit_post_store) */
 static uint32_t s_dyn_imm_lin; /* nonzero: read the current instruction's immediate from this physical address */
-/* Flat blocks address memory as R_MEM + offset; the fast path is everything
- * below 16 MB, less (for reads, while a device answers them) the VGA
- * window A0000-AFFFF. Anything else is the slow path's. */
+/* Flat blocks address memory as R_MEM + offset; the fast path is every
+ * offset below s_flat_top — the run's memory less 3, so an access of up
+ * to 4 bytes stays inside it (at least 16 MB: -mem 128's Linux copies its
+ * initrd at 120 MB, and a fixed 16 MB sent every byte to the slow path) —
+ * less (for reads, while a device answers them) the VGA window
+ * A0000-AFFFF. Anything else is the slow path's. */
 #define FLAT_TOP 0x1000000u
 _Static_assert(FLAT_TOP + 4 <= X86_MEM_SIZE, "flat fast path must stay inside guest memory");
+static uint32_t s_flat_top = FLAT_TOP;
 static int s_model;
 static int s_bmi2 = -1;       /* host has RORX (flag-free rotates for the high bytes) */
 static const x86_cpu *s_cpu;
@@ -235,6 +240,7 @@ static void fastmem_init(x86_dbt *dbt);
 
 void dbt_emit_trampoline(x86_dbt *dbt) {
     fastmem_init(dbt);                                       /* (a flush re-emits this: the trap table starts over) */
+    s_flat_top = dbt->cpu && dbt->cpu->mem_size - 3 > FLAT_TOP ? dbt->cpu->mem_size - 3 : FLAT_TOP;
     emit_t e = { .buf = dbt->code_buf, .offset = 0, .capacity = CODE_BUF_SIZE };
     x64_mem_t m;
     host_features();
@@ -376,6 +382,34 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_call_r(&e, X64_RAX);
     emit_mov_rr(&e, 4, W_T0, X64_RAX);
     emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8 + ABI_SHADOW);
+    emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
+    emit_pop_r(&e, X64_RDX); emit_pop_r(&e, X64_RCX); emit_pop_r(&e, X64_RAX);
+    emit_popfq(&e);
+    emit_ret(&e);
+
+    /* ---- TLB refill thunk: CALLed from a paged access's miss prelude
+     * (emit_slow_chunks) with R11 = the linear address, R10 = the bits
+     * the inline check needs, and R10's own value pushed by the caller
+     * (so RSP is 0 mod 16 here). R11 comes back nonzero when the entry
+     * now serves the access (dbt_h_tlb_fill: the walk the access would
+     * make, accessed and dirty bits set, the entry filled). Called in the
+     * middle of an instruction, so every other register is kept, and
+     * RFLAGS (the guest's DF rides in it). ---- */
+    s_tlbfill_thunk_off = e.offset;
+    emit_pushfq(&e);
+    emit_push_r(&e, X64_RAX); emit_push_r(&e, X64_RCX); emit_push_r(&e, X64_RDX);
+    emit_push_r(&e, X64_RSI); emit_push_r(&e, X64_RDI);
+    emit_push_r(&e, W_T0); emit_push_r(&e, W_T1);
+    if (ABI_SHADOW) emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, ABI_SHADOW);
+    emit_mov_rr(&e, 4, ABI_A1, W_T3);
+    emit_mov_rr(&e, 4, ABI_A2, W_T2);
+    emit_mov_rr(&e, 8, ABI_A0, R_CPU);
+    emit_cld(&e);
+    emit_mov_ri(&e, 8, X64_RAX, (uint64_t)(uintptr_t)dbt_h_tlb_fill);
+    emit_call_r(&e, X64_RAX);
+    emit_mov_rr(&e, 4, W_T3, X64_RAX);
+    if (ABI_SHADOW) emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, ABI_SHADOW);
+    emit_pop_r(&e, W_T1); emit_pop_r(&e, W_T0);
     emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
     emit_pop_r(&e, X64_RDX); emit_pop_r(&e, X64_RCX); emit_pop_r(&e, X64_RAX);
     emit_popfq(&e);
@@ -643,6 +677,9 @@ typedef struct {
     uint32_t rf_after;        /* bits the continuation expects in RFLAGS */
     uint8_t  trap;            /* a fastmem range: entered by the fault handler, not a Jcc */
     uint32_t start, rf_at;    /* ...its first host byte, and the guest bits RFLAGS held there */
+    uint8_t  tlb;             /* a paged access's TLB miss: refill by a walk and retry before the replay */
+    int      tlb_lin;         /* ...the register holding the linear address */
+    uint32_t tlb_need, tlb_retry;   /* ...the bits the check needs, and where the lookup starts */
 } slow_site_t;
 #define SLOW_MAX 256
 static slow_site_t s_slow[SLOW_MAX];
@@ -662,6 +699,20 @@ static void slow_site(emit_t *e, int cc) {
     s->op_i = s_cur_i;
     s->rf_after = 0;
     s->trap = 0;
+    s->tlb = 0;
+}
+
+/* A TLB check's miss (the entry for another page, or one without a bit
+ * the access needs): the chunk first refills by a walk (the refill thunk)
+ * and goes back to `retry`; only what the walk cannot serve — a fault, a
+ * watched page, device memory — replays the instruction. */
+static void tlb_site(emit_t *e, int cc, int lin, uint32_t need, uint32_t retry) {
+    slow_site(e, cc);
+    slow_site_t *s = &s_slow[s_nslow - 1];
+    s->tlb = 1;
+    s->tlb_lin = lin;
+    s->tlb_need = need;
+    s->tlb_retry = retry;
 }
 
 /* ----------------------------------------------------------------------
@@ -715,6 +766,7 @@ static void trap_site(emit_t *e) {
     t->op_i = s_cur_i;
     t->rf_after = 0;
     t->trap = 1;
+    t->tlb = 0;
     t->start = emit_pos(e);
     t->rf_at = s_rf & ARITH;
 }
@@ -802,10 +854,27 @@ static void emit_slow_chunks(x86_dbt *dbt, emit_t *e) {
     for (uint32_t k = 0; k < s_nslow; ) {
         slow_site_t *s = &s_slow[k];
         if (!s->back_off) { fprintf(stderr, "dbt: slow site without a rejoin (op %u)\n", s->op_i); abort(); }
-        uint32_t chunk = emit_pos(e), j = k;
+        /* the TLB misses' refill preludes first, each falling back to
+         * the instruction's replay below when the walk cannot serve it */
+        uint32_t j = k, to_main[SLOW_MAX], n_main = 0;
         for (; j < s_nslow && s_slow[j].op_i == s->op_i; j++) {
+            slow_site_t *t = &s_slow[j];
+            if (!t->tlb) continue;
+            emit_patch_rel32(e, t->patch_off, emit_pos(e));
+            emit_push_r(e, W_T2);                                /* (R10's value kept; RSP 0 mod 16 at the thunk) */
+            emit_mov_rr(e, 4, W_T3, t->tlb_lin);                 /* (before R10: XLAT's address can be in it) */
+            emit_mov_ri(e, 4, W_T2, t->tlb_need);
+            emit_call_rel32_to(e, s_tlbfill_thunk_off);
+            emit_pop_r(e, W_T2);
+            emit_test_rr(e, 4, W_T3, W_T3);
+            emit_patch_rel32(e, emit_jcc_rel32(e, X64_CC_NE), t->tlb_retry);
+            to_main[n_main++] = emit_jmp_rel32(e);
+        }
+        uint32_t chunk = emit_pos(e);
+        for (uint32_t q = 0; q < n_main; q++) emit_patch_rel32(e, to_main[q], chunk);
+        for (j = k; j < s_nslow && s_slow[j].op_i == s->op_i; j++) {
             if (s_slow[j].trap) trap_add(dbt, s_slow[j].start, s_slow[j].back_off, chunk, s_slow[j].rf_at);
-            else emit_patch_rel32(e, s_slow[j].patch_off, chunk);
+            else if (!s_slow[j].tlb) emit_patch_rel32(e, s_slow[j].patch_off, chunk);
         }
         s_cur_ip_after = s->ip_after;
         s_cur_ip_start = s->ip_start;
@@ -999,15 +1068,16 @@ static void emit_tlb_lookup(emit_t *e, int lin, int idx, int size, int write, in
     x64_mem_t m;
     uint32_t need = X86_TLB_V | (pure_store ? X86_TLB_WMEM : X86_TLB_MEM) | (write ? X86_TLB_D : 0)
                   | (s_pg_user ? (write ? X86_TLB_UW : X86_TLB_U) : 0);
+    uint32_t top = emit_pos(e);                                                            /* (a refill retries from here) */
     emit_mov_rr(e, 4, idx, lin); emit_shift_ri(e, 4, X64_SH_SHR, idx, 12); emit_movzx_rr(e, 4, idx, 1, idx);   /* index */
     m = x64_mi(R_CPU, idx, 3, OFF_TLB); emit_mov_rm(e, 4, W_T3, &m);                      /* tag */
     emit_alu_rr(e, 4, X64_ALU_XOR, W_T3, lin);
     emit_test_ri(e, 4, W_T3, 0xFFFFF000u);                                                 /* the entry is for this page */
-    slow_site(e, X64_CC_NE);
+    tlb_site(e, X64_CC_NE, lin, need, top);
     m = x64_mi(R_CPU, idx, 3, OFF_TLB); emit_mov_rm(e, 4, W_T3, &m);
     emit_alu_ri(e, 4, X64_ALU_AND, W_T3, need);
     emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, need);                                            /* every needed bit */
-    slow_site(e, X64_CC_NE);
+    tlb_site(e, X64_CC_NE, lin, need, top);
     if (size > 1) {
         emit_mov_rr(e, 4, W_T3, lin);
         emit_alu_ri(e, 4, X64_ALU_AND, W_T3, 0xFFF);
@@ -1250,7 +1320,7 @@ static void emit_pop16(emit_t *e, int dst) { emit_pop_seg(e, dst, 2); }
 static void emit_check_flat(emit_t *e, ea_t *ea, int size, int store, int reads);
 
 /* The flat stack: PUSH/POP of a dword at ESP off R_MEM, range-checked
- * (a 32-bit wrap lands above FLAT_TOP), the push's bitmap bytes too. */
+ * (a 32-bit wrap lands above s_flat_top), the push's bitmap bytes too. */
 static void emit_push32(emit_t *e, int val) {
     x64_mem_t m = M(X64_R12, -4);
     emit_lea(e, 4, W_T0, &m);
@@ -1284,7 +1354,7 @@ static void emit_pusha32(emit_t *e, uint32_t live_in) {
     x64_mem_t m;
     fl_save(e, live_in);
     m = M(X64_R12, -32); emit_lea(e, 4, W_T0, &m);
-    emit_alu_ri(e, 4, X64_ALU_CMP, W_T0, FLAT_TOP - 28); slow_site(e, X64_CC_AE);
+    emit_alu_ri(e, 4, X64_ALU_CMP, W_T0, s_flat_top - 28); slow_site(e, X64_CC_AE);
     for (int k = 0; k < 4; k++) { m = x64_mi(R_MEM, W_T0, 0, (int32_t)X86_BM_DELTA + 8 * k); emit_alu_mi(e, 8, X64_ALU_CMP, &m, 0); slow_site(e, X64_CC_NE); }
     static const int order[8] = { R_DI, R_SI, R_BP, R_SP, R_BX, R_DX, R_CX, R_AX };
     for (int k = 0; k < 8; k++) { m = x64_mi(R_MEM, W_T0, 0, 4 * k); emit_mov_mr(e, 4, &m, R_GPR(order[k])); }
@@ -1293,7 +1363,7 @@ static void emit_pusha32(emit_t *e, uint32_t live_in) {
 static void emit_popa32(emit_t *e, uint32_t live_in) {
     x64_mem_t m;
     fl_save(e, live_in);
-    emit_alu_ri(e, 4, X64_ALU_CMP, X64_R12, FLAT_TOP - 28); slow_site(e, X64_CC_AE);
+    emit_alu_ri(e, 4, X64_ALU_CMP, X64_R12, s_flat_top - 28); slow_site(e, X64_CC_AE);
     static const int order[8] = { R_DI, R_SI, R_BP, -1, R_BX, R_DX, R_CX, R_AX };
     for (int k = 0; k < 8; k++) { if (order[k] < 0) continue; m = x64_mi(R_MEM, X64_R12, 0, 4 * k); emit_mov_rm(e, 4, R_GPR(order[k]), &m); }
     m = M(X64_R12, 32); emit_lea(e, 4, X64_R12, &m);
@@ -1461,9 +1531,10 @@ static int inline_ok_v86(const dbt_block *b, const x86_insn *in) {
 /* Flat protected mode: 32-bit code and addressing through DS/ES/SS. */
 static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
     /* (a based block reaches FS and GS too — Linux 2.0 addresses user
-     * memory through FS — but not CS, whose readability is not checked) */
+     * memory through FS — and any paged one with run-time checks
+     * (emit_fsgs_linear); not CS, whose readability is not checked) */
     if (in->ea_valid && (in->adsize != 4 || (in->seg != S_DS && in->seg != S_ES && in->seg != S_SS
-                                             && !(b->based && (in->seg == S_FS || in->seg == S_GS))))) return 0;
+                                             && !((b->based || b->paged) && (in->seg == S_FS || in->seg == S_GS))))) return 0;
     if (b->paged) {                                      /* one translated access an instruction */
         switch (in->op) {
         case OP_MOVS: case OP_STOS: case OP_CMPS: case OP_SCAS: case OP_LODS: case OP_PUSHA: case OP_POPA:
@@ -1540,13 +1611,20 @@ int dbt_arch_can_inline(const dbt_block *b, const x86_insn *in) {
     env_switches();
     if (s_env_helpers) return 0;
     if (b->paged && s_env_nopaged) return 0;
+    /* SMP: a bus-locked read-modify-write (LOCK, XCHG with memory,
+     * CMPXCHG8B) is the interpreter's, which does it with the host's
+     * atomics. Inline it was a load and a store: another processor's
+     * store between them was lost — Linux's qspinlock word put back
+     * stale, both processors spinning with interrupts off on a lock
+     * nobody held. */
+    if (dbt_smp && dbt_insn_locked(in)) return 0;
     if (b->v86) return inline_ok_v86(b, in);
     if (b->flat) return inline_ok_flat(b, in);
     if (b->seg16) return inline_ok_seg16(b, in);
     return inline_ok(b, in);
 }
 
-/* Flat checks: the offset below FLAT_TOP (every access of up to 4 bytes
+/* Flat checks: the offset below s_flat_top (every access of up to 4 bytes
  * then stays inside memory); a read outside the VGA window while a device
  * answers reads there; a store's bitmap bytes. RFLAGS must be free. */
 /* A based block's access: the 32-bit offset against the segment's limit
@@ -1576,9 +1654,41 @@ static void emit_based_linear(emit_t *e, ea_t *ea, int size) {
     ea->off = W_T0;
 }
 
+/* FS or GS in a paged flat block (Linux's per-CPU data and TLS, NT's
+ * processor and thread blocks): the key says nothing about them, and
+ * they change under the block, so everything is checked here at run
+ * time — a data segment, expand-up, writable for a store, usable, the
+ * last byte's offset (in 64 bits) within the limit — and anything else
+ * is the slow path, whose interpreter raises the fault exactly (the
+ * front end keeps the flags live into such an access whole). Then
+ * linear = base + offset into W_T0, as emit_based_linear leaves it.
+ * Clobbers W_T1, W_T3 and RFLAGS. */
+static void emit_fsgs_linear(emit_t *e, ea_t *ea, int size, int store) {
+    int seg = ea->seg;
+    x64_mem_t m = M(R_CPU, OFF_SEG_ATTR(seg));
+    emit_movzx_rm(e, 4, W_T1, 2, &m);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T1, store ? 0x1E : 0x1C);
+    emit_alu_ri(e, 4, X64_ALU_CMP, W_T1, store ? 0x12 : 0x10);
+    slow_site(e, X64_CC_NE);
+    m = M(R_CPU, OFF_SEG_USABLE(seg));
+    emit_alu_mi(e, 1, X64_ALU_CMP, &m, 0);
+    slow_site(e, X64_CC_E);
+    emit_mov_rr(e, 4, W_T3, ea->off);                        /* zero-extended */
+    if (size > 1) emit_alu_ri(e, 8, X64_ALU_ADD, W_T3, (uint32_t)(size - 1));
+    m = M(R_CPU, OFF_SEG_LIMIT(seg));
+    emit_mov_rm(e, 4, W_T1, &m);
+    emit_alu_rr(e, 8, X64_ALU_CMP, W_T3, W_T1);
+    slow_site(e, X64_CC_A);
+    m = M(R_CPU, OFF_SEG_BASE(seg));
+    if (ea->off == W_T0) emit_alu_rm(e, 4, X64_ALU_ADD, W_T0, &m);
+    else { emit_mov_rm(e, 4, W_T0, &m); emit_alu_rr(e, 4, X64_ALU_ADD, W_T0, ea->off); }
+    ea->off = W_T0;
+}
+
 static void emit_check_flat(emit_t *e, ea_t *ea, int size, int store, int reads) {
     if (s_paged) {
         if (s_based) emit_based_linear(e, ea, size);
+        else if (ea->seg == S_FS || ea->seg == S_GS) emit_fsgs_linear(e, ea, size, store);
         emit_pgflat(e, ea, size, store, store && s_skip_smc);      /* (the window: reads have no MEM entry, pure stores go by the bitmap) */
         if (store && !s_skip_smc) emit_check_smc(e, ea, size);
         return;
@@ -1599,17 +1709,17 @@ static void emit_check_flat(emit_t *e, ea_t *ea, int size, int store, int reads)
     if (reads && s_blk->devread) {
         /* In range and outside the VGA window, in one test for the common
          * case (a program's data above the window): off - B0000h below
-         * FLAT_TOP - B0000h; else off below A0000h; anything else — the
+         * s_flat_top - B0000h; else off below A0000h; anything else — the
          * window, or past the fast range — is the slow path. */
         x64_mem_t m = M(ea->off, -0xB0000);
         emit_lea(e, 4, W_T3, &m);
-        emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, FLAT_TOP - 0xB0000);
+        emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, s_flat_top - 0xB0000);
         uint32_t ok = emit_jcc_rel8(e, X64_CC_B);
         emit_alu_ri(e, 4, X64_ALU_CMP, ea->off, 0xA0000);
         slow_site(e, X64_CC_AE);
         emit_patch_rel8(e, ok, emit_pos(e));
     } else {
-        emit_alu_ri(e, 4, X64_ALU_CMP, ea->off, FLAT_TOP);
+        emit_alu_ri(e, 4, X64_ALU_CMP, ea->off, s_flat_top);
         slow_site(e, X64_CC_AE);
     }
     if (store && !s_skip_smc) emit_check_smc(e, ea, size);
@@ -2490,7 +2600,7 @@ static void emit_rep_string(emit_t *e, const x86_insn *in, uint32_t live_in) {
     /* byte count (64 bits: a flat ECX times four can pass 32) */
     if (size == 1) emit_mov_rr(e, 4, W_T0, X64_RCX);
     else { m = x64_mi(X64_NOREG, X64_RCX, size == 2 ? 1 : 2, 0); emit_lea(e, 8, W_T0, &m); }
-    uint32_t top_off = s_flat ? FLAT_TOP : 0x10000;   /* offsets below this are the fast path's */
+    uint32_t top_off = s_flat ? s_flat_top : 0x10000;   /* offsets below this are the fast path's */
     /* seg16: both segments usable (else the interpreter's #GP), and below
      * every byte at or below the limit: the last one in DF's direction on
      * the way up, the first one on the way down (so no wrap either) */
