@@ -1,6 +1,6 @@
 # dos-monster
 
-An 8086–Pentium PC emulator built around a dynamic binary translator: x86
+An 8086–Pentium 4 PC emulator built around a dynamic binary translator: x86
 real mode, protected mode, virtual-8086 mode and paging, and the 387/486
 floating-point unit, translated to AArch64 or x86-64 at run time, with
 the goal of running DOS software at billions of instructions per second.
@@ -33,10 +33,13 @@ Two ways to run things:
   diskette and hard-disk images, the two 8259s, the 8254, the 8042 with a
   PS/2 mouse, an MC146818 real-time clock, an IDE (ATA) controller with
   an AT disk BIOS that drives it in real instructions, a VGA (text, mode
-  13h and unchained, 16-colour planar modes), A20, and up to 257 MB of
-  memory (`-mem`). The CPU is an 8086, 186, 286, 386, 486 or Pentium
-  (`-m`), with an x87 on the 486 and the Pentium (and beside a 386 with
-  `-fpu`), and with the Pentium its local APIC and an I/O APIC, with
+  13h and unchained, 16-colour planar modes), A20, and up to 2047 MB of
+  memory (`-mem`; 257 MB on Windows, where the code bitmap sits above
+  guest memory). The CPU is an 8086, 186, 286, 386, 486, Pentium,
+  Pentium Pro, Pentium II, Pentium III or Pentium 4 (`-m`), with an x87
+  from the 486 on (and beside a 386 with `-fpu`), MMX from the Pentium II,
+  SSE on the Pentium III and SSE2 on the Pentium 4, and with the Pentium
+  its local APIC and an I/O APIC, with
   the MultiProcessor Specification tables that announce them (`-noapic`
   for a Pentium without) — and more than one Pentium (`-smp N`): each
   application processor is a host thread with a translator of its own
@@ -233,7 +236,7 @@ Windows 2000 wants about 2 GB) and run `WINNT` from it.
 - `make test-jit` — the translator against the interpreter, instruction
   sequences fuzzed in real mode, flat and segmented protected mode
 - `make test-pm`, `test-pm-compare`, `test-pg` — protected mode, paging
-  and V86 mode against QEMU and Bochs, and the 486's and the Pentium's
+  and V86 mode against QEMU and Bochs, and the 486's through the Pentium 4's
   additions against Bochs as each (`tools/pmoracle`: boot images that
   log their observations)
 - `make test-fpu` — the x87: 6,600 cases (every instruction, the awkward
