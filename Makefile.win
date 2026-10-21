@@ -48,8 +48,9 @@ DOS_OBJS  = $(O)\dos\dos_load.obj $(O)\dos\dos_host.obj $(O)\dos\dos_int21.obj $
 TARGET  = $(O)\dos-monster.exe
 SST     = $(O)\tools\sst.exe
 JITTEST = $(O)\tools\jittest.exe
+STRTEST = $(O)\tools\strtest.exe
 
-all: dirs $(O)\softfloat.lib $(TARGET) $(SST) $(JITTEST)
+all: dirs $(O)\softfloat.lib $(TARGET) $(SST) $(JITTEST) $(STRTEST)
 
 dirs:
 	@for %d in (core dbt pc dos win tools softfloat softfloat\8086) do @if not exist $(O)\%d mkdir $(O)\%d
@@ -67,6 +68,9 @@ $(O)\pc\pc_net.obj: pc\pc_net.c
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) /c /Fo$@ pc\pc_net.c
 
 $(SST): $(O)\tools\sst.obj $(CORE_OBJS) $(O)\softfloat.lib
+	link $(LDFLAGS) /OUT:$@ $** $(LIBS)
+
+$(STRTEST): $(O)\tools\strtest.obj $(CORE_OBJS) $(O)\softfloat.lib
 	link $(LDFLAGS) /OUT:$@ $** $(LIBS)
 
 $(JITTEST): $(O)\tools\jittest.obj $(CORE_OBJS) $(DBT_OBJS) $(O)\softfloat.lib
@@ -96,8 +100,11 @@ $(O)\main.obj: main.c
 {tools}.c{$(O)\tools}.obj::
 	$(CC) $(CFLAGS) /c /Fo$(O)\tools\ $<
 
-test-jit: $(JITTEST)
-	$(JITTEST) -p 0 && $(JITTEST) -p 1 && $(JITTEST) -m 286 -p 0 && \
+test-str: $(STRTEST)
+	$(STRTEST) -n 20000
+
+test-jit: $(JITTEST) $(STRTEST)
+	$(STRTEST) -n 20000 && $(JITTEST) -p 0 && $(JITTEST) -p 1 && $(JITTEST) -m 286 -p 0 && \
 	$(JITTEST) -f 2000 && $(JITTEST) -m 286 -f 2000 && $(JITTEST) -m 386 -f 2000 && \
 	$(JITTEST) -P -f 3000 && $(JITTEST) -P -f 1000 -r 100000 -n 40 && \
 	$(JITTEST) -G -f 3000 && $(JITTEST) -G -f 1000 -r 100000 -n 40 && \
