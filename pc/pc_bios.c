@@ -741,10 +741,17 @@ static int poll(x86_cpu *c) {
         if (pc_net_present() && nap > 1000000ull) nap = 1000000ull;
         if (nap) {
             uint64_t w0 = pc_wall_ns();
+            int slept = 0;
             if (netwait) pc_net_poll(1);
             else if (pc.ncpus > 1) pc_smp_wait(c, hnow + nap);   /* (an IPI wakes it) */
-            else usleep((useconds_t)(nap / 1000 + 1));
-            pc.blocked_ns += pc_wall_ns() - w0; pc.blocked_calls++;
+            else { usleep((useconds_t)(nap / 1000 + 1)); slept = 1; }
+            uint64_t took = pc_wall_ns() - w0;
+            /* The virtual clock takes the nap it asked for: a host whose
+             * sleeps overshoot (Windows', by most of a millisecond) would
+             * otherwise carry the guest's timers past their deadlines,
+             * differently each run — RTC's 1024 Hz is 976 us apart. */
+            if (pc.vclock && slept) took = nap;
+            pc.blocked_ns += took; pc.blocked_calls++;
         }
         pc_uart_poll();
         pc_net_poll(0);
