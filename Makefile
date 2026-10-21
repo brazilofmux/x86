@@ -57,11 +57,12 @@ DOS_OBJS  = $(addprefix $(O)/,$(DOS_SRCS:.c=.o))
 TARGET = $(O)/dos-monster
 SST    = $(O)/tools/sst
 JITTEST = $(O)/tools/jittest
+STRTEST = $(O)/tools/strtest
 MAIN_O = $(O)/main.o
 
-.PHONY: test-smp-soak test-pm all clean test-sst test-jit test-dos test-x64enc test-hwflags test-fpu
+.PHONY: test-smp-soak test-pm all clean test-sst test-jit test-str test-dos test-x64enc test-hwflags test-fpu
 
-all: $(TARGET) $(SST) $(JITTEST)
+all: $(TARGET) $(SST) $(JITTEST) $(STRTEST)
 
 $(TARGET): $(MAIN_O) $(CORE_OBJS) $(DBT_OBJS) $(PC_OBJS) $(DOS_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lz -lm $(SDL_LIBS) $(SLIRP_LIBS)
@@ -94,6 +95,9 @@ $(SST): $(O)/tools/sst.o $(CORE_OBJS)
 $(JITTEST): $(O)/tools/jittest.o $(CORE_OBJS) $(DBT_OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
 
+$(STRTEST): $(O)/tools/strtest.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -lm
+
 $(O)/core/softfloat/%.o: core/softfloat/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(SF_CFLAGS) -MMD -MP -c -o $@ $<
@@ -113,7 +117,7 @@ $(O)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
--include $(CORE_OBJS:.o=.d) $(DBT_OBJS:.o=.d) $(PC_OBJS:.o=.d) $(DOS_OBJS:.o=.d) $(MAIN_O:.o=.d) $(SST:=.d) $(JITTEST:=.d) $(HWFLAGS:=.d)
+-include $(CORE_OBJS:.o=.d) $(DBT_OBJS:.o=.d) $(PC_OBJS:.o=.d) $(DOS_OBJS:.o=.d) $(MAIN_O:.o=.d) $(SST:=.d) $(JITTEST:=.d) $(STRTEST:=.d) $(HWFLAGS:=.d)
 
 # SingleStepTests suites (tests/sst*/, not committed — see tests/sst8088/fetch.sh, tests/sst386/fetch.sh)
 test-sst: $(SST)
@@ -123,9 +127,14 @@ test-sst286: $(SST)
 test-sst386: $(SST)
 	$(SST) -n 3 tests/sst386/*.MOO.gz
 
-# JIT vs interpreter: built-in programs plus a fuzz sweep, all under -V lockstep
-test-jit: $(JITTEST)
-	$(JITTEST) -p 0 && $(JITTEST) -p 1 && $(JITTEST) -m 286 -p 0 && \
+# The interpreter's REP MOVS/STOS fast path against its element loop
+test-str: $(STRTEST)
+	$(STRTEST) -n 20000
+
+# JIT vs interpreter: built-in programs plus a fuzz sweep, all under -V
+# lockstep (the interpreter first checked against itself: test-str)
+test-jit: $(JITTEST) $(STRTEST)
+	$(STRTEST) -n 20000 && $(JITTEST) -p 0 && $(JITTEST) -p 1 && $(JITTEST) -m 286 -p 0 && \
 	$(JITTEST) -f 2000 && $(JITTEST) -m 286 -f 2000 && $(JITTEST) -m 386 -f 2000 && \
 	$(JITTEST) -P -f 3000 && $(JITTEST) -P -f 1000 -r 100000 -n 40 && \
 	$(JITTEST) -G -f 3000 && $(JITTEST) -G -f 1000 -r 100000 -n 40 && \
@@ -195,5 +204,5 @@ test-pm-jit: $(TARGET)
 clean:
 	rm -f $(CORE_OBJS) $(CORE_OBJS:.o=.d) $(DBT_OBJS) $(DBT_OBJS:.o=.d) \
 	      $(PC_OBJS) $(PC_OBJS:.o=.d) $(DOS_OBJS) $(DOS_OBJS:.o=.d) main.o main.d \
-	      tools/sst tools/sst.o tools/sst.d tools/jittest tools/jittest.o tools/jittest.d dos-monster
+	      tools/sst tools/sst.o tools/sst.d tools/jittest tools/jittest.o tools/jittest.d tools/strtest tools/strtest.o tools/strtest.d dos-monster
 	rm -rf build-a64

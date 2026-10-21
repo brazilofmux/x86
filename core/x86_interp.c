@@ -1001,6 +1001,104 @@ static void do_div(x86_cpu *c, uint32_t src, int size, int is_signed, int negate
 static inline void set_si(x86_cpu *c, uint32_t am, uint32_t v) { c->r[R_SI] = am == 0xFFFF ? ((c->r[R_SI] & 0xFFFF0000u) | (v & 0xFFFF)) : v; }
 static inline void set_di(x86_cpu *c, uint32_t am, uint32_t v) { c->r[R_DI] = am == 0xFFFF ? ((c->r[R_DI] & 0xFFFF0000u) | (v & 0xFFFF)) : v; }
 
+/* How many of a REP's next elements at offset OFF stay inside one page,
+ * the segment's limit and the address size, stepping by DELTA. */
+static uint32_t str_span(const x86_cpu *c, int seg, uint32_t off, uint32_t am, int size, int32_t delta) {
+    uint32_t top = c->seg[seg].limit < am ? c->seg[seg].limit : am;
+    uint32_t pg = (c->seg[seg].base + off) & 0xFFF;
+    if (off > top || top - off < (uint32_t)size - 1 || pg + (uint32_t)size > 0x1000) return 0;
+    if (delta > 0) {
+        uint32_t n = (0x1000 - pg) / (uint32_t)size, room = (top - off + 1) / (uint32_t)size;
+        if (top - off == 0xFFFFFFFFu) room = 0xFFFFFFFFu / (uint32_t)size;
+        return n < room ? n : room;
+    }
+    uint32_t n = pg / (uint32_t)size + 1, room = off / (uint32_t)size + 1;
+    return n < room ? n : room;
+}
+/* ... and its first element's host bytes when they are plain RAM: a read
+ * outside the VGA read window, a write with no code-bitmap byte (code,
+ * a device, a watched descriptor) anywhere in the N elements. Translating
+ * takes the first element's page walk and fault, as its access would. */
+static uint8_t *str_ram(x86_cpu *c, int seg, uint32_t off, int size, int32_t delta, uint32_t n, int write) {
+    uint32_t lin = c->seg[seg].base + off, bytes = n * (uint32_t)size;
+    if ((delta > 0 ? lin + bytes : lin + (uint32_t)size) == 0) return NULL;   /* linear FFFFFFFF: unpaged, the probe's miss (open bus) */
+    uint32_t p = x86_lin(c, lin, write);
+    if (p == X86_PG_BAD) return NULL;
+    p &= c->a20_mask;
+    uint32_t lo = delta > 0 ? p : p - (bytes - (uint32_t)size);
+    if (lo > p || lo + bytes > c->mem_size) return NULL;
+    if (!write) {
+        if (c->device_read && lo < 0xB0000u && lo + bytes > 0xA0000u) return NULL;
+    } else {
+        const uint8_t *bm = &c->code_bitmap[lo];
+        uint8_t any = 0;
+        for (uint32_t i = 0; i < bytes; i++) any |= bm[i];
+        if (any) return NULL;
+    }
+    return &c->mem[p];
+}
+static inline uint32_t str_ld(const uint8_t *p, int size) {
+    uint32_t v = 0;
+    if (x86_smp && !((uintptr_t)p & (uintptr_t)(size - 1)))
+        return size == 4 ? __atomic_load_n((const uint32_t *)(const void *)p, __ATOMIC_ACQUIRE)
+             : size == 2 ? __atomic_load_n((const uint16_t *)(const void *)p, __ATOMIC_ACQUIRE)
+             : __atomic_load_n(p, __ATOMIC_ACQUIRE);
+    if (x86_smp) { for (int i = 0; i < size; i++) v |= (uint32_t)__atomic_load_n(p + i, __ATOMIC_ACQUIRE) << (8 * i); return v; }
+    memcpy(&v, p, (size_t)size);
+    return v;
+}
+static inline void str_st(uint8_t *p, int size, uint32_t v) {
+    if (x86_smp && !((uintptr_t)p & (uintptr_t)(size - 1))) {
+        if (size == 4) __atomic_store_n((uint32_t *)(void *)p, v, __ATOMIC_RELEASE);
+        else if (size == 2) __atomic_store_n((uint16_t *)(void *)p, (uint16_t)v, __ATOMIC_RELEASE);
+        else __atomic_store_n(p, (uint8_t)v, __ATOMIC_RELEASE);
+    } else if (x86_smp) {
+        for (int i = 0; i < size; i++) __atomic_store_n(p + i, (uint8_t)(v >> (8 * i)), __ATOMIC_RELEASE);
+    } else memcpy(p, &v, (size_t)size);
+}
+
+/* REP MOVS and REP STOS on the 386 and later, a page at a time: the
+ * elements up to the nearer page end (the lower one when DF is set), the
+ * segment's limit or CX, moved host to host and committed together.
+ * Exact against the element loop below, which it hands anything else:
+ * both pages are translated (source first, as the first element's read
+ * comes before its write) before anything is stored, so a fault lands on
+ * the chunk's first element with everything before it committed — REP
+ * restarts there; the source is read element by element in the copy's
+ * direction wherever the ranges overlap (MOVSB with DI = SI+1 is a fill);
+ * a destination the code bitmap watches anywhere, device memory, the VGA
+ * read window, a watchpoint or alignment checking are the element loop's,
+ * with its hooks. Returns the elements done, 0 for none. */
+static uint32_t do_string_bulk(x86_cpu *c, const x86_insn *in, uint32_t am, int size, int32_t delta) {
+    uint32_t n = c->r[R_CX] & am, si = c->r[R_SI] & am, di = c->r[R_DI] & am, k;
+    int movs = in->op == OP_MOVS;
+    if (x86_nwatch || x86_ac_live(c)) return 0;
+    uint32_t d = str_span(c, S_ES, di, am, size, delta);
+    if (d < n) n = d;
+    if (movs) { uint32_t s = str_span(c, in->seg, si, am, size, delta); if (s < n) n = s; }
+    if (n < 2) return 0;
+    uint8_t *src = NULL;
+    if (movs && !(src = str_ram(c, in->seg, si, size, delta, n, 0))) return 0;
+    uint8_t *dst = str_ram(c, S_ES, di, size, delta, n, 1);
+    if (!dst) return 0;
+    uint32_t bytes = n * (uint32_t)size;
+    if (movs) {
+        uint8_t *slo = delta > 0 ? src : src - (bytes - (uint32_t)size);
+        uint8_t *dlo = delta > 0 ? dst : dst - (bytes - (uint32_t)size);
+        if (!x86_smp && (slo + bytes <= dlo || dlo + bytes <= slo)) memcpy(dlo, slo, bytes);
+        else for (k = 0; k < n; k++) str_st(dst + (int32_t)k * delta, size, str_ld(src + (int32_t)k * delta, size));
+        set_si(c, am, si + n * (uint32_t)delta);
+    } else {
+        uint32_t v = x86_get_reg(c, R_AX, size);
+        if (!x86_smp && size == 1) memset(delta > 0 ? dst : dst - (bytes - 1), (int)(v & 0xFF), bytes);
+        else for (k = 0; k < n; k++) str_st(dst + (int32_t)k * delta, size, v);
+    }
+    set_di(c, am, di + n * (uint32_t)delta);
+    uint32_t cx = (c->r[R_CX] - n) & am;
+    c->r[R_CX] = am == 0xFFFF ? ((c->r[R_CX] & 0xFFFF0000u) | cx) : cx;
+    return n;
+}
+
 static void do_string(x86_cpu *c, const x86_insn *in) {
     int size = in->ops[0].size;
     uint32_t am = admask(in);
@@ -1008,9 +1106,11 @@ static void do_string(x86_cpu *c, const x86_insn *in) {
     int rep = in->rep;
     int test_z = (in->op == OP_CMPS || in->op == OP_SCAS);
     int early = c->model == X86_MODEL_286;   /* the 386 commits nothing on a faulting iteration (measured) */
+    int bulk = rep && c->model >= X86_MODEL_386 && (in->op == OP_MOVS || in->op == OP_STOS);
 
     for (;;) {
         if (rep && (c->r[R_CX] & am) == 0) break;
+        if (bulk && do_string_bulk(c, in, am, size, delta)) continue;
         uint32_t si = c->r[R_SI] & am, di = c->r[R_DI] & am;
         uint32_t a, b;
         if (early && rep) {
