@@ -1016,24 +1016,32 @@ static uint32_t str_span(const x86_cpu *c, int seg, uint32_t off, uint32_t am, i
     return n < room ? n : room;
 }
 /* ... and its first element's host bytes when they are plain RAM: a read
- * outside the VGA read window, a write with no code-bitmap byte (code,
- * a device, a watched descriptor) anywhere in the N elements. Translating
- * takes the first element's page walk and fault, as its access would. */
-static uint8_t *str_ram(x86_cpu *c, int seg, uint32_t off, int size, int32_t delta, uint32_t n, int write) {
-    uint32_t lin = c->seg[seg].base + off, bytes = n * (uint32_t)size;
+ * outside the VGA read window; a write up to the first element (in the
+ * copy's direction) with a code-bitmap byte — code, a device, a watched
+ * descriptor — which *N is cut to, NULL if that is the first: the
+ * element loop takes the marked one, and the next chunk starts after it
+ * (scanning the whole chunk and refusing it whole was quadratic over a
+ * page that once held code: the kernel poisons its freed init text with
+ * REP STOSB). Translating takes the first element's page walk and fault,
+ * as its access would. */
+static uint8_t *str_ram(x86_cpu *c, int seg, uint32_t off, int size, int32_t delta, uint32_t *np, int write) {
+    uint32_t n = *np, lin = c->seg[seg].base + off, bytes = n * (uint32_t)size;
     if ((delta > 0 ? lin + bytes : lin + (uint32_t)size) == 0) return NULL;   /* linear FFFFFFFF: unpaged, the probe's miss (open bus) */
     uint32_t p = x86_lin(c, lin, write);
     if (p == X86_PG_BAD) return NULL;
     p &= c->a20_mask;
     uint32_t lo = delta > 0 ? p : p - (bytes - (uint32_t)size);
-    if (lo > p || lo + bytes > c->mem_size) return NULL;
+    if (lo > p || (uint64_t)lo + bytes > c->mem_size) return NULL;
     if (!write) {
-        if (c->device_read && lo < 0xB0000u && lo + bytes > 0xA0000u) return NULL;
+        if (c->device_read && lo < 0xB0000u && (uint64_t)lo + bytes > 0xA0000u) return NULL;
     } else {
-        const uint8_t *bm = &c->code_bitmap[lo];
-        uint8_t any = 0;
-        for (uint32_t i = 0; i < bytes; i++) any |= bm[i];
-        if (any) return NULL;
+        const uint8_t *bm = c->code_bitmap;
+        uint32_t clean = bytes;                          /* bytes before the first mark, in DF's direction */
+        if (delta > 0) { for (uint32_t i = 0; i < bytes; i++) if (bm[lo + i]) { clean = i; break; } }
+        else { uint32_t top = p + (uint32_t)size - 1; for (uint32_t i = 0; i < bytes; i++) if (bm[top - i]) { clean = i; break; } }
+        n = clean / (uint32_t)size;
+        if (!n) return NULL;
+        *np = n;
     }
     return &c->mem[p];
 }
@@ -1078,8 +1086,8 @@ static uint32_t do_string_bulk(x86_cpu *c, const x86_insn *in, uint32_t am, int 
     if (movs) { uint32_t s = str_span(c, in->seg, si, am, size, delta); if (s < n) n = s; }
     if (n < 2) return 0;
     uint8_t *src = NULL;
-    if (movs && !(src = str_ram(c, in->seg, si, size, delta, n, 0))) return 0;
-    uint8_t *dst = str_ram(c, S_ES, di, size, delta, n, 1);
+    if (movs && !(src = str_ram(c, in->seg, si, size, delta, &n, 0))) return 0;
+    uint8_t *dst = str_ram(c, S_ES, di, size, delta, &n, 1);
     if (!dst) return 0;
     uint32_t bytes = n * (uint32_t)size;
     if (movs) {
