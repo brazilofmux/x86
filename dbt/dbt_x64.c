@@ -296,13 +296,22 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_pop_r(&e, X64_RBP); emit_pop_r(&e, X64_RBX);
     emit_ret(&e);
 
-    /* ---- Exec thunk: CALLed with R8 = insn pool index, R9 = the block's
-     * linear address, R10 = ip after the instruction, R11 = instructions
-     * executed in the block so far, including this one. ---- */
+    /* ---- Exec thunk: CALLed with R8 = insn pool index; the rest of the
+     * call's context — the block's linear address, the ip after the
+     * instruction, the instructions executed in the block so far
+     * including this one — is that index's insn_ctx entry, written at
+     * translation (a call site is 11 bytes, not 29). ---- */
     s_exec_thunk_off = e.offset;
+    _Static_assert(sizeof(struct dbt_insn_ctx) == 12, "insn_ctx entries are 12 bytes");
+    emit_mov_ri(&e, 8, W_T1, (uint64_t)(uintptr_t)dbt->insn_ctx);
+    m = x64_mi(W_T0, W_T0, 1, 0); emit_lea(&e, 8, W_T2, &m);                  /* index * 3 */
+    m = x64_mi(W_T1, W_T2, 2, 0); emit_lea(&e, 8, W_T1, &m);                  /* &insn_ctx[index] */
+    m = M(W_T1, 8); emit_mov_rm(&e, 4, W_T3, &m);
     emit_push_r(&e, W_T3);                                   /* n_done, and the alignment */
-    m = M(R_CPU, OFF_JIT_CUR_LIN); emit_mov_mr(&e, 4, &m, W_T1);
+    m = M(W_T1, 0); emit_mov_rm(&e, 4, W_T2, &m);
+    m = M(R_CPU, OFF_JIT_CUR_LIN); emit_mov_mr(&e, 4, &m, W_T2);
     m = M(R_CPU, OFF_JIT_CUR_HIT); emit_mov_mi(&e, 4, &m, 0);
+    m = M(W_T1, 4); emit_mov_rm(&e, 4, W_T2, &m);
     m = M(R_CPU, OFF_EIP);         emit_mov_mr(&e, 4, &m, W_T2);
     emit_mov_rr(&e, 8, W_T2, W_T0);                          /* the index survives the spill in W_T2 */
     emit_spill_pinned(&e);
@@ -548,8 +557,13 @@ static void emit_dynamic_tail(x86_dbt *dbt, emit_t *e) {
 /* Static edge to `key`:
  *   JMP <target | .+5>      patchable link site (dbt_arch_patch_link)
  *   MOV R10, key            only reached while unlinked
- *   <probe + exit>
- * The linked path executes nothing but the JMP. */
+ *   <the probe of key's own slot, or the exit>
+ * The linked path executes nothing but the JMP. Unlinked, the key is a
+ * constant, so is its slot: the probe is the entry's address, a compare
+ * and the jump through it — 23 bytes, not the hash's 80, and still a jump
+ * of the edge's own (one shared out-of-line probe, tried, cost a third of
+ * translated code's speed: its one indirect jump mispredicted for every
+ * edge that stays unlinked, as many in paged code do). */
 static void emit_edge(x86_dbt *dbt, emit_t *e, uint64_t key) {
     if (s_strict_exit > 0) {
         emit_mov_ri(e, 8, R_KEY, key);
@@ -567,7 +581,13 @@ static void emit_edge(x86_dbt *dbt, emit_t *e, uint64_t key) {
     }
     if (!linked) { uint32_t at = emit_jmp_rel32(e); emit_patch_rel32(e, at, emit_pos(e)); }
     emit_mov_ri(e, 8, R_KEY, key);
-    emit_dynamic_tail(dbt, e);
+    uint64_t base = dbt->golden ? 0x60D1DE4ACAC4E000ull : (uint64_t)(uintptr_t)dbt->aux->cache;   /* (as emit_dynamic_tail) */
+    emit_mov_ri(e, 8, W_T1, base + (uint64_t)dbt_slot(key) * 16);
+    x64_mem_t m = M(W_T1, 0);
+    emit_alu_rm(e, 8, X64_ALU_CMP, R_KEY, &m);
+    emit_patch_rel32(e, emit_jcc_rel32(e, X64_CC_NE), dbt->exit_stub_off);
+    m = M(W_T1, 8);
+    emit_jmp_m(e, &m);
 }
 
 /* Key of the static target ip within the block's CS. */
@@ -649,11 +669,9 @@ static void emit_helper_call(x86_dbt *dbt, emit_t *e, const x86_insn *in, int ta
     dbt->insn_pool[idx] = *in;
     dbt->insn_tag[idx] = (uint8_t)tag;
     dbt->insn_lin[idx] = dbt->cpu->seg[S_CS].base + s_cur_ip_start;
+    dbt->insn_ctx[idx] = (struct dbt_insn_ctx){ s_cur_lin, s_cur_ip_after, s_cur_n_done };
     dbt->helper_insns++;
     emit_mov_ri(e, 4, W_T0, idx);
-    emit_mov_ri(e, 4, W_T1, s_cur_lin);
-    emit_mov_ri(e, 4, W_T2, s_cur_ip_after);
-    emit_mov_ri(e, 4, W_T3, s_cur_n_done);
     emit_call_rel32_to(e, s_exec_thunk_off);
 }
 
@@ -1069,21 +1087,19 @@ static void emit_tlb_lookup(emit_t *e, int lin, int idx, int size, int write, in
     uint32_t need = X86_TLB_V | (pure_store ? X86_TLB_WMEM : X86_TLB_MEM) | (write ? X86_TLB_D : 0)
                   | (s_pg_user ? (write ? X86_TLB_UW : X86_TLB_U) : 0);
     uint32_t top = emit_pos(e);                                                            /* (a refill retries from here) */
+    /* One compare: the page of the access's last byte with the needed
+     * bits, against the tag — equal under page | need when the entry is
+     * for that page and has every bit, and the access ends in the page it
+     * starts in (the index is the first byte's: a crossing access misses,
+     * and the refill leaves it to the slow path) */
+    if (size > 1) { m = M(lin, size - 1); emit_lea(e, 4, W_T3, &m); }
+    else emit_mov_rr(e, 4, W_T3, lin);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T3, 0xFFFFF000u);
+    emit_alu_ri(e, 4, X64_ALU_OR, W_T3, need);
     emit_mov_rr(e, 4, idx, lin); emit_shift_ri(e, 4, X64_SH_SHR, idx, 12); emit_movzx_rr(e, 4, idx, 1, idx);   /* index */
-    m = x64_mi(R_CPU, idx, 3, OFF_TLB); emit_mov_rm(e, 4, W_T3, &m);                      /* tag */
-    emit_alu_rr(e, 4, X64_ALU_XOR, W_T3, lin);
-    emit_test_ri(e, 4, W_T3, 0xFFFFF000u);                                                 /* the entry is for this page */
-    tlb_site(e, X64_CC_NE, lin, need, top);
-    m = x64_mi(R_CPU, idx, 3, OFF_TLB); emit_mov_rm(e, 4, W_T3, &m);
-    emit_alu_ri(e, 4, X64_ALU_AND, W_T3, need);
-    emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, need);                                            /* every needed bit */
-    tlb_site(e, X64_CC_NE, lin, need, top);
-    if (size > 1) {
-        emit_mov_rr(e, 4, W_T3, lin);
-        emit_alu_ri(e, 4, X64_ALU_AND, W_T3, 0xFFF);
-        emit_alu_ri(e, 4, X64_ALU_CMP, W_T3, (uint32_t)(0x1000 - size));
-        slow_site(e, X64_CC_A);
-    }
+    m = x64_mi(R_CPU, idx, 3, OFF_TLB); emit_alu_rm(e, 4, X64_ALU_XOR, W_T3, &m);         /* ^ tag */
+    emit_test_ri(e, 4, W_T3, 0xFFFFF000u | need);
+    tlb_site(e, X64_CC_NE, lin, need | (uint32_t)size << 8, top);
     m = x64_mi(R_CPU, idx, 3, OFF_TLB + 4); emit_mov_rm(e, 4, W_T3, &m);                  /* physical page, zero-extended */
 }
 /* Flat: ea->segp becomes R_MEM + physical page - linear page, the offset

@@ -247,6 +247,8 @@ typedef struct {
     uint32_t *insn_hits;           /* per pooled insn: dynamic helper calls (stats) */
     uint8_t  *insn_tag;            /* per pooled insn: 0 all-helper PM block, 1 flat block helper, 2 flat slow path */
     uint32_t *insn_lin;            /* per pooled insn: its linear address (stats) */
+    struct dbt_insn_ctx { uint32_t blk_lin, ip_after, n_done; } *insn_ctx;   /* per pooled insn: where its call sits (x86-64's
+                                                                                * exec thunk reads these: the call passes the index only) */
 
     /* Instruction budget per trampoline entry; the run loop delivers
      * host events (timer, keyboard) when it comes back. */
@@ -351,6 +353,20 @@ typedef struct {
     uint64_t pm_insns, pm_mem, pm_sib, pm_segovr, pm_rep;
     uint32_t *pm_hits;                  /* per 16-byte line of linear memory */
     uint32_t max_block_bytes;
+    /* The SMC sweep's index: every key put in the cache, listed by its
+     * linear page (sweep_head[page] = record index + 1), so a store's
+     * sweep looks at the blocks that can start within max_block_bytes
+     * before it — one or two pages' records — instead of probing every
+     * slot a key starting there could hash to (~3,700 per stored byte).
+     * Records go stale when their slot is evicted or reused, and are
+     * dropped when a sweep or a compaction finds them so. sweep_off: the
+     * pool could not grow, the probing sweep until the next flush. */
+#define DBT_SWEEP_PAGES (1u << 20)
+    uint32_t *sweep_head;
+    struct dbt_sweep_rec { uint64_t key; uint32_t next; } *sweep_rec;
+    uint32_t sweep_used, sweep_free, sweep_cap;
+    uint32_t *sweep_pages, n_sweep_pages;   /* the pages with a list, for the flush */
+    uint8_t  sweep_off;
     uint32_t bm_lo, bm_hi;         /* bitmap range holding CODE/DESC marks: [lo, hi) */
     /* The pages inside it that hold any: a wipe clears those, not the
      * whole range — a paged OS scatters code over all of memory, and

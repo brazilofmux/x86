@@ -78,9 +78,12 @@ int dbt_init(x86_dbt *dbt, x86_cpu *cpu) {
     dbt->insn_hits = calloc(INSN_POOL_SIZE, sizeof(uint32_t));
     dbt->insn_tag  = calloc(INSN_POOL_SIZE, 1);
     dbt->insn_lin  = calloc(INSN_POOL_SIZE, sizeof(uint32_t));
+    dbt->insn_ctx  = calloc(INSN_POOL_SIZE, sizeof *dbt->insn_ctx);
+    dbt->sweep_head  = calloc(DBT_SWEEP_PAGES, sizeof *dbt->sweep_head);
+    dbt->sweep_pages = calloc(DBT_SWEEP_PAGES, sizeof *dbt->sweep_pages);
     dbt->smc_heat  = calloc((size_t)cpu->mem_size + X86_MEM_SLACK, 1);     /* touched only where SMC happens */
     dbt->smc_win   = calloc((size_t)cpu->mem_size + X86_MEM_SLACK, 1);
-    if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool || !dbt->smc_heat || !dbt->smc_win) {
+    if (!dbt->aux || !dbt->span || !dbt->link_head || !dbt->link_pool || !dbt->insn_pool || !dbt->insn_ctx || !dbt->sweep_head || !dbt->sweep_pages || !dbt->smc_heat || !dbt->smc_win) {
         fprintf(stderr, "dbt_init: out of memory\n");
         return -1;
     }
@@ -151,7 +154,8 @@ void dbt_cleanup(x86_dbt *dbt) {
     free(dbt->smc_heat);
     free(dbt->smc_win);
     free(dbt->aux); free(dbt->span); free(dbt->link_head); free(dbt->link_pool); free(dbt->insn_pool);
-    free(dbt->insn_hits); free(dbt->insn_tag); free(dbt->insn_lin);
+    free(dbt->insn_hits); free(dbt->insn_tag); free(dbt->insn_lin); free(dbt->insn_ctx);
+    free(dbt->sweep_head); free(dbt->sweep_pages); free(dbt->sweep_rec);
     memset(dbt, 0, sizeof(*dbt));
 }
 
@@ -194,6 +198,13 @@ void dbt_h_post_store(x86_cpu *cpu, uint32_t arg) {
  * whole instruction through the interpreter. */
 uint32_t dbt_h_tlb_fill(x86_cpu *cpu, uint32_t lin, uint32_t need) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    /* bits 8 and up: the access's size, when the caller's one compare
+     * also misses on an access that crosses into the next page — which
+     * no entry serves, so that is the slow path's (else it would retry
+     * forever) */
+    uint32_t size = need >> 8;
+    need &= 0xFF;
+    if (size && (lin & 0xFFF) + size > 0x1000) { dbt->tlb_fill_fails++; return 0; }
     if (cpu->fault_armed || !(cpu->cr0 & X86_CR0_PG)) { dbt->tlb_fill_fails++; return 0; }
     uint32_t p = x86_page_walk(cpu, lin, (need & X86_TLB_D) != 0);
     const struct x86_tlbe *t = &cpu->tlb[(lin >> 12) & 255];

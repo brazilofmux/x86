@@ -37,6 +37,7 @@ static void evict_slot(x86_dbt *dbt, uint32_t slot) {
 }
 
 static void page_record(x86_dbt *dbt, uint64_t key, uint8_t *code, uint32_t span);
+static void sweep_note(x86_dbt *dbt, uint64_t key);
 static int32_t pcode_find(x86_dbt *dbt, uint32_t lin_page, uint8_t sp);
 static void page_evict(x86_dbt *dbt, int32_t i, int park);
 
@@ -54,6 +55,7 @@ void dbt_cache_insert(x86_dbt *dbt, uint64_t key, uint8_t *code) {
      * the window so it is always retried. */
     dbt->span[slot] = code ? dbt->last_block_bytes : 0xFFFFFFFFu;
     e->code = code;
+    sweep_note(dbt, key);
     dbt_links_repatch(dbt, key, code);
     if (code && (key & KEY_PAGED)) page_record(dbt, key, code, dbt->span[slot]);
 }
@@ -73,8 +75,17 @@ static void pcode_reset(x86_dbt *dbt) {
     memset(dbt->cr3s, 0, sizeof dbt->cr3s);
 }
 
+static void sweep_reset(x86_dbt *dbt) {
+    for (uint32_t k = 0; k < dbt->n_sweep_pages; k++) dbt->sweep_head[dbt->sweep_pages[k]] = 0;
+    dbt->n_sweep_pages = 0;
+    dbt->sweep_used = 0;
+    dbt->sweep_free = 0;
+    dbt->sweep_off = 0;
+}
+
 void dbt_cache_invalidate_all(x86_dbt *dbt) {
     pcode_reset(dbt);
+    sweep_reset(dbt);
     memset(dbt->phys_alias, 0, sizeof dbt->phys_alias);
     dbt->alias_used = 0;
     memset(dbt->space_used, 0, sizeof dbt->space_used);   /* ids start over */
@@ -179,15 +190,92 @@ void dbt_mark_block_bytes(x86_dbt *dbt, uint32_t start, uint32_t end) {
     bm_note(dbt, start, end);
 }
 
+/* A record's slot no longer holds its key: evicted, or another key's. */
+static inline int sweep_stale(const x86_dbt *dbt, const struct dbt_sweep_rec *r) {
+    const x86_block_entry *e = &dbt->aux->cache[dbt_slot(r->key)];
+    return e->key == BLOCK_EMPTY_KEY || (e->key & ~BLOCK_REFUSED_BIT) != r->key;
+}
+/* Drop every stale record: when the pool is full. 1 if that made room. */
+static int sweep_compact(x86_dbt *dbt) {
+    for (uint32_t k = 0; k < dbt->n_sweep_pages; k++) {
+        uint32_t *pp = &dbt->sweep_head[dbt->sweep_pages[k]];
+        while (*pp) {
+            struct dbt_sweep_rec *r = &dbt->sweep_rec[*pp - 1];
+            if (!sweep_stale(dbt, r)) { pp = &r->next; continue; }
+            uint32_t i = *pp;
+            *pp = r->next;
+            r->next = dbt->sweep_free;
+            dbt->sweep_free = i;
+        }
+    }
+    return dbt->sweep_free != 0;
+}
+/* KEY went into its slot: on its linear page's list. */
+static void sweep_note(x86_dbt *dbt, uint64_t key) {
+    if (dbt->sweep_off) return;
+    key &= ~BLOCK_REFUSED_BIT;
+    uint32_t i;
+    if (!dbt->sweep_free && dbt->sweep_used == dbt->sweep_cap && !sweep_compact(dbt)) {
+        /* every record live: grow, up to twice the cache (each slot holds one key) */
+        uint32_t cap = dbt->sweep_cap ? dbt->sweep_cap * 2 : 1u << 18;
+        void *n = cap <= 2 * BLOCK_CACHE_SIZE ? realloc(dbt->sweep_rec, (size_t)cap * sizeof *dbt->sweep_rec) : NULL;
+        if (!n) { dbt->sweep_off = 1; return; }
+        dbt->sweep_rec = n;
+        dbt->sweep_cap = cap;
+    }
+    if (dbt->sweep_free) { i = dbt->sweep_free; dbt->sweep_free = dbt->sweep_rec[i - 1].next; }
+    else i = ++dbt->sweep_used;
+    uint32_t page = dbt_key_lin(key) >> 12;
+    if (!dbt->sweep_head[page]) dbt->sweep_pages[dbt->n_sweep_pages++] = page;
+    dbt->sweep_rec[i - 1].key = key;
+    dbt->sweep_rec[i - 1].next = dbt->sweep_head[page];
+    dbt->sweep_head[page] = i;
+}
+
+static void sweep_evict(x86_dbt *dbt, x86_block_entry *e, uint32_t p) {
+    uint64_t old = e->key & ~BLOCK_REFUSED_BIT;
+    e->key  = BLOCK_EMPTY_KEY;
+    e->code = NULL;
+    dbt_links_repatch(dbt, old, NULL);
+    /* The block that is executing right now (a JIT store or a helper
+     * op inside it): the thunk sees this flag and leaves the block
+     * before its next, now stale, instruction. */
+    if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = dbt->cpu->jit_cur_inval = 1;
+}
+
 /* A store landed on a byte some cached block covers. Invalidate every
- * block whose start lies in [phys - max_block_bytes + 1, phys] and
- * whose span reaches phys; clear the bitmap byte last, once no block
+ * block whose start lies in [lin - max_block_bytes + 1, lin] and whose
+ * span reaches lin, under every mode variant and address space — found
+ * through the index, or (sweep_off) by probing each slot such a key
+ * could hash to. The caller clears the bitmap byte last, once no block
  * covers it (the rule paid for in blood: never leave a bitmap byte set
  * after its covering blocks are gone, never clear it before the sweep). */
-/* Invalidate every block whose start lies in [lin - max_block_bytes + 1,
- * lin] and whose span reaches lin, under each mode variant. */
 static void sweep_blocks_at(x86_dbt *dbt, uint32_t lin) {
     uint32_t window = dbt->max_block_bytes;
+    if (!window) return;
+    if (!dbt->sweep_off) {
+        /* the blocks keyed at p in [lin - window + 1, lin], every mode and
+         * space, whose span reaches lin: on lin's page or the one before */
+        uint32_t lo = lin >= window - 1 ? lin - (window - 1) : 0;
+        for (uint32_t page = lo >> 12; page <= lin >> 12; page++) {
+            uint32_t *pp = &dbt->sweep_head[page];
+            while (*pp) {
+                struct dbt_sweep_rec *r = &dbt->sweep_rec[*pp - 1];
+                uint32_t p = dbt_key_lin(r->key), slot = dbt_slot(r->key);
+                int drop = sweep_stale(dbt, r);
+                if (!drop && p >= lo && p <= lin && lin - p < dbt->span[slot]) {
+                    sweep_evict(dbt, &dbt->aux->cache[slot], p);
+                    drop = 1;
+                }
+                if (!drop) { pp = &r->next; continue; }
+                uint32_t i = *pp;
+                *pp = r->next;
+                r->next = dbt->sweep_free;
+                dbt->sweep_free = i;
+            }
+        }
+        return;
+    }
     /* paged modes' blocks sit by address space too: each one in use */
     uint8_t spaces[DBT_SPACES]; int nsp = 0;
     for (int s = 0; s < DBT_SPACES; s++) if (s == 0 || dbt->space_used[s]) spaces[nsp++] = (uint8_t)s;
@@ -198,14 +286,7 @@ static void sweep_blocks_at(x86_dbt *dbt, uint32_t lin) {
             uint32_t slot = dbt_slot_hash(p, dbt_key_modes[m], spaces[si]);
             x86_block_entry *e = &dbt->aux->cache[slot];
             if (e->key == BLOCK_EMPTY_KEY || dbt_key_lin(e->key) != p || k >= dbt->span[slot]) continue;
-            uint64_t old = e->key & ~BLOCK_REFUSED_BIT;
-            e->key  = BLOCK_EMPTY_KEY;
-            e->code = NULL;
-            dbt_links_repatch(dbt, old, NULL);
-            /* The block that is executing right now (a JIT store or a helper
-             * op inside it): the thunk sees this flag and leaves the block
-             * before its next, now stale, instruction. */
-            if (p == dbt->cpu->jit_cur_lin) dbt->cpu->jit_cur_hit = dbt->cpu->jit_cur_inval = 1;
+            sweep_evict(dbt, e, p);
         }
     }
 }
@@ -527,6 +608,7 @@ static void unpark_page(x86_dbt *dbt, int32_t i) {
                 e->key = key;
                 e->code = code;
                 dbt->span[slot] = dbt->pblk[n].span;
+                sweep_note(dbt, key);
                 dbt_links_repatch(dbt, key, code);
                 dbt->pblk[n].state = PB_LIVE;
                 dbt->blocks_reinstated++;
