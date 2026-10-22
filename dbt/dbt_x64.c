@@ -137,6 +137,7 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 #define OFF_PGD_W       ((int32_t)offsetof(x86_cpu, pgd_w))
 #define OFF_TLB         ((int32_t)offsetof(x86_cpu, tlb))
 #define OFF_CR0         ((int32_t)offsetof(x86_cpu, cr0))
+#define OFF_CR4         ((int32_t)offsetof(x86_cpu, cr4))
 #define OFF_FPU_SW      ((int32_t)(offsetof(x86_cpu, fpu) + offsetof(x86_fpu, sw)))
 
 #define ARITH  X86_ARITH_FLAGS
@@ -144,7 +145,7 @@ _Static_assert(offsetof(x86_seg, attr) == offsetof(x86_seg, sel) + 2, "sel and a
 #define M(base, disp) x64_m((base), (disp))
 
 /* Thunk/stub offsets in the code buffer (emitted with the trampoline). */
-static uint32_t s_exec_thunk_off, s_post_thunk_off, s_port_thunk_off, s_tlbfill_thunk_off, s_exit_eip_off;
+static uint32_t s_exec_thunk_off, s_post_thunk_off, s_port_thunk_off, s_tlbfill_thunk_off, s_tsc_thunk_off, s_exit_eip_off;
 
 /* -V strict mode: every block returns to dbt_run (no links, no probe). */
 static int s_strict_exit = -1;
@@ -421,6 +422,27 @@ void dbt_emit_trampoline(x86_dbt *dbt) {
     emit_pop_r(&e, W_T1); emit_pop_r(&e, W_T0);
     emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI);
     emit_pop_r(&e, X64_RDX); emit_pop_r(&e, X64_RCX); emit_pop_r(&e, X64_RAX);
+    emit_popfq(&e);
+    emit_ret(&e);
+
+    /* ---- TSC thunk: CALLed for RDTSC; EDX:EAX = dbt_h_rdtsc, every
+     * other register and RFLAGS kept (the guest's DF rides there). Entry
+     * RSP is 8 mod 16: eight pushes and 8 more align the call. ---- */
+    s_tsc_thunk_off = e.offset;
+    emit_pushfq(&e);
+    emit_push_r(&e, X64_RCX); emit_push_r(&e, X64_RSI); emit_push_r(&e, X64_RDI);
+    emit_push_r(&e, W_T0); emit_push_r(&e, W_T1); emit_push_r(&e, W_T2); emit_push_r(&e, W_T3);
+    emit_alu_ri(&e, 8, X64_ALU_SUB, X64_RSP, 8 + ABI_SHADOW);
+    emit_mov_rr(&e, 8, ABI_A0, R_CPU);
+    emit_cld(&e);
+    emit_mov_ri(&e, 8, X64_RAX, (uint64_t)(uintptr_t)dbt_h_rdtsc);
+    emit_call_r(&e, X64_RAX);
+    emit_mov_rr(&e, 8, X64_RDX, X64_RAX);
+    emit_shift_ri(&e, 8, X64_SH_SHR, X64_RDX, 32);
+    emit_mov_rr(&e, 4, X64_RAX, X64_RAX);
+    emit_alu_ri(&e, 8, X64_ALU_ADD, X64_RSP, 8 + ABI_SHADOW);
+    emit_pop_r(&e, W_T3); emit_pop_r(&e, W_T2); emit_pop_r(&e, W_T1); emit_pop_r(&e, W_T0);
+    emit_pop_r(&e, X64_RDI); emit_pop_r(&e, X64_RSI); emit_pop_r(&e, X64_RCX);
     emit_popfq(&e);
     emit_ret(&e);
 
@@ -1424,6 +1446,8 @@ static void emit_div16(emit_t *e, const x86_insn *in, ea_t *ea, uint32_t live_in
 static void emit_shift_cl(emit_t *e, const x86_insn *in, ea_t *ea, uint32_t live_in, uint32_t live_out);
 static void emit_pushf16(emit_t *e, uint32_t live_in);
 static void emit_popf16(emit_t *e, uint32_t live_in);
+static void emit_pushf32(emit_t *e, uint32_t live_in);
+static void emit_popf32(emit_t *e, uint32_t live_in);
 
 /* POP [mem] addresses its destination with the SP it has already
  * incremented; the inline POP computes the address first, so a [esp+...]
@@ -1555,7 +1579,11 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
         switch (in->op) {
         case OP_MOVS: case OP_STOS: case OP_CMPS: case OP_SCAS: case OP_LODS: case OP_PUSHA: case OP_POPA:
             return 0;
-        case OP_PUSH: case OP_POP: case OP_CALL:
+        case OP_POP: case OP_CALL:
+            /* (a POP's destination pointer, a CALL's target, would have to
+             * live across the stack's translation, which takes W_T3; PUSH's
+             * operand is a value by then, in W_T2: two translations, 1.2 M
+             * kernel helper calls in 9 s of a Linux boot) */
             if (in->ops[0].kind == OPK_MEM) return 0;
             break;
         default: break;
@@ -1568,8 +1596,16 @@ static int inline_ok_flat(const dbt_block *b, const x86_insn *in) {
     case OP_MOV: case OP_XCHG: case OP_LEA: case OP_NOP: case OP_CBW: case OP_CWD:
     case OP_CLC: case OP_STC: case OP_CMC: case OP_CLD: case OP_STD:
     case OP_MOVZX: case OP_MOVSX: case OP_SETCC: case OP_LAHF: case OP_SAHF:
-    case OP_MUL: case OP_IMUL: case OP_IMUL3: case OP_OUT: case OP_WAIT:
+    case OP_MUL: case OP_IMUL: case OP_IMUL3: case OP_OUT: case OP_WAIT: case OP_RDTSC:
         return 1;
+    case OP_CLI: case OP_STI:
+        /* at CPL 0 they cannot fault (CPL <= IOPL whatever IOPL is): a
+         * kernel's spinlocks and its IRQ save/restore */
+        return ((b->key >> 32) & 3) == 0;
+    case OP_PUSHF:
+        return in->opsize == 4;                  /* never faults outside V86 */
+    case OP_POPF:
+        return in->opsize == 4 && ((b->key >> 32) & 3) == 0;   /* every bit but VM is its own there */
     case OP_SHL: case OP_SAL: case OP_SHR: case OP_SAR: case OP_ROL: case OP_ROR: case OP_RCL: case OP_RCR:
         if (in->ops[1].kind == OPK_IMM) return (in->ops[1].imm & 0xFF) < (uint32_t)in->ops[0].size * 8;
         return in->ops[0].size != 1;                 /* by CL: the byte-by-16/24 quirk */
@@ -1998,6 +2034,21 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         return;
     }
 
+    case OP_RDTSC:
+        /* Through the TSC thunk (the classifier sends RDTSC here only
+         * when the machine's TSC is a clock). Kernel code keyed at CPL 0
+         * may always; elsewhere CR4.TSD set means the interpreter's #GP
+         * (protected mode only: a flat block always is). */
+        if (((s_blk->key >> 32) & 3) != 0) {
+            fl_save(e, live_in);
+            m = M(R_CPU, OFF_CR4);
+            emit_test_mi(e, 4, &m, X86_CR4_TSD);
+            slow_site(e, X64_CC_NE);
+        }
+        emit_call_rel32_to(e, s_tsc_thunk_off);
+        if (s_nslow > s_slow_first) slow_back(e, s_rf);
+        return;
+
     case OP_MOVSEG:
         if (d->kind == OPK_SREG) {                               /* MOV DS/ES, r/m16 */
             int src;
@@ -2259,8 +2310,8 @@ static void emit_op(x86_dbt *dbt, emit_t *e, const x86_insn *in, uint32_t live_i
         emit_div16(e, in, &ea, live_in);
         return;
 
-    case OP_PUSHF: emit_pushf16(e, live_in); slow_back(e, 0); return;
-    case OP_POPF:  emit_popf16(e, live_in); slow_back(e, 0); return;
+    case OP_PUSHF: if (s_flat) emit_pushf32(e, live_in); else emit_pushf16(e, live_in); slow_back(e, 0); return;
+    case OP_POPF:  if (s_flat) emit_popf32(e, live_in); else emit_popf16(e, live_in); slow_back(e, 0); return;
 
     case OP_LDS: case OP_LES: {
         /* the far pointer as one dword (at FFFD..FFFF it straddles: the
@@ -2912,6 +2963,63 @@ static void emit_popf16(emit_t *e, uint32_t live_in) {
     emit_alu_ri(e, 4, X64_ALU_AND, W_T2, X86_DF);
     emit_push_r(e, W_T2); emit_popfq(e);
     s_rf = 0;
+}
+
+/* PUSHFD on the flat stack: EFLAGS with the arithmetic flags from the
+ * slot and DF from RFLAGS, RF and VM clear, the bits above the model's
+ * top 0 — CONTRACT (interp, OP_PUSHF). Never faults outside V86. */
+static void emit_pushf32(emit_t *e, uint32_t live_in) {
+    fl_save(e, live_in | ARITH);
+    emit_flags_image(e, W_T2);
+    uint32_t keep = s_model >= X86_MODEL_586 ? 0x27FFFFu : s_model >= X86_MODEL_486 ? 0x7FFFFu : 0x3FFFFu;
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T2, keep & ~(uint32_t)(X86_RF | X86_VM));
+    emit_push32(e, W_T2);
+}
+/* POPFD on the flat stack at CPL 0. CONTRACT (interp, OP_POPF, CPL 0):
+ * every bit but VM from the image, then x86_flags_fixup — bit 1 set,
+ * bits 3, 5 and 15 clear, and above the 386 the model's top (the 386
+ * keeps bits 18-31 as popped). An image with RF or TF up is the
+ * interpreter's, which leaves the block for the run loop: the slow path
+ * replays it, nothing committed yet (ESP moves after the test). IF coming
+ * on with an interrupt waiting leaves after it, as STI does (no shadow:
+ * POPF has none) — Windows' and Linux's "pushfd; cli; ...; popfd". */
+static void emit_popf32(emit_t *e, uint32_t live_in) {
+    x64_mem_t m;
+    fl_save(e, live_in);
+    ea_t ea = { R_MEM, X64_R12, S_SS };
+    emit_check_flat(e, &ea, 4, 0, 1);
+    m = ea_mem(&ea); emit_mov_rm(e, 4, W_T2, &m);
+    emit_test_ri(e, 4, W_T2, X86_RF | X86_TF);
+    slow_site(e, X64_CC_NE);
+    m = M(X64_R12, 4); emit_lea(e, 4, X64_R12, &m);
+    m = M(R_CPU, OFF_EFLAGS); emit_mov_rm(e, 4, W_T1, &m);                 /* the old flags */
+    emit_mov_rr(e, 4, W_T0, W_T1);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T0, X86_VM);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T2, ~(uint32_t)X86_VM);
+    emit_alu_rr(e, 4, X64_ALU_OR, W_T2, W_T0);
+    uint32_t keep = ~0x8028u;
+    if (s_model >= X86_MODEL_486) keep &= s_model >= X86_MODEL_586 ? 0x0027FFFFu : 0x0007FFFFu;
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T2, keep);
+    emit_alu_ri(e, 4, X64_ALU_OR, W_T2, X86_F1);
+    m = M(R_CPU, OFF_EFLAGS); emit_mov_mr(e, 4, &m, W_T2);
+    m = M(R_CPU, OFF_JIT_FLAGS); emit_mov_mr(e, 4, &m, W_T2);
+    emit_mov_rr(e, 4, W_T0, W_T2);
+    emit_alu_ri(e, 4, X64_ALU_AND, W_T0, X86_DF);
+    emit_push_r(e, W_T0); emit_popfq(e);                                 /* DF to the host (the rest is the slot's) */
+    s_rf = 0;
+    /* IF off before, on now, and an interrupt waits: leave after it */
+    emit_g3_r(e, 4, X64_G3_NOT, W_T1);
+    emit_alu_rr(e, 4, X64_ALU_AND, W_T1, W_T2);
+    emit_test_ri(e, 4, W_T1, X86_IF);
+    uint32_t no_if = emit_jcc_rel8(e, X64_CC_E);
+    m = M(R_CPU, OFF_INTR_WAIT);
+    emit_alu_mi(e, 1, X64_ALU_CMP, &m, 0);
+    uint32_t none = emit_jcc_rel8(e, X64_CC_E);
+    emit_mov_ri(e, 4, W_T0, 1);                                          /* the leave chunk's "after it" */
+    if (s_nleave >= LEAVE_MAX) { fprintf(stderr, "dbt: leave-site table overflow\n"); abort(); }
+    s_leave[s_nleave++] = (leave_site_t){ emit_jmp_rel32(e), s_cur_ip_after, s_cur_ip_start, s_cur_n_done };
+    emit_patch_rel8(e, no_if, emit_pos(e));
+    emit_patch_rel8(e, none, emit_pos(e));
 }
 
 /* ----------------------------------------------------------------------

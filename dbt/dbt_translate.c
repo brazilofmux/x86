@@ -107,8 +107,10 @@ static int classify_sem(const x86_insn *in) {
          * replays the real cpu's readings to the shadow. A bare CPU's TSC
          * is its instruction count, exact only between blocks. (Linux
          * reads it millions of times in a boot — its clocksource.) The
-         * MSRs still end the block: WRMSR 10h moves the TSC. */
-        return s_cls_tsc_clock ? C_HELPER : C_REFUSE;
+         * MSRs still end the block: WRMSR 10h moves the TSC. A backend
+         * may read it inline (x86-64's TSC thunk in flat blocks); else
+         * its can_inline says no and it is a helper. */
+        return s_cls_tsc_clock ? C_INLINE : C_REFUSE;
     case OP_AAM:
         return in->ops[0].imm ? C_HELPER : C_REFUSE;
     case OP_MOVSEG:

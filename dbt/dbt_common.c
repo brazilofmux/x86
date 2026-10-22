@@ -223,6 +223,15 @@ uint32_t dbt_h_tlb_fill(x86_cpu *cpu, uint32_t lin, uint32_t need) {
  * the machine (the oracle's exit port), or flipped A20 and with it the
  * cache under the running block — and 2 for #GP, cpu->exc set, to leave
  * at the instruction. Ports never touch the guest registers or flags. */
+/* RDTSC from inside a block, through a light thunk (x86-64: only the
+ * caller-saved registers kept, no spill): the reading the interpreter
+ * takes. The privilege check (CR4.TSD) is the block's. */
+uint64_t dbt_h_rdtsc(x86_cpu *cpu) {
+    x86_dbt *dbt = (x86_dbt *)cpu->dbt;
+    dbt->tsc_inline++;
+    return x86_tsc(cpu);
+}
+
 uint32_t dbt_h_out(x86_cpu *cpu, uint32_t port_size, uint32_t value) {
     x86_dbt *dbt = (x86_dbt *)cpu->dbt;
     uint32_t port = port_size & 0xFFFF;
@@ -1195,6 +1204,8 @@ void dbt_print_stats(x86_dbt *dbt, FILE *out) {
                                   (unsigned long long)dbt->tlb_flushes, (unsigned long long)dbt->tlb_page_drops);
     if (dbt->tlb_fills || dbt->tlb_fill_fails)
         fprintf(out, "  TLB refills inline:     %llu (%llu left to the interpreter)\n", (unsigned long long)dbt->tlb_fills, (unsigned long long)dbt->tlb_fill_fails);
+    if (dbt->tsc_inline)
+        fprintf(out, "  RDTSC through the thunk: %llu\n", (unsigned long long)dbt->tsc_inline);
     if (dbt->space_evictions || dbt->n_pcode)
         fprintf(out, "  code spaces evicted: %llu, kernel/user space moves %llu / %llu (code pages watched now: %u)\n"
                      "  pages parked/unparked: %llu / %llu, blocks reinstated %llu%s\n",

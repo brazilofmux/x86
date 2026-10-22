@@ -269,6 +269,7 @@ typedef struct {
     uint64_t fastmem_traps;        /* x86-64: flat accesses past memory sent to their slow path by the fault handler */
     uint64_t jit_block_entries;
     uint64_t smc_invalidations;
+    uint64_t tsc_inline;           /* RDTSCs read through the light thunk (x86-64) */
     uint64_t tlb_fills, tlb_fill_fails;   /* translated code's TLB misses: refilled by a walk, or left to the interpreter */
     uint64_t a20_flushes;
     /* Code pages paged blocks were translated on (V86 or flat protected
@@ -543,6 +544,7 @@ int      dbt_classify_op_seg16(const x86_insn *in);
 void dbt_h_exec(x86_cpu *cpu, uint32_t insn_index);
 void dbt_h_post_store(x86_cpu *cpu, uint32_t arg);
 uint32_t dbt_h_out(x86_cpu *cpu, uint32_t port_size, uint32_t value);
+uint64_t dbt_h_rdtsc(x86_cpu *cpu);
 
 /* The flat model: base 0, limit 4G, 32-bit, and for data segments
  * writable and expanding up. A block translated under KEY_FLAT addresses
