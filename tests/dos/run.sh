@@ -168,4 +168,16 @@ if [ -f disks/doom/inst/DOOMS/DOOM.EXE ]; then
         esac
     done
 fi
+if [ -f disks/msdos622/c.img ] && command -v mcopy >/dev/null 2>&1; then
+    # -transcript: QBasic 1.1 (MS-DOS 6.22's) running a program that prints
+    # 300 numbered lines; each scrolls off through INT 10h AH=06h and the
+    # transcript has them all, in order, the last screen's included
+    rm -rf tmp/qbt && mkdir -p tmp/qbt
+    mcopy -i disks/msdos622/c.img@@32256 ::/DOS/QBASIC.EXE tmp/qbt/
+    printf 'FOR I = 1 TO 300\r\nPRINT "LINE"; I\r\nNEXT I\r\nSYSTEM\r\n' > tmp/qbt/PROG.BAS
+    $DM -m 386 -W -C tmp/qbt -transcript tmp/qbt/tr.txt -T 60 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
+    if [ "$(awk '{print $2}' tmp/qbt/tr.txt 2>/dev/null)" = "$(seq 1 300)" ]; then echo "ok   qbasic -transcript"
+    else echo "FAIL qbasic -transcript"; fail=1; fi
+    rm -rf tmp/qbt
+fi
 exit $fail

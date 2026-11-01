@@ -58,6 +58,8 @@ static void usage(const char *prog) {
     printf("  -L N        stop after N instructions\n");
     printf("  -T SECS     stop after SECS seconds of wall-clock time\n");
     printf("  -D FILE     write the text screen to FILE on exit\n");
+    printf("  -transcript FILE  every text line as it scrolls off the top (INT 10h), then the\n");
+    printf("              last screen at exit: the whole of a long run's output\n");
     printf("  -K FILE     key trace: scripted keys go in one at a time, each when the program is\n");
     printf("              waiting for it; the text screen and cursor go to FILE before each\n");
     printf("  -G FILE     write the screen (text, mode 13h or a 16-colour mode) to FILE as a PNG on exit\n");
@@ -398,6 +400,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-L") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-T") && i + 1 < argc) g_time_limit = atof(argv[++i]);
         else if (!strcmp(argv[i], "-D") && i + 1 < argc) dump = argv[++i];
+        else if (!strcmp(argv[i], "-transcript") && i + 1 < argc) {
+            if (pc_video_transcript(argv[++i]) < 0) { perror(argv[i]); return 1; }
+        }
         else if (!strcmp(argv[i], "-K") && i + 1 < argc) ktrace = argv[++i];
         else if (!strcmp(argv[i], "-G") && i + 1 < argc) gdump = argv[++i];
         else if (!strcmp(argv[i], "-w")) window = 1;
@@ -638,6 +643,7 @@ int main(int argc, char **argv) {
     pc_kbd_shutdown();
     pc_uart_shutdown();
     if (!tty) fflush(stdout);
+    pc_video_transcript_close(&cpu);
     if (dump) {
         FILE *f = strcmp(dump, "-") ? fopen(dump, "w") : stdout;
         if (f) { pc_video_dump(&cpu, f); if (f != stdout) fclose(f); }

@@ -92,6 +92,48 @@ static uint16_t cell_off(x86_cpu *c, int pg, int row, int col) {
     return (uint16_t)(page_off(pg) + (row * cols(c) + col) * 2);
 }
 
+/* -transcript FILE: every text line as it scrolls off the top of a
+ * full-width window through the BIOS (INT 10h AH=06h, and the teletype's
+ * own scroll), then the final screen at exit, trailing blanks trimmed:
+ * the whole of a long run's output, in order, where -D has only its last
+ * screen. QBasic's PRINT scrolls that way; a program that moves video
+ * memory itself is not seen. Clearing a window is not a scroll. */
+static FILE *transcript;
+int pc_video_transcript(const char *path) {
+    transcript = fopen(path, "w");
+    return transcript ? 0 : -1;
+}
+static void transcript_row(x86_cpu *c, int pg, int row, int nc) {
+    int last = nc;
+    while (last > 0) {
+        uint8_t ch = pc_rd8(c, PC_VIDEO_SEG, cell_off(c, pg, row, last - 1));
+        if (ch != ' ' && ch) break;
+        last--;
+    }
+    for (int col = 0; col < last; col++) {
+        uint8_t ch = pc_rd8(c, PC_VIDEO_SEG, cell_off(c, pg, row, col));
+        put_utf8(transcript, ch ? cp437[ch] : ' ');
+    }
+    fputc('\n', transcript);
+}
+/* At exit: the screen as it was left, without its blank rows at the bottom */
+void pc_video_transcript_close(x86_cpu *c) {
+    if (!transcript) return;
+    int m = pc_rd8(c, BDA, 0x49) & 0x7F;
+    if (m <= 3 || m == 7) {
+        int nr = rows(c), nc = cols(c), pg = page(c), last = nr;
+        while (last > 0) {
+            int col = 0;
+            for (; col < nc; col++) { uint8_t ch = pc_rd8(c, PC_VIDEO_SEG, cell_off(c, pg, last - 1, col)); if (ch != ' ' && ch) break; }
+            if (col < nc) break;
+            last--;
+        }
+        for (int r = 0; r < last; r++) transcript_row(c, pg, r, nc);
+    }
+    fclose(transcript);
+    transcript = NULL;
+}
+
 /* Scroll the window (r0,c0)-(r1,c1) by n lines (0 = clear), filling with attr. */
 static void scroll(x86_cpu *c, int pg, int up, int n, int r0, int c0, int r1, int c1, uint8_t attr) {
     int nr = rows(c), nc = cols(c);
@@ -99,6 +141,11 @@ static void scroll(x86_cpu *c, int pg, int up, int n, int r0, int c0, int r1, in
     if (c1 >= nc) c1 = nc - 1;
     if (r0 > r1 || c0 > c1) return;
     int h = r1 - r0 + 1;
+    if (transcript && up && n > 0 && n < h && c0 == 0 && c1 == nc - 1 && pg == page(c)) {
+        int m = pc_rd8(c, BDA, 0x49) & 0x7F;
+        if (m <= 3 || m == 7)
+            for (int i = 0; i < n; i++) transcript_row(c, pg, r0 + i, nc);
+    }
     if (n <= 0 || n >= h) n = h;
     for (int i = 0; i < h; i++) {
         int dst = up ? r0 + i : r1 - i;

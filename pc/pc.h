@@ -235,6 +235,8 @@ void pc_video_flush(int force);                          /* tty mode painter */
 void pc_video_shutdown(void);
 void pc_video_set_hud(const char *text);
 void pc_video_dump(x86_cpu *c, FILE *f);                 /* the text buffer as 25 lines of UTF-8 */
+int  pc_video_transcript(const char *path);              /* -transcript FILE: lines as they scroll off, then the last screen */
+void pc_video_transcript_close(x86_cpu *c);
 void pc_video_cursor(int *row, int *col, int *start, int *end);  /* the CRTC's cursor: 0-based cell, scan lines (start bit 5: hidden) */
 int  pc_video_png(x86_cpu *c, const char *path);         /* the screen: text, 13h or 16-colour; -1 if none */
 int  pc_vga_port_read(uint16_t port, uint32_t *val);     /* 1 if the port is the VGA's */
