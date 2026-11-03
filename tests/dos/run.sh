@@ -82,6 +82,12 @@ for mode in -j -V; do
     if [ "$(python3 tests/dos/pnghash.py tmp/text.png 2>/dev/null)" = "$(cat tests/dos/text.out)" ]; then echo "ok   text render $mode"; else echo "FAIL text render $mode"; fail=1; fi
     got=$( (printf '\033[1;5D\033[1;5C\033[1;5H\033[1;5F\033[5;5~\033[6;5~\033[1;2P\033[1;3R\033[12;5~\033[23~\033[24;2~a'; sleep 2; printf '\033') | $DM -W $mode -L 200000000 tests/dos/kbd.com 2>/dev/null | tr -d '\r')
     if [ "$got" = "$(cat tests/dos/kbd.out)" ]; then echo "ok   kbd codes $mode"; else echo "FAIL kbd codes $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
+    # Held keys: kitty keyboard protocol press/repeat/release events, a
+    # CSI N w hold, and (after a kitty terminal's answer, CSI ? 11 u) bare
+    # presses; scan.com prints each code at port 60h, then what the BIOS
+    # buffered. Shift held by its own events makes the a an A.
+    got=$( (sleep 0.5; printf '\033[57441;1:1u\033[97;1:1u\033[97;1:2u\033[97;1:3u\033[57441;1:3u\033[1;1:1C\033[300w\033[1;1:3Cb\033[65u\033[?11u\033[98u\033[1;1:3D\033[98;1:3u'; sleep 1.5; printf '\033') | $DM -W $mode -L 400000000 tests/dos/scan.com 2>/dev/null | tr -d '\r')
+    if [ "$got" = "$(cat tests/dos/scan.out)" ]; then echo "ok   held keys $mode"; else echo "FAIL held keys $mode"; echo "$got" | tr '\n' ' '; echo; fail=1; fi
     # -K: scripted keys go in one at a time, a frame (screen, cursor) written
     # before each; and CSI Z is Shift+Tab (0F00)
     kt=$(mktemp "${TMPDIR:-/tmp}/dmkt.XXXXXX")

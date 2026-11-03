@@ -221,6 +221,25 @@ the exception and a symbolized stack from the `.pdb` beside the `.exe`.
 `-V` runs the translator in lockstep with the interpreter and stops at
 the first difference; `-s` prints statistics; `-h` lists the rest.
 
+### Keyboard
+
+In a terminal, dos-monster asks for the [kitty keyboard
+protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)'s press,
+repeat and release events, so keys go down and come up when yours do:
+Shift held over arrows, two keys at once in a game. kitty, Ghostty,
+WezTerm, iTerm2, foot and Alacritty have it; elsewhere (macOS
+Terminal.app) each key arrives as a press and its release together, and
+Shift, Ctrl and Alt only modify the key they come with. The window (`-w`)
+always has real key events.
+
+Piped stdin is typed as keys: text, and the escape sequences a terminal
+sends (`\033[A` is Up, `\033[1;5D` Ctrl+Left). A key is held with the
+kitty form, press then release: `\033[57441;1:1u` left Shift down,
+`\033[1;1:1C` Right down, `\033[300w` (a dos-monster sequence) feeds
+nothing for 300 ms, `\033[1;1:3C` Right up, `\033[57441;1:3u` Shift up.
+`tools/expect.py` writes these for you: `down shift right`, `up right
+shift`, `hold 0.3 shift right`.
+
 ## Disk images
 
 No DOS software is included — bring your own copies into `disks/`

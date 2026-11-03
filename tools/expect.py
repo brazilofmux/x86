@@ -14,6 +14,14 @@ puts the next diskette of an -fda sequence in. "delay SECONDS" pauses.
 there is no text to match); "shot FILE" copies the latest picture of the
 screen (the emulator rewrites it four times a second) to FILE;
 "waitpix X,Y R G B" waits until that picture's pixel is that colour.
+"down KEY..." presses keys and leaves them down, "up KEY..." lets them
+go, "hold SECONDS KEY..." presses them in order, waits, and lets them go
+in reverse (Shift with an arrow, DOOM's run and turn): the kitty keyboard
+protocol's press and release events, which dos-monster reads from any
+stream. A KEY is one character (the key that types it: "down a", not
+"A"; hold shift for capitals) or a name: shift ctrl alt (the left ones),
+rshift rctrl ralt, esc enter tab backspace space, up down left right,
+home end pgup pgdn ins del, f1-f12, kp0-kp9, capslock.
 -v also prints the seconds since the start at each step (benchmarks).
 Blank lines and # comments are ignored. After each send the next step
 waits for the screen to change, so a prompt still showing is not taken
@@ -40,6 +48,27 @@ def pixel(path, x, y):
         return (raw[o], raw[o + 1], raw[o + 2])
     except Exception:
         return None
+
+# kitty keyboard protocol: CSI code u, or the legacy final byte, or N ~
+KEYS = {"shift": (57441, "u"), "lshift": (57441, "u"), "rshift": (57447, "u"),
+        "ctrl": (57442, "u"), "lctrl": (57442, "u"), "rctrl": (57448, "u"),
+        "alt": (57443, "u"), "lalt": (57443, "u"), "ralt": (57449, "u"),
+        "esc": (27, "u"), "enter": (13, "u"), "tab": (9, "u"), "backspace": (127, "u"),
+        "space": (32, "u"), "capslock": (57358, "u"),
+        "up": (1, "A"), "down": (1, "B"), "right": (1, "C"), "left": (1, "D"),
+        "home": (1, "H"), "end": (1, "F"), "ins": (2, "~"), "del": (3, "~"),
+        "pgup": (5, "~"), "pgdn": (6, "~"),
+        "f1": (1, "P"), "f2": (1, "Q"), "f3": (13, "~"), "f4": (1, "S"),
+        "f5": (15, "~"), "f6": (17, "~"), "f7": (18, "~"), "f8": (19, "~"),
+        "f9": (20, "~"), "f10": (21, "~"), "f11": (23, "~"), "f12": (24, "~")}
+KEYS.update({"kp%d" % n: (57399 + n, "u") for n in range(10)})
+
+def key_event(name, event):
+    """The bytes of one key's press (event 1) or release (3)."""
+    if name in KEYS: code, final = KEYS[name]
+    elif len(name) == 1 and " " < name <= "~": code, final = ord(name.lower()), "u"
+    else: raise SystemExit("expect: no key named %r" % name)
+    return ("\x1b[%d;1:%d%s" % (code, event, final)).encode()
 
 def screen(path):
     try:
@@ -74,6 +103,16 @@ def main():
             continue
         if line.startswith("shot "):
             steps.append(("shot", line[5:].strip(), False))
+            continue
+        if line.startswith("down ") or line.startswith("up "):
+            event = 1 if line.startswith("down ") else 3
+            steps.append(("send", b"".join(key_event(k, event) for k in line.split()[1:]), False))
+            continue
+        if line.startswith("hold "):
+            secs, names = float(line.split()[1]), line.split()[2:]
+            steps.append(("send", b"".join(key_event(k, 1) for k in names), False))
+            steps.append(("delay", secs, False))
+            steps.append(("send", b"".join(key_event(k, 3) for k in reversed(names)), False))
             continue
         if line.startswith("waitpix "):
             xy, r, g, b = line.split()[1:5]

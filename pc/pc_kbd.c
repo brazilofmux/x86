@@ -53,6 +53,15 @@ static uint8_t scancode_for(uint8_t ascii) {
     }
 }
 
+/* The kitty keyboard protocol (sw.kovidgoyal.net/kitty/keyboard-protocol):
+ * asked for at start in a terminal — disambiguate (1), report press,
+ * repeat and release (2), every key as an escape code (8) — so a key
+ * goes down and comes up when it does, and two can be held at once
+ * (Shift with an arrow, DOOM's run and turn). A terminal without it
+ * ignores the request and the query, and sends what it always has.
+ * kitty_events: the terminal answered the query with event types on. */
+static int kitty_pushed, kitty_events;
+
 void pc_kbd_init(void) {
     if (isatty(STDIN_FILENO) && pc.tty_mode) {
         tcgetattr(STDIN_FILENO, &saved_tio);
@@ -62,12 +71,18 @@ void pc_kbd_init(void) {
         t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 0;
         tcsetattr(STDIN_FILENO, TCSANOW, &t);
         raw_active = 1;
+        if (isatty(STDOUT_FILENO)) {
+            fputs("\033[>11u\033[?u", stdout);         /* push our flags, then ask what took */
+            fflush(stdout);
+            kitty_pushed = 1;
+        }
     }
 }
 
 static int mouse_reporting;
 void pc_kbd_shutdown(void) {
     if (mouse_reporting) { fputs("\033[?1003l\033[?1006l", stdout); fflush(stdout); mouse_reporting = 0; }
+    if (kitty_pushed) { fputs("\033[<u", stdout); fflush(stdout); kitty_pushed = kitty_events = 0; }
     if (raw_active) { tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio); raw_active = 0; }
 }
 
@@ -269,6 +284,198 @@ static void fill_pending(void) {
     npending = (int)n;
 }
 
+/* ---- Key events: press, repeat, release ------------------------------
+ * The kitty protocol's form, from a terminal that speaks it or from a
+ * script that writes it:
+ *
+ *   CSI code [; mods [:event]] u      a key by its code: Unicode for text
+ *                                     keys (the unshifted one), 57344 and
+ *                                     up for the others (keypad, Shift...)
+ *   CSI 1 ; mods:event A..D H F P Q S arrows, Home, End, F1-F4
+ *   CSI num ; mods:event ~            Ins 2, Del 3, PgUp 5, PgDn 6,
+ *                                     F5-F12 15..24 (F3 13)
+ *
+ * mods is 1 + Shift 1, Alt 2, Ctrl 4 (CapsLock 64); event 1 press,
+ * 2 repeat (the key's make again, as typematic sends it), 3 release. With
+ * an event the key does just that, and a script holds a key by sending
+ * its press, then later its release. Without one: from a terminal with
+ * kitty events on, a press (the protocol's rule); anywhere else a whole
+ * keystroke, the modifiers in mods bracketing it, as legacy sequences do.
+ * Modifiers are keys of their own here (57441 left Shift, 57442 left
+ * Ctrl, 57443 left Alt, 57447-57449 the right ones): their events are
+ * what moves the guest's shift state. And for piped scripts:
+ *
+ *   CSI N w                           feed nothing more for N ms (a hold) */
+typedef struct { uint8_t sc, ext, text; } keydef;     /* text: the ASCII comes from the US layout */
+static uint64_t hold_until;
+static int esc_last;                                  /* the last press was Esc: + then swaps diskettes */
+static int held_mods;                                 /* Shift 1, Alt 2, Ctrl 4 that key events hold down */
+
+static uint8_t shifted_ascii(uint8_t sc) {
+    for (int a = 0x20; a < 0x7F; a++) if (sc_ascii[a - 0x20] == sc && needs_shift((uint8_t)a)) return (uint8_t)a;
+    return 0;
+}
+static uint8_t plain_ascii(uint8_t sc) {
+    for (int a = 0x20; a < 0x7F; a++) if (sc_ascii[a - 0x20] == sc && !needs_shift((uint8_t)a)) return (uint8_t)a;
+    return 0;
+}
+
+/* The key a kitty code names, by final byte; 0 if none we know. */
+static int kitty_key(int code, uint8_t final, keydef *k) {
+    k->ext = 0; k->text = 0;
+    if (final == 'u') {
+        switch (code) {
+        case 13: k->sc = 0x1C; k->text = 1; return 1;
+        case 9: k->sc = 0x0F; k->text = 1; return 1;
+        case 8: case 127: k->sc = 0x0E; k->text = 1; return 1;
+        case 27: k->sc = 0x01; k->text = 1; return 1;
+        case 57358: k->sc = 0x3A; return 1;                       /* Caps Lock */
+        case 57359: k->sc = 0x46; return 1;                       /* Scroll Lock */
+        case 57360: k->sc = 0x45; return 1;                       /* Num Lock */
+        case 57363: k->sc = 0x5D; k->ext = 1; return 1;           /* Menu */
+        case 57409: k->sc = 0x53; return 1;                       /* keypad . */
+        case 57410: k->sc = 0x35; k->ext = 1; return 1;           /* keypad / */
+        case 57411: k->sc = 0x37; return 1;                       /* keypad * */
+        case 57412: k->sc = 0x4A; return 1;                       /* keypad - */
+        case 57413: k->sc = 0x4E; return 1;                       /* keypad + */
+        case 57414: k->sc = 0x1C; k->ext = 1; return 1;           /* keypad Enter */
+        case 57441: k->sc = 0x2A; return 1;                       /* left Shift */
+        case 57442: k->sc = 0x1D; return 1;                       /* left Ctrl */
+        case 57443: k->sc = 0x38; return 1;                       /* left Alt */
+        case 57444: k->sc = 0x5B; k->ext = 1; return 1;           /* left Super */
+        case 57447: k->sc = 0x36; return 1;                       /* right Shift */
+        case 57448: k->sc = 0x1D; k->ext = 1; return 1;           /* right Ctrl */
+        case 57449: k->sc = 0x38; k->ext = 1; return 1;           /* right Alt */
+        case 57450: k->sc = 0x5C; k->ext = 1; return 1;           /* right Super */
+        }
+        if (code >= 57399 && code <= 57408) {                     /* keypad 0-9 */
+            static const uint8_t kp[10] = { 0x52, 0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49 };
+            k->sc = kp[code - 57399]; return 1;
+        }
+        if (code >= 57417 && code <= 57427) {                     /* keypad navigation */
+            static const uint8_t kn[11] = { 0x4B, 0x4D, 0x48, 0x50, 0x49, 0x51, 0x47, 0x4F, 0x52, 0x53, 0x4C };
+            k->sc = kn[code - 57417]; return 1;
+        }
+        if (code >= 0x20 && code < 0x7F) { k->sc = scancode_for((uint8_t)code); k->text = 1; return k->sc != 0; }
+        return 0;
+    }
+    int f = 0;
+    if (final == '~') {
+        switch (code) {
+        case 2: k->sc = 0x52; k->ext = 1; return 1;   case 3: k->sc = 0x53; k->ext = 1; return 1;
+        case 5: k->sc = 0x49; k->ext = 1; return 1;   case 6: k->sc = 0x51; k->ext = 1; return 1;
+        case 1: case 7: k->sc = 0x47; k->ext = 1; return 1;
+        case 4: case 8: k->sc = 0x4F; k->ext = 1; return 1;
+        case 11: f = 1; break; case 12: f = 2; break; case 13: f = 3; break; case 14: f = 4; break;
+        case 15: f = 5; break; case 17: f = 6; break; case 18: f = 7; break; case 19: f = 8; break;
+        case 20: f = 9; break; case 21: f = 10; break; case 23: f = 11; break; case 24: f = 12; break;
+        default: return 0;
+        }
+    } else switch (final) {
+        case 'A': k->sc = 0x48; k->ext = 1; return 1;  case 'B': k->sc = 0x50; k->ext = 1; return 1;
+        case 'C': k->sc = 0x4D; k->ext = 1; return 1;  case 'D': k->sc = 0x4B; k->ext = 1; return 1;
+        case 'H': k->sc = 0x47; k->ext = 1; return 1;  case 'F': k->sc = 0x4F; k->ext = 1; return 1;
+        case 'E': k->sc = 0x4C; return 1;                         /* keypad 5 (Begin) */
+        case 'P': f = 1; break; case 'Q': f = 2; break; case 'S': f = 4; break;
+        default: return 0;
+    }
+    k->sc = (uint8_t)(f <= 10 ? 0x3B + f - 1 : 0x57 + f - 11);
+    return 1;
+}
+
+static void key_down(const keydef *k, uint8_t ascii) {
+    if (k->ext) raw_enqueue(0xE0, 0);
+    raw_enqueue(k->sc, ascii);
+}
+static void key_up(const keydef *k) {
+    if (k->ext) raw_enqueue(0xE0, 0);
+    raw_enqueue((uint8_t)(k->sc | 0x80), 0);
+}
+
+/* A CSI sequence at pending[0] in the key-event form (or the terminal's
+ * answer, or a hold): done and consumed, 1; 0 if it is not one of these
+ * (the legacy parse takes it). */
+static int key_event_csi(void) {
+    int p[4][3], np = 0, sub = 0, i = 2;
+    uint8_t priv = 0;
+    memset(p, 0xFF, sizeof p);                                    /* -1: absent */
+    if (i < npending && strchr("?<>=", pending[i])) priv = pending[i++];
+    for (; i < npending; i++) {
+        uint8_t d = pending[i];
+        if (d >= '0' && d <= '9') { if (p[np][sub] < 0) p[np][sub] = 0; if (p[np][sub] < 100000000) p[np][sub] = p[np][sub] * 10 + (d - '0'); }
+        else if (d == ':') { if (sub < 2) sub++; }
+        else if (d == ';') { if (np < 3) np++; sub = 0; }
+        else break;
+    }
+    if (i >= npending) return 0;
+    uint8_t final = pending[i];
+    int used = i + 1;
+    if (priv == '?' && final == 'u') {                            /* the terminal's flags: kitty events on or not */
+        kitty_events = p[0][0] >= 0 && (p[0][0] & 2);
+    } else if (priv) {
+        return 0;
+    } else if (final == 'w') {                                    /* hold the feed */
+        hold_until = pc_now_ns() + (uint64_t)(p[0][0] > 0 ? p[0][0] : 0) * 1000000ull;
+    } else {
+        int event = p[1][1];
+        if (final != 'u' && event < 0 && !kitty_events) return 0;   /* a legacy key: next_key's own parse */
+        if (!strchr("u~ABCDEHFPQS", final)) return 0;
+        keydef k;
+        int code = p[0][0] < 0 ? 1 : p[0][0];
+        int mods = p[1][0] > 0 ? p[1][0] - 1 : 0;
+        memmove(pending, pending + used, (size_t)(npending - used)); npending -= used;
+        if (!kitty_key(code, final, &k)) return 1;               /* a key no PC has: dropped */
+        /* a modifier's own events move what is held; a key's text sees
+         * what is held as well as its own mods (a script's "down shift",
+         * then "down a" types A) */
+        int bit = (k.sc == 0x2A || k.sc == 0x36) ? 1 : k.sc == 0x38 ? 2 : k.sc == 0x1D ? 4 : 0;
+        if (bit && event >= 0) held_mods = event == 3 ? held_mods & ~bit : held_mods | bit;
+        int wrap = mods & ~held_mods;                     /* a whole keystroke brackets only what is not held */
+        mods |= held_mods;
+        int shift = mods & 1, alt = mods & 2, ctrl = mods & 4;
+        uint8_t ascii = 0;
+        if (k.text) {
+            if (final == 'u' && code >= 0x20 && code < 0x7F && needs_shift((uint8_t)code)) shift = 1;   /* 'A', '!': shifted already */
+            uint8_t base = plain_ascii(k.sc);
+            int letter = base >= 'a' && base <= 'z';
+            int up = shift ^ (letter && (mods & 64));             /* Caps Lock turns letters */
+            ascii = code == 13 ? 0x0D : code == 9 ? 0x09 : (code == 8 || code == 127) ? 0x08 : code == 27 ? 0x1B
+                  : up ? shifted_ascii(k.sc) : plain_ascii(k.sc);
+            if (ctrl && letter) ascii = (uint8_t)(base & 0x1F);
+            if (alt) ascii = 0;
+        }
+        if (event < 0 && !kitty_events) {                         /* a whole keystroke */
+            int ws = (wrap & 1) || (shift && !(held_mods & 1)), wa = wrap & 2, wc = wrap & 4;
+            if (ws) raw_enqueue(0x2A, 0);
+            if (wc) raw_enqueue(0x1D, 0);
+            if (wa) raw_enqueue(0x38, 0);
+            key_down(&k, ascii); key_up(&k);
+            if (wa) raw_enqueue(0xB8, 0);
+            if (wc) raw_enqueue(0x9D, 0);
+            if (ws) raw_enqueue(0xAA, 0);
+            return 1;
+        }
+        if (event == 3) { key_up(&k); return 1; }
+        /* a press (or a repeat). Esc then + changes diskettes, as ESC +
+         * does in a legacy stream; the + does not reach the guest. */
+        int is_shift = k.sc == 0x2A || k.sc == 0x36;
+        if (esc_last && (code == '+' || (code == '=' && shift)) && pc.swap_disk) { esc_last = 0; pc.swap_disk(); return 1; }
+        if (!is_shift) esc_last = k.sc == 0x01 && !k.ext && event != 2;
+        key_down(&k, ascii);
+        return 1;
+    }
+    memmove(pending, pending + used, (size_t)(npending - used)); npending -= used;
+    return 1;
+}
+
+/* A hold right behind the key just fed starts now, not a feed later. */
+static void take_hold(void) {
+    int i = 2;
+    if (npending < 4 || pending[0] != 0x1B || pending[1] != '[') return;
+    while (i < npending && pending[i] >= '0' && pending[i] <= '9') i++;
+    if (i > 2 && i < npending && pending[i] == 'w') key_event_csi();
+}
+
 /* Translate one key from the pending bytes; returns 0 if none. */
 static int next_key(x86_cpu *c, int blocking) {
     if (pc_uart_owns_stdin()) return 0;          /* stdin is COM1's (-com1 stdio): keys come from the window */
@@ -308,6 +515,7 @@ static int next_key(x86_cpu *c, int blocking) {
             pc_mouse_button(btn == 0 ? 0 : btn == 2 ? 1 : 2, !release);
         return 1;
     }
+    if (b == 0x1B && npending >= 3 && pending[1] == '[' && key_event_csi()) return 1;
     if (b == 0x1B && npending >= 3 && (pending[1] == '[' || pending[1] == 'O')) {
         /* CSI / SS3 sequences: arrows, home/end, function keys */
         /* CSI num [; mod] final — xterm: mod 2 shift, 3 alt, 5 ctrl */
@@ -471,11 +679,12 @@ void pc_kbd_poll(x86_cpu *c) {
      * not 250 ms (four keys a second, which was most of the time any
      * scripted command took on them). */
     static uint64_t last_fed, takes_at_last;
+    if (now < hold_until) return;                         /* CSI N w: a key held down */
     int polled = pc.kbd_reads >= reads_at_last + 8;
     int taken = pc.kbd_pm_takes > takes_at_last && !pc_kbd_raw_pending() && !pc.irq9_busy;
     int silent = !polled && now - last_fed >= 250000000ull;
     if (now < next_ok || !(polled || taken || silent)) return;
-    if (next_key(c, 0)) { next_ok = now + (taken ? 5000000ull : 20000000ull); reads_at_last = pc.kbd_reads; takes_at_last = pc.kbd_pm_takes; last_fed = now; if (pc.debug > 1) fprintf(stderr, "[kbd] fed a key @%llu\n", (unsigned long long)now); }
+    if (next_key(c, 0)) { take_hold(); next_ok = now + (taken ? 5000000ull : 20000000ull); reads_at_last = pc.kbd_reads; takes_at_last = pc.kbd_pm_takes; last_fed = now; if (pc.debug > 1) fprintf(stderr, "[kbd] fed a key @%llu\n", (unsigned long long)now); }
 }
 /* -s with -smp: the feed's state at the end */
 void pc_kbd_debug_dump(FILE *out) {
