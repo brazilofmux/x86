@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <termios.h>
 #include <poll.h>
+#include <signal.h>
 
 #define BDA PC_BDA_SEG
 
@@ -62,8 +63,34 @@ static uint8_t scancode_for(uint8_t ascii) {
  * kitty_events: the terminal answered the query with event types on. */
 static int kitty_pushed, kitty_events;
 
+/* A run that ends any way but main's return — exit() from deep inside,
+ * abort() on an internal check, SIGTERM or SIGHUP — still gives the
+ * terminal back: cooked mode, mouse reporting off, the kitty flags popped
+ * (left on, every key the shell sees would be an escape code). Only
+ * write() and tcsetattr() from the handler; SIGSEGV and SIGBUS are the
+ * fastmem trap's and stay its. */
+static int mouse_reporting;
+static void tty_restore_async(void) {
+    static const char off[] = "\033[?1003l\033[?1006l\033[<u";
+    if (mouse_reporting || kitty_pushed) { ssize_t r = write(STDOUT_FILENO, off, sizeof off - 1); (void)r; }
+    if (raw_active) tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio);
+}
+static void tty_fatal(int sig) {
+    tty_restore_async();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void tty_atexit(void) { pc_kbd_shutdown(); }
+
 void pc_kbd_init(void) {
     if (isatty(STDIN_FILENO) && pc.tty_mode) {
+        atexit(tty_atexit);
+        signal(SIGTERM, tty_fatal);
+        signal(SIGABRT, tty_fatal);
+#ifdef SIGHUP
+        signal(SIGHUP, tty_fatal);
+        signal(SIGQUIT, tty_fatal);
+#endif
         tcgetattr(STDIN_FILENO, &saved_tio);
         struct termios t = saved_tio;
         t.c_lflag &= ~(ICANON | ECHO | ISIG | IEXTEN);
@@ -79,7 +106,6 @@ void pc_kbd_init(void) {
     }
 }
 
-static int mouse_reporting;
 void pc_kbd_shutdown(void) {
     if (mouse_reporting) { fputs("\033[?1003l\033[?1006l", stdout); fflush(stdout); mouse_reporting = 0; }
     if (kitty_pushed) { fputs("\033[<u", stdout); fflush(stdout); kitty_pushed = kitty_events = 0; }
