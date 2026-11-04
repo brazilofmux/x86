@@ -522,7 +522,13 @@ static int cga_addr(int m, int x, int y, int *shift) {
 static uint32_t plane_addr(int x, int y, uint32_t page) {
     return (page + (uint32_t)y * ((uint32_t)vga.crtc[0x13] * 2) + (uint32_t)(x >> 3)) & 0xFFFF;
 }
+static int gfx_bounds(int m, int x, int y) {          /* a BIOS call's row or column off the screen draws nothing */
+    int w = m == 6 || m == 0x0E || (m >= 0x0F && m != 0x13) ? 640 : 320;
+    int h = m == 0x0F || m == 0x10 ? 350 : m == 0x11 || m == 0x12 ? 480 : 200;
+    return x >= 0 && y >= 0 && x < w && y < h;
+}
 int pc_vga_gfx_read(x86_cpu *c, int m, int x, int y, uint32_t page) {
+    if (!gfx_bounds(m, x, y)) return 0;
     if (m >= 4 && m <= 6) {
         int sh, a = cga_addr(m, x, y, &sh);
         return (c->mem[0xB8000 + a] >> sh) & (m == 6 ? 1 : 3);
@@ -535,6 +541,7 @@ int pc_vga_gfx_read(x86_cpu *c, int m, int x, int y, uint32_t page) {
     return v;
 }
 void pc_vga_gfx_write(x86_cpu *c, int m, int x, int y, uint32_t page, int colour) {
+    if (!gfx_bounds(m, x, y)) return;
     if (m >= 4 && m <= 6) {
         int sh, a = cga_addr(m, x, y, &sh), mask = m == 6 ? 1 : 3;
         uint8_t *b = c->mem + 0xB8000 + a;

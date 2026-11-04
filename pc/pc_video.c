@@ -162,8 +162,9 @@ static void gfx_char(x86_cpu *c, int pg, int row, int col, int ch, int attr) {
 static int gfx_read_char(x86_cpu *c, int pg, int row, int col) {
     int m = gmode(c), h = pc_rd8(c, BDA, 0x85);
     uint32_t page_b = (uint32_t)(pg * pc_rd16(c, BDA, 0x4C));
-    uint8_t cell[16];
-    for (int y = 0; y < h && y < 16; y++) {
+    uint8_t cell[32];
+    if (h > 32) return 0;
+    for (int y = 0; y < h; y++) {
         cell[y] = 0;
         for (int x = 0; x < 8; x++)
             if (pc_vga_gfx_read(c, m, col * 8 + x, row * h + y, page_b)) cell[y] |= (uint8_t)(0x80 >> x);
@@ -477,6 +478,21 @@ void pc_video_int10(x86_cpu *c, int vector) {
         case 0x01: case 0x11: h = 14; break;       /* the ROM 8x14 set: 28 rows */
         case 0x02: case 0x12: h = 8; break;        /* 8x8: 50 rows */
         case 0x04: case 0x14: h = 16; break;       /* 8x16: 25 rows */
+        case 0x20:                                 /* graphics modes' fonts: INT 1Fh's high half at ES:BP */
+            pc_wr16(c, 0, 0x1F * 4, x86_get_r16(c, R_BP));
+            pc_wr16(c, 0, 0x1F * 4 + 2, c->seg[S_ES].sel);
+            break;
+        case 0x21: case 0x22: case 0x23: case 0x24: {   /* INT 43h's: the user's (CX high) or a ROM set, and the rows */
+            int gh = al == 0x21 ? x86_get_r16(c, R_CX) : al == 0x22 ? 14 : al == 0x23 ? 8 : 16;
+            uint16_t seg = PC_HLE_SEG, off = al == 0x22 ? PC_FONT14_OFF : al == 0x23 ? PC_FONT8_OFF : PC_FONT16_OFF;
+            if (al == 0x21) { seg = c->seg[S_ES].sel; off = x86_get_r16(c, R_BP); }
+            pc_wr16(c, 0, 0x43 * 4, off);
+            pc_wr16(c, 0, 0x43 * 4 + 2, seg);
+            int nr = (bl & 0xFF) == 1 ? 14 : (bl & 0xFF) == 2 ? 25 : (bl & 0xFF) == 3 ? 43 : x86_get_r8(c, R_DL);
+            if (nr > 0) pc_wr8(c, BDA, 0x84, (uint8_t)(nr - 1));
+            if (gh > 0) pc_wr16(c, BDA, 0x85, (uint16_t)gh);
+            break;
+        }
         case 0x30: {                               /* font information: ES:BP by BH */
             int ch = pc_rd8(c, BDA, 0x85);
             x86_set_r16(c, R_CX, (uint16_t)(ch ? ch : 16));

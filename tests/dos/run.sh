@@ -211,6 +211,22 @@ BAS
     want=" 12  3  0  72  200  0  255  73  11  0  15  74  1  0  75  2  0  76  11  0"
     if [ "$got" = "$want" ]; then echo "ok   qbasic POINT and SCREEN() in graphics"
     else echo "FAIL qbasic POINT and SCREEN() in graphics"; echo "$got"; fail=1; fi
+    # WIDTH in a graphics mode: AX=1123h loads the 8x8 set, with the rows in DL
+    cat > tmp/qbt/PROG.BAS <<'BAS'
+DIM R(10)
+SCREEN 9: WIDTH 80, 43: LOCATE 43, 1: PRINT "A";: R(1)=SCREEN(43,1)
+DEF SEG = 0: R(2)=PEEK(&H484): R(3)=PEEK(&H485): DEF SEG
+SCREEN 12: WIDTH 80, 60: LOCATE 60, 1: PRINT "B";: R(4)=SCREEN(60,1)
+DEF SEG = 0: R(5)=PEEK(&H484): R(6)=PEEK(&H485): DEF SEG
+SCREEN 0
+FOR I=1 TO 6: PRINT R(I);: NEXT
+SYSTEM
+BAS
+    $DM -m 386 -W -C tmp/qbt -D tmp/qbt/s.txt -T 20 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
+    got=$(grep -m1 '[0-9]' tmp/qbt/s.txt)
+    want=" 65  42  8  66  59  8"
+    if [ "$got" = "$want" ]; then echo "ok   qbasic WIDTH in graphics"
+    else echo "FAIL qbasic WIDTH in graphics"; echo "$got"; fail=1; fi
     printf 'SCREEN 12\r\nLINE (0,0)-(639,479),15\r\nLOCATE 2,2: PRINT "PNG"\r\nDO: LOOP\r\n' > tmp/qbt/PROG.BAS
     rm -f tmp/qbt/g.png
     $DM -m 386 -W -C tmp/qbt -G tmp/qbt/g.png -T 2 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
