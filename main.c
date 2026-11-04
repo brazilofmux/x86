@@ -41,7 +41,7 @@ static void usage(const char *prog) {
     printf("  -pci        a PCI bus: a 440FX host bridge, the BIOS32 PCI BIOS (default: ISA only)\n");
     printf("  -noapic     a Pentium without its local APIC (default: one at FEE00000h, with MP tables)\n");
     printf("  -smp N      N processors (Pentium, JIT): the others are host threads, started by INIT/STARTUP IPIs\n");
-    printf("  -acpi       ACPI tables naming the processors and the I/O APIC (RSDP, RSDT, FADT, MADT) — what Haiku needs for SMP\n");
+    printf("  -acpi       ACPI tables: the processors, the I/O APIC, the PCI root and its interrupts (RSDP, RSDT, FADT, MADT, DSDT) — what Haiku needs for SMP\n");
     printf("  -vbe        VESA BIOS Extensions 3.0: 640x480 to 1280x1024 at 8/16/32 bpp, a linear\n"
            "              framebuffer in the top 8 MB of RAM (needs -mem 32 or more)\n");
     printf("  -dispi      -vbe on the display Bochs and QEMU emulate (PCI 1234:1111, DISPI registers\n"

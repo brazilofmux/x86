@@ -323,6 +323,7 @@ int  pc_pci_present(void);
 void pc_pci_add(int dev, pc_pci_dev *d);                  /* at device DEV, function 0 */
 void pc_pci_irq_line(pc_pci_dev *d, int level);          /* the card's interrupt pin: its ISA IRQ at the 8259s, input 16-19 at the I/O APIC */
 int  pc_pci_card_pin(int dev);                            /* the card's interrupt pin (1-4), 0 for none or no card */
+int  pc_pci_card_irq(int dev);                               /* its IRQ at the 8259s */
 uint32_t pc_pci_bar(const pc_pci_dev *d, int i);          /* BAR I's base, type bits off */
 void pc_pci_post(x86_cpu *c);
 int  pc_pci_port_read(uint16_t port, int size, uint32_t *val);

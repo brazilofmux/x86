@@ -85,6 +85,7 @@ int pc_pci_card_pin(int dev) {
     pc_pci_dev *d = dev > 0 && dev < 32 ? pci.slot[dev] : NULL;
     return d && d->cfg[0x3D] >= 1 && d->cfg[0x3D] <= 4 ? d->cfg[0x3D] : 0;
 }
+int pc_pci_card_irq(int dev) { return dev > 0 && dev < 32 && pci.slot[dev] ? pci.slot[dev]->irq : 0; }
 void pc_pci_irq_line(pc_pci_dev *d, int level) {
     int slot = 0;
     for (int s = 1; s < 32; s++) if (pci.slot[s] == d) slot = s;

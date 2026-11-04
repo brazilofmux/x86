@@ -44,8 +44,9 @@ Two ways to run things:
   application processor is a host thread with a translator of its own
   over the one memory, brought up by the INIT and STARTUP IPIs, with
   the machine's devices behind one lock, and x86's memory ordering kept
-  on the ARM host; `-acpi` adds the ACPI tables that name them (RSDP,
-  RSDT, FADT, MADT), for a guest that asks ACPI first. On it:
+  on the ARM host; `-acpi` adds the ACPI tables that name them and route
+  the PCI cards' interrupts (RSDP, RSDT, FADT, MADT, DSDT with `_PRT`), for
+  a guest that asks ACPI first. On it:
   - FreeDOS 1.3 — installed by its own installer; under HIMEMX, JEMMEX
     and JEMM386
   - MS-DOS 6.22 — installed by its own Setup from diskette images; under
@@ -79,7 +80,8 @@ Two ways to run things:
     driver on our VBE through the kernel's V86 monitor, 800x600x32; its
     kernel debugger's log on COM1
   - Haiku R1/beta6 (32-bit, gcc2) from its anyboot image, to its welcome
-    window, on one Pentium or on two (`-smp 2 -acpi`): its loader through
+    window, on one Pentium or on several with the e1000's network
+    (`-smp 2 -acpi -nic e1000,user`): its loader through
     VBE at 1024x768, its kernel on the APIC timer and the I/O APIC
 - **As a DOS program runner** (the default): an emulated DOS (INT 21h in
   the host, a host directory as C:, a DPMI host of our own) for running a

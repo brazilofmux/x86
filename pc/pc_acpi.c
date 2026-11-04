@@ -3,8 +3,9 @@
  * The MP tables (pc_apic.c) tell Linux everything it needs, but a guest
  * that asks ACPI first and trusts only that gets the same facts here:
  * the RSDP at F000:F400 in the ROM, one of the places an OS looks, the
- * RSDT after it, a FADT (ACPI 1.0, with an empty DSDT and a FACS, for
- * interpreters that insist on loading them) and the MADT — every
+ * RSDT after it, a FADT (ACPI 1.0, with a FACS, for
+ * interpreters that insist on loading them), a DSDT with the PCI root and
+ * its interrupt routing, and the MADT — every
  * processor's local APIC, the I/O APIC at FEC00000h with GSI base 0,
  * the PIT's IRQ 0 on GSI 2, the NMI into every LINT1. Haiku's boot
  * loader needs this: its MP-table parser compares the configuration
@@ -29,7 +30,10 @@ static uint8_t pm[8];
 int pc_acpi_port_read(uint16_t port, uint32_t *v) {
     if (!acpi_on || port < ACPI_PM_PORT || port >= ACPI_PM_PORT + 8) return 0;
     unsigned i = port - ACPI_PM_PORT;
-    *v = i < 2 ? 0 : i == 4 ? (uint32_t)(pm[4] | 1) : pm[i];
+    uint32_t r = 0;                                   /* as wide as the caller reads: the enables' high byte holds PWRBTN_EN */
+    for (unsigned k = 0; k < 4 && i + k < 8; k++)
+        r |= (uint32_t)(i + k < 2 ? 0 : i + k == 4 ? (uint32_t)(pm[4] | 1) : pm[i + k]) << (8 * k);
+    *v = r;
     return 1;
 }
 int pc_acpi_port_write(uint16_t port, uint32_t val, int size) {
@@ -51,9 +55,99 @@ static int header(uint8_t *t, const char *sig, uint32_t len, uint8_t rev) {
 }
 static void seal(uint8_t *t) { uint32_t len = t[4] | t[5] << 8 | t[6] << 16 | (uint32_t)t[7] << 24; t[9] = (uint8_t)(0 - sum(t, (int)len)); }
 
+/* ---- The DSDT, assembled by hand: there is no ASL compiler in the build.
+ *
+ *   Name (PICF, 0)
+ *   Method (_PIC, 1) { Store (Arg0, \\PICF) }
+ *   Scope (\\_SB) {
+ *     Device (PCI0) {
+ *       Name (_HID, EisaId ("PNP0A03")), _ADR, _UID, _BBN all 0
+ *       Name (_CRS, ...)                 bus 0-255, the config ports, I/O
+ *                                        and memory windows
+ *       Name (PRTA, Package { {slot<<16 | FFFFh, pin, 0, GSI}, ... })
+ *       Name (PRTP, Package { ... IRQ ... })
+ *       Method (_PRT) { If (\\PICF) { Return (PRTA) } Return (PRTP) }
+ *     }
+ *   }
+ *
+ * _PRT says what the MP table says (pc_apic.c): a card's pin on I/O APIC
+ * input 16 + ((slot + pin - 1) mod 4), or at the 8259s its own IRQ, which
+ * the OS chooses between by calling _PIC. Fixed GSIs rather than link
+ * devices: the routing never changes, and source 0 says so. */
+static uint8_t *aml;
+static int aml_n;
+static void a8(uint8_t b) { aml[aml_n++] = b; }
+static void astr(const char *t) { while (*t) a8((uint8_t)*t++); }
+static void a16(uint32_t v) { a8((uint8_t)v); a8((uint8_t)(v >> 8)); }
+static void a32(uint32_t v) { a16(v); a16(v >> 16); }
+static int  pkg_open(void) { int at = aml_n; aml_n += 2; return at; }
+static void pkg_close(int at) {                    /* always the two-byte PkgLength form */
+    int len = aml_n - at;
+    aml[at] = (uint8_t)(0x40 | (len & 0x0F));
+    aml[at + 1] = (uint8_t)(len >> 4);
+}
+static void name_int0(const char *n) { a8(0x08); astr(n); a8(0x00); }   /* Name (n, Zero) */
+static void word_addr(uint8_t type, uint8_t tflags, uint32_t min, uint32_t max) {  /* Word Address Space */
+    a8(0x88); a16(13); a8(type); a8(0x0C); a8(tflags);
+    a16(0); a16(min); a16(max); a16(0); a16(max - min + 1);
+}
+static void dword_mem(uint32_t min, uint32_t max) {                     /* DWord Memory */
+    a8(0x87); a16(23); a8(0); a8(0x0C); a8(0x01);
+    a32(0); a32(min); a32(max); a32(0); a32(max - min + 1);
+}
+static void routing(const char *n, int apic) {
+    a8(0x08); astr(n);
+    a8(0x12); int p = pkg_open();
+    int count_at = aml_n; a8(0);
+    int count = 0;
+    for (int slot = 1; slot < 32; slot++) {
+        int pin = pc_pci_card_pin(slot);
+        if (!pin) continue;
+        a8(0x12); int e = pkg_open(); a8(4);
+        a8(0x0C); a32((uint32_t)slot << 16 | 0xFFFF);
+        a8(0x0A); a8((uint8_t)(pin - 1));
+        a8(0x00);                                  /* source: none, the number is the interrupt */
+        a8(0x0A); a8((uint8_t)(apic ? 16 + ((slot + pin - 1) & 3) : pc_pci_card_irq(slot)));
+        pkg_close(e);
+        count++;
+    }
+    aml[count_at] = (uint8_t)count;
+    pkg_close(p);
+}
+static int dsdt_body(uint8_t *out, uint32_t mem_size) {
+    aml = out; aml_n = 0;
+    name_int0("PICF");
+    a8(0x14); int m = pkg_open(); astr("_PIC"); a8(1); a8(0x70); a8(0x68); a8(0x5C); astr("PICF"); pkg_close(m);
+    a8(0x10); int sb = pkg_open(); a8(0x5C); astr("_SB_");
+    a8(0x5B); a8(0x82); int d = pkg_open(); astr("PCI0");
+    a8(0x08); astr("_HID"); a8(0x0C); a32(0x030AD041u);   /* EisaId ("PNP0A03") */
+    name_int0("_ADR"); name_int0("_UID"); name_int0("_BBN");
+    a8(0x08); astr("_CRS"); a8(0x11); int b = pkg_open();
+    a8(0x0A); int size_at = aml_n; a8(0);
+    int start = aml_n;
+    word_addr(2, 0, 0, 0xFF);                      /* the bus numbers */
+    a8(0x47); a8(1); a16(0xCF8); a16(0xCF8); a8(1); a8(8);   /* the configuration ports */
+    word_addr(1, 3, 0x0000, 0x0CF7);               /* I/O either side of them */
+    word_addr(1, 3, 0x0D00, 0xFFFF);
+    dword_mem(0x000A0000u, 0x000BFFFFu);           /* the VGA's window, and everything from RAM's end to the I/O APIC */
+    dword_mem(mem_size, 0xFEBFFFFFu);
+    a8(0x79); a8(0);                               /* end tag, checksum not used */
+    aml[size_at] = (uint8_t)(aml_n - start);
+    pkg_close(b);
+    routing("PRTA", 1);
+    routing("PRTP", 0);
+    a8(0x14); int prt = pkg_open(); astr("_PRT"); a8(0);
+    a8(0xA0); int cond = pkg_open(); a8(0x5C); astr("PICF"); a8(0xA4); astr("PRTA"); pkg_close(cond);
+    a8(0xA4); astr("PRTP");
+    pkg_close(prt);
+    pkg_close(d);
+    pkg_close(sb);
+    return aml_n;
+}
+
 void pc_acpi_tables(x86_cpu *c) {
     if (!acpi_on || !pc_apic_present()) return;
-    uint8_t buf[1024];
+    uint8_t buf[0xFA6E - ACPI_OFF];               /* up to the 8x8 font in the ROM */
     memset(buf, 0, sizeof buf);
     uint32_t base = ((uint32_t)PC_HLE_SEG << 4) + ACPI_OFF;
     int at = 0;
@@ -80,10 +174,11 @@ void pc_acpi_tables(x86_cpu *c) {
     facs_at = at;
     memcpy(buf + facs_at, "FACS", 4); put32(buf + facs_at + 4, 64);
     at = facs_at + 64;
-    /* DSDT: a header and nothing to interpret */
+    /* DSDT */
     dsdt_at = at;
-    header(buf + dsdt_at, "DSDT", 36, 1); seal(buf + dsdt_at);
-    at = dsdt_at + 48;
+    int dsdt_len = 36 + dsdt_body(buf + dsdt_at + 36, c->mem_size);
+    header(buf + dsdt_at, "DSDT", (uint32_t)dsdt_len, 1); seal(buf + dsdt_at);
+    at = dsdt_at + ((dsdt_len + 15) & ~15);
     /* FADT (ACPI 1.0, 116 bytes): the FACS and the DSDT, SCI on IRQ 9, no
      * PM registers to speak of; flags: the PIT-like PM timer absent */
     fadt_at = at;

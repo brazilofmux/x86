@@ -177,9 +177,9 @@ if [ -f disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso ]; then
     # loader rejects every MP table, see tests/boot/README; the kernel runs
     # on both and routes the disk's interrupt through the I/O APIC to the second
     printf 'waitpix 60,60 51 102 152\nwaitpix 345,147 255 233 148\n' > tmp/boot-haiku.exp
-    if python3 tools/expect.py -t 420 tmp/boot-haiku.exp -- $DM -m 586 -mem 257 -vbe -smp 2 -acpi -W -T 410 -ro \
+    if python3 tools/expect.py -t 420 tmp/boot-haiku.exp -- $DM -m 586 -mem 257 -vbe -smp 2 -acpi -nic e1000,user -W -T 410 -ro \
          -hda disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso -boot c >/dev/null 2>&1
-    then echo "ok   haiku r1/beta6 on two processors (acpi, smp)"; else echo "FAIL haiku smp"; fail=1; fi
+    then echo "ok   haiku r1/beta6 on two processors with a network (acpi, smp, slirp)"; else echo "FAIL haiku smp"; fail=1; fi
     rm -f tmp/boot-haiku.exp
 fi
 if [ -f disks/reactos/reactos-installed.img ]; then
@@ -252,6 +252,12 @@ if [ -f disks/linux/tc.img ] && $DM -nic e1000,user -h >/dev/null 2>&1; then
     printf '%s\t%s\\r\n%s\t\n' 'tc@box:~\$' "ifconfig eth0 | grep -q addr:10.0.2.15 && [ \$(ping -c 2 10.0.2.2 | grep -c 'bytes from') = 2 ] && echo NET-O''K" '*NET-OK' > tmp/boot-tcn.exp
     if python3 tools/expect.py -t 280 tmp/boot-tcn.exp -- $DM -m 586 -mem 128 -W -T 270 -nic e1000,user -hda tmp/boot-tcn.img -boot c >/dev/null 2>&1
     then echo "ok   linux 6.12 on the network: an e1000, dhcp and ping through slirp"; else echo "FAIL linux on the network (e1000, slirp)"; fail=1; fi
+    # ... and on two processors through ACPI: the DSDT's _PRT is what puts the
+    # card on I/O APIC input 19, and the PM enables read back as written
+    cp disks/linux/tc.img tmp/boot-tcn.img
+    printf '%s\t%s\\r\n%s\t\n' 'tc@box:~\$' "i=0; until ifconfig eth0 2>/dev/null | grep -q addr:10.0.2.15 || [ \$i = 60 ]; do sleep 1; i=\$((i+1)); done; [ \$(grep -c processor /proc/cpuinfo) = 2 ] && grep -q 'IO-APIC.*eth0' /proc/interrupts && [ \$(dmesg | grep -c 'Could not enable') = 0 ] && [ \$(ping -c 2 10.0.2.2 | grep -c 'bytes from') = 2 ] && echo NET-O''K" '*NET-OK' > tmp/boot-tcn.exp
+    if python3 tools/expect.py -t 280 tmp/boot-tcn.exp -- $DM -m 586 -mem 128 -smp 2 -acpi -W -T 270 -nic e1000,user -hda tmp/boot-tcn.img -boot c >/dev/null 2>&1
+    then echo "ok   linux 6.12 on two processors and the network through acpi (_PRT)"; else echo "FAIL linux on acpi, smp and the network"; fail=1; fi
     rm -f tmp/boot-tcn.img tmp/boot-tcn.exp
 fi
 if [ -f disks/linux/tcroot.img ] && [ -x "$(brew --prefix e2fsprogs 2>/dev/null)/sbin/debugfs" ]; then

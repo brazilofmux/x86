@@ -331,7 +331,9 @@ memory): every specification-conformant table is "invalid config table
 signature", a bug real machines never show because they have ACPI
 (headers/private/kernel/arch/x86/arch_smp.h, still so in master). So
 pc/pc_acpi.c lays the least ACPI at F000:F400: RSDP, RSDT, a FADT with
-an empty DSDT, a FACS and PM1a blocks on a quiet I/O range (B000h),
+a small DSDT (the PCI root, _CRS, and _PRT, by _PIC: each card's pin on
+I/O APIC input 16-19, or its IRQ at the 8259s; hand-assembled AML), a
+FACS and PM1a blocks on a quiet I/O range (B000h),
 and the MADT with the processors, the I/O APIC, the IRQ 0 override and
 the NMI line. Off by default: an installer that sees ACPI picks its
 ACPI HAL and expects the rest (Windows 2000). With it Haiku's kernel

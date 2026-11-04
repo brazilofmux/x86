@@ -736,8 +736,13 @@ static int poll_bsp(x86_cpu *c) {
          * typed into it took one such nap a key. */
         int kbd = pc_kbd_incoming() && !pc_uart_owns_stdin();
         if (kbd && nap > 2000000ull) nap = 2000000ull;
-        /* ... and a network's frames every millisecond, waiting in its poll() */
-        int netwait = pc_net_present() && nap >= 1000000ull;
+        /* ... and a network's frames every millisecond, waiting in its poll()
+         * — on one processor. With more, poll() would sleep holding the big
+         * lock, and the one still running would crawl through every port it
+         * touches (Haiku's disk, to a standstill at its boot splash): those
+         * nap in pc_smp_wait, which lets go and which an IPI can end, and
+         * look at the network just after. */
+        int netwait = pc_net_present() && nap >= 1000000ull && pc.ncpus <= 1;
         if (pc_net_present() && nap > 1000000ull) nap = 1000000ull;
         if (nap) {
             uint64_t w0 = pc_wall_ns();
