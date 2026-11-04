@@ -184,6 +184,37 @@ if [ -f disks/msdos622/c.img ] && command -v mcopy >/dev/null 2>&1; then
     $DM -m 386 -W -C tmp/qbt -transcript tmp/qbt/tr.txt -T 60 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
     if [ "$(awk '{print $2}' tmp/qbt/tr.txt 2>/dev/null)" = "$(seq 1 300)" ]; then echo "ok   qbasic -transcript"
     else echo "FAIL qbasic -transcript"; fail=1; fi
+    # QBasic knows a VGA by INT 10h AH=1Bh: 43 and 50 text rows (-D gets them
+    # all), and SCREEN 9, 11, 12 and 13, drawn and read back.
+    for geom in 80,43 80,50 40,43 40,50; do
+        r=${geom#*,}
+        printf 'WIDTH %s\r\nLOCATE %s, 1: PRINT "BOTTOM"; CSRLIN;\r\nLOCATE 1, 1: PRINT SCREEN(%s, 2)\r\nDO: LOOP\r\n' "$geom" "$r" "$r" > tmp/qbt/PROG.BAS
+        $DM -m 386 -W -C tmp/qbt -D tmp/qbt/s.txt -T 2 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
+        if [ "$(wc -l < tmp/qbt/s.txt | tr -d ' ')" = "$r" ] && [ "$(sed -n 1p tmp/qbt/s.txt)" = " 79" ] && [ "$(sed -n "${r}p" tmp/qbt/s.txt)" = "BOTTOM $r" ]; then echo "ok   qbasic width $geom"
+        else echo "FAIL qbasic width $geom"; head -2 tmp/qbt/s.txt; fail=1; fi
+    done
+    cat > tmp/qbt/PROG.BAS <<'BAS'
+DIM R(30)
+SCREEN 12: LINE (10,10)-(630,470),3: PSET (5,5),12
+R(1)=POINT(5,5): R(2)=POINT(10,10): R(3)=POINT(0,0): PRINT "H": R(4)=SCREEN(1,1)
+SCREEN 13: PSET (5,5),200: R(5)=POINT(5,5): R(6)=POINT(6,5): PSET (319,199),255: R(7)=POINT(319,199): PRINT "I": R(8)=SCREEN(1,1)
+SCREEN 9: PSET (5,5),11: R(9)=POINT(5,5): R(10)=POINT(6,5): PSET (639,349),15: R(11)=POINT(639,349): PRINT "J": R(12)=SCREEN(1,1)
+SCREEN 11: PSET (5,5),1: R(13)=POINT(5,5): R(14)=POINT(6,5): PRINT "K": R(15)=SCREEN(1,1)
+SCREEN 1: PSET (5,5),2: R(16)=POINT(5,5): R(17)=POINT(6,5): PRINT "L": R(18)=SCREEN(1,1)
+SCREEN 9,,1,0: PSET (5,5),11: R(19)=POINT(5,5): SCREEN 9,,0,0: R(20)=POINT(5,5)
+SCREEN 0
+FOR I=1 TO 20: PRINT R(I);: NEXT
+SYSTEM
+BAS
+    $DM -m 386 -W -C tmp/qbt -D tmp/qbt/s.txt -T 20 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
+    got=$(grep -m1 '[0-9]' tmp/qbt/s.txt)
+    want=" 12  3  0  72  200  0  255  73  11  0  15  74  1  0  75  2  0  76  11  0"
+    if [ "$got" = "$want" ]; then echo "ok   qbasic POINT and SCREEN() in graphics"
+    else echo "FAIL qbasic POINT and SCREEN() in graphics"; echo "$got"; fail=1; fi
+    printf 'SCREEN 12\r\nLINE (0,0)-(639,479),15\r\nLOCATE 2,2: PRINT "PNG"\r\nDO: LOOP\r\n' > tmp/qbt/PROG.BAS
+    rm -f tmp/qbt/g.png
+    $DM -m 386 -W -C tmp/qbt -G tmp/qbt/g.png -T 2 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
+    case "$(file tmp/qbt/g.png 2>/dev/null)" in *"640 x 480"*) echo "ok   qbasic -G SCREEN 12";; *) echo "FAIL qbasic -G SCREEN 12"; fail=1;; esac
     rm -rf tmp/qbt
 fi
 exit $fail

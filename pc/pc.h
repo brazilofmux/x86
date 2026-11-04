@@ -37,6 +37,7 @@ enum { HLE_RET_FLAGS, HLE_RET_IRET };
 #define PC_STUB_VGATAB  0x0400     /*   the modes' parameter tables, 64 bytes apart */
 #define PC_STUB_DAC64   0x0800     /*   the EGA 64-colour DAC set */
 #define PC_STUB_DAC256  0x0900     /*   mode 13h's 256 */
+#define PC_STUB_VGAFUNC 0x0C00     /* INT 10h AH=1Bh's static functionality table */
 /* The ROM fonts, in the BIOS segment where INT 10h AX=1130h points (data:
  * only execution there traps). 8x8's first half also at the AT's FA6E. */
 #define PC_FONT16_OFF   0xC000
@@ -263,6 +264,10 @@ int  pc_kbd_raw_reply_pending(void);                 /* a command's reply is nex
 int  pc_kbd_raw_next(uint8_t *code);                     /* next raw make/break code for port 60h */
 void pc_kbd_raw_key(uint8_t code, uint8_t ascii);         /* queue one make/break code (the window's keyboard) */
 void pc_kbd_paste(const char *text);                      /* Cmd-V: the clipboard, typed in key by key */
+int pc_vga_gfx_read(x86_cpu *c, int m, int x, int y, uint32_t page);     /* the BIOS's view of a graphics pixel */
+void pc_vga_gfx_write(x86_cpu *c, int m, int x, int y, uint32_t page, int colour);
+int pc_vga_lines(void);                                    /* scan lines the CRTC displays */
+void pc_vga_set_text350(int on);                           /* the text modes' 350-line timing, or 400 */
 void pc_vga_rom(x86_cpu *c);                               /* POST: the native mode-set code and its tables */
 void pc_vga_rom_mode(x86_cpu *c, int mode);                /* point its ROM variables at MODE's table */
 int  pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h);   /* RGB24, at most 640x480; -1 if not graphics */

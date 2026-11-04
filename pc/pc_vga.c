@@ -107,6 +107,15 @@ static const struct vga_regs {
       { 0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,0x00,0x41,0x00,0x00,0x00,0x00,0x00,0x00,0x9C,0x8E,0x8F,0x28,0x40,0x96,0xB9,0xA3,0xFF },
       { 0x00,0x00,0x00,0x00,0x00,0x40,0x05,0x0F,0xFF },
       { 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x41,0x00,0x0F,0x00,0x00 } },
+    /* the 350-line text modes (AH=12h BL=30h AL=1), where 8x8 makes 43 rows */
+    { 0x81, 0xA3, { 0x09, 0x03, 0x00, 0x02 },
+      { 0x2D,0x27,0x28,0x90,0x2B,0xA0,0xBF,0x1F,0x00,0x4D,0x0B,0x0C,0x00,0x00,0x00,0x00,0x83,0x85,0x5D,0x14,0x1F,0x63,0xBA,0xA3,0xFF },
+      { 0x00,0x00,0x00,0x00,0x00,0x10,0x0E,0x00,0xFF },
+      { 0x00,0x01,0x02,0x03,0x04,0x05,0x14,0x07,0x38,0x39,0x3A,0x3B,0x3C,0x3D,0x3E,0x3F,0x08,0x00,0x0F,0x08,0x00 } },
+    { 0x83, 0xA3, { 0x01, 0x03, 0x00, 0x02 },
+      { 0x5F,0x4F,0x50,0x82,0x55,0x81,0xBF,0x1F,0x00,0x4D,0x0B,0x0C,0x00,0x00,0x00,0x00,0x83,0x85,0x5D,0x28,0x1F,0x63,0xBA,0xA3,0xFF },
+      { 0x00,0x00,0x00,0x00,0x00,0x10,0x0E,0x00,0xFF },
+      { 0x00,0x01,0x02,0x03,0x04,0x05,0x14,0x07,0x38,0x39,0x3A,0x3B,0x3C,0x3D,0x3E,0x3F,0x08,0x00,0x0F,0x08,0x00 } },
 };
 
 /* tools/vgabios.asm, assembled: programs a mode's table through OUTs */
@@ -149,10 +158,14 @@ void pc_vga_rom_mode(x86_cpu *c, int mode) {
     pc_wr16(c, PC_STUB_SEG, PC_STUB_VGAVARS + 4, m13 ? 256 * 3 : 64 * 3);
 }
 
+static int text350;                                      /* AH=12h BL=30h's choice for the text modes */
+void pc_vga_set_text350(int on) { text350 = on; }
+
 static const struct vga_regs *vga_table(int mode) {
     mode &= 0x7F;
     if (mode == 0x00) mode = 0x01;                       /* 40 columns, colour burst off: same timing */
     if (mode == 0x02) mode = 0x03;
+    if (text350 && (mode == 0x01 || mode == 0x03)) mode |= 0x80;
     if (mode == 0x05) mode = 0x04;
     if (mode == 0x11) mode = 0x12;                       /* 640x480 mono: 12h's timing */
     for (size_t i = 0; i < sizeof vga_tables / sizeof vga_tables[0]; i++)
@@ -176,6 +189,7 @@ static int wants_planar(void) { return is_16() || (is_256() && !(vga.seq[4] & 0x
 static int crtc_lines(void) {
     return (vga.crtc[0x12] | (vga.crtc[0x07] & 0x02) << 7 | (vga.crtc[0x07] & 0x40) << 3) + 1;
 }
+int pc_vga_lines(void) { return crtc_lines(); }
 static int crtc_scan(void) { return ((vga.crtc[0x09] & 0x1F) + 1) * (vga.crtc[0x09] & 0x80 ? 2 : 1); }
 static void gfx_size(int *w, int *h) {
     int chars = vga.crtc[0x01] + 1;
@@ -366,9 +380,10 @@ void pc_vga_set_mode(x86_cpu *c, int mode) {
             memset(c->mem + WIN, 0, 320 * 200);
             memset(vga.plane, 0, sizeof vga.plane);
         }
-    } else if (m == 0x0D || m == 0x0E || m == 0x10 || m == 0x12) {
+    } else if (m == 0x0D || m == 0x0E || m == 0x10 || m == 0x11 || m == 0x12) {
         text_default(c);                                 /* the EGA DAC set */
         memcpy(vga.ac, t->ac, sizeof vga.ac);
+        if (m == 0x11) for (int i = 1; i < 16; i++) vga.ac[i] = 0x3F;   /* one bit: black or white */
         memcpy(vga.crtc, t->crtc, sizeof vga.crtc);      /* text_default's font height is the text modes' */
         set_planar(c, 1);
         if (!(mode & 0x80)) { memset(vga.plane, 0, sizeof vga.plane); refresh_view(c); }
@@ -494,12 +509,76 @@ static void frame16(uint8_t *rgb, int w, int h) {
         }
 }
 
+/* ---- the BIOS's pixels (INT 10h's text and AH=0Ch/0Dh in graphics) ------
+ * m is the mode from 40:49h, page the byte offset of the page. The CGA
+ * modes interleave their lines at B800h; 13h is linear unless unchained;
+ * the 16-colour modes' planes are written whole, as the BIOS's own
+ * set/reset would, and the window kept showing the read plane. */
+static int cga_addr(int m, int x, int y, int *shift) {
+    int bpp = m == 6 ? 1 : 2;
+    *shift = 8 - bpp - (x * bpp) % 8;
+    return (y & 1) * 0x2000 + (y >> 1) * 80 + (x * bpp) / 8;
+}
+static uint32_t plane_addr(int x, int y, uint32_t page) {
+    return (page + (uint32_t)y * ((uint32_t)vga.crtc[0x13] * 2) + (uint32_t)(x >> 3)) & 0xFFFF;
+}
+int pc_vga_gfx_read(x86_cpu *c, int m, int x, int y, uint32_t page) {
+    if (m >= 4 && m <= 6) {
+        int sh, a = cga_addr(m, x, y, &sh);
+        return (c->mem[0xB8000 + a] >> sh) & (m == 6 ? 1 : 3);
+    }
+    if (m == 0x13) return pixel(c, x, y, 320);
+    if (!vga.planar) return 0;
+    uint32_t a = plane_addr(x, y, page);
+    int v = 0;
+    for (int i = 0; i < 4; i++) v |= ((vga.plane[i][a] >> (7 - (x & 7))) & 1) << i;
+    return v;
+}
+void pc_vga_gfx_write(x86_cpu *c, int m, int x, int y, uint32_t page, int colour) {
+    if (m >= 4 && m <= 6) {
+        int sh, a = cga_addr(m, x, y, &sh), mask = m == 6 ? 1 : 3;
+        uint8_t *b = c->mem + 0xB8000 + a;
+        *b = (uint8_t)((*b & ~(mask << sh)) | (colour & mask) << sh);
+        return;
+    }
+    if (m == 0x13) {
+        if (!vga.planar) { c->mem[WIN + (uint32_t)(y * 320 + x)] = (uint8_t)colour; return; }
+        uint32_t a = (uint32_t)y * ((uint32_t)vga.crtc[0x13] * 2) + (uint32_t)(x >> 2);
+        vga.plane[x & 3][a & 0xFFFF] = (uint8_t)colour;
+        if ((x & 3) == read_plane()) c->mem[WIN + (a & 0xFFFF)] = (uint8_t)colour;
+        return;
+    }
+    if (!vga.planar) return;
+    uint32_t a = plane_addr(x, y, page);
+    uint8_t bit = (uint8_t)(0x80 >> (x & 7));
+    for (int i = 0; i < 4; i++) {
+        if (colour & (1 << i)) vga.plane[i][a] |= bit; else vga.plane[i][a] &= (uint8_t)~bit;
+    }
+    c->mem[WIN + a] = vga.plane[read_plane()][a];
+}
+
+/* A CGA mode's picture: memory at B800h, lines interleaved, two bits a
+ * pixel (mode 4, 5) or one (6), through the attribute palette to the DAC. */
+static int is_cga(void) { return is_graphics() && (vga.gc[6] & 0x0C) == 0x0C; }
+static void frame_cga(x86_cpu *c, uint8_t *rgb, int *w, int *h) {
+    int two = (vga.gc[5] & 0x20) != 0;
+    *w = two ? 320 : 640; *h = 200;
+    for (int y = 0; y < *h; y++)
+        for (int x = 0; x < *w; x++) {
+            int sh, a = cga_addr(two ? 4 : 6, x, y, &sh);
+            int ci = (c->mem[0xB8000 + a] >> sh) & (two ? 3 : 1);
+            int d = (vga.ac[ci] & 0x3F) | ((vga.ac[0x14] & 0x0C) << 4);
+            for (int k = 0; k < 3; k++) { uint8_t v = vga.dac[d][k]; rgb[(y * *w + x) * 3 + k] = (uint8_t)((v << 2) | (v >> 4)); }
+        }
+}
+
 /* The current graphics picture as RGB24 rows, *w by *h (at most 640x480):
  * mode 13h at 320x200, or a 16-colour mode at its size. 0, or -1 if the
  * screen is in neither. The window and the PNG writer both use it. */
 int pc_vga_frame(x86_cpu *c, uint8_t *rgb, int *w, int *h) {
     if (pc_vbe_frame(c, rgb, w, h) == 0) return 0;   /* a VBE mode (up to PC_FRAME_MAX_W x _H) */
     if (!is_graphics()) return -1;
+    if (is_cga()) { frame_cga(c, rgb, w, h); return 0; }
     gfx_size(w, h);
     if (is_16()) { frame16(rgb, *w, *h); return 0; }
     uint8_t lut[256][3];

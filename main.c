@@ -62,7 +62,7 @@ static void usage(const char *prog) {
     printf("              last screen at exit: the whole of a long run's output\n");
     printf("  -K FILE     key trace: scripted keys go in one at a time, each when the program is\n");
     printf("              waiting for it; the text screen and cursor go to FILE before each\n");
-    printf("  -G FILE     write the screen (text, mode 13h or a 16-colour mode) to FILE as a PNG on exit\n");
+    printf("  -G FILE     write the screen (text or a VGA graphics mode) to FILE as a PNG on exit\n");
     printf("  -w          the window is the display: text modes and graphics, from the start\n");
     printf("  -W          no window at all (default: one opens for graphics modes if stdout is a terminal)\n");
     printf("  -pmtrace LO:HI  -i: dump state before each instruction in [LO,HI], QEMU -d cpu format\n");
@@ -655,7 +655,7 @@ int main(int argc, char **argv) {
         if (f) { fwrite(cpu.mem, 1, cpu.mem_size, f); fclose(f); }
     }
     if (gdump && pc_video_png(&cpu, gdump) < 0)
-        fprintf(stderr, "-G %s: the screen is in neither a text mode nor mode 13h\n", gdump);
+        fprintf(stderr, "-G %s: the screen could not be written\n", gdump);
 
     if (rc < 0) {
         fprintf(stderr, "dos-monster: run failed\n");

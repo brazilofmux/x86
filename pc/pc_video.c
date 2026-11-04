@@ -20,7 +20,6 @@
 #include <sys/ioctl.h>
 
 #define BDA PC_BDA_SEG
-#define PAGE_BYTES 0x1000
 
 static uint8_t  shadow[PC_ROWS * PC_COLS * 2];
 static int      shadow_valid;
@@ -60,7 +59,7 @@ static void put_utf8(FILE *f, unsigned cp) {
 static int cols(x86_cpu *c) { int n = pc_rd16(c, BDA, 0x4A); return n ? n : 80; }
 static int rows(x86_cpu *c) { return pc_rd8(c, BDA, 0x84) + 1; }
 static int page(x86_cpu *c) { return pc_rd8(c, BDA, 0x62) & 7; }
-static uint16_t page_off(int pg) { return (uint16_t)(pg * PAGE_BYTES); }
+static uint16_t page_off(x86_cpu *c, int pg) { return (uint16_t)(pg * pc_rd16(c, BDA, 0x4C)); }
 
 static void get_cursor(x86_cpu *c, int pg, int *row, int *col) {
     uint16_t v = pc_rd16(c, BDA, (uint16_t)(0x50 + pg * 2));
@@ -71,7 +70,7 @@ static void set_cursor(x86_cpu *c, int pg, int row, int col) {
     /* the displayed page's cursor is also the CRTC's, in words from the
      * start of video memory, as a real BIOS programs it */
     if (pg == (pc_rd8(c, BDA, 0x62) & 7))
-        pc_vga_set_cursor_pos((uint16_t)(page_off(pg) / 2 + row * cols(c) + col));
+        pc_vga_set_cursor_pos((uint16_t)(page_off(c, pg) / 2 + row * cols(c) + col));
 }
 
 /* INT 10h AH=01: the cursor's start/end scan lines in CH/CL, bit 5 of CH
@@ -89,7 +88,7 @@ static void cursor_shape(x86_cpu *c, uint16_t cx) {
 }
 
 static uint16_t cell_off(x86_cpu *c, int pg, int row, int col) {
-    return (uint16_t)(page_off(pg) + (row * cols(c) + col) * 2);
+    return (uint16_t)(page_off(c, pg) + (row * cols(c) + col) * 2);
 }
 
 /* -transcript FILE: every text line as it scrolls off the top of a
@@ -134,12 +133,67 @@ void pc_video_transcript_close(x86_cpu *c) {
     transcript = NULL;
 }
 
+/* ---- Text in graphics modes: the character generator, as a VGA BIOS ----
+ * A glyph comes from INT 43h's table (in the CGA modes INT 1Fh's above
+ * 127), on a background of 0; attribute bit 7 XORs it in, except in 13h. */
+static int gfx(x86_cpu *c) { int m = pc_rd8(c, BDA, 0x49) & 0x7F; return m >= 4 && m != 7; }
+static int gmode(x86_cpu *c) { return pc_rd8(c, BDA, 0x49) & 0x7F; }
+
+static uint32_t glyph(x86_cpu *c, int ch) {
+    int m = gmode(c), h = pc_rd8(c, BDA, 0x85), v = 0x43;
+    if (m >= 4 && m <= 6 && ch >= 128) { v = 0x1F; ch -= 128; }
+    uint32_t a = ((uint32_t)pc_rd16(c, 0, (uint16_t)(v * 4 + 2)) << 4) + pc_rd16(c, 0, (uint16_t)(v * 4));
+    return a + (uint32_t)(ch * h);
+}
+static void gfx_char(x86_cpu *c, int pg, int row, int col, int ch, int attr) {
+    int m = gmode(c), h = pc_rd8(c, BDA, 0x85), page_b = pg * pc_rd16(c, BDA, 0x4C);
+    int xr = (attr & 0x80) && m != 0x13, fg = m == 0x13 ? attr : attr & 0x7F;
+    uint32_t g = glyph(c, ch);
+    for (int y = 0; y < h; y++) {
+        uint8_t bits = c->mem[g + (uint32_t)y];
+        for (int x = 0; x < 8; x++) {
+            int X = col * 8 + x, Y = row * h + y, on = bits & (0x80 >> x);
+            if (xr) { if (on) pc_vga_gfx_write(c, m, X, Y, (uint32_t)page_b, pc_vga_gfx_read(c, m, X, Y, (uint32_t)page_b) ^ fg); }
+            else pc_vga_gfx_write(c, m, X, Y, (uint32_t)page_b, on ? fg : 0);
+        }
+    }
+}
+/* AH=08h: the code whose glyph the cell shows (non-zero pixels), or 0 */
+static int gfx_read_char(x86_cpu *c, int pg, int row, int col) {
+    int m = gmode(c), h = pc_rd8(c, BDA, 0x85);
+    uint32_t page_b = (uint32_t)(pg * pc_rd16(c, BDA, 0x4C));
+    uint8_t cell[16];
+    for (int y = 0; y < h && y < 16; y++) {
+        cell[y] = 0;
+        for (int x = 0; x < 8; x++)
+            if (pc_vga_gfx_read(c, m, col * 8 + x, row * h + y, page_b)) cell[y] |= (uint8_t)(0x80 >> x);
+    }
+    for (int ch = 0; ch < 256; ch++) {
+        uint32_t g = glyph(c, ch);
+        if (g && !memcmp(c->mem + g, cell, (size_t)h)) return ch;
+    }
+    return 0;
+}
+static void gfx_scroll(x86_cpu *c, int pg, int up, int n, int r0, int c0, int r1, int c1, int attr) {
+    int m = gmode(c), ch = pc_rd8(c, BDA, 0x85), h = r1 - r0 + 1;
+    uint32_t page_b = (uint32_t)(pg * pc_rd16(c, BDA, 0x4C));
+    if (n <= 0 || n >= h) n = h;
+    for (int i = 0; i < h; i++) {
+        int dst = up ? r0 + i : r1 - i, src = up ? dst + n : dst - n, keep = src >= r0 && src <= r1;
+        for (int y = 0; y < ch; y++)
+            for (int x = c0 * 8; x < (c1 + 1) * 8; x++)
+                pc_vga_gfx_write(c, m, x, dst * ch + y, page_b,
+                                 keep ? pc_vga_gfx_read(c, m, x, src * ch + y, page_b) : attr);
+    }
+}
+
 /* Scroll the window (r0,c0)-(r1,c1) by n lines (0 = clear), filling with attr. */
 static void scroll(x86_cpu *c, int pg, int up, int n, int r0, int c0, int r1, int c1, uint8_t attr) {
     int nr = rows(c), nc = cols(c);
     if (r1 >= nr) r1 = nr - 1;
     if (c1 >= nc) c1 = nc - 1;
     if (r0 > r1 || c0 > c1) return;
+    if (gfx(c)) { gfx_scroll(c, pg, up, n, r0, c0, r1, c1, attr); return; }
     int h = r1 - r0 + 1;
     if (transcript && up && n > 0 && n < h && c0 == 0 && c1 == nc - 1 && pg == page(c)) {
         int m = pc_rd8(c, BDA, 0x49) & 0x7F;
@@ -175,6 +229,7 @@ static void echo(uint8_t ch) {
     }
 }
 
+static int tty_attr = 7;                          /* AH=0Eh's BL, in graphics */
 void pc_video_teletype(x86_cpu *c, uint8_t ch) {
     int pg = page(c), row, col;
     get_cursor(c, pg, &row, &col);
@@ -185,35 +240,58 @@ void pc_video_teletype(x86_cpu *c, uint8_t ch) {
     case 0x0A: row++; break;
     case 0x0D: col = 0; break;
     default:
-        pc_wr8(c, PC_VIDEO_SEG, cell_off(c, pg, row, col), ch);
+        if (gfx(c)) gfx_char(c, pg, row, col, ch, tty_attr);
+        else pc_wr8(c, PC_VIDEO_SEG, cell_off(c, pg, row, col), ch);
         col++;
         if (col >= nc) { col = 0; row++; }
         break;
     }
     if (row >= nr) {
-        scroll(c, pg, 1, 1, 0, 0, nr - 1, nc - 1, 0x07);
+        scroll(c, pg, 1, 1, 0, 0, nr - 1, nc - 1, gfx(c) ? 0 : 0x07);
         row = nr - 1;
     }
     set_cursor(c, pg, row, col);
     echo(ch);
 }
 
+/* 40:4Ch, the bytes a page takes: a text page rounds up to 256, as the
+ * VGA BIOS has it (0800h at 40x25, 1000h at 80x25, 2000h at 80x50). */
+static uint16_t regen_bytes(int m, int nr, int nc) {
+    switch (m) {
+    case 4: case 5: case 6: case 0x0E: return 0x4000;
+    case 0x0D: return 0x2000;
+    case 0x0F: case 0x10: return 0x8000;
+    case 0x11: case 0x12: return 0xA000;
+    case 0x13: return 0xFA00;
+    default: return (uint16_t)(((nr * nc * 2) | 0xFF) + 1);
+    }
+}
+
 static void set_mode(x86_cpu *c, int mode) {
     int m = mode & 0x7F;
-    int nc = (m == 0 || m == 1 || m == 0x13) ? 40 : 80;
+    int nc = (m == 0 || m == 1 || m == 4 || m == 5 || m == 0x0D || m == 0x13) ? 40 : 80;
     pc_wr8(c, BDA, 0x49, (uint8_t)(mode & 0x7F));
     pc_wr16(c, BDA, 0x4A, (uint16_t)nc);
-    pc_wr16(c, BDA, 0x4C, PAGE_BYTES);
+    pc_wr16(c, BDA, 0x4C, regen_bytes(m, 25, nc));
     pc_wr16(c, BDA, 0x4E, 0);
     for (int i = 0; i < 8; i++) set_cursor(c, i, 0, 0);
     pc_wr16(c, BDA, 0x60, 0x0607);
     pc_wr8(c, BDA, 0x62, 0);
     pc_wr16(c, BDA, 0x63, mode == 7 ? 0x3B4 : 0x3D4);
-    pc_wr8(c, BDA, 0x84, PC_ROWS - 1);
-    pc_wr16(c, BDA, 0x85, 16);
+    /* AH=12h BL=30h chose the text modes' scan lines; the mode set takes
+     * them from 40:89h, and the rows and font height follow from the mode */
+    uint8_t scan = pc_rd8(c, BDA, 0x89) & 0x90;
+    int h = 16, nr = PC_ROWS;
+    if (m <= 3 && scan == 0x00) h = 14;
+    else if (m == 0x0F || m == 0x10) h = 14;
+    else if (m == 0x11 || m == 0x12) nr = 30;
+    else if (m >= 4 && m != 7) h = 8;
+    pc_wr8(c, BDA, 0x84, (uint8_t)(nr - 1));
+    pc_wr16(c, BDA, 0x85, (uint16_t)h);
     pc_wr8(c, BDA, 0x87, 0x60);
     pc_wr8(c, BDA, 0x88, 0x09);
-    pc_wr8(c, BDA, 0x89, 0x51);
+    pc_wr8(c, BDA, 0x89, (uint8_t)(scan | 0x41));
+    pc_vga_set_text350(scan == 0x00);
     pc_wr8(c, BDA, 0x8A, 0x08);
     pc_vga_set_mode(c, mode);                    /* graphics state follows the mode, text or 13h */
     /* INT 43h: the graphics modes' character set, as the VGA BIOS sets it */
@@ -221,13 +299,19 @@ static void set_mode(x86_cpu *c, int mode) {
                  : (m >= 4 && m <= 6) ? PC_FONT8_AT_OFF : PC_FONT8_OFF;
     pc_wr16(c, 0, 0x43 * 4, f43); pc_wr16(c, 0, 0x43 * 4 + 2, PC_HLE_SEG);
     pc_vga_set_cursor_pos(0);
-    if (m != 0x13 && !(mode & 0x80))
-        for (int i = 0; i < PC_ROWS * PC_COLS; i++)
-            pc_wr16(c, PC_VIDEO_SEG, (uint16_t)(i * 2), 0x0720);
+    if (m != 0x13 && !(mode & 0x80))                   /* all of it: 50 rows and the higher pages too */
+        for (int i = 0; i < 0x4000; i++)
+            pc_wr16(c, PC_VIDEO_SEG, (uint16_t)(i * 2), m >= 4 && m <= 6 ? 0 : 0x0720);
     shadow_valid = 0;
 }
 
+/* INT 10h AH=1Bh's static functionality table (RBIL's layout): every VGA
+ * mode, 200/350/400 text lines, 8 character blocks, 2 active. */
+static const uint8_t vga_func[16] = { 0xFF, 0xE0, 0x0F, 0, 0, 0, 0, 0x07, 0x02, 0x08, 0xE7, 0x0C, 0, 0, 0, 0 };
+
 void pc_video_init(x86_cpu *c) {
+    for (size_t i = 0; i < sizeof vga_func; i++) pc_wr8(c, PC_STUB_SEG, (uint16_t)(PC_STUB_VGAFUNC + i), vga_func[i]);
+    pc_wr8(c, BDA, 0x89, 0x51);                  /* 400 scan lines */
     set_mode(c, 3);
     memset(hud_text, 0, sizeof hud_text);
     hud_painted[0] = 0;
@@ -271,8 +355,11 @@ void pc_video_int10(x86_cpu *c, int vector) {
     }
     case 0x05: {
         pc_wr8(c, BDA, 0x62, (uint8_t)(al & 7));
-        pc_wr16(c, BDA, 0x4E, page_off(al & 7));
-        pc_vga_set_start((uint16_t)(page_off(al & 7) / 2));
+        pc_wr16(c, BDA, 0x4E, page_off(c, al & 7));
+        {   /* the start address counts words in text, bytes in the planes */
+            int m = pc_rd8(c, BDA, 0x49) & 0x7F;
+            pc_vga_set_start((uint16_t)(page_off(c, al & 7) / (m <= 3 || m == 7 ? 2 : 1)));
+        }
         int row, col; get_cursor(c, al & 7, &row, &col);
         set_cursor(c, al & 7, row, col);              /* the new page's cursor into the CRTC */
         break;
@@ -283,6 +370,7 @@ void pc_video_int10(x86_cpu *c, int vector) {
         break;
     case 0x08: {
         int row, col; get_cursor(c, bh & 7, &row, &col);
+        if (gfx(c)) { x86_set_r16(c, R_AX, (uint16_t)gfx_read_char(c, bh & 7, row, col)); break; }
         x86_set_r16(c, R_AX, pc_rd16(c, PC_VIDEO_SEG, cell_off(c, bh & 7, row, col)));
         break;
     }
@@ -290,6 +378,11 @@ void pc_video_int10(x86_cpu *c, int vector) {
         int row, col; get_cursor(c, bh & 7, &row, &col);
         int n = x86_get_r16(c, R_CX), nc = cols(c);
         for (int i = 0; i < n && row < rows(c); i++) {
+            if (gfx(c)) {
+                gfx_char(c, bh & 7, row, col, al, bl);
+                if (++col >= nc) { col = 0; row++; }
+                continue;
+            }
             uint16_t off = cell_off(c, bh & 7, row, col);
             pc_wr8(c, PC_VIDEO_SEG, off, (uint8_t)al);
             if (ah == 0x09) pc_wr8(c, PC_VIDEO_SEG, (uint16_t)(off + 1), (uint8_t)bl);
@@ -297,8 +390,33 @@ void pc_video_int10(x86_cpu *c, int vector) {
         }
         break;
     }
+    case 0x0B:                                     /* the CGA palette: BH 0 background and intensity, 1 which set */
+        if (bh == 0) {
+            pc_vga_set_ac(0, (uint8_t)(bl & 0x0F));
+            pc_vga_set_ac(0x11, (uint8_t)(bl & 0x0F));
+            for (int i = 1; i < 4; i++) pc_vga_set_ac(i, (uint8_t)((pc_vga_get_ac(i) & ~0x10) | (bl & 0x10)));
+            pc_wr8(c, BDA, 0x66, (uint8_t)((pc_rd8(c, BDA, 0x66) & 0xE0) | (bl & 0x1F)));
+        } else if (bh == 1) {
+            for (int i = 1; i < 4; i++) pc_vga_set_ac(i, (uint8_t)((pc_vga_get_ac(i) & 0x10) | (i * 2 + (bl & 1))));
+            pc_wr8(c, BDA, 0x66, (uint8_t)((pc_rd8(c, BDA, 0x66) & 0xDF) | (bl & 1) << 5));
+        }
+        break;
+    case 0x0C: {                                   /* write a pixel: CX, DX, colour AL (bit 7 XORs), page BH */
+        int m = gmode(c), x = x86_get_r16(c, R_CX), y = x86_get_r16(c, R_DX);
+        uint32_t pb = (uint32_t)((bh & 7) * pc_rd16(c, BDA, 0x4C));
+        if (!gfx(c)) break;
+        if ((al & 0x80) && m != 0x13) pc_vga_gfx_write(c, m, x, y, pb, pc_vga_gfx_read(c, m, x, y, pb) ^ (al & 0x7F));
+        else pc_vga_gfx_write(c, m, x, y, pb, al);
+        break;
+    }
+    case 0x0D:                                     /* read one */
+        if (gfx(c)) x86_set_r8(c, R_AL, (uint8_t)pc_vga_gfx_read(c, gmode(c), x86_get_r16(c, R_CX), x86_get_r16(c, R_DX),
+                                                                 (uint32_t)((bh & 7) * pc_rd16(c, BDA, 0x4C))));
+        break;
     case 0x0E:
+        tty_attr = bl;
         pc_video_teletype(c, (uint8_t)al);
+        tty_attr = 7;
         break;
     case 0x0F:
         x86_set_r8(c, R_AL, pc_rd8(c, BDA, 0x49));
@@ -380,15 +498,21 @@ void pc_video_int10(x86_cpu *c, int vector) {
         }
         if (h) {
             pc_wr8(c, BDA, 0x85, (uint8_t)h);
-            pc_wr8(c, BDA, 0x84, (uint8_t)(400 / h - 1));
+            int m = pc_rd8(c, BDA, 0x49) & 0x7F, nr = pc_vga_lines() / h;
+            pc_wr8(c, BDA, 0x84, (uint8_t)(nr - 1));
+            pc_wr16(c, BDA, 0x4C, regen_bytes(m, nr, cols(c)));
             pc_vga_set_char_height(h);
             cursor_shape(c, 0x0607);
         }
         break;
     }
     case 0x12:
-        if (bl == 0x10) { x86_set_r8(c, R_BH, 0); x86_set_r8(c, R_BL, 3); x86_set_r16(c, R_CX, 0); }
-        else if (bl == 0x30) x86_set_r8(c, R_AL, 0x12);
+        if (bl == 0x10) { x86_set_r8(c, R_BH, 0); x86_set_r8(c, R_BL, 3); x86_set_r16(c, R_CX, 0x0009); }   /* 256K, colour; switches 9: an enhanced display, as a VGA BIOS answers */
+        else if (bl == 0x30) {                     /* the next text mode's scan lines: 0 200, 1 350, 2 400 */
+            static const uint8_t bits[3] = { 0x80, 0x00, 0x10 };
+            if (al <= 2) pc_wr8(c, BDA, 0x89, (uint8_t)((pc_rd8(c, BDA, 0x89) & ~0x90) | bits[al]));
+            x86_set_r8(c, R_AL, 0x12);
+        }
         else if (bl >= 0x31 && bl <= 0x36) x86_set_r8(c, R_AL, 0x12);
         break;
     case 0x13: {   /* write string ES:BP, CX chars, at DH,DL; AL bits: 0 move cursor, 1 attrs inline */
@@ -402,6 +526,7 @@ void pc_video_int10(x86_cpu *c, int vector) {
             uint8_t at = (al & 2) ? pc_rd8(c, c->seg[S_ES].sel, p++) : (uint8_t)bl;
             if (ch == 0x0D || ch == 0x0A || ch == 0x08 || ch == 0x07) { pc_video_teletype(c, ch); continue; }
             int r, cl; get_cursor(c, bh & 7, &r, &cl);
+            if (gfx(c)) { tty_attr = at; pc_video_teletype(c, ch); tty_attr = 7; continue; }
             uint16_t off = cell_off(c, bh & 7, r, cl);
             pc_wr8(c, PC_VIDEO_SEG, off, ch);
             pc_wr8(c, PC_VIDEO_SEG, (uint16_t)(off + 1), at);
@@ -413,9 +538,30 @@ void pc_video_int10(x86_cpu *c, int vector) {
     case 0x1A:
         if (al == 0) { x86_set_r8(c, R_AL, 0x1A); x86_set_r16(c, R_BX, 0x0008); }
         break;
-    case 0x1B:
-        x86_set_r8(c, R_AL, 0);      /* not supported */
+    case 0x1B: {                                   /* VGA state, the 64 bytes at ES:DI: how QBasic knows a VGA */
+        if (x86_get_r16(c, R_BX) != 0) break;
+        uint16_t es = c->seg[S_ES].sel, di = x86_get_r16(c, R_DI);
+        int m = pc_rd8(c, BDA, 0x49) & 0x7F, text = m <= 3 || m == 7;
+        int colours = m == 7 || m == 0x0F ? 0 : m == 6 || m == 0x11 ? 2 : m == 4 || m == 5 ? 4 : m == 0x13 ? 256 : 16;
+        int regen = pc_rd16(c, BDA, 0x4C);
+        int pages = text ? 0x8000 / regen : (m >= 4 && m <= 6) ? 1 : 0x10000 / regen;
+        int code = m == 0x0F || m == 0x10 ? 1 : m == 0x11 || m == 0x12 ? 3 : !text ? 0
+                 : pc_vga_lines() == 350 ? 1 : 2;
+        for (int i = 0; i < 64; i++) pc_wr8(c, es, (uint16_t)(di + i), 0);
+        pc_wr16(c, es, di, PC_STUB_VGAFUNC);
+        pc_wr16(c, es, (uint16_t)(di + 2), PC_STUB_SEG);
+        for (int i = 0; i < 0x1E; i++) pc_wr8(c, es, (uint16_t)(di + 4 + i), pc_rd8(c, BDA, (uint16_t)(0x49 + i)));
+        pc_wr8(c, es, (uint16_t)(di + 0x22), (uint8_t)rows(c));
+        pc_wr16(c, es, (uint16_t)(di + 0x23), pc_rd16(c, BDA, 0x85));
+        pc_wr8(c, es, (uint16_t)(di + 0x25), 8);   /* the display combination: AH=1Ah's */
+        pc_wr16(c, es, (uint16_t)(di + 0x27), (uint16_t)colours);
+        pc_wr8(c, es, (uint16_t)(di + 0x29), (uint8_t)(pages > 8 ? 8 : pages ? pages : 1));
+        pc_wr8(c, es, (uint16_t)(di + 0x2A), (uint8_t)code);
+        pc_wr8(c, es, (uint16_t)(di + 0x2D), (uint8_t)(pc_rd8(c, BDA, 0x65) & 0x20));
+        pc_wr8(c, es, (uint16_t)(di + 0x31), 3);   /* 256K */
+        x86_set_r8(c, R_AL, 0x1B);
         break;
+    }
     case 0xFE:                        /* TopView: get video buffer — unchanged */
         break;
     case 0x4F:                        /* VESA BIOS Extensions (pc_vbe.c; -vbe) */
@@ -500,7 +646,7 @@ void pc_video_flush(int force) {
     last_paint_ns = now;
 
     FILE *f = stdout;
-    const uint8_t *vm = c->mem + ((uint32_t)PC_VIDEO_SEG << 4) + page_off(page(c));
+    const uint8_t *vm = c->mem + ((uint32_t)PC_VIDEO_SEG << 4) + page_off(c, page(c));
     int nr = rows(c) < PC_ROWS ? rows(c) : PC_ROWS, nc = cols(c) < PC_COLS ? cols(c) : PC_COLS;
     int cur_attr = -1, painted = 0;
     for (int r = 0; r < nr && r < term_rows; r++) {
