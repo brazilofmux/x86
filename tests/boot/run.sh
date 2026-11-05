@@ -177,9 +177,11 @@ if [ -f disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso ]; then
     # loader rejects every MP table, see tests/boot/README; the kernel runs
     # on both and routes the disk's interrupt through the I/O APIC to the second
     printf 'waitpix 60,60 51 102 152\nwaitpix 345,147 255 233 148\n' > tmp/boot-haiku.exp
-    if python3 tools/expect.py -t 420 tmp/boot-haiku.exp -- $DM -m 586 -mem 257 -vbe -smp 2 -acpi -nic e1000,user -W -T 410 -ro \
+    # (with the network when the build has one: without libslirp, -nic is refused)
+    hnic=; if $DM -nic e1000,user -h >/dev/null 2>&1; then hnic="-nic e1000,user"; fi
+    if python3 tools/expect.py -t 420 tmp/boot-haiku.exp -- $DM -m 586 -mem 257 -vbe -smp 2 -acpi $hnic -W -T 410 -ro \
          -hda disks/haiku/haiku-r1beta6-x86_gcc2h-anyboot.iso -boot c >/dev/null 2>&1
-    then echo "ok   haiku r1/beta6 on two processors with a network (acpi, smp, slirp)"; else echo "FAIL haiku smp"; fail=1; fi
+    then echo "ok   haiku r1/beta6 on two processors${hnic:+ with a network} (acpi, smp${hnic:+, slirp})"; else echo "FAIL haiku smp"; fail=1; fi
     rm -f tmp/boot-haiku.exp
 fi
 if [ -f disks/reactos/reactos-installed.img ]; then

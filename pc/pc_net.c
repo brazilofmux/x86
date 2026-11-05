@@ -145,20 +145,21 @@ static int get_revents(int idx, void *opaque) {
  * "user,fwd=2222:22" is ssh -p 2222 into the guest. */
 int pc_net_open(const char *spec) {
     if (strncmp(spec, "user", 4) || (spec[4] && spec[4] != ',')) { fprintf(stderr, "-nic: the network behind the card is 'user' (slirp)\n"); return -1; }
+    /* (outside the initializer: GCC takes no #pragma inside one) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     static const SlirpCb cb = {
         .send_packet = send_packet, .guest_error = guest_error, .clock_get_ns = clock_get_ns,
         .timer_new = timer_new, .timer_free = timer_free, .timer_mod = timer_mod,
         .notify = notify,
         /* before config version 6, libslirp calls the old pair, and
          * unchecked: both are given (this layer polls everything anyway) */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         .register_poll_fd = no_socket, .unregister_poll_fd = no_socket,
-#pragma GCC diagnostic pop
 #if SLIRP_CHECK_VERSION(4, 8, 0)
         .register_poll_socket = no_socket, .unregister_poll_socket = no_socket,
 #endif
     };
+#pragma GCC diagnostic pop
     SlirpConfig cfg = { 0 };
     cfg.version = 1;
     cfg.in_enabled = true;
