@@ -4,6 +4,9 @@
 # a Turbo Pascal 5.5 compile + run + a scripted IDE session.
 cd "$(dirname "$0")/../.." || exit 1
 DM=${DM:-./dos-monster}      # the binary under test (a cross build: build-a64/dos-monster)
+# Git Bash would turn QBasic's /RUN into a Windows path; only that one
+# (it still has to make -com1 /dev/null into NUL).
+export MSYS2_ARG_CONV_EXCL=/RUN
 # The guest's clock is its instruction count (plus time spent blocked on
 # the host): a compiler's "N seconds" line and the input-exhausted deadline
 # then come out the same on a fast Mac, under -V and under qemu-user.
@@ -232,5 +235,7 @@ BAS
     $DM -m 386 -W -C tmp/qbt -G tmp/qbt/g.png -T 2 tmp/qbt/QBASIC.EXE /RUN PROG.BAS >/dev/null 2>&1 </dev/null
     case "$(file tmp/qbt/g.png 2>/dev/null)" in *"640 x 480"*) echo "ok   qbasic -G SCREEN 12";; *) echo "FAIL qbasic -G SCREEN 12"; fail=1;; esac
     rm -rf tmp/qbt
+elif [ -f disks/msdos622/c.img ]; then
+    echo "skip qbasic (QBASIC.EXE comes off the image with mcopy: no mtools)"
 fi
 exit $fail

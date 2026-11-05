@@ -182,6 +182,7 @@ def main():
         p.wait(timeout=5)
     except subprocess.TimeoutExpired:
         p.kill()
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # Windows' default, cp1252, has no box drawing
     sys.stdout.write(screen(scr))
     return 0
 
