@@ -38,7 +38,7 @@ def lines(text):
     return [l for l in text.splitlines() if l.startswith("C") or l in ("fputest", "done")]
 
 def ours(img, extra):
-    p = subprocess.run([os.path.join(ROOT, "dos-monster"), "-W", "-m", "486", "-T", "120", *extra, "-boot", img],
+    p = subprocess.run([os.environ.get("DM") or os.path.join(ROOT, "dos-monster"), "-W", "-m", "486", "-T", "120", *extra, "-boot", img],
                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=180)
     return lines(p.stdout.decode("latin-1"))
 

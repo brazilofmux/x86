@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import pmrun, pmcases
 
-MONSTER = os.path.join(HERE, "..", "..", "dos-monster")
+MONSTER = os.environ.get("DM") or os.path.join(HERE, "..", "..", "dos-monster")
 LOG = "/tmp/pmours.log"
 
 def run(img=None, insn_limit=2_000_000):

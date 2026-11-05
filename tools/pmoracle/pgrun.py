@@ -120,7 +120,7 @@ def bochs(img, model="386"):
 def ours(img, extra, model="386"):
     # stdin stays an open, empty pipe: end of input would feed the guest a
     # Ctrl-Z, and its keyboard interrupt would land in a slow -V run
-    p = subprocess.Popen([os.path.join(ROOT, "dos-monster"), "-W", "-m", model, "-T", "60",
+    p = subprocess.Popen([os.environ.get("DM") or os.path.join(ROOT, "dos-monster"), "-W", "-m", model, "-T", "60",
                           *extra, "-boot", img],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:

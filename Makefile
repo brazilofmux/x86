@@ -165,12 +165,13 @@ $(HWFLAGS): $(O)/tools/hwflags.o $(CORE_OBJS)
 test-hwflags: $(HWFLAGS)
 	$(HWFLAGS) -m 386 -n 2000
 
-test-pm:
-	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && python3 pmrun.py
+test-pm: $(TARGET)
+	cd tools/pmoracle && nasm -f bin -o pmtest.img pmtest.asm && DM=$(abspath $(TARGET)) python3 pmrun.py
 
 # Paging and V86 transcript images: dos-monster against stored, adjudicated
 # transcripts (what QEMU says there depends on its version, and Bochs is the
 # reference), so no emulator on the host is needed
+test-pg: export DM = $(abspath $(TARGET))
 test-pg: $(TARGET)
 	cd tools/pmoracle && python3 pgrun.py pgtest.asm --expect pgtest.expected && python3 pgrun.py vmtest.asm --expect vmtest.expected && \
 	    python3 pgrun.py c486test.asm --m486 --expect c486test.expected && \
@@ -188,6 +189,7 @@ test-pg: $(TARGET)
 
 # The x87 against its transcript (tools/pmoracle/fpurun.py): the interpreter,
 # the JIT and -V
+test-fpu: export DM = $(abspath $(TARGET))
 test-fpu: $(TARGET)
 	cd tools/pmoracle && python3 fpurun.py --expect fputest.expected -- -i && \
 	    python3 fpurun.py --expect fputest.expected && python3 fpurun.py --expect fputest.expected -- -V

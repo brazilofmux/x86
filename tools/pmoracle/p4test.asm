@@ -1863,7 +1863,7 @@ fault_stubs:
 %assign v 0
 %rep 32
         push dword v
-        jmp near fault
+        jmp strict near fault
         nop
 %assign v v+1
 %endrep
