@@ -207,6 +207,11 @@ if [ -f disks/win2k/c-mp.img ] && [ -f disks/win2k/d-mp.img ]; then
     if python3 tools/expect.py -t 300 tmp/boot-w2k.exp -- $DM -m 586 -mem 64 -smp 2 -W -T 290 -ro \
          -hda disks/win2k/c-mp.img -hdb disks/win2k/d-mp.img -boot c >/dev/null 2>&1
     then echo "ok   windows 2000 on two processors (mp kernel, mps hal)"; else echo "FAIL windows 2000 smp"; fail=1; fi
+    # ... and the second processor really ran: a desktop alone does not say
+    # so (when the HAL gave up on it, it showed the same desktop on one)
+    n=$(sleep 32 | $DM -s -m 586 -mem 64 -smp 2 -W -T 30 -ro -hda disks/win2k/c-mp.img -hdb disks/win2k/d-mp.img -boot c 2>&1 >/dev/null \
+        | sed -n 's/^ *processor 1: \([0-9]*\) insns.*/\1/p')
+    if [ "${n:-0}" -gt 10000000 ]; then echo "ok   windows 2000's second processor runs"; else echo "FAIL windows 2000's second processor ran ${n:-0} instructions"; fail=1; fi
     rm -f tmp/boot-w2k.exp
 fi
 if [ -f disks/linux/tc.img ]; then

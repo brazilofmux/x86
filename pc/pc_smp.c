@@ -16,7 +16,7 @@
 #include <time.h>
 
 static pthread_mutex_t big;
-static pthread_cond_t wake[PC_MAX_CPUS];
+static pthread_cond_t wake[PC_MAX_CPUS], sipi_ran;
 static int ready, exiting;
 static struct { int sipi_vector, init_pending, running; } ap[PC_MAX_CPUS];
 
@@ -26,6 +26,7 @@ void pc_smp_setup(void) {
     pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&big, &a);
     for (int i = 0; i < PC_MAX_CPUS; i++) pthread_cond_init(&wake[i], NULL);
+    pthread_cond_init(&sipi_ran, NULL);
     memset(ap, 0, sizeof ap);
     ap[0].running = 1;
     ready = 1;
@@ -75,11 +76,36 @@ int pc_smp_wait_sipi(x86_cpu *c) {
     return v;
 }
 /* From the ICR, the lock held: a STARTUP IPI starts a waiting processor
- * at VECTOR:0000; one that is running ignores it, as the silicon does. */
+ * at VECTOR:0000; one that is running ignores it, as the silicon does.
+ *
+ * A real processor is executing within microseconds. This one first has
+ * to wake a thread, reset a translator and translate its first blocks
+ * (20 ms on an EC2 Xeon), while the sender runs on: Windows 2000's HAL
+ * maps its startup page, sends this, waits in a calibrated delay loop and
+ * then gives up and unmaps the page. So the processor found the page gone
+ * and shut down (a boot that "passed" on one CPU), or, later still, came
+ * up after the kernel had freed its control block (STOP 0A in the IPI
+ * loop). The sender waits until the new processor has really run; a delay
+ * loop cannot see that, its count does not advance. The time is the
+ * backstop for one that halts or spins on the lock. */
+#define SIPI_RUN_INSNS 100000u
+#define SIPI_WAIT_NS   200000000ull
 void pc_smp_sipi(int cpu, int vector) {
     if (cpu <= 0 || cpu >= pc.ncpus || ap[cpu].running) return;
+    x86_cpu *c = pc.cpus[cpu];
+    uint64_t from = c->insn_count, t0 = pc_wall_ns();
     ap[cpu].sipi_vector = vector + 1;
     pthread_cond_signal(&wake[cpu]);
+    while (!exiting && pc_wall_ns() - t0 < SIPI_WAIT_NS
+           && (ap[cpu].sipi_vector || c->insn_count < from || c->insn_count - from < SIPI_RUN_INSNS)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200000;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
+        /* Nothing signals this: it is a 200 us sleep that releases the lock
+         * the new processor needs (held once here, from the ICR write). */
+        pthread_cond_timedwait(&sipi_ran, &big, &ts);
+    }
 }
 /* INIT: a running processor goes back to waiting for STARTUP, at its
  * next boundary (pc_smp_take_init, from its poll). */
