@@ -10,7 +10,9 @@
 #           and prints SOAK=OK or SOAK=BAD with what it saw
 #   w2kN    Windows 2000 MP (disks/win2k/c-mp.img, d-mp.img) to its desktop,
 #           KeBugCheckEx trapped (X86_INTERP_FROM) so a failure's log holds
-#           both processors' state at the bugcheck
+#           both processors' state at the bugcheck. This disk starts only
+#           processor 1, whatever -smp says (it is Professional, licensed
+#           for two, probably why): w2k4 tests two processors, not four
 #   haikuN  Haiku R1/beta6 (its anyboot image, -acpi) to the welcome window
 #
 # SOAK_N runs per case (30), SOAK_CASES which ("linux2 linux4 w2k2 w2k4
